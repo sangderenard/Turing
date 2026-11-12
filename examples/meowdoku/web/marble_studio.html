@@ -351,6 +351,11 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
       <button id="photo-frame-focus" type="button" class="wide">Frame &amp; focus marble</button>
       <button id="photo-focus-target" type="button" class="wide">Focus camera target (Custom analytical)</button>
       <p id="photo-focus-diagnostic" class="wide" role="status" aria-live="polite"></p>
+      <label>Shift (sensor half-size) X<input id="photo-shift-x" type="number" min="-1" max="1" step="0.01" value="0"></label>
+      <label>Shift (sensor half-size) Y<input id="photo-shift-y" type="number" min="-1" max="1" step="0.01" value="0"></label>
+      <label>Analytical focus-plane tilt (degrees) X<input id="photo-tilt-x" type="number" min="-30" max="30" step="0.1" value="0"></label>
+      <label>Analytical focus-plane tilt (degrees) Y<input id="photo-tilt-y" type="number" min="-30" max="30" step="0.1" value="0"></label>
+<p class="wide">Off-axis framing and tilted focus plane shared with the ray camera. Phong uses opaque-depth blur, not compound lens transport or glass depth.</p>
       <label class="wide"><input id="studio-dof" type="checkbox" checked> Phong depth-of-field preview</label>
       <output id="studio-dof-status" class="wide" role="status">Preparing depth-buffer focus blur.</output>
       <p class="wide">Aperture and focus blur the actual Phong image, including the player camera, using 48 dithered depth samples with a 64-pixel radius limit. This screen-space approximation uses opaque depth: glass, refraction, reflections and hidden surfaces need the ray tracer. Photos and live rays are unchanged.</p>
@@ -442,6 +447,9 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
   <h2>Marble size &amp; physical properties</h2><div class="grid">
     <label>Marble-only radius (mm)<input id="radius-mm" type="number" min="0.1" max="200" step="any" value="10"></label>
     <label>Marble size <output id="marble-scale-out"></output><input id="marble-scale-slider" type="range" min="0" max="100" step="0.01" value="60.59"></label>
+    <label class="wide"><input id="studio-orbit-lock" type="checkbox" checked> Orbit subject (uncheck to point from fixed camera position)</label>
+    <label>Camera / tripod mount height (feet above floor)<input id="studio-camera-height" type="number" min="0.05" max="100" step="0.1" placeholder="Orbit controlled"></label>
+    <p class="wide">Height moves the camera, not the subject. Free-pointing drag pans/tilts in place. Frame &amp; focus restores orbit. No physical tripod mesh is added.</p>
     <button id="frame-marble" type="button" class="wide">Frame &amp; focus marble</button>
     <p class="wide">Size changes keep the material definition and table contact. Thickness, absorption, mass and inertia change physically. User orbit stays centred on the displayed marble without changing zoom. A held photographic pose stays fixed. Particle-course radius remains a separate simulator setting.</p>
     <label>Shell density (kg/m³)<input id="shell-density" type="number" min="1" max="30000" step="10" value="2500"></label>
