@@ -5,6 +5,7 @@ import {ensureObjAsset, importedMechanics} from "./marble_imported_object.js";
 // A close-up on the same exported Pluck Phong shader and MaterialDatabase
 // tables used by the game. All edits are local to this preview.
 import { marbleMass } from "./marble_mass.js";
+import {cutConvexShell} from "./gem_cutter.js";
 import { bubbleCount, validateBubbleHost, validateBubbleInclusions, validateBubbleRadius, phongInterior } from "./marble_bubbles.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
 import { ComputeRuntime } from "./compute.js";
@@ -14,6 +15,8 @@ import { bindMarbleDriveInput } from "./marble_drive_input.js";
 import { MarbleChaseCamera, chaseViewMatrix } from "./marble_chase_camera.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CENTER } from "./marble_photo.js";
+import {mountMarbleTriggerGrid} from "./marble_trigger_grid.js";
+import {pickStageProgrammer} from './marble_stage_programmer.js';
 import { createLiveRayView } from "./marble_live.js";
 import {createStudioLightField} from "./marble_light_field.js";
 import {fieldCategoryEnabled,fieldCategoryRuns,withSceneCategory} from './marble_field_categories.js';
@@ -50,6 +53,7 @@ import {PhotographicCameraBinding,mountPhotographicCameraBinding,linkedPhotoOrbi
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
+let triggerGrid = null;
 let opticalControls = null;
 let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null;
 // A late-bound facade lets existing photo controls start before WebGL setup.
@@ -61,7 +65,7 @@ document.addEventListener("studio-lens-change", () => liveRay?.cameraChanged());
 let studioSceneRevision=0,lastStudioFrame=null;
 // Conservative edit revision catches an edit and reversal during a hidden
 // bake. Exact captured data is still compared before ownership transfers.
-for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox, #phong-capture-controls, #phong-field-categories'))studioSceneRevision++;},true);
+for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox, #phong-capture-controls, #phong-field-categories, #camera-trigger-grid'))studioSceneRevision++;},true);
 let suppliedSubjectAsset=null;
 let objectAutosave=null, savedObjectSnapshot=null, objectKey="", objectEditQueued=false, applyingObject=false, objectLoadIntent=0;
 // Keep the ray-traced photo's "Current Studio orbit and zoom" camera option
@@ -81,7 +85,8 @@ const exposureClock={active:false,dt:0,modelNow:0,waiters:[],
   nextTick(callback){exposureClock.waiters.push(callback);},
   completeTick(){for(const callback of this.waiters.splice(0))callback();}};
 const photo = createMarblePhoto(document, currentCameraOptions,
-  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock);
+  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock,
+  ()=>triggerGrid?.graph(),()=>triggerGrid?.generators());
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),
@@ -257,6 +262,22 @@ let tables, ids, P, interior, glass, glassOpaque, checkerMesh, backdropMesh, coa
 let FIXTURE_MAT_BASE=0, FIXTURE_HOUSING_MAT=0, FIXTURE_LABEL_MAT=0, fixtureMeshes=null, glyphMeshes={};
 let opaqueSaved = null;
 let tableOpaque=null, tableTransparentFaces=[], marbleTransparentFaces=[], sceneGlass=null, sceneGlassKey=null, savedPhotoRadius=null;
+let gemPreviewCache=null;
+function phongExteriorFaces() {
+  const style=$("phong-gem-cut")?.value??"off";
+  if(style==="off")return lastGeometry.glass;
+  if($("base-shape").value!=="marble") {
+    $("phong-gem-cut").value="off";
+    $("phong-gem-status").value="Gem study reset: choose Marble for the convex-shell trial.";
+    return lastGeometry.glass;
+  }
+  const strength=Number($("phong-gem-strength").value)/100;
+  if(gemPreviewCache?.geometry===lastGeometry&&gemPreviewCache.style===style&&gemPreviewCache.strength===strength)
+    return gemPreviewCache.faces;
+  const faces=cutConvexShell(lastGeometry.glass,{style,strength,capMaterial:ids[$("shell").value]});
+  gemPreviewCache={geometry:lastGeometry,style,strength,faces};
+  return faces;
+}
 let standOpaque=null,standGlass=null,standTransparentFaces=[],standMeshKey=null;
 let shopOpaque=null,shopGlass=null,shopTransparentFaces=[],shopMeshKey=null,shopGeometry=null;
 let studioOrbitTarget=[0,0,0];
@@ -553,6 +574,7 @@ function setupObjSubjects(run) {
 }
 function repartitionExterior(force=false) {
   if(!lastGeometry)return;
+  const previewOutside=phongExteriorFaces(),gemCut=$("phong-gem-cut")?.value!=="off";
   tagSubjectResponseFaces(lastGeometry,lightField?.responseInformationRequested===true);
   if(tableOpaque) rebuildTable();
   const classes=new Map();
@@ -564,8 +586,8 @@ function repartitionExterior(force=false) {
   exteriorClass=classes;
   dispose(interior);dispose(glass);dispose(glassOpaque);
   const opaque=[],transparent=[],insideOpaque=[];
-  for(const face of phongInterior(lastGeometry)) (classes.get(face[3])?insideOpaque:transparent).push(face);
-  for(const face of lastGeometry.glass) (classes.get(face[3])?opaque:transparent).push(face);
+  if(!gemCut)for(const face of phongInterior(lastGeometry)) (classes.get(face[3])?insideOpaque:transparent).push(face);
+  for(const face of previewOutside) (classes.get(face[3])?opaque:transparent).push(face);
   interior=mesh(insideOpaque);glassOpaque=mesh(opaque);glass=transparentMesh(transparent);
   marbleTransparentFaces=transparent; sceneGlassKey=null;
 }
@@ -607,7 +629,7 @@ function refreshSceneMaterialTargets() {
   const layer=$("layer"),chosen=layer.value;
   for(const group of layer.querySelectorAll('optgroup[data-scene-materials]'))group.remove();
   const roles=computeFixtureRoles(studioSubjectTransform(false,"exposure").subjectCenter,"exposure").fixtureRoles;
-  const targets={stage:[...tableFaces("exposure"),...lightStandFacesForStudio("exposure",roles)],
+  const targets={stage:[...tableFaces("exposure"),...programmerFaces("exposure"),...lightStandFacesForStudio("exposure",roles)],
     room:[...checkerboardFaces("exposure"),...backdropRollFaces("exposure"),...backdropSupportFacesForStudio("exposure"),...goboFaces("exposure"),...shopLightFacesForStudio("exposure")]};
   for(const [name,faces]of Object.entries(targets)) {
     const group=document.createElement('optgroup');group.dataset.sceneMaterials=name;group.label=name==='stage'?'Product stage materials':'Remaining room materials';
@@ -762,6 +784,31 @@ function studioBuilderOptions(channel="studio",saved=false) {
 function studioRoomScale(channel="studio") { return Number(studioControlValue("room-scale",channel) || 3); }
 function studioTableState(channel="studio") { return studioRenderState(channel)?.table ?? studioLighting?.table?.getState() ?? defaultStudioTable(); }
 function studioFloorDrop(channel="studio") { return tableFloorDrop(studioTableState(channel)); }
+function activateStageProgrammerKey(key) {
+  if(typeof key==='object'){
+    const slider=$(`lighting-rack-${key.bus}-dimmer`);slider.value=String(key.level);
+    slider.dispatchEvent(new Event('input',{bubbles:true}));return;
+  }
+  if(key==='flash'){$('camera-trigger-fire').click();return;}
+  if(key==='all-out'){$('lighting-rack-all-out').click();return;}
+  if(key==='shop'){
+    const slider=$('lighting-rack-shop-dimmer');slider.value='0.15';
+    slider.dispatchEvent(new Event('input',{bubbles:true}));return;
+  }
+  $('stage-programmer-open').click();
+}
+function mountStageProgrammer() {
+  const dialog=$('stage-programmer'),rack=studioLighting.rackControls.element,mixer=$('camera-trigger-grid');
+  const rackHome=document.createComment('stage programmer rack home'),mixerHome=document.createComment('stage programmer mixer home');
+  rack.after(rackHome);mixer.after(mixerHome);
+  const close=()=>{if(dialog.open)dialog.close();};
+  $('stage-programmer-open').addEventListener('click',()=>{
+    $('stage-programmer-rack').append(rack);$('stage-programmer-mixer').append(mixer);
+    mixer.open=true;dialog.showModal();
+  });
+  $('stage-programmer-close').addEventListener('click',close);
+  dialog.addEventListener('close',()=>{rackHome.before(rack);mixerHome.before(mixer);});
+}
 function studioSubjectTransform(saved = false, channel = saved ? "exposure" : "studio") {
   const radiusMm = saved && savedPhotoRadius !== null ? savedPhotoRadius * 1000 : Number($("radius-mm").value);
   return studioScaleTransform(studioRenderState(channel)?.scale ?? studioLighting?.scale?.getState() ?? defaultStudioScale(), radiusMm, studioTableState(channel).enabled);
@@ -820,6 +867,9 @@ function responsePartCallback(prefix,onPart) {
 function tableFaces(channel="studio",onPart) {
   return createStudioSceneGeometry(studioBuilderOptions(channel)).tableFaces(responsePartCallback('table',onPart));
 }
+function programmerFaces(channel="studio",onPart) {
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).programmerFaces(responsePartCallback('programmer',onPart));
+}
 function goboFaces(channel="studio",onPart) {
   return createStudioSceneGeometry(studioBuilderOptions(channel)).goboFaces(responsePartCallback('gobo',onPart));
 }
@@ -876,6 +926,7 @@ function rebuildTable() {
   // Free-standing gobos share the existing furniture partition and world-space
   // glass sort, including when their front and back use different materials.
   for(const face of [...withSceneCategory(tableFaces(),STUDIO_SCENE_PART_GROUP.table),
+    ...withSceneCategory(programmerFaces(),STUDIO_SCENE_PART_GROUP.programmer),
     ...withSceneCategory(goboFaces(),STUDIO_SCENE_PART_GROUP.gobo)])
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:tableTransparentFaces).push(face);
   tableOpaque=mesh(opaque); sceneGlassKey=null;
@@ -998,7 +1049,7 @@ function captureCurrentStudioScene() {
   if(studioControlValue("checker","studio")) {
     checkerboardFaces("studio",collect("room"));backdropRollFaces("studio",collect("backdrop"));
   }
-  tableFaces("studio",collect("table"));goboFaces("studio",collect("gobo"));
+  tableFaces("studio",collect("table"));programmerFaces("studio",collect("programmer"));goboFaces("studio",collect("gobo"));
   buildFixtureFaces(displayed.fixtureRoles,FIXTURE_HOUSING_MAT,collect("fixture"));
   lightStandFacesForStudio("studio",displayed.fixtureRoles,collect("stand"));
   backdropSupportFacesForStudio("studio",collect("backdrop-holder"));
@@ -1067,7 +1118,7 @@ function controls() {
   const skipPhotoInvalidation=new Set(["object-name","saved-object","obj-asset","obj-file","obj-mtl","layer","preview-engine","preview-camera","preview-motion",
     "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
   const designChanged=(event)=>{
-    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls, #phong-capture-controls'))return;
+    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls, #phong-capture-controls, #camera-trigger-grid'))return;
     if(event.target.closest?.('#photo-camera-binding'))return;
     if(applyingObject||event.target.closest("#optical-material-controls")||event.target.closest("#room-profile-overrides")||event.target.closest("#live-ray-controls")||event.target.id==="object-autosave")return;
     if(event.target.id==="object-name"){objectEdited();return;}
@@ -1079,15 +1130,29 @@ function controls() {
     if(studioLighting?.gobos.ownsControl(event.target.id))return;
     if(studioLighting?.scale.ownsControl(event.target.id))return;
     if(studioLighting?.surfaces.ownsControl(event.target.id))return;
-    if(event.target.closest("#studio-scene-controls, #lighting-profiles, #light-pose-controls, #backdrop-layer-controls")||["checker","window-glass"].includes(event.target.id)){
+    if(event.target.closest("#studio-scene-controls, #lighting-profiles, #stage-programmer-rack, #light-pose-controls, #backdrop-layer-controls")||["checker","window-glass"].includes(event.target.id)){
       liveRay?.sceneChanged();photo.sceneChanged();return;
     }
     else if(!event.target.closest("#photo-controls") && !skipPhotoInvalidation.has(event.target.id))objectEdited();
-    if(!event.target.closest("#photo-controls, #light-pose-controls, #lighting-profiles, #backdrop-layer-controls") && !skipPhotoInvalidation.has(event.target.id)) photo.stale();
+    if(!event.target.closest("#photo-controls, #light-pose-controls, #lighting-profiles, #stage-programmer-rack, #backdrop-layer-controls") && !skipPhotoInvalidation.has(event.target.id)) photo.stale();
   };
   for(const id of ["reroll","reset-material"]) $(id).addEventListener("click",()=>{photo.stale();objectEdited();},true);
   $("photo-start").addEventListener("click",()=>photo.start(lastGeometry)
     .catch((error)=>photo.status(error.message||String(error))));
+  const gemMode=$("phong-gem-cut"),gemStrength=$("phong-gem-strength"),gemStatus=$("phong-gem-status");
+  const updateGem=()=>{
+    $("phong-gem-strength-out").value=`${gemStrength.value}%`;
+    try {
+      if(gemMode.value!=="off"&&$("base-shape").value!=="marble")
+        throw new Error("Choose Marble as the base shape for this first convex-shell trial.");
+      repartitionExterior(true);
+      gemStatus.value=gemMode.value==="off"?"Original Phong shell shown.":
+        `${gemMode.selectedOptions[0].textContent} · ${gemPreviewCache.faces.length.toLocaleString()} closed-shell triangles. Preview only; saved object and ray exposures keep the original geometry.`;
+    } catch(error) {gemMode.value="off";repartitionExterior(true);gemStatus.value=error.message;}
+  };
+  gemMode.addEventListener("change",updateGem);
+  gemStrength.addEventListener("change",updateGem);
+  gemStrength.addEventListener("input",()=>{$("phong-gem-strength-out").value=`${gemStrength.value}%`;});
   const diceCost=()=>{const kind=$("base-shape").value,
     factor={d4:12,d6:24,d8:24,d10:40,d12:60,d20:60}[kind]||0;
     $("dice-detail-cost").value=kind==="marble"?"Die detail applies to polyhedra":
@@ -1325,6 +1390,13 @@ function controls() {
   };
   canvas.addEventListener("pointerdown",event=>{
     if(event.pointerType==="mouse"&&event.button!==0)return;
+    if(lastStudioFrame?.engine==='visual'&&studioControlValue('stage-programmer-enabled','studio')){
+      const rect=canvas.getBoundingClientRect();
+      const key=pickStageProgrammer(lastStudioFrame,
+        studioRoomBounds(studioRoomScale(),studioFloorDrop()),studioTableState(),
+        (event.clientX-rect.left)/rect.width,(event.clientY-rect.top)/rect.height);
+      if(key){event.preventDefault();activateStageProgrammerKey(key);return;}
+    }
     cameraPointers.set(event.pointerId,[event.clientX,event.clientY]);
     if(cameraPointers.size===1){cameraGesture="orbit";last=[event.clientX,event.clientY];chaseCamera.drag(true,performance.now()/1000);}
     else if(cameraPointers.size===2&&cameraGesture==="orbit"){cameraGesture="pinch";pinchSpan=cameraSpan();last=null;}
@@ -1487,8 +1559,23 @@ function frame(now=0) {
     // via computeFixtureRoles()/ROOM_FIXTURES so the ray-traced photo
     // bridge renders the identical rig, not an independently-guessed one.
     const {fixtureRoles, roleColor, roleStrength}=computeFixtureRoles(simOn&&particleWorld?particleWorld:[object[12],object[13],object[14]]);
+    const manualFlash=triggerGrid?.levels(performance.now());
+    if(manualFlash)for(let i=0;i<roleStrength.length;i++)if(manualFlash.active.has(`studio:${i}`))
+      roleStrength[i]*=manualFlash.gains[`studio:${i}`]??0;
+    if(manualFlash)for(let i=0;i<roleColor.length;i++)for(let channel=0;channel<3;channel++){
+      const receiver=`filter:studio:${i}:${'rgb'[channel]}`;
+      if(manualFlash.active.has(receiver))roleColor[i][channel]*=Math.min(1,manualFlash.gains[receiver]??0);
+    }
     rebuildStandMeshes(fixtureRoles);
-    writeShopLightEmitterRows(tables.pbr.data,tables.pbr.table.floats_per_record,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,shopLightState(),{profiles:shopEmissionProfiles});
+    const previewShops=structuredClone(shopLightState());
+    if(manualFlash){
+      previewShops.fixtures.forEach((fixture,i)=>{
+        const receiver=`shop:${fixture.id}`;
+        if(manualFlash.active.has(receiver))fixture.dimmer*=manualFlash.gains[receiver]??0;
+        else if(manualFlash.shopCutoff)fixture.dimmer=0;
+      });
+    }
+    writeShopLightEmitterRows(tables.pbr.data,tables.pbr.table.floats_per_record,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,previewShops,{profiles:shopEmissionProfiles});
     const displayedShop=rebuildShopMeshes();
     // Real emitter registration (the same process spectral-analyzer's own
     // camera uses to derive lights from emissive material groups:
@@ -1770,6 +1857,14 @@ async function boot() {
       onBackdropChange:()=>{dispose(backdropMesh);backdropMesh=backdropRoll();},
       onGoboChange:()=>rebuildTable(),
       onRoomChange:()=>{dispose(checkerMesh);checkerMesh=checkerboard();rebuildTable();},
+    });
+    triggerGrid=mountMarbleTriggerGrid({doc:document,getReceivers:()=>[
+      ...STUDIO_LIGHTS.map((_,i)=>`studio:${i}`),
+      ...shopLightState().fixtures.map(fixture=>`shop:${fixture.id}`),
+      ...STUDIO_LIGHTS.flatMap((_,i)=>['r','g','b'].map(channel=>`filter:studio:${i}:${channel}`))]});
+    mountStageProgrammer();
+    $('stage-programmer-enabled').addEventListener('change',()=>{
+      rebuildTable();photo.sceneChanged();liveRay?.sceneChanged();
     });
     copyCoating(); copyPaint(); checkerMesh=checkerboard(); backdropMesh=backdropRoll();rebuildTable();
     if ($("backdrop-layers-out")) $("backdrop-layers-out").value=$("backdrop-layers").value;

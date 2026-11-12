@@ -26,7 +26,20 @@ def _copy_source(value):
             bindings = getattr(node, '_python_bindings', None)
             if isinstance(bindings, dict):
                 memo[id(bindings)] = bindings
-    return copy.deepcopy(value, memo)
+    copied = copy.deepcopy(value, memo)
+    # The conversion installs the copy's body in place of the authored one.
+    # Record, on each authored node, the node it became, so a receipt that
+    # holds an authored statement (assignment_normalization's projection
+    # statements) can follow it into the program instead of keeping a
+    # statement the program no longer contains.
+    for root in roots:
+        if not isinstance(root, ast.AST):
+            continue
+        for node in ast.walk(root):
+            twin = memo.get(id(node))
+            if isinstance(twin, ast.AST) and twin is not node:
+                node._turing_source_copy = twin
+    return copied
 
 
 @dataclass

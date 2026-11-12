@@ -8,6 +8,7 @@ import {resolveLightingPoses} from './marble_lighting.js';
 import {STUDIO_LIGHTS} from './marble_light_strengths.js';
 import {tableLightRoles,tableLightModifierFaces} from './marble_table_lights.js';
 import {studioRoomBounds,studioRoomFaces} from './marble_room.js';
+import {stageProgrammerFaces} from './marble_stage_programmer.js';
 import {defaultStudioTable,tableFloorDrop,studioTableFaces,FLOOR_FIXTURE_INDICES} from './marble_studio_table.js';
 import {studioGoboFaces} from './marble_studio_gobos.js';
 import {studioLightStandFaces} from './marble_light_stand_settings.js';
@@ -328,6 +329,7 @@ export function createStudioSceneGeometry({lighting,materials,subject,geometrySu
   const backdropRollFaces=onPart=>backdropFaces({count:Number(control('backdrop-layers')),material:control('backdrop-material'),
     sweep:control('backdrop-sweep'),layers:lighting.backdrops??defaultBackdropLayers(),wallZ:bounds.backZ,floorY:bounds.floorY},ids,onPart);
   const tableFaces=onPart=>studioTableFaces(table,ids,bounds.floorY,onPart);
+  const programmerFaces=onPart=>control('stage-programmer-enabled')?stageProgrammerFaces(bounds,table,ids,onPart):[];
   const goboFaces=onPart=>studioGoboFaces(lighting.gobos,ids,onPart);
   const lightStandFaces=(fixtureRoles,onPart)=>{
     const state=lighting.lightStands;if(!state?.enabled)return [];
@@ -345,12 +347,12 @@ export function createStudioSceneGeometry({lighting,materials,subject,geometrySu
     return {...geometry,faces:[...geometry.faces,...rails.faces],parts:[...geometry.parts,...rails.parts]};
   };
   const shopLightFaces=onPart=>{const geometry=shopLightGeometry();for(const part of geometry.parts)onPart?.(part);return geometry.faces;};
-  return {roomFaces,backdropRollFaces,tableFaces,goboFaces,lightStandFaces,backdropHolderFaces,shopLightGeometry,shopLightFaces};
+  return {roomFaces,backdropRollFaces,tableFaces,programmerFaces,goboFaces,lightStandFaces,backdropHolderFaces,shopLightGeometry,shopLightFaces};
 }
 // Canonical ownership shared by photo material-engine groups and raster receivers.
 export const STUDIO_SCENE_PART_GROUP=Object.freeze({
   fixture:'stage',room:'room',backdrop:'room',backdropHolder:'room',
-  table:'stage',gobo:'room',lightStand:'stage',shopLight:'room',
+  table:'stage',programmer:'stage',gobo:'room',lightStand:'stage',shopLight:'room',
 });
 export function buildStudioPhotoFixtures({lighting,materials,subject,geometrySubject=subject,rayOriginM,shopEmissionProfiles,solo=null,getOpticalRecord,lightFieldInformation,timedExposure=false}) {
   const {ids,pbr:sourcePbr,fixtureMaterialBase:FIXTURE_MAT_BASE}=materials;
@@ -370,6 +372,7 @@ export function buildStudioPhotoFixtures({lighting,materials,subject,geometrySub
   collect(STUDIO_SCENE_PART_GROUP.backdrop,'Backdrop',cb=>geometry.backdropRollFaces(cb),'backdrop');
   collect(STUDIO_SCENE_PART_GROUP.backdropHolder,'Backdrop holder',cb=>geometry.backdropHolderFaces(cb),'backdrop-holder');
   collect(STUDIO_SCENE_PART_GROUP.table,'Table',cb=>geometry.tableFaces(cb),'table');
+  collect(STUDIO_SCENE_PART_GROUP.programmer,'Stage programmer',cb=>geometry.programmerFaces(cb),'programmer');
   collect(STUDIO_SCENE_PART_GROUP.gobo,'Gobo',cb=>geometry.goboFaces(cb),'gobo');
   collect(STUDIO_SCENE_PART_GROUP.lightStand,'Light stand',cb=>geometry.lightStandFaces(fixtureRoles,cb),'stand');
   collect(STUDIO_SCENE_PART_GROUP.shopLight,'Shop light',cb=>geometry.shopLightFaces(cb),'shop');
@@ -422,11 +425,17 @@ export function packStudioPhotoParts({parts,materials,subject,rayOriginM,lightin
     const fixture=lighting.shopLights?.fixtures?.find(value=>value.id===row.fixtureId);
     const material=materialIndex.get(row.materialId);
     return fixture?.enabled&&fixture.exposureMode==='burst'&&material!==undefined?
-      [{material,receiver:`shop:${material}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
+      [{material,receiver:`shop:${fixture.id}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
+  });
+  const shop_receiver_candidates=shopRows.flatMap(row=>{
+    const fixture=lighting.shopLights?.fixtures?.find(value=>value.id===row.fixtureId);
+    const material=materialIndex.get(row.materialId);
+    return fixture?.enabled&&material!==undefined?
+      [{material,receiver:`shop:${fixture.id}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
   });
   const response_lineage=lightFieldInformation===RESPONSE_INFORMATION?fixtureResponseLineage(parts):null;
   return {vertices,material_ids:materialIds,pbr,material_engines,emitter_profiles,
-    ...(timedExposure?{shop_material_ids,trigger_emitters}:{}),...(response_lineage?{response_lineage}:{})};
+    ...(timedExposure?{shop_material_ids,trigger_emitters,shop_receiver_candidates}:{}),...(response_lineage?{response_lineage}:{})};
 }
 export function initializeStudioFixtureRows(data,pbrStride,FIXTURE_MAT_BASE) {
     const base=(slot)=>(FIXTURE_MAT_BASE+slot)*pbrStride;

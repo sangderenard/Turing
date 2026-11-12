@@ -385,3 +385,70 @@ def test_resource_demand_finalization_records_all_refusals_and_is_order_independ
                                  for row in gap_rows)
     finally:
         end_identity_book(token)
+
+
+def _pickle_receipt(identity: str) -> dict:
+    return {
+        "action": "use_native", "rule_id": "native-pickle-object-result", "identity": identity,
+        "classification": "native_extension",
+        "parameters": {"execution": "shell_io.external_references", "result_dtype": "opaque_ref"},
+    }
+
+
+def _pickle_scopes(source: str) -> ast.AST:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":
+            node._extraction_contract = _file_receipt("io.open")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("dump", "load"):
+            node._extraction_contract = _pickle_receipt(f"_pickle.{node.func.attr}")
+    return lower_python_shell_file_contexts(tree)
+
+
+def test_a_file_scope_that_only_pickle_uses_becomes_tensor_payload_calls():
+    tree = _pickle_scopes("""
+def save_map(file_path, map_data):
+    with open(file_path, 'wb') as f:
+        pickle.dump(map_data, f)
+
+def load_map(file_path):
+    with open(file_path, 'rb') as f:
+        log('loaded')
+        return to_tensor(pickle.load(f))
+""")
+    assert not any(isinstance(node, ast.With) for node in ast.walk(tree))
+    calls = {
+        node.func.id: node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id.startswith("__turing_")
+    }
+    assert set(calls) == {"__turing_tensor_payload_save", "__turing_tensor_payload_load"}
+    save, load = calls["__turing_tensor_payload_save"], calls["__turing_tensor_payload_load"]
+    assert [ast.unparse(a) for a in save.args] == ["turing_payload_path_1", "map_data"]
+    assert [ast.unparse(a) for a in load.args] == ["turing_payload_path_2"]
+    assert save._extraction_contract["identity"] == "src.common.tensors.compression.tensor_payload.save"
+    assert load._extraction_contract["parameters"]["result_dtype"] == "tensor_region"
+    assert save._extraction_contract["parameters"]["argument_sequences"] == [
+        {"position": 0, "encoding": "unicode-codepoints"}, {"position": 1, "encoding": "tensor-region"},
+    ]
+    unparsed = ast.unparse(tree)
+    assert "turing_payload_path_2 = file_path" in unparsed and "log('loaded')" in unparsed
+    assert "return to_tensor(__turing_tensor_payload_load(turing_payload_path_2))" in unparsed
+    scopes = tree._turing_tensor_payload_scopes
+    assert [s["mode"] for s in scopes] == ["wb", "rb"]
+    assert scopes[0]["replaced"][0]["identity"] == "_pickle.dump"
+    assert scopes[1]["replaced"][0]["becomes"] == "src.common.tensors.compression.tensor_payload.load"
+
+
+@pytest.mark.parametrize("body", [
+    "pickle.dump(m, f)\n        f.flush()",        # the stream used for something else too
+    "pickle.dump(m, f, protocol=4)",              # a keyword changes the protocol
+    "pickle.load(f)",                             # loading from a stream opened to write
+])
+def test_a_pickle_scope_with_any_other_stream_use_is_left_as_it_was(body):
+    tree = _pickle_scopes(f"""
+def save_map(p, m):
+    with open(p, 'wb') as f:
+        {body}
+""")
+    assert any(isinstance(node, ast.With) for node in ast.walk(tree))
+    assert not hasattr(tree, "_turing_tensor_payload_scopes")

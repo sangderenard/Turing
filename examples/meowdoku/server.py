@@ -2535,6 +2535,22 @@ def make_handler(sessions: Sessions):
                 except (ValueError, TypeError) as error:
                     self.close_connection = True
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 == "/api/marble_camera/trigger_grid":
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not self._require("photo_submit"):
+                    return
+                account = self._account()
+                if account is None:
+                    return self._json({"error": "Log in to edit camera routing"}, HTTPStatus.UNAUTHORIZED)
+                body = self._body_json(limit=262144)
+                if body is None:
+                    return
+                try:
+                    from meowdoku.trigger_grid_service import command
+                    return self._json(command(account["id"], body, sessions.marble_photos.spectral_root))
+                except (ValueError, TypeError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             if path0 == "/api/marble_photo/calibration_qr":
                 if not self._require("photo_read"):
                     return

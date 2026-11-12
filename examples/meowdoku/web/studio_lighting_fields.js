@@ -225,7 +225,8 @@ export const STUDIO_LIGHTING_FIELDS = {
     "min": "1",
     "max": "8",
     "defaultValue": 6
-  }
+  },
+  "stage-programmer-enabled": {"type":"checkbox","defaultValue":true}
 };
 export function studioLightingFields(materialNames) {
   return Object.fromEntries(Object.entries(STUDIO_LIGHTING_FIELDS).map(([id,field])=>[id,

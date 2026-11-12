@@ -110,6 +110,13 @@ def test_a_rows_program_never_runs_git_or_inside_the_core(world):
     assert "inside the core" in core_git.exec_refusal(policy, "C:/tools/zstd.exe", work / "src")
     for program in ("git", "C:/Program Files/Git/cmd/git.exe", "GIT.EXE", "git-upload-pack"):
         assert "never runs Git" in core_git.exec_refusal(policy, program, outside)
+    # User folders and checkout leases sit inside the core's folders but are where people are meant to work.
+    users = work / "srv" / "users"
+    with_users = dict(policy, work_roots=[str(users)])
+    assert core_git.exec_refusal(with_users, "C:/tools/zstd.exe", users / "account" / "2" / "exec") is None
+    assert "inside the core" in core_git.exec_refusal(with_users, "C:/tools/zstd.exe", work / "srv")
+    assert "inside the core" in core_git.exec_refusal(with_users, "C:/tools/zstd.exe", work / "srv" / "users-old")
+    assert "never runs Git" in core_git.exec_refusal(with_users, "git.exe", users / "account" / "2")
 
 
 def test_no_service_account_and_no_tier_holds_the_capability():
