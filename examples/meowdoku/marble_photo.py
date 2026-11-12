@@ -394,14 +394,27 @@ def _film_response(value: object) -> dict:
 _CAMERA_POSE_FIELDS = frozenset((
     "eye_m", "target_m", "fov_degrees", "aperture_radius_m", "focus_distance_m",
     "aperture_blades", "aperture_rotation_radians", "lens_selection",
-    "camera_back", "back_reference_fov_degrees",
+    "camera_back", "back_reference_fov_degrees", "tilt_shift", "lens_tilt",
 ))
+
+
+def _camera_movements(camera_in):
+    """Existing sensor controls: normalized principal-point shift and focal-plane radians."""
+    result = {}
+    for key, limit in (("tilt_shift", 1.0), ("lens_tilt", math.pi / 4)):
+        values = camera_in.get(key, [0.0, 0.0])
+        if (not isinstance(values, list) or len(values) != 2
+                or any(type(v) not in (int, float) for v in values)):
+            raise PhotoError(f"camera.{key} must contain two finite numbers")
+        result[key] = [_number(v, -limit, limit, "camera." + key) for v in values]
+    return result
 
 
 def _camera_config(camera_in: dict, resolution: int, spectral_root: Path) -> dict:
     """Use the same bounded analytical controls for a still or every pose."""
     camera = {
         "resolution": resolution,
+        **_camera_movements(camera_in),
         "eye_m": _finite_vectors(camera_in.get("eye_m", [0, 0, .07]), 3, "camera.eye_m"),
         "target_m": _finite_vectors(camera_in.get("target_m", [0, 0, .18]), 3, "camera.target_m"),
         "fov_degrees": _number(camera_in.get("fov_degrees", 36), .001 if camera_in.get("camera_back") is not None else FOV_MIN_DEGREES, 100, "camera.fov_degrees"),
