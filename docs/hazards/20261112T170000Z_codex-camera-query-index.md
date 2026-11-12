@@ -16,3 +16,11 @@ surface evaluation, path coverage, valid medium or deposited energy. Physical
 source coverage, usable shading contract and hardware resource validation are
 still open. No shader/GPU compile, link, render, live job or deployment occurred.
 Reproduction is in docs/STUDIO_CAMERA_PAIR_RECEIVER_V2.md.
+
+Follow-up conservative clipping correction: reproduced a genuine finite crossing
+(-1e30 origin, 2e30 parameter) whose ROI entry/exit collapse to equal float64
+values. It previously reported empty support. Shared walker now reports equality
+as unavailable (-1), without tolerance or guessed cells; strict disjoint remains
+empty (0). Camera and copied-segment regression fixtures preserve native bits.
+All 18 index tests, camera-pair checks, existing response/lifecycle checks, and
+actual-store serialization roundtrip pass. No GPU/live activity.

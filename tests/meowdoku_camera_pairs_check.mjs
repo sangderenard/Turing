@@ -93,6 +93,14 @@ if(process.argv.includes('--stdin')) {
     const invalid=await query(edit);assert.equal(invalid.recordIndex.stats.references,0);
     assert.equal(invalid.recordIndex.stats.cameraQueryUnavailableRows,2);
   }
+  let hugeWords;
+  const huge=await query((w,f)=>{f[48]=-1e30;f[51]=2e30;f[52]=1;f[12]=1;hugeWords=Array.from(w.subarray(40));});
+  assert.equal(huge.recordIndex.stats.references,0);
+  assert.equal(huge.recordIndex.stats.cameraQueryUnavailableRows,2);
+  assert.deepEqual(Array.from(huge.cameraRhsRows),hugeWords);
+  const disjoint=await query((w,f)=>{f[48]=5;f[51]=1;});
+  assert.equal(disjoint.recordIndex.stats.references,0);
+  assert.equal(disjoint.recordIndex.stats.cameraQueryUnavailableRows,1);
   for(const status of [0,1,2,4,5,6,7])for(const medium of [0,4,UINT,UINT-1]) {
     let expected;
     const retained=await query(w=>{w[40+32]=status;w[40+5]=medium;w[40+48]=0xfedcba98;

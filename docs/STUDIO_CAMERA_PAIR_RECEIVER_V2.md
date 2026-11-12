@@ -115,3 +115,8 @@ The final command serializes two real SceneResponseStore pairs, verifies all
 512 words unchanged, and confirms four query references with no GPU bytes.
 It requires the matching Spectral v2 producer; no runtime/compiler readiness
 is implied. Existing completed camera samples remain the default alternative.
+
+Clipping equality is conservatively unavailable: finite huge coordinates can
+collapse a positive ROI interval to equal float64 entry/exit parameters, which
+cannot be distinguished from tangency here. No tolerance or guessed cell is
+introduced. Strictly disjoint entry > exit still produces no references.

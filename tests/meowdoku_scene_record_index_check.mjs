@@ -175,3 +175,17 @@ test('empty snapshot is a zero-reference index and still makes no availability c
   assert.deepEqual(lookup(result,[0,0,0]),[]);assert.equal(result.recordIndex.stats.references,0);
   assert.equal(result.recordIndex.applicationReady,false);assert.equal(result.recordIndex.energyStatements,false);
 });
+
+test('collapsed clipping interval is unavailable, not fabricated support or a proven miss',async()=>{
+  const specs=[{start:[-1e30,.5,.5],end:[1e30,.5,.5]}];
+  const f=await fixture(specs),before=new Uint8Array(f.payload).slice();
+  const plain=await receiveSceneResponses(f.manifest,f.payload,{...options,recordIndexBytes:0});
+  const result=await receiveSceneResponses(f.manifest,f.payload,options);
+  assert.equal(result.recordIndex.stats.references,0);
+  assert.equal(result.recordIndex.stats.segmentUnavailableRows,1);
+  assert.deepEqual(result.nativeRows,plain.nativeRows);
+  assert.deepEqual(new Uint8Array(f.payload),before);
+  const disjoint=await receive([{start:[5,.5,.5],end:[6,.5,.5]}]);
+  assert.equal(disjoint.recordIndex.stats.references,0);
+  assert.equal(disjoint.recordIndex.stats.segmentUnavailableRows,0);
+});

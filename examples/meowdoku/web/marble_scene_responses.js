@@ -278,7 +278,10 @@ function indexSceneRecords(snapshot,budget,cameraQuerySegments) {
         enter=Math.max(enter,Math.min(a,b));leave=Math.min(leave,Math.max(a,b));
       }
     }
-    if(!(enter<leave))return 0;
+    // Equality can be a tangent or a positive interval collapsed by rounding.
+    // Do not invent a tolerance/cell or report a proven empty intersection.
+    if(enter===leave)return -1;
+    if(enter>leave)return 0;
     let count=0;times[count++]=enter;times[count++]=leave;
     for(let j=0;j<3;j++)if(delta[j]!==0)for(let plane=1;plane<shape[j];plane++) {
       const t=(plane-start[j])/delta[j];if(t>enter&&t<leave)times[count++]=t;
