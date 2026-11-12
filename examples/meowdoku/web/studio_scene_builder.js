@@ -312,7 +312,7 @@ export function buildStudioFixtureFaces(fixtureRoles, housingMat, onPart, ids={}
 }
 
 // The same calls previously owned by the page, with explicit captured values.
-export function createStudioSceneGeometry({lighting,materials,subject,geometrySubject=subject}) {
+export function createStudioSceneGeometry({lighting,materials,subject,geometrySubject=subject,fabricPositions}) {
   const {ids,fixtureMaterialBase}=materials,control=id=>lighting.controls[id];
   const table=lighting.table??defaultStudioTable();
   const bounds=studioRoomBounds(Number(control('room-scale')||3),tableFloorDrop(table));
@@ -327,7 +327,8 @@ export function createStudioSceneGeometry({lighting,materials,subject,geometrySu
   const roomFaces=onSurface=>studioRoomFaces({scale:Number(control('room-scale')||3),floorDrop:tableFloorDrop(table),
     windowOn:!!control('window-glass'),glassMaterial:ids.marble_clear_glass,material:surfaceMaterial,onSurface});
   const backdropRollFaces=onPart=>backdropFaces({count:Number(control('backdrop-layers')),material:control('backdrop-material'),
-    sweep:control('backdrop-sweep'),layers:lighting.backdrops??defaultBackdropLayers(),wallZ:bounds.backZ,floorY:bounds.floorY,table},ids,onPart);
+    sweep:control('backdrop-sweep'),layers:lighting.backdrops??defaultBackdropLayers(),wallZ:bounds.backZ,floorY:bounds.floorY,table,
+    fabricPositions},ids,onPart);
   const tableFaces=onPart=>studioTableFaces(table,ids,bounds.floorY,onPart);
   const programmerFaces=onPart=>control('stage-programmer-enabled')?stageProgrammerFaces(bounds,table,ids,onPart):[];
   const goboFaces=onPart=>studioGoboFaces(lighting.gobos,ids,onPart);

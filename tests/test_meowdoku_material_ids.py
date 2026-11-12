@@ -36,7 +36,7 @@ def test_export_material_ids_and_private_slots_are_stable():
     assert index["black_matte_paint"] == 38
     assert index["polished_silver"] == 39
     assert index["polished_gold"] == 40
-    assert len(index) == 57
+    assert len(index) == 60
     assert {name: index[name] for name in ("reference_gray18_matte", "reference_red_matte",
         "reference_green_matte", "reference_blue_matte", "reference_yellow_matte")} == dict(zip(
         ("reference_gray18_matte", "reference_red_matte", "reference_green_matte",
@@ -45,12 +45,14 @@ def test_export_material_ids_and_private_slots_are_stable():
     assert [index[name + "__nir850"] for name in ("reference_gray18_matte",
         "reference_red_matte", "reference_green_matte", "reference_blue_matte",
         "reference_yellow_matte")] == list(range(55, 60))
+    assert [index[name] for name in ("fabric_canvas_cotton", "fabric_muslin_white",
+        "fabric_velvet_blue")] == [60, 61, 62]
     assert not set(index.values()) & set(extra.values())
     assert not any(name.startswith("meowdoku_studio_") for name in index)
     tables = db.build_tensors()
     for name in ("pbr", "phong_compat", "enamel", "texture_stack"):
         table = np.asarray(tables[name])
-        assert table.shape[0] == 60
+        assert table.shape[0] == 63
         assert np.isfinite(table).all()
         np.testing.assert_array_equal(table[32], table[index["marble_clear_glass"]])
         np.testing.assert_array_equal(table[33], table[index["ceramic_porcelain"]])

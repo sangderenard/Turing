@@ -151,3 +151,15 @@ for _paint in ("white_plaster", "black_matte_paint", "reference_gray18_matte",
                "reference_red_matte", "reference_green_matte",
                "reference_blue_matte", "reference_yellow_matte"):
     MATERIAL_CATALOG[_paint + "__nir850"] = dict(MATERIAL_CATALOG[_paint])
+
+# Append fabric finishes after every existing row so saved Studio material IDs
+# remain stable. These are artistic surface profiles, not measured BRDFs.
+MATERIAL_CATALOG["fabric_canvas_cotton"] = _surface(
+    (0.68, 0.57, 0.42), roughness=0.96, spec_strength=0.035,
+    shininess=4, grain=0.11)
+MATERIAL_CATALOG["fabric_muslin_white"] = _surface(
+    (0.78, 0.76, 0.69), roughness=0.99, spec_strength=0.025,
+    shininess=3, grain=0.09)
+MATERIAL_CATALOG["fabric_velvet_blue"] = _surface(
+    (0.025, 0.09, 0.23), roughness=1.0, spec_strength=0.018,
+    shininess=2, grain=0.13)

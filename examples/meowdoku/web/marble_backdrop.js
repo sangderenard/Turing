@@ -2,6 +2,7 @@
 // Preview and photo use these same faces; the saved marble mesh is untouched.
 import {validateStudioGrid,studioGridCells,createStudioGridControls,validateStudioArtwork,studioArtworkFaces} from './marble_studio_grid.js';
 import {TABLE_TOP_Y} from './marble_studio_table.js';
+import {fabricWallMesh} from './marble_backdrop_fabric.js';
 export const MAX_BACKDROP_LAYERS = 6;
 export const MAX_BACKDROP_SIZE = 64;
 export const BACKDROP_CIRCLE_SEGMENTS = 96;
@@ -25,6 +26,12 @@ export function validateBackdropLayers(value, materialNames) {
         throw new RangeError(`Backdrop ${key} must be between 0.4 and ${MAX_BACKDROP_SIZE}`);
     if (layer.shape !== undefined && !["rectangle", "ellipse"].includes(layer.shape))
       throw new RangeError("Unknown backdrop shape");
+    if(layer.surfaceBehavior!==undefined&&!['cardstock','fabric'].includes(layer.surfaceBehavior))
+      throw new RangeError('Unknown backdrop surface behavior');
+    if(layer.fabricFrozen!==undefined&&typeof layer.fabricFrozen!=='boolean')
+      throw new RangeError('Invalid backdrop fabric freeze state');
+    if(layer.surfaceBehavior==='fabric'&&(layer.shape==='ellipse'||layer.grid||layer.artwork))
+      throw new RangeError('Fabric requires a solid rectangular backdrop wall');
     if (layer.centerY !== undefined && (!Number.isFinite(layer.centerY) || Math.abs(layer.centerY) > 32))
       throw new RangeError("Backdrop centre height must be between -32 and 32");
     for (const [key, min, max] of [["heightOffGround", 0, 32], ["stageDistance", 0, 64],
@@ -41,6 +48,8 @@ export function validateBackdropLayers(value, materialNames) {
     // Optional fields keep legacy rectangular profiles byte-for-byte in shape.
     return {material: layer.material, width: layer.width, height: layer.height,
       ...(layer.shape === undefined ? {} : {shape: layer.shape}),
+      ...(layer.surfaceBehavior===undefined?{}:{surfaceBehavior:layer.surfaceBehavior}),
+      ...(layer.fabricFrozen===undefined?{}:{fabricFrozen:layer.fabricFrozen}),
       ...(layer.centerY === undefined ? {} : {centerY: layer.centerY}),
       ...Object.fromEntries(["heightOffGround", "stageDistance", "pitch", "curveRadius",
         "lockToBackWall", "lockToTableBack", "aspectLocked"].filter(key => layer[key] !== undefined).map(key => [key, layer[key]])),
@@ -48,7 +57,8 @@ export function validateBackdropLayers(value, materialNames) {
   });
 }
 
-export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, floorY = -1.02, table}, ids, onPart) {
+export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, floorY = -1.02, table,
+    fabricPositions}, ids, onPart) {
   if (!Number.isInteger(count) || count < 0 || count > MAX_BACKDROP_LAYERS)
     throw new RangeError("Backdrop count must be between zero and six");
   if (!count) return [];
@@ -147,15 +157,23 @@ export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, flo
         faces.push([[0,cy,z],rim(a),rim(b),mat,[n,n,n]]);
       }
     } else {
+      const wallFirst=faces.length;
       faces.push([[-w,cy-h,z],[w,cy-h,z],[w,cy+h,z],mat,[n,n,n]],
         [[-w,cy-h,z],[w,cy+h,z],[-w,cy+h,z],mat,[n,n,n]]);
+      if(layer.surfaceBehavior==='fabric'){
+        transformWalls();
+        faces.splice(wallFirst,2,...fabricWallMesh(faces.slice(wallFirst),
+          {positions:fabricPositions?.[i]}).faces);
+      }
     }
-    pendingParts.push({id:`layer-${i}-wall`,bodyId:`backdrop-layer-${i}`,construction:"planar-sheet",closed:false,convex:true,faces:faces.slice(first)});
+    pendingParts.push({id:`layer-${i}-wall`,bodyId:`backdrop-layer-${i}`,
+      construction:layer.surfaceBehavior==='fabric'?'spring-sheet':'planar-sheet',
+      closed:false,convex:layer.surfaceBehavior!=='fabric',faces:faces.slice(first)});
     if(layer.artwork)faces.push(...studioArtworkFaces(layer.artwork,layer.width,layer.height,ids,
       ([x,y])=>[x,cy+y,z+.001],n,part=>pendingParts.push({...part,id:`layer-${i}-art-${part.id}`,bodyId:`backdrop-layer-${i}-art-${part.id}`})));
     transformWalls();
     flushParts();
-    if (sweep && layer.shape !== "ellipse") {
+    if (sweep && layer.shape !== "ellipse" && layer.surfaceBehavior !== 'fabric') {
       // Keep the existing sweep proportions, now derived from this sheet's
       // authored size instead of an implicit layer-index inset.
       const sweepDepth = Math.max(1.2 - (4 - w) * 0.3,radius*Math.cos(pitch)+.1);
@@ -191,10 +209,28 @@ export function createBackdropLayerControls(container, materialNames, onChange =
     }
     shape.value = "rectangle";
     shape.addEventListener("change", () => {
-      if((layers[index].grid||layers[index].artwork) && shape.value==='ellipse'){shape.value=layers[index].shape??'rectangle';return;}
+      if((layers[index].grid||layers[index].artwork||layers[index].surfaceBehavior==='fabric') && shape.value==='ellipse'){
+        shape.value=layers[index].shape??'rectangle';return;
+      }
       layers[index].shape = shape.value; onChange();
     });
     shapeLabel.append(shape); panel.append(shapeLabel);
+    const behaviorLabel=doc.createElement('label'),behavior=doc.createElement('select');
+    behaviorLabel.textContent='Surface behavior';behavior.id=`backdrop-layer-${index}-surfaceBehavior`;
+    for(const [value,name] of [['cardstock','Cardstock (rigid)'],['fabric','Fabric (spring mesh)']]){
+      const option=doc.createElement('option');option.value=value;option.textContent=name;behavior.append(option);
+    }
+    behavior.addEventListener('change',()=>{
+      if(behavior.value==='fabric'&&(layers[index].shape==='ellipse'||layers[index].grid||layers[index].artwork)){
+        behavior.value=layers[index].surfaceBehavior??'cardstock';return;
+      }
+      layers[index].surfaceBehavior=behavior.value;onChange();
+    });
+    behaviorLabel.append(behavior);panel.append(behaviorLabel);
+    const freezeLabel=doc.createElement('label'),freeze=doc.createElement('input');
+    freeze.type='checkbox';freeze.id=`backdrop-layer-${index}-fabricFrozen`;freeze.disabled=true;
+    freezeLabel.append(freeze,' Freeze fabric state (requires Nodus stream connection)');panel.append(freezeLabel);
+    freeze.addEventListener('change',()=>{layers[index].fabricFrozen=freeze.checked;onChange();});
     const sizes = {};
     for (const key of ["width", "height", "centerY", "heightOffGround", "stageDistance", "pitch", "curveRadius"]) {
       const sizeLabel = doc.createElement("label"); sizeLabel.textContent = ({centerY:"Centre height",heightOffGround:"Height off ground/table",stageDistance:"Distance from stage",pitch:"Pitch (degrees)",curveRadius:"Sweep curve radius"})[key]??`Mat ${key}`;
@@ -238,20 +274,22 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       onChange();
     });quick.append(factor,apply);panel.append(quick);
     const grid=createStudioGridControls(panel,`backdrop-layer-${index}-grid`,names,value=>{
-      const next={...layers[index]};if(value===undefined)delete next.grid;else next.grid=value;
+      const next={...layers[index]};if(value===undefined)delete next.grid;else {next.grid=value;next.surfaceBehavior='cardstock';behavior.value='cardstock';}
       const candidate=layers.map((layer,i)=>i===index?next:layer);
       layers=validateBackdropLayers(candidate,names);onChange();
     });
     container.append(panel);
-    return {panel, select, shape, sizes,switches,grid};
+    return {panel, select, shape, behavior, freeze, sizes,switches,grid};
   });
   return {
     getState: () => validateBackdropLayers(layers,names),
     setState(value) {
       layers = validateBackdropLayers(value, names);
-      editors.forEach(({select, shape, sizes,switches,grid}, i) => {
+      editors.forEach(({select, shape, behavior, freeze, sizes,switches,grid}, i) => {
         select.value = layers[i].material;
         shape.value = layers[i].shape ?? "rectangle";
+        behavior.value=layers[i].surfaceBehavior??'cardstock';freeze.checked=layers[i].fabricFrozen??false;
+        freeze.disabled=true;
         grid.setState(layers[i].grid);
         for (const [key, {input, output}] of Object.entries(sizes)) {
           const value=layers[i][key]??(key==='stageDistance'?3.1:0);
