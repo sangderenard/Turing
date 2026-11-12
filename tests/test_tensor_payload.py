@@ -83,3 +83,25 @@ def test_what_is_not_a_tensor_is_refused_before_writing(tmp_path):
     assert not (tmp_path / "x").exists() and not (tmp_path / "x.partial").exists()
     with pytest.raises(ValueError):
         tensor_payload.loads(b"pickle bytes, not a payload")
+
+
+def test_a_saved_payload_is_held_in_memory_for_a_minute(tmp_path, monkeypatch):
+    import time as clock
+
+    tensor = AbstractTensor.tensor([[1.5, 2.5], [3.5, 4.5]], dtype="float64")
+    target = tmp_path / "held.tp"
+    written = tensor_payload.save(target, tensor, store=None)          # memory only: nothing on disk
+    assert written > 0 and not target.exists()
+    _same(tensor_payload.load(target), tensor)                           # served from memory
+    later = clock.monotonic() + tensor_payload.RETAIN_SECONDS + 1
+    assert tensor_payload.retained(target, now=later) is None            # gone after the minute
+    import pytest as _pytest
+    with _pytest.raises(FileNotFoundError):
+        tensor_payload.load(target)
+
+
+def test_the_store_receives_the_same_payload_memory_holds(tmp_path):
+    seen = {}
+    tensor = AbstractTensor.tensor([7, 8, 9], dtype="int32")
+    tensor_payload.save(tmp_path / "x.tp", tensor, store=lambda path, payload: seen.update({str(path): payload}))
+    assert seen == {str(tmp_path / "x.tp"): tensor_payload.retained(tmp_path / "x.tp")}

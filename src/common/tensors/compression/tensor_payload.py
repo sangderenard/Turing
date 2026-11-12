@@ -11,18 +11,31 @@ shape whose elements are the same bits. A compiled program's ``pickle.dump(tenso
 ``pickle.load(stream)`` are lowered by the ingester's special cases (``transmogrifier/graph/python_special_cases.py``)
 to :func:`save` and :func:`load`, served by the hosting Python shell until this codec itself lowers to native code.
 Anything that is not a tensor of one of :data:`DTYPES` is refused with ``TypeError`` before anything is written.
+
+The host answers ``save`` once the payload is held: it keeps every saved payload in memory for
+:data:`RETAIN_SECONDS` (a minute), and a ``load`` of that path inside the minute is served from memory without
+touching storage. Durable storage is the ``store`` given to :func:`save` (by default the file at ``path``); a Nodus
+file FIFO (a FIFO over ``gp_mem_backend_create_filesystem``) is meant to take that place.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
+import threading
+import time
+from typing import Any, Callable
 
 import numpy as np
 
 from ....compiler import tile_row_codec
 
 MAGIC = b"TURTP2"
+
+# How long the host keeps a saved payload in memory, in seconds.
+RETAIN_SECONDS = 60.0
+
+_retained: dict[str, tuple[float, bytes]] = {}
+_retained_lock = threading.Lock()
 
 # The dtypes a payload carries, by the name its handle records.
 DTYPES = ("bool", "uint8", "int8", "int16", "int32", "int64", "float16", "float32", "float64")
@@ -88,23 +101,52 @@ def loads(data: bytes) -> Any:
     return AbstractTensor.tensor(region)
 
 
-def save(path: Any, value: Any) -> int:
-    """Write one tensor's payload to ``path`` (replacing it); the number of bytes written."""
+def _key(path: Any) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
 
-    payload = dumps(value)
+
+def write_file(path: Any, payload: bytes) -> None:
+    """The default durable store: the file at ``path``, replaced whole (never seen half written)."""
+
     target = os.fspath(path)
     temporary = f"{target}.partial"
     with open(temporary, "wb") as stream:
         stream.write(payload)
     os.replace(temporary, target)
+
+
+def retained(path: Any, now: float | None = None) -> bytes | None:
+    """The payload saved to ``path`` within the last :data:`RETAIN_SECONDS`, or None."""
+
+    now = time.monotonic() if now is None else now
+    with _retained_lock:
+        for key in [key for key, (deadline, _payload) in _retained.items() if deadline <= now]:
+            del _retained[key]
+        held = _retained.get(_key(path))
+    return None if held is None else held[1]
+
+
+def save(path: Any, value: Any, *, store: Callable[[Any, bytes], None] | None = write_file) -> int:
+    """Save one tensor's payload under ``path``; the number of payload bytes.
+
+    The payload is held in memory for :data:`RETAIN_SECONDS` and handed to ``store`` (``None``: memory only)."""
+
+    payload = dumps(value)
+    with _retained_lock:
+        _retained[_key(path)] = (time.monotonic() + RETAIN_SECONDS, payload)
+    if store is not None:
+        store(path, payload)
     return len(payload)
 
 
 def load(path: Any) -> Any:
-    """The tensor whose payload ``path`` holds."""
+    """The tensor saved under ``path``: from memory inside the minute, else from the file."""
 
-    with open(os.fspath(path), "rb") as stream:
-        return loads(stream.read())
+    payload = retained(path)
+    if payload is None:
+        with open(os.fspath(path), "rb") as stream:
+            payload = stream.read()
+    return loads(payload)
 
 
-__all__ = ["DTYPES", "MAGIC", "dtype_name", "dumps", "load", "loads", "save"]
+__all__ = ["DTYPES", "MAGIC", "RETAIN_SECONDS", "dtype_name", "dumps", "load", "loads", "retained", "save", "write_file"]
