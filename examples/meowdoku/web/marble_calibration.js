@@ -768,19 +768,23 @@ export function initCalibration(doc, ctx) {
       status.textContent='Could not add the reflective exposure card. Check the gobo controls.';return;
     }
     runButton.disabled=false;watchButton.disabled=false;downloadButton.hidden=true;
-    status.textContent='500 mock lux sequence loaded with a reflective card. Run calibration to capture the RGB scene and monochrome peanut at seven source levels.';
+    status.textContent='500 mock lux sequence loaded with a reflective card. Click Watch accumulating calibration to start the two sensors, or Run calibration for the seven-level sweep. No YAML upload is needed.';
   });
   upload.addEventListener("change", async () => {
     const file = upload.files?.[0];
     runButton.disabled = true;
     watchButton.disabled=true;
     downloadButton.hidden = true;
-    if (!file) { calib = null; return; }
+    if (!file) { calib = null; status.textContent='Choose Set up 500 mock lux exposure calibration to enable the watcher without a YAML file.'; return; }
     try {
       calib = parseYaml(await file.text());
       if (!Array.isArray(calib.cases) || !calib.cases.length) throw new Error("recipe has no \"cases\" list");
       status.textContent = `Loaded "${calib.name || file.name}" · ${calib.cases.length} case(s). Click Run calibration.`;
       runButton.disabled = false;
+      watchButton.disabled = !calib.dual_camera;
+      status.textContent += calib.dual_camera
+        ? ' Watch accumulating calibration is also available.'
+        : ' This recipe is sweep-only; use Set up 500 mock lux exposure calibration for the two-sensor watcher.';
     } catch (error) {
       calib = null;
       status.textContent = `Could not read calibration recipe: ${error.message || error}`;
@@ -793,9 +797,10 @@ export function initCalibration(doc, ctx) {
     watcher?.stop();status.textContent='Calibration watcher stopped.';
   });
   watchButton.addEventListener('click',async()=>{
-    if(!calib?.dual_camera)return;
+    if(!calib?.dual_camera){status.textContent='Choose Set up 500 mock lux exposure calibration first, or upload a dual-camera recipe, to enable the watcher.';return;}
     watchButton.disabled=true;runButton.disabled=true;upload.disabled=true;stopButton.disabled=false;
     stopRequested=false;watchDigest=null;
+    status.textContent='Preparing calibration scene and saving the subject before sensor registration.';
     const shopSwitches=[...doc.querySelectorAll('input[id^="shop-light-input-"][id$="-enabled"]')]
       .map(input=>({input,checked:input.checked}));
     const profileOwner=doc.getElementById('lighting-profiles');
