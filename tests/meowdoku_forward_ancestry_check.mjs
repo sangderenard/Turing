@@ -24,6 +24,28 @@ for(const [offset,value] of [[2,4],[3,2],[101,99],[102,13],[103,3],[125,0x7fc000
   const m={...manifest,payload_sha256:Buffer.from(await crypto.subtle.digest('SHA-256',p)).toString('hex')};
   await assert.rejects(()=>receiveSceneResponses(m,p,opts));
 }
+// A one-bounce parent has no authentic enqueue opportunity. Keep its forward
+// record while rejecting any reactive row against zero queue capacity.
+const forwardPayload=new ArrayBuffer(80+512),fw=new Uint32Array(forwardPayload);
+fw.set(new Uint32Array(payload,0,20));fw.set(result.nativeRows.subarray(0,128),20);
+const forwardManifest=structuredClone(manifest);
+forwardManifest.payload_bytes=forwardPayload.byteLength;
+forwardManifest.payload_sha256=Buffer.from(await crypto.subtle.digest('SHA-256',forwardPayload)).toString('hex');
+forwardManifest.sections=[{name:'scene_index',offset:0,stride:80,count:1},
+  {name:'native_rows',offset:80,stride:512,count:1},
+  {name:'camera_rhs_rows',offset:592,stride:1024,count:0},{name:'scalar_cells',offset:592,stride:24,count:0}];
+forwardManifest.retention.retained_entries=1;
+forwardManifest.retention.partitions.native_only_retained_entries=1;
+const queue=forwardManifest.contexts[0].dispatch.native_queue;
+queue.capacity=0;queue.parent_dispatch.bounce_limit=1;
+assert.equal((await receiveSceneResponses(forwardManifest,forwardPayload,opts)).families.forward,1);
+for(const edit of [q=>q.parent_dispatch.ray_count=0,q=>q.parent_dispatch.bounce_limit=0,
+  q=>q.parent_dispatch.total_rays=12,q=>{q.logical_ray_base=0xffffffff;q.capacity=1;}]) {
+  const m=structuredClone(forwardManifest);edit(m.contexts[0].dispatch.native_queue);
+  await assert.rejects(()=>receiveSceneResponses(m,forwardPayload,opts));
+}
+const zeroReactive=structuredClone(manifest);zeroReactive.contexts[0].dispatch.native_queue.capacity=0;
+await assert.rejects(()=>receiveSceneResponses(zeroReactive,payload,opts));
 const receipt={schema:manifest.schema,digest:manifest.scene_revision,live_revision:0,sequence:1,
   name:'light-scene-response-'+'1'.repeat(32)+'.bin',byte_length:payload.byteLength,
   sha256:manifest.payload_sha256,metadata:manifest,application_ready:false};

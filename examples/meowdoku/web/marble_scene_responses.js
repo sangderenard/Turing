@@ -48,7 +48,8 @@ function validateForwardAncestry(row,context) {
   if(q?.version!=='native-queued-ancestry-v1'||!p||typeof p!=='object'||
       ['generation','logical_ray_base','capacity','source_root_count'].some(k=>!integer(q[k]))||
       ['dispatch_id','population_index','ray_offset','ray_count','total_rays','bounce_limit','seed'].some(k=>!integer(p[k],Number.MAX_SAFE_INTEGER))||
-      !q.capacity||!q.source_root_count||q.generation!==p.dispatch_id||!p.root_sampling||typeof p.root_sampling!=='object'||Array.isArray(p.root_sampling))
+      !q.source_root_count||p.ray_count<1||p.bounce_limit<1||p.ray_offset+p.ray_count>p.total_rays||
+      q.logical_ray_base+q.capacity>UINT||q.generation!==p.dispatch_id||!p.root_sampling||typeof p.root_sampling!=='object'||Array.isArray(p.root_sampling))
     throw Error('Invalid native parent queue identity.');
   if(row[1]===1) {
     if([101,102,103,125,126,127].some(i=>row[i]!==0))throw Error('Forward row cannot invent queued ancestry.');

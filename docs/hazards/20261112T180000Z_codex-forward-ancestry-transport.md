@@ -11,3 +11,9 @@ actual Python-store-to-JS v3 roundtrip, existing v1/v2 response/lifecycle progra
 and18 existing index cases pass. Spectral store/camera/ancestry suite71 passed, including coexistence regression. Reproduction in
 STUDIO_FORWARD_ANCESTRY_TRANSPORT_V3.md. CPU Nodus fallback/deprecation warnings
 are not native execution evidence. Matching producer contract is a dependency.
+
+Correction: capacity0 is legitimate for an opted-in one-bounce forward parent.
+Forward rows retain v2 contract; any reactive row against capacity0 still fails.
+Both validators enforce positive parent ray/bounce counts, submitted ray-range
+within total_rays, and logical_ray_base+capacity within UINT32. Added CPU cases
+cover zero-capacity success and all invalid bounds. No GPU/live activity.
