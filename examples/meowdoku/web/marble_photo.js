@@ -1002,14 +1002,17 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       const prepared = await prepareExposure();
       geometry = prepared.geometry; options.objectSnapshot = prepared.value;
     }
+    if(options.fixtures?.shop_material_ids){
+      options.fixtures={...options.fixtures,emissive_material_ids:[...new Set([
+        ...Array.from({length:STUDIO_LIGHTS.length},(_,i)=>i),
+        ...(options.fixtures.emitter_profiles?.records??[]).map(record=>record.material),
+        ...options.fixtures.shop_material_ids])]};
+    }
     if (options.fixtures?.material_engines && options.fixtures.pbr?.length >= (STUDIO_LIGHTS.length+1)*16 &&
         !options.live && !options.tiled && options.oversampling === 1 &&
         options.width === undefined && options.height === undefined &&
         !options.cameraPoses && !options.clientIntersections && !options.receiveLightField &&
-        options.transport === "fixed:3" && options.orbitFrames === 1) {
-      options.fixtures = {...options.fixtures, emissive_material_ids:[...new Set([
-        ...Array.from({length:STUDIO_LIGHTS.length},(_,i)=>i),
-        ...(options.fixtures.emitter_profiles?.records??[]).map(record=>record.material)])]};
+        options.orbitFrames === 1) {
       let canceled = false;
       recordingCancel = () => { canceled = true; };
       setButtons();

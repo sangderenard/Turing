@@ -217,8 +217,9 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <label class="wide">Calibration recipe (YAML)<input id="calibration-yaml-upload" type="file" accept=".yaml,.yml,text/yaml"></label>
     <button id="calibration-run" disabled>Run calibration</button>
     <button id="calibration-watch" type="button" disabled>Watch accumulating calibration</button>
+    <label>Watcher Studio duration<select id="calibration-watch-duration"><option value="12">12 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option></select></label>
     <button id="calibration-watch-stop" type="button" disabled>Stop watcher</button>
-    <p class="wide">The watcher registers the chart once, then keeps one static Studio scene accumulating in disjoint RGB and monochrome sensor lanes. Each sensor gets a separate static viewer page; sparse linear chart readings update its response curve on each published slice. The secondary Phong field is optional. Timed captions are view-only and never enter the captured scene.</p>
+    <p class="wide">The watcher registers the chart once, then keeps one static Studio scene accumulating in disjoint RGB and monochrome sensor lanes for the selected duration (up to the photo contract's one-hour limit). Stop ends it early. Each sensor gets a separate static viewer page; the RGB page can switch spectral false color off to show visible bands without changing sensor data. Sparse linear chart readings update its response curve on each published slice. The secondary Phong field is optional. Timed captions are view-only and never enter the captured scene.</p>
     <output id="calibration-status" class="wide" role="status">Upload a calibration YAML to run an automatic single-light colour sweep.</output>
     <div id="calibration-watch-view" class="wide" hidden></div>
     <div id="calibration-gallery" class="wide" hidden></div>

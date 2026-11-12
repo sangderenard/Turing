@@ -438,7 +438,8 @@ async function exposeCase(geometry, baseDigest, calib, kase, cameraOptions, tran
       throw Error('Calibration needs the captured Studio fixture light state');
     options.fixtures={...fixture,emissive_material_ids:[...new Set([
       ...Array.from({length:STUDIO_LIGHTS.length},(_,i)=>i),
-      ...(fixture.emitter_profiles.records??[]).map(record=>record.material)])]};
+      ...(fixture.emitter_profiles.records??[]).map(record=>record.material),
+      ...(fixture.shop_material_ids??[])])]};
     const {resolution:meterResolution,...meterPose}=peanutOptions.camera;
     if(meterResolution!==options.resolution)
       throw Error('Both disjoint sensors need the same capture resolution');
@@ -677,8 +678,12 @@ export function mountCalibrationWatch(doc,container,{fixedLane=null,laneCount=2}
     selector.append(option);
   }
   if(fixedLane!==null){selector.value=String(fixedLane);selector.hidden=true;}
+  const falseColorLabel=doc.createElement('label');
+  const falseColor=doc.createElement('input');falseColor.type='checkbox';falseColor.checked=true;
+  falseColorLabel.append(falseColor,' Show spectral false color');
+  const lookStatus=doc.createElement('small');lookStatus.style.cssText='display:block;min-height:1.3em';
   const info=doc.createElement('p'),plot=doc.createElement('div');
-  panel.append(selector,info,plot);row.append(imageWrap,panel);container.append(row);
+  panel.append(selector,falseColorLabel,lookStatus,info,plot);row.append(imageWrap,panel);container.append(row);
   const jokes=['A marble-sized technician checks the focus chart.',
     'The peanut camera is pretending to be very serious.',
     'A tiny clipboard records absolutely no invented photons.',
@@ -690,8 +695,11 @@ export function mountCalibrationWatch(doc,container,{fixedLane=null,laneCount=2}
   function draw(){
     if(!current)return;
     const lane=fixedLane??Number(selector.value),record=current.sensor_lanes?.find(item=>item.index===lane);
+    falseColorLabel.hidden=lane!==0;
     if(record?.image){
-      image.src=`/api/marble_photo/image?digest=${current.digest}&name=${encodeURIComponent(record.image.split('/').at(-1))}${lane?`&lane=${lane}`:''}&epoch=${current.epoch}`;
+      const alternate=lane===0&&!falseColor.checked&&current.retouch_params?.spectral_look==='visible_reference'
+        ?current.retouched_image:null;
+      image.src=`/api/marble_photo/image?digest=${current.digest}&name=${encodeURIComponent((alternate??record.image).split('/').at(-1))}${lane?`&lane=${lane}`:''}&epoch=${current.epoch}`;
     }
     const curves=[];
     for(const [index,color] of (lane?[ [0,'#eeeeee'] ]:[[0,'#ff6b6b'],[1,'#74dc80'],[2,'#7ba8ff']])){
@@ -705,6 +713,22 @@ export function mountCalibrationWatch(doc,container,{fixedLane=null,laneCount=2}
     info.textContent=`Studio tick ${current.epoch??0} · ${current.exposure_integrated_seconds??0} simulated seconds · ${points[lane].length} sparse linear readings. Horizontal scale: nominal grey-card mock lux × seconds. The lines refit as accumulated sensor data arrives.`;
   }
   selector.addEventListener('change',draw);
+  falseColor.addEventListener('change',async()=>{
+    draw();
+    if(falseColor.checked){lookStatus.textContent='Spectral false color; raw sensor readings are unchanged.';return;}
+    if(!current?.digest)return;
+    lookStatus.textContent='Preparing visible-band preview…';
+    try{
+      const response=await fetch('/api/marble_photo/retouch',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({digest:current.digest,spectral_look:'visible_reference'})});
+      const value=await response.json().catch(()=>({}));
+      if(!response.ok)throw Error(value.error||`retouch HTTP ${response.status}`);
+      const refreshed=await fetch(`/api/marble_photo?digest=${current.digest}`,{cache:'no-store'});
+      if(refreshed.ok)current=await refreshed.json();
+      lookStatus.textContent='Visible-band preview requested; raw sensor readings are unchanged.';
+      draw();
+    }catch(error){lookStatus.textContent=`Visible preview: ${error.message||error}`;}
+  });
   return {update(value){
     current=value;if(!value.sensor_lanes||value.epoch===lastEpoch)return;
     lastEpoch=value.epoch;
@@ -730,6 +754,7 @@ export function initCalibration(doc, ctx) {
   const downloadButton = doc.getElementById("calibration-download");
   const builtIn=doc.getElementById('calibration-exposure-preset');
   const watchButton=doc.getElementById('calibration-watch');
+  const watchDuration=doc.getElementById('calibration-watch-duration');
   const stopButton=doc.getElementById('calibration-watch-stop');
   const watchView=doc.getElementById('calibration-watch-view');
   let calib = null, lastDataset = null;
@@ -812,7 +837,9 @@ export function initCalibration(doc, ctx) {
           status.textContent=`Accumulating static Studio scene: tick ${value.epoch}, ${value.exposure_integrated_seconds} simulated seconds, ${value.calibration_history.length} sparse readings retained.`;
       },stop:()=>{}};
       status.textContent='Accumulating the unchanged 500 mock lux scene…';
-      const longCase={...reference,exposure_seconds:12};
+      const duration=Number(watchDuration?.value??12);
+      if(!Number.isSafeInteger(duration)||duration<12||duration>3600)throw Error('Watcher duration must be between 12 and 3600 Studio seconds');
+      const longCase={...reference,exposure_seconds:duration};
       const result=await exposeCase(geometry,baseDigest,calib,longCase,cameraOptions,'fixed:8',peanutOptions,
         {regions,frameSeconds:1,onStart:digest=>{
           watchDigest=digest;
@@ -824,7 +851,7 @@ export function initCalibration(doc, ctx) {
           }
         },
           canceled:()=>stopRequested,onStatus:value=>watcher?.update(value)});
-      if(!stopRequested)status.textContent=result.state==='complete'?'Calibration watcher completed twelve seconds of Studio time. Start again for another accumulation.':
+      if(!stopRequested)status.textContent=result.state==='complete'?`Calibration watcher completed ${duration} seconds of Studio time. Start again for another accumulation.`:
         `Calibration watcher ended: ${result.error||result.state}`;
     }catch(error){if(!stopRequested)status.textContent=`Calibration watcher: ${error.message||error}`;}
     finally{
