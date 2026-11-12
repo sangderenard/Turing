@@ -46,6 +46,29 @@ def test_a_repetitive_map_compresses():
     _same(tensor_payload.loads(payload), tensor)
 
 
+def test_the_payload_is_the_handle_and_the_raw_region():
+    import numpy as np
+    from src.compiler import tile_row_codec
+
+    region = (np.arange(4096 * 12, dtype=np.float64).reshape(4096, 4, 3) % 7) * 0.25
+    payload = tensor_payload.dumps(region)
+    handle, packed = tile_row_codec.decode_rows(payload[len(tensor_payload.MAGIC):])
+    assert handle == ("float64", (4096, 4, 3))
+    assert tile_row_codec.decompress_octets(packed) == region.astype("<f8").tobytes()
+    assert len(payload) < region.nbytes / 8
+    back = tensor_payload.loads(payload)
+    assert tuple(back.get_shape()) == (4096, 4, 3) and (np.asarray(back.tolist()) == region).all()
+
+
+def test_a_numpy_region_and_a_strided_view_come_back_in_c_order():
+    import numpy as np
+
+    base = np.arange(24, dtype=np.int32).reshape(4, 6)
+    view = base[:, ::2].T                       # not contiguous
+    back = tensor_payload.loads(tensor_payload.dumps(view))
+    assert tensor_payload.dtype_name(back) == "int32" and back.tolist() == view.tolist()
+
+
 def test_save_and_load_through_a_file(tmp_path):
     tensor = AbstractTensor.tensor([[1, 2, 3], [4, 5, 6]], dtype="int64")
     target = tmp_path / "triangle_map.tp"
