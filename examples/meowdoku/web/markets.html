@@ -81,7 +81,7 @@
       <p id="training-control-state" role="status" aria-live="polite">Checking supervisor…</p>
     </div>
     <h3>Nodus training canvas</h3>
-    <p class="muted">The graph view updates while the continuous worker runs. Training pauses briefly to save weights. Historical validation is a tuning signal, not an unseen qualification.</p>
+    <p class="muted">The graph view updates while the continuous worker runs. Current market bars are observed without future labels; once their four-hour outcomes arrive, training batches contain equal historical and live-labeled frames. Training pauses briefly to save weights. Validation is a tuning signal, not an unseen qualification.</p>
     <iframe id="training-canvas" title="Live Nodus training canvas" src="/nodus.html?instance=nodus-training&amp;picture=1" loading="lazy"></iframe>
   </section>
   <section class="panel"><h2>Latest minute bars</h2><div id="tickers"></div></section>

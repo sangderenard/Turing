@@ -19,6 +19,8 @@ from meowdoku import paper_arena
 RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 PHASES = frozenset(("training", "validation", "compiling", "holdout", "autosaving", "complete"))
 STATUSES = frozenset(("running", "stopped", "passed_historical", "unqualified", "failed"))
+LIVE_SOURCES = frozenset(("waiting", "current", "stale", "missing", "unaligned", "invalid",
+                          "insufficient", "unavailable"))
 
 
 def _tables(db) -> None:
@@ -33,6 +35,28 @@ def _tables(db) -> None:
                "validation_passed INTEGER, created REAL NOT NULL)")
     db.execute("CREATE INDEX IF NOT EXISTS paper_qualification_progress_run "
                "ON paper_qualification_progress(run_id,id)")
+    db.execute("CREATE TABLE IF NOT EXISTS paper_training_live_state ("
+               "run_id TEXT PRIMARY KEY, source TEXT NOT NULL, observed_at TEXT, "
+               "matured_frames INTEGER NOT NULL, historical_batch INTEGER NOT NULL, "
+               "live_batch INTEGER NOT NULL, updated REAL NOT NULL)")
+
+
+def live_state(db, run_id: str, *, source: str, observed_at: str | None,
+               matured_frames: int, historical_batch: int, live_batch: int) -> None:
+    """Publish market freshness and the actual supervised batch composition."""
+    _tables(db)
+    if (not RUN_ID.fullmatch(run_id) or source not in LIVE_SOURCES
+            or observed_at is not None and (not isinstance(observed_at, str) or len(observed_at) > 40)
+            or any(type(value) is not int or value < 0 for value in
+                   (matured_frames, historical_batch, live_batch))
+            or live_batch and historical_batch != live_batch):
+        raise ValueError("invalid live training state")
+    db.execute("INSERT INTO paper_training_live_state VALUES(?,?,?,?,?,?,?) "
+               "ON CONFLICT(run_id) DO UPDATE SET source=excluded.source, "
+               "observed_at=excluded.observed_at, matured_frames=excluded.matured_frames, "
+               "historical_batch=excluded.historical_batch, live_batch=excluded.live_batch, "
+               "updated=excluded.updated",
+               (run_id, source, observed_at, matured_frames, historical_batch, live_batch, time.time()))
 
 
 def begin(db, *, market: str, model: str, worker: str, planned_epochs: int) -> str:
@@ -115,13 +139,16 @@ def public_snapshot(db, *, limit: int = 12) -> dict:
         recent = db.execute("SELECT phase,seed,epoch,loss,validation_mean,validation_passed,created "
                             "FROM paper_qualification_progress WHERE run_id=? ORDER BY id DESC LIMIT 24",
                             (row["id"],)).fetchall()
+        live = db.execute("SELECT source,observed_at,matured_frames,historical_batch,live_batch,updated "
+                          "FROM paper_training_live_state WHERE run_id=?", (row["id"],)).fetchone()
         runs.append({"id": row["id"], "market": row["market"], "model": row["model"],
                      "worker": row["worker"], "status": "stalled" if stale else row["status"],
                      "phase": row["phase"], "completed_epochs": row["completed_epochs"],
                      "planned_epochs": row["planned_epochs"], "created": row["created"],
                      "updated": row["updated"], "finished": row["finished"],
                      "result": json.loads(row["result"]),
-                     "progress": [dict(event) for event in reversed(recent)]})
+                     "progress": [dict(event) for event in reversed(recent)],
+                     "live": dict(live) if live is not None else None})
     return {"schema": "paper-qualification-spectator-v1", "runs": runs, "asof": now}
 
 

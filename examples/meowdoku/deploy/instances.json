@@ -187,7 +187,11 @@
         "--publish-db", "C:/dev/Powershell/srv/state/sql/paper_arena.sqlite",
         "--worker", "nodus-training",
         "--autosave-seconds", "60",
-        "--validation-epochs", "1000"
+        "--validation-epochs", "1000",
+        "--market-owner", "admin",
+        "--accounts-db", "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--secrets-dir", "C:/dev/Powershell/srv/state/secrets",
+        "--market-poll-seconds", "60"
       ],
       "leases": [],
       "nodus": {

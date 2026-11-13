@@ -70,6 +70,14 @@ function drawQualification(payload) {
                                        : `${run.completed_epochs} epochs · continuous`];
     if (last?.loss != null) fields.push(`loss ${Number(last.loss).toFixed(5)}`);
     if (last?.validation_mean != null) fields.push(`validation mean ${(Number(last.validation_mean) * 100).toFixed(2)}% of order cap`);
+    if (run.live) {
+      const observed = run.live.observed_at ? ` · last AAPL bar ${new Date(run.live.observed_at).toLocaleString()}` : "";
+      fields.push(`market feed ${run.live.source}${observed}`);
+      fields.push(`${run.live.matured_frames} live frames with known outcomes`);
+      fields.push(run.live.live_batch
+        ? `${run.live.historical_batch} historical + ${run.live.live_batch} live labeled frames per batch`
+        : "historical training while live outcomes mature");
+    }
     if (run.result?.holdout_mean_return_on_order_cap != null)
       fields.push(`holdout mean ${(Number(run.result.holdout_mean_return_on_order_cap) * 100).toFixed(2)}% of order cap`);
     for (const value of fields) { const item = document.createElement("span"); item.textContent = value; meta.append(item); }
@@ -81,7 +89,7 @@ function drawQualification(payload) {
       bar.removeAttribute("value");
     }
     const checks = document.createElement("ol"); checks.className = "checks";
-    for (const check of (run.progress || []).filter((item) => item.phase === "validation").slice(-8)) {
+    for (const check of (run.progress || []).filter((item) => item.validation_mean != null).slice(-8)) {
       const line = document.createElement("li");
       line.textContent = `seed ${check.seed}, epoch ${check.epoch}: validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
       checks.append(line);
