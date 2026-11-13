@@ -975,23 +975,38 @@ def make_handler(sessions: Sessions):
                 SchemaVersionError=experience_reports_mod.schema_version.SchemaVersionError,
                 max_body=experience_reports_mod.MAX_BODY)
 
-        # ---- [RADIO] explicit account-owned native speaker subscription.
+        # ---- [RADIO] construction is inert; only explicit POST starts native work.
+        def _radio_jukebox_services(self):
+            # Caller holds sessions.radio_lock, shared by both entry points.
+            from meowdoku.nodus_radio_jukebox import Jukebox
+            from meowdoku.nodus_radio_jukebox_runner import Runner
+            if sessions.radio_jukebox is None:
+                sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
+                sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs)
+            return sessions.radio_jukebox, sessions.radio_jukebox_runner
+
         def _radio_playback(self, method):
             from meowdoku.nodus_radio_control import Manager, http_route
             with sessions.radio_lock:
                 if sessions.radio_control is None:
                     sessions.radio_control = Manager(sessions.state.radio_json, sessions.jobs)
+                    # Station mode is selected by operator config, not request data.
+                    # Binding this tap does not start the runner, source, or speakers.
+                    try:
+                        config = json.loads(sessions.state.radio_json.read_text(encoding="utf-8"))
+                        native = config.get("jukebox", {}).get("native")
+                    except (OSError, ValueError, AttributeError):
+                        native = None
+                    if isinstance(native, dict):
+                        _, runner = self._radio_jukebox_services()
+                        sessions.radio_control.source_provider = runner
                 manager = sessions.radio_control
             return http_route(self, method, manager)
 
         def _radio_jukebox(self, method):
-            from meowdoku.nodus_radio_jukebox import Jukebox, http_route
-            from meowdoku.nodus_radio_jukebox_runner import Runner
+            from meowdoku.nodus_radio_jukebox import http_route
             with sessions.radio_lock:
-                if sessions.radio_jukebox is None:
-                    sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
-                    sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs)
-                store, runner = sessions.radio_jukebox, sessions.radio_jukebox_runner
+                store, runner = self._radio_jukebox_services()
             return http_route(self, method, store, runner)
 
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
