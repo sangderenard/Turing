@@ -237,7 +237,7 @@ const dmTemplates = {
   "look:strategies": () => ({}),
   "look:orders": () => ({}), "look:mock_orders": () => ({}),
   "look:mock_ledger": () => ({ strategy_id: "" }),
-  "look:scoreboard": () => ({}), "look:map": () => ({}),
+  "look:scoreboard": () => ({}), "look:map": () => ({}), "look:picture": () => ({}),
   "look:qualification": () => ({}),
   "look:proposals": () => ({ stock: "AAPL", offset: 0, limit: 100 }),
   "examine:node": () => ({ radius: 1 }),
@@ -275,7 +275,15 @@ $("dm-form").addEventListener("submit", async (event) => {
     const result = await response.json();
     $("dm-output").textContent = JSON.stringify(result, null, 2);
     if (!response.ok) $("dm-output").textContent = `Command failed (${response.status})\n` + $("dm-output").textContent;
-  } catch (error) { $("dm-output").textContent = error.message; }
+    const picture = $("dm-picture");
+    picture.hidden = !(response.ok && verb === "look" && target === "picture" && result.view);
+    if (!picture.hidden) {
+      const view = new URL(result.view, location.href);
+      view.searchParams.set("picture", "1");
+      picture.src = view.href;
+      $("dm-output").textContent = "Living Data map picture";
+    } else picture.removeAttribute("src");
+  } catch (error) { $("dm-picture").hidden = true; $("dm-picture").removeAttribute("src"); $("dm-output").textContent = error.message; }
   finally { button.disabled = false; }
 });
 

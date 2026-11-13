@@ -26,6 +26,7 @@
   [hidden] { display: none !important; }
   #dm-input { display: block; width: min(100%, 48rem); min-height: 7rem; box-sizing: border-box; margin: .7rem 0; }
   #dm-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow: auto; }
+  #dm-picture { width:100%; height:min(78vh, 52rem); border:1px solid #60718e; border-radius:6px; background:#17171a; }
   #bot-presence { display: grid; grid-template-columns: repeat(auto-fill,minmax(12rem,1fr)); gap: .8rem; }
   .bot-unit { display: flex; align-items: center; gap: .65rem; padding: .65rem; border: 1px solid #50678c; border-radius: 10px; background: #213451; transition: opacity 1s linear; min-width: 0; }
   .bot-avatar { position: relative; flex: 0 0 2.7rem; width: 2.7rem; height: 3rem; }
@@ -98,6 +99,7 @@
         <option value="look:proposals">Compare strategy proposals</option>
         <option value="look:qualification">Look at qualification runs</option>
         <option value="look:map">Look at living map</option>
+        <option value="look:picture">Picture of the Nodus Living Data map</option>
         <option value="examine:node">Examine map node</option>
         <option value="make:strategy">Make strategy</option>
         <option value="make:bot">Register a bot</option>
@@ -111,6 +113,7 @@
       <button type="submit">Send command</button>
     </form>
     <pre id="dm-output" role="status">Choose a command to inspect your paper arena.</pre>
+    <iframe id="dm-picture" title="Nodus Living Data map picture" hidden></iframe>
   </section>
   <section class="panel">
     <h2>Active market bots</h2>

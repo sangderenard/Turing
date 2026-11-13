@@ -403,6 +403,7 @@ class Sessions:
         # [SITE] a map as pages: rendered on first look and kept under products/site; the maps this host declares
         self.site = shared_rest_loader.site.Site(self.state.products_dir / "site", GraphView)
         self.site_maps = {"system": {"source": self.system_map, "capability": "dev_ui", "ttl": 5.0}}
+        self.nodus_ui_ports = {}  # managed instance name -> loopback Nodus UI server port
         if shared_rest_loader.manual is not None:
             self.site_maps["manual"] = {"source": shared_rest_loader.manual.as_map, "capability": "view_site", "ttl": 3600.0}
         self.tickets = tickets_mod.Store(self.state.tickets_dir)
@@ -436,7 +437,8 @@ class Sessions:
         try:
             g = nodus_mod.graph(db, self.state, None)
             g.setdefault("canvas", nodus_mod.digest(db, self.state, g["instance"]).get("canvas"))
-            return nodus_mod.as_living_map(g, g["instance"])
+            return nodus_mod.as_living_map(g, g["instance"], nodus_mod.ui_feeds(
+                g["instance"], g["instance"] in self.nodus_ui_ports))
         finally:
             db.close()
 
@@ -1346,6 +1348,7 @@ def make_handler(sessions: Sessions):
                             ("look", "scoreboard"): ("/api/paper/scoreboard", "GET"),
                             ("look", "proposals"): ("/api/paper/proposals", "GET"),
                             ("look", "qualification"): ("/api/paper/qualification/live", "GET"),
+                            ("look", "picture"): ("/api/nodus/picture", "GET"),
                             ("look", "map"): ("/api/paper/map", "GET"),
                             ("examine", "node"): ("/api/paper/map/query", "GET"),
                             ("make", "strategy"): ("/api/paper/strategies", "POST"),
@@ -1358,6 +1361,11 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "unknown paper DM command"}, HTTPStatus.BAD_REQUEST)
                 path, method = dispatch[command]
                 body = body["input"]
+                picture_instance = None
+                if command == ("look", "picture"):
+                    if set(body) - {"instance"} or ("instance" in body and not isinstance(body["instance"], str)):
+                        return self._json({"error": "picture accepts an optional instance"}, HTTPStatus.BAD_REQUEST)
+                    picture_instance = body.get("instance") or None
                 if command == ("examine", "node"):
                     if set(body) - {"at", "radius"}:
                         return self._json({"error": "examine accepts at and radius"}, HTTPStatus.BAD_REQUEST)
@@ -1375,8 +1383,10 @@ def make_handler(sessions: Sessions):
                         return self._json({"error": "reconcile requires id"}, HTTPStatus.BAD_REQUEST)
                     path = f"/api/paper/orders/{body['id']}/reconcile"
                     body = {}
-                elif method == "GET" and body:
+                elif method == "GET" and body and command != ("look", "picture"):
                     return self._json({"error": "look accepts an empty input"}, HTTPStatus.BAD_REQUEST)
+                if path == "/api/nodus/picture":
+                    return self._nodus_get(path, picture_instance)
                 if path == "/api/nodus/action":
                     return self._nodus_action(body)
             db = paper_arena_mod.connect(sessions.state.sql_dir / "paper_arena.sqlite")
@@ -1769,14 +1779,17 @@ def make_handler(sessions: Sessions):
             import sqlite3
             return sqlite3.connect(Path(sessions.accounts_db).as_uri() + "?mode=ro", uri=True, timeout=5)
 
-        def _nodus_get(self, path: str) -> None:
-            from urllib.parse import parse_qs
+        def _nodus_get(self, path: str, instance_override=None) -> None:
+            from urllib.parse import parse_qs, quote
             if not ({"dev_ui", "nodus_edit"} & self._caps()) and not self._require("nodus_edit"):
                 return
             self._set_cookie = []
             name = path[len("/api/nodus/"):]
-            query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
-            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract", "map"):
+            parsed_query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+            if any(len(values) != 1 for values in parsed_query.values()):
+                return self._json({"error": "repeated query parameter"}, HTTPStatus.BAD_REQUEST)
+            query = {k: v[0] for k, v in parsed_query.items()}
+            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract", "map", "picture", "frame"):
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             try:
                 db = self._nodus_db()
@@ -1785,17 +1798,42 @@ def make_handler(sessions: Sessions):
             try:
                 if name == "instances":
                     return self._json({"instances": nodus_mod.instances(db, sessions.state)})
-                inst = query.get("instance") or None
+                inst = instance_override or query.get("instance") or None
+                if name == "frame":
+                    where = nodus_mod.locate(db, sessions.state, inst)
+                    port = sessions.nodus_ui_ports.get(where["name"])
+                    if port is None:
+                        return self._json({"error": "no Nodus UI feed is configured for this instance"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    region_keys = {"x", "y", "width", "height"}
+                    if set(query) - {"instance"} not in (set(), region_keys):
+                        return self._json({"error": "region requires x, y, width and height"}, HTTPStatus.BAD_REQUEST)
+                    try:
+                        region = {key: int(query[key]) for key in region_keys} if region_keys <= set(query) else None
+                    except ValueError:
+                        return self._json({"error": "invalid UI region"}, HTTPStatus.BAD_REQUEST)
+                    data = nodus_mod.ui_frame(port, region)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if name == "abstract":
                     g = nodus_mod.graph(db, sessions.state, inst)
                     g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
                     return self._json({"instance": g["instance"], "revision": g.get("revision"),
-                                       "nodes": nodus_mod.as_generic_graph(g, g["instance"])})
-                if name == "map":      # the graph as the Living Data map (nodus_service.as_living_map); enter at "at" via /api/living-data/sessions
+                                       "nodes": nodus_mod.as_generic_graph(g, g["instance"], nodus_mod.ui_feeds(
+                                           g["instance"], g["instance"] in sessions.nodus_ui_ports))})
+                if name in ("map", "picture"):
                     g = nodus_mod.graph(db, sessions.state, inst)
                     g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
-                    living = nodus_mod.as_living_map(g, g["instance"])
-                    return self._json({"instance": g["instance"], "revision": g.get("revision"), "at": living["identity"], "map": living})
+                    living = nodus_mod.as_living_map(g, g["instance"], nodus_mod.ui_feeds(
+                        g["instance"], g["instance"] in sessions.nodus_ui_ports))
+                    return self._json({"instance": g["instance"], "revision": g.get("revision"), "at": living["identity"],
+                                       "map": living, **({"view": "/nodus.html?instance=" + quote(g["instance"], safe="") + "#living-map"}
+                                                         if name == "picture" else {})})
                 return self._json(getattr(nodus_mod, name)(db, sessions.state, inst))
             except nodus_mod.NodusError as error:
                 return self._json({"error": error.message}, error.status)
@@ -3803,6 +3841,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="[FEDERATE] that Nodus instance's canvas file; its sha256 and web-dir api.yaml module:entry pairs are what a peer must promise")
     parser.add_argument("--studio-nodus-port", type=int, default=None,
                         help="[SHOW] the local Nodus host's 127.0.0.1 contract port of the Studio prefix (with --studio-assets)")
+    parser.add_argument("--nodus-ui", action="append", default=[], metavar="INSTANCE:PORT",
+                        help="loopback Nodus UI feed for an instance's inner console wall; repeat for multiple instances")
     parser.add_argument("--studio-nodus-prefix", default="studio.product", help="[SHOW] the Studio contract prefix on that port")
     parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
     parser.add_argument("--studio-defaults", default=None,
@@ -3829,6 +3869,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dev-route", default="",      # [ROUTE]
                         help="[ROUTE] route of the Development server; absent = none is enabled (a stored 'dev' preference falls back to the Stable server)")
     args = parser.parse_args(argv)
+    nodus_ui_ports = {}
+    for item in args.nodus_ui:
+        name, sep, raw_port = item.rpartition(":")
+        if (sep != ":" or not name or not raw_port.isdecimal()
+                or not 1 <= int(raw_port) <= 65535 or name in nodus_ui_ports):
+            parser.error("--nodus-ui expects a unique INSTANCE:PORT")
+        nodus_ui_ports[name] = int(raw_port)
     if args.route:
         try:
             proxy_trust_mod.route_cookie(args.route)
@@ -3860,6 +3907,7 @@ def main(argv: list[str] | None = None) -> int:
     logring_mod.RING = logring_mod.Ring(path=state.log_ring); logring_mod.tee_stdout()   # [LOG]
     profiles_path = Path(args.profiles) if args.profiles else (state.profiles_json if args.state_dir else PROFILES)
     sessions = Sessions(web_dir, Profiles(profiles_path), state)
+    sessions.nodus_ui_ports = nodus_ui_ports
     sessions.route = args.route
     sessions.routes = [r for r in args.routes.split(",") if r]                    # [ROUTE]
     if args.accounts_db:                                                          # [ROUTE] every module opens sessions.accounts_db; Accounts and the policy follow it

@@ -1,7 +1,7 @@
-// /nodus.html: READ-ONLY view of the graph of a running Nodus canvas host (/api/nodus/*).  Structure only; no canvas is drawn and nothing here
-// can change one.  Everything is set with textContent / createElement; no innerHTML.
+// /nodus.html: Living Data graph picture and read-only UI feeds from Nodus.
 const $ = (id) => document.getElementById(id);
-const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, tools: [], activity: null, abstract: null, busy: false };
+const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, busy: false };
+let feedImages = [];
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -99,6 +99,58 @@ function drawGeneric() {
     nodes.reduce((n, x) => n + (x.dependencies || []).length, 0) + " dependencies";
 }
 
+function drawMap() {
+  const map = state.map;
+  $("maproot").textContent = map ? `${map.name} [${map.identity}]` : "Map unavailable.";
+  const nodes = $("mapregions");
+  const wall = $("console-wall");
+  nodes.replaceChildren(); wall.replaceChildren(); feedImages = [];
+  if (!map) return;
+  const feeds = (map.tracks || []).filter((t) => t.relationship === "feeds");
+  for (const region of map.regions || []) {
+    if (region.kind === "console" || region.kind === "console-wall") continue;
+    const card = el("div", region.name, "map-node");
+    card.title = region.identity;
+    const outgoing = feeds.filter((t) => t.source === region.identity).length;
+    if (outgoing) card.append(el("small", ` → ${outgoing} feed${outgoing === 1 ? "" : "s"}`, "mut"));
+    nodes.append(card);
+  }
+  const consoles = (map.regions || []).filter((r) => r.kind === "console" && r.view?.full);
+  if (!consoles.length) { wall.append(el("p", "No Nodus UI feed is configured for this graph.", "mut")); return; }
+  for (const consoleNode of consoles) {
+    const card = el("article", null, "console-device card");
+    card.dataset.identity = consoleNode.identity;
+    card.append(el("strong", consoleNode.name));
+    const image = el("img"); image.alt = consoleNode.name + " UI feed";
+    image.dataset.url = consoleNode.view.full;
+    image.src = image.dataset.url;
+    feedImages.push(image);
+    card.append(image);
+    const full = el("a", "Open full view"); full.href = consoleNode.view.full; full.target = "_blank"; full.rel = "noopener";
+    card.append(full);
+    const form = el("form");
+    const fields = {};
+    for (const [key, value] of Object.entries({ x: 0, y: 0, width: 320, height: 240 })) {
+      const label = el("label", key + " ");
+      const input = el("input"); input.type = "number"; input.min = key === "width" || key === "height" ? "1" : "0";
+      input.value = String(value); input.required = true;
+      label.append(input); form.append(label); fields[key] = input;
+    }
+    const select = el("button", "Show region"); select.type = "submit"; form.append(select);
+    const reset = el("button", "Show whole UI"); reset.type = "button";
+    reset.addEventListener("click", () => { image.dataset.url = consoleNode.view.full; image.src = image.dataset.url; });
+    form.append(reset);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const values = Object.fromEntries(Object.entries(fields).map(([key, input]) => [key, Number(input.value)]));
+      if (Object.values(values).some((value) => !Number.isInteger(value)) || values.width < 1 || values.height < 1) return;
+      image.dataset.url = consoleNode.view.region.replace(/\{(x|y|width|height)\}/g, (_, key) => String(values[key]));
+      image.src = image.dataset.url;
+    });
+    card.append(form); wall.append(card);
+  }
+}
+
 function explain(res, what) {
   if (res.status === 501) return what + ": not supported by this host";
   if (res.status === 503) return (res.body && res.body.error) || "the console is unreachable";
@@ -116,13 +168,15 @@ async function refresh() {
     $("digest").textContent = digestLine(d.body);
     const key = state.instance + "@" + d.body.revision;
     if (key !== state.graphKey) {
-      const [g, t, a] = await Promise.all([get(q("/api/nodus/graph")), get(q("/api/nodus/tools")), get(q("/api/nodus/abstract"))]);
+      const [g, t, a, m] = await Promise.all([get(q("/api/nodus/graph")), get(q("/api/nodus/tools")), get(q("/api/nodus/abstract")), get(q("/api/nodus/map"))]);
       if (g.status === 200) { state.graph = g.body; state.graphKey = key; }
       else setStatus(explain(g, "graph"), true);
       if (t.status === 200) { state.tools = t.body.tools || []; if (t.body.complete === false) setStatus("Tool list is incomplete: " + show(t.body.missing), true); }
       if (a.status === 200) state.abstract = a.body;
+      if (m.status === 200) state.map = m.body.map;
       drawTools();
       drawGeneric();
+      drawMap();
     }
     const bucket = d.body.tick;
     if (bucket !== state.tick || !state.activity) {
@@ -146,7 +200,8 @@ async function loadInstances() {
     o.value = i.name;
     select.append(o);
   }
-  const ready = list.find((i) => i.console) || list[0];
+  const requested = new URLSearchParams(location.search).get("instance");
+  const ready = list.find((i) => i.name === requested) || list.find((i) => i.console) || list[0];
   if (!ready) { setStatus("No nodus instance is recorded.", false); return; }
   select.value = ready.name;
   state.instance = ready.name;
@@ -154,7 +209,8 @@ async function loadInstances() {
 }
 
 function resetFor(name) {
-  Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, tools: [], activity: null, abstract: null });
+  Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null });
+  drawMap();
 }
 
 async function whoamiHasMessage() {
@@ -221,6 +277,10 @@ function drawWalk(cursor) {
   walk.id = cursor.session_id;
   walk.revision = cursor.revision;
   $("walkhere").textContent = cursor.text;
+  if (cursor.at?.kind === "console") {
+    const consoleCard = [...$("console-wall").children].find((card) => card.dataset.identity === cursor.at.identity);
+    consoleCard?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
   const names = walkNames();
   (cursor.exits || []).forEach((item, i) => {
     const b = el("button", exitLabel(i + 1, item, names));
@@ -277,6 +337,7 @@ async function copyJson() {
 }
 
 async function main() {
+  if (new URLSearchParams(location.search).get("picture") === "1") document.body.classList.add("picture-mode");
   $("instance").addEventListener("change", () => { resetFor($("instance").value); refresh(); });
   $("filter").addEventListener("input", drawTools);
   $("copy").addEventListener("click", copyJson);
@@ -285,6 +346,8 @@ async function main() {
   await setupWalk();
   await loadInstances();
   setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 2000);
+  setInterval(() => { if (document.visibilityState === "visible") for (const img of feedImages)
+    img.src = img.dataset.url + (img.dataset.url.includes("?") ? "&" : "?") + "frame=" + Date.now(); }, 500);
 }
 
 if (typeof document !== "undefined" && document.getElementById("instance")) main();

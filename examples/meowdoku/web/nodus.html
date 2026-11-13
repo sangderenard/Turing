@@ -20,17 +20,36 @@
   th, td { text-align:left; padding:.3rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--mut); font-weight:600; }
   .mut { color:var(--mut); } .bad { color:#ff8a80; } [hidden] { display:none !important; }
+  .map-grid { display:flex; flex-wrap:wrap; gap:.5rem; }
+  .map-node { padding:.45rem .65rem; border:1px solid var(--line); border-radius:6px; background:var(--card); }
+  .console-wall { display:flex; gap:1rem; overflow-x:auto; padding:.6rem; border:1px solid var(--line); border-radius:6px; }
+  .console-device { min-width:min(90vw, 34rem); max-width:34rem; }
+  .console-device img { display:block; width:100%; height:auto; background:#080808; margin:.5rem 0; }
+  .console-device form { display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; }
+  .console-device input { width:5rem; }
+  body.picture-mode main { max-width:none; padding:0 .8rem 1rem; }
+  body.picture-mode nav, body.picture-mode h1, body.picture-mode #digest,
+  body.picture-mode #details, body.picture-mode main > p.mut { display:none; }
 </style>
 </head>
 <body>
 <main>
   <nav><a href="/browse">Back to browse</a></nav>
   <h1>Nodus graph</h1>
-  <p class="mut">This page shows the graph of the system. It does not draw the canvas.</p>
+  <p class="mut">The Living Data map is the graph picture. Console devices on its inner wall show Nodus UI feeds when configured.</p>
   <p id="status" class="mut" role="status">Loading...</p>
   <div class="bar"><label for="instance">Instance</label><select id="instance"></select></div>
   <section id="digest" class="card mono"></section>
 
+  <section id="living-map">
+    <h2>Living Data map picture</h2>
+    <p id="maproot" class="mut"></p>
+    <div id="mapregions" class="map-grid"></div>
+    <h3>Inner console wall</h3>
+    <div id="console-wall" class="console-wall"></div>
+  </section>
+
+  <div id="details">
   <h2>Modules</h2>
   <div class="scroll"><table id="modules"><thead><tr><th>Module</th><th>Rows (tools, in order)</th><th>Exec mode</th><th>Place</th></tr></thead><tbody></tbody></table></div>
 
@@ -73,6 +92,7 @@
     </form>
     <p class="mut">Sends one plain-text message with the digest summary to a mutual contact. Nothing else is shared.</p>
   </section>
+  </div>
 </main>
 <script type="module" src="/nodus.js"></script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>
