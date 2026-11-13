@@ -32,9 +32,15 @@ class NativeTrack:
         argv = [c['executable'], c['scope_dll'], c['fft_dll'], '127.0.0.1',
                 str(c['spectrum_port']), '0', '5', '1024', self.song['path'],
                 '0', str(c['pcm_port']), '1']
+        environment = dict(os.environ, SDL_AUDIODRIVER='dummy')
+        if c.get('hls_env'):
+            from meowdoku import nodus_radio_hls
+            nodus_radio_hls.clear_output(c['hls_state'])
+            environment.update(c['hls_env'])
+            argv.append('1')
         self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
-            env=dict(os.environ, SDL_AUDIODRIVER='dummy'),
+            env=environment,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         def read():
             for line in self.process.stdout:
@@ -119,8 +125,9 @@ class PcmTap:
 
 
 class Runner:
-    def __init__(self, store, config_path, jobs, *, track=NativeTrack):
+    def __init__(self, store, config_path, jobs, *, track=NativeTrack, state=None):
         self.store, self.config_path, self.jobs, self.track = store, Path(config_path), jobs, track
+        self.state = state
         self.lock = threading.RLock()
         self.worker = None
         self.stop = threading.Event()
@@ -162,6 +169,14 @@ class Runner:
             for key in ('router_port', 'pcm_port', 'spectrum_port'):
                 if type(c[key]) is not int or not 0 < c[key] < 65536: raise ValueError()
             if c['pcm_port'] == c['spectrum_port']: raise ValueError()
+            hls = c.get('hls')
+            if hls is not None:
+                if not isinstance(hls, dict) or type(hls.get('enabled')) is not bool: raise ValueError()
+                if hls['enabled']:
+                    if self.state is None or self.state.radio_json != self.config_path: raise ValueError()
+                    from meowdoku import nodus_radio_hls
+                    c['hls_env'] = nodus_radio_hls.prepare(self.state, hls)
+                    c['hls_state'] = self.state
             return c
         except (OSError, ValueError, KeyError, TypeError):
             raise ControlError('Native jukebox source is not configured', 503)
