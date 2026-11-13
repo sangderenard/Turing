@@ -175,7 +175,7 @@ function mountRadio(wrap, host, canControl = false) {
   const rating = el("select", {"aria-label": "Rate the playing song"});
   rating.append(el("option", {value: "", text: "No rating"}));
   for (let n = 0; n <= 5; n++) rating.append(el("option", {value: String(n), text: String(n)}));
-  const vote = el("button", {class: "chip", type: "button", text: "Vote 0–5"});
+  const vote = el("button", {class: "chip", type: "button", text: "Vote 0â€“5"});
   const adminButtons = [];
   let jukeboxBusy = false, currentPlay = null;
   request.disabled = vote.disabled = true;
@@ -203,9 +203,9 @@ function mountRadio(wrap, host, canControl = false) {
       }
       queue.append(line);
     }
-    charts.replaceChildren(el("strong", {text: "Billboard · average rating, then vote count"}));
+    charts.replaceChildren(el("strong", {text: "Billboard Â· average rating, then vote count"}));
     for (const row of (data.charts || [])) charts.append(el("p", {text:
-      (names.get(row.song_id) || row.song_id) + " · " + Number(row.average).toFixed(2) + "/5 · " + row.votes + " votes"}));
+      (names.get(row.song_id) || row.song_id) + " Â· " + Number(row.average).toFixed(2) + "/5 Â· " + row.votes + " votes"}));
   }
   async function commandJukebox(body) {
     if (jukeboxBusy) return;

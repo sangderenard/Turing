@@ -63,7 +63,7 @@ const songs=panel.children.find(n=>n.attrs['aria-label']==='Song to request');so
 request.click();request.click();for(let i=0;i<20;i++)await Promise.resolve();
 assert.equal(jukeboxCommands.length,1);assert.equal(jukeboxCommands[0].action,'request');
 const rating=panel.children.find(n=>n.attrs['aria-label']==='Rate the playing song');rating.value='0';
-panel.children.find(n=>n.textContent==='Vote 0–5').click();for(let i=0;i<20;i++)await Promise.resolve();
+panel.children.find(n=>n.textContent==='Vote 0â€“5').click();for(let i=0;i<20;i++)await Promise.resolve();
 assert.equal(jukeboxCommands[1].rating,0);assert.equal(jukeboxCommands[1].play_id,1);
 const resume=panel.children.find(n=>n.textContent==='Start / resume jukebox');
 assert.equal(!!resume,admin);
