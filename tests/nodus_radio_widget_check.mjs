@@ -23,9 +23,10 @@ const document=new Node('document');document.body=new Node('body');document.crea
 document.querySelectorAll=()=>[{src:'test',getAttribute:()=> 'allow'}];
 const window=new Node('window');window.dispatchEvent=e=>window.fire(e.type,e);
 const context={document,window,console,Event:class{constructor(type){this.type=type;}},requestAnimationFrame:fn=>{frames.set(++nextFrame,fn);return nextFrame;},cancelAnimationFrame:id=>frames.delete(id),fetch:async()=>({ok:false,status:503}),Set,Map,Number,TypeError,Error};
+const admin = process.argv.includes('--admin'); let commands=[];
 let polls=0, timerId=0;const timers=new Map();
 Object.assign(context,{URLSearchParams, location:{search:'',pathname:'/'}, setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id)});
-context.fetch=async path=>({ok:true,json:async()=>path==='/api/whoami'?{signed_in:true,username:'dot',capabilities:['view_site']}:(polls++,{status:'live',title:'Tempest',rms:.25,bands:[.1,.2,.3,.4,.5]})});
+context.fetch=async (path, options={})=>({ok:true,json:async()=>path==='/api/whoami'?{signed_in:true,username:'dot',capabilities:admin?['view_site','account_manage']:['view_site']}:path==='/api/radio/playback'?(options.method==='POST'?(commands.push(options),{status:JSON.parse(options.body).action==='start'?'playing':'stopped',configured:true,can_stop:JSON.parse(options.body).action==='start'}):{status:'stopped',configured:true,can_stop:false}):(polls++,{status:'live',title:'Tempest',rms:.25,bands:[.1,.2,.3,.4,.5]})});
 vm.createContext(context);
 const source=fs.readFileSync(new URL('../examples/meowdoku/web/site-nav.js',import.meta.url),'utf8').replace('export function registerControlSuite','function registerControlSuite').replace('import.meta.url','"test"');
 vm.runInContext(source,context);
@@ -34,7 +35,7 @@ const host=document.body.children[0],nav=host.shadow.children[1],actions=nav.chi
 const chip=actions.children.find(n=>n.textContent==='Nodus Radio');assert.ok(chip);
 const panel=actions.children.find(n=>n.attrs['aria-label']==='Nodus Radio');assert.ok(panel.hidden);assert.equal(polls,0);
 chip.click();for(let i=0;i<12;i++)await Promise.resolve();
-assert.equal(polls,1);assert.equal(panel.hidden,false);assert.equal(timers.size,1);
+assert.equal(polls,1);assert.equal(panel.hidden,false);assert.equal(timers.size,admin?2:1);
 assert.equal(panel.children.find(n=>n.className==='radio-bands').children.length,5);
 assert.equal(panel.children.find(n=>n.tag==='strong').textContent,'Tempest');
 toggle.click();assert.ok(panel.hidden);assert.equal(timers.size,0);
@@ -43,3 +44,14 @@ chip.click();for(let i=0;i<12;i++)await Promise.resolve();panel.fire('keydown',{
 chip.click();document.fire('pointerdown',{composedPath:()=>[document]});for(let i=0;i<12;i++)await Promise.resolve();assert.equal(timers.size,0);
 chip.click();window.fire('pagehide');for(let i=0;i<12;i++)await Promise.resolve();assert.equal(timers.size,0);
 console.log('PASS: Radio lazy polling, real packet display, collapse, rapid toggles, Escape, outside close, unload, stale-response protection');
+
+if(admin){
+  chip.click();for(let i=0;i<12;i++)await Promise.resolve();
+  const play=panel.children.find(n=>n.textContent==='Play on server speakers');
+  const stop=panel.children.find(n=>n.textContent==='Stop my server playback');
+  assert.ok(play);assert.equal(commands.length,0);assert.equal(play.disabled,false);assert.equal(stop.disabled,true);
+  play.click();for(let i=0;i<12;i++)await Promise.resolve();
+  assert.equal(commands.length,1);assert.equal(commands[0].headers['X-Meowdoku-Radio'],'1');assert.equal(JSON.parse(commands[0].body).action,'start');assert.equal(stop.disabled,false);
+  stop.click();for(let i=0;i<12;i++)await Promise.resolve();assert.equal(commands.length,2);assert.equal(JSON.parse(commands[1].body).action,'stop');assert.equal(stop.disabled,true);
+  console.log('PASS: Admin PA controls require explicit click, use guarded JSON route, distinguish server speakers, stop follows ownership');
+}

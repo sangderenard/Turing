@@ -158,7 +158,7 @@ function mountControlSuite(wrap, host, spec) {
 
 // Nodus owns capture/FFT; Python reads its existing UDP relay inbox.
 // This widget shows NRAD bands, not a browser FFT or an invented audio stream.
-function mountRadio(wrap, host) {
+function mountRadio(wrap, host, canControl = false) {
   const chip = el("button", {class: "chip", type: "button", text: "Nodus Radio", "aria-expanded": "false"});
   const panel = el("section", {class: "suite", hidden: "", "aria-label": "Nodus Radio"});
   const close = el("button", {class: "chip", type: "button", text: "Close radio"});
@@ -167,6 +167,43 @@ function mountRadio(wrap, host) {
   const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
   panel.append(close, title, status, bands,
     el("p", {text: "Live spectrum from Nodus. This feed carries levels, not playable audio."}));
+  let paTimer = null, paBusy = false;
+  const paStatus = el("p", {role: "status", text: "Server speakers: checking configuration"});
+  const play = el("button", {class: "chip", type: "button", text: "Play on server speakers"});
+  const stop = el("button", {class: "chip", type: "button", text: "Stop my server playback"});
+  play.disabled = stop.disabled = true;
+  function showPA(data) {
+    paStatus.textContent = "Server speakers: " + (data.error || data.status || "unavailable");
+    play.disabled = paBusy || !data.configured || !["stopped", "failed"].includes(data.status);
+    stop.disabled = paBusy || !data.can_stop;
+  }
+  async function pollPA(epoch) {
+    try {
+      const data = await getJson("/api/radio/playback");
+      if (epoch !== generation || panel.hidden) return;
+      showPA(data);
+    } catch (error) {
+      if (epoch !== generation || panel.hidden) return;
+      showPA({error: "unavailable"});
+    }
+    if (epoch === generation && !panel.hidden) paTimer = setTimeout(() => pollPA(epoch), 1000);
+  }
+  async function commandPA(action) {
+    if (paBusy) return;
+    paBusy = true; play.disabled = stop.disabled = true;
+    try {
+      const response = await fetch("/api/radio/playback", {method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-Meowdoku-Radio": "1"}, body: JSON.stringify({action})});
+      const data = await response.json();
+      paBusy = false;
+      showPA(data);
+    } catch (error) {paBusy = false; showPA({error: "request failed; check status before retrying"});}
+  }
+  if (canControl) {
+    panel.append(el("p", {text: "Admin PA control: plays on the server's selected speakers, not this browser. Continues until Stop or the source ends."}), paStatus, play, stop);
+    play.addEventListener("click", () => commandPA("start"));
+    stop.addEventListener("click", () => commandPA("stop"));
+  }
   let generation = 0, timer = null;
   const dismiss = () => setOpen(false);
   async function poll(epoch) {
@@ -194,9 +231,9 @@ function mountRadio(wrap, host) {
   function setOpen(open) {
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
-    generation++; clearTimeout(timer); timer = null;
+    generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
-    if (open) poll(generation);
+    if (open) {poll(generation); if (canControl) pollPA(generation);}
   }
   chip.addEventListener("click", () => setOpen(panel.hidden));
   close.addEventListener("click", () => {setOpen(false); chip.focus();});
@@ -254,7 +291,7 @@ async function main() {
     return;
   }
 
-  if (caps.has("view_site")) mountRadio(actions, host);
+  if (caps.has("view_site")) mountRadio(actions, host, caps.has("account_manage"));
 
   if (!new URLSearchParams(location.search).has("viewer")) {
     // Tickets is a small menu: the account's issue tickets, and (dev_ui) the change reviews an admin approves.

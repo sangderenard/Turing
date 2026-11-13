@@ -393,6 +393,8 @@ class Sessions:
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
         self.accounts = accounts_mod.Accounts(self.state.accounts_db)   # [ACCOUNTS] real password login
         self.accounts_db = self.state.accounts_db
+        self.radio_lock = threading.Lock()
+        self.radio_control = None
         self.mathlab_lock = threading.Lock()
         self.mathlab_worker = None                                      # [MATHLAB] set by main() unless --no-mathlab
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
@@ -970,6 +972,15 @@ def make_handler(sessions: Sessions):
                 account_cookie=ACCOUNT_COOKIE, ReportError=experience_reports_mod.ReportError,
                 SchemaVersionError=experience_reports_mod.schema_version.SchemaVersionError,
                 max_body=experience_reports_mod.MAX_BODY)
+
+        # ---- [RADIO] explicit account-owned native speaker subscription.
+        def _radio_playback(self, method):
+            from meowdoku.nodus_radio_control import Manager, http_route
+            with sessions.radio_lock:
+                if sessions.radio_control is None:
+                    sessions.radio_control = Manager(sessions.state.radio_json, sessions.jobs)
+                manager = sessions.radio_control
+            return http_route(self, method, manager)
 
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
         def _issues_route(self, path: str, method: str) -> None:
@@ -1952,6 +1963,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id else {"tickets": sessions.tickets.list()})
                 except (ValueError, FileNotFoundError):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
+            if path == "/api/radio/playback":
+                return self._radio_playback("GET")
             if path == "/api/radio":
                 if not self._require("view_site"):
                     return
@@ -2403,6 +2416,8 @@ def make_handler(sessions: Sessions):
             path0 = self.path.split("?", 1)[0]
             if self._route_gate(path0):                           # [ROUTE]
                 return
+            if path0 == "/api/radio/playback":
+                return self._radio_playback("POST")
             if path0 == "/api/route":                             # [ROUTE]
                 return self._route_post()
             # Worker-only payload mailbox: credentials are process-local and
@@ -3294,6 +3309,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lc.stopping = True
+        if sessions.radio_control is not None:
+            sessions.radio_control.close()
         if sessions.mathlab_worker is not None:
             sessions.mathlab_worker.stop()
         if site_compiler is not None:
