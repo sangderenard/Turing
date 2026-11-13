@@ -5555,3 +5555,28 @@ SOURCE_COMPREHENSION_CAPACITY_BOUND = declare_page(
         RowField("destination_value_id", K.VALUE_ID),
     ), SourceComprehensionCapacityBound,
 )
+
+
+class SequenceLifetimeKind(Enum):
+    LOCAL_NEW = "local_new"
+    BORROWED = "borrowed"
+    ADOPTED = "adopted"
+
+
+@dataclass(frozen=True)
+class SequenceStorageLifetime:
+    """Descriptor birth lifetime; not permission to escape its native frame."""
+    kind: SequenceLifetimeKind
+    source_cell: Ref
+    contract_cell: Ref
+    column_cells: tuple[Ref, ...]
+    length_cell: Ref
+    capacity_cell: Ref
+    owner_cell: Ref | None
+    birth_cells: tuple[Ref, ...]
+    parent_cell: Ref | None = None
+
+
+SEQUENCE_STORAGE_LIFETIME = declare_page("sequence_storage_lifetime", (
+    RowField("function_scope", K.SCOPE), RowField("sequence_value_id", K.VALUE_ID),
+), SequenceStorageLifetime)

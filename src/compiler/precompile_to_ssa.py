@@ -13278,6 +13278,8 @@ class _ControlSSABuilder(TiledObject):
                     existing, column_shapes=tuple(merged_shapes),
                 )
                 self.sequence_descriptors[value_id] = existing
+            from .source_sequence_lifetime import publish_sequence_lifetime
+            publish_sequence_lifetime(self, existing)
             return existing
         concorded_column_dtypes = concord_sequence_row_dtypes(
             self.function_name,
@@ -13834,6 +13836,11 @@ class _ControlSSABuilder(TiledObject):
                     "program_abi_storage": _member_fact.storage,
                     "program_abi_rank": _member_fact.rank,
                 }
+        from .source_sequence_lifetime import publish_sequence_lifetime
+        publish_sequence_lifetime(
+            self, descriptor, parameter_kind=_owner_kind,
+            adopted_owner=incumbent_owner,
+        )
         return descriptor
 
     def _heap_sequence_contract(
