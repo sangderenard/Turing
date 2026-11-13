@@ -31,7 +31,7 @@ def decode_packet(data):
     return {'sample_rate': rate, 'frame': str(frame), 'rms': rms, 'bands': list(bands)}
 
 
-def snapshot(config_path, accounts_db, *, now=None):
+def snapshot(config_path, accounts_db, *, now=None, station=None):
     now = time.time() if now is None else now
     empty = {'status': 'unavailable', 'title': 'Nodus Radio', 'bands': [], 'audio': False}
     try:
@@ -42,6 +42,10 @@ def snapshot(config_path, accounts_db, *, now=None):
     if config.get('enabled') is not True or config.get('source') != 'file':
         return empty
     address, owner, peer = config.get('address'), config.get('owner_id'), config.get('peer')
+    # Trusted in-process native source metadata, never taken from HTTP inputs.
+    if station is not None:
+        peer = station['peer']
+        config['title'] = station['title']
     if type(address) is not int or type(owner) is not int or not isinstance(peer, str) or not peer:
         raise ValueError('invalid Radio station configuration')
     state = {**empty, 'title': str(config.get('title', 'Nodus Radio'))[:160], 'status': 'waiting'}

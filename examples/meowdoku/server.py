@@ -395,6 +395,8 @@ class Sessions:
         self.accounts_db = self.state.accounts_db
         self.radio_lock = threading.Lock()
         self.radio_control = None
+        self.radio_jukebox = None
+        self.radio_jukebox_runner = None
         self.mathlab_lock = threading.Lock()
         self.mathlab_worker = None                                      # [MATHLAB] set by main() unless --no-mathlab
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
@@ -981,6 +983,16 @@ def make_handler(sessions: Sessions):
                     sessions.radio_control = Manager(sessions.state.radio_json, sessions.jobs)
                 manager = sessions.radio_control
             return http_route(self, method, manager)
+
+        def _radio_jukebox(self, method):
+            from meowdoku.nodus_radio_jukebox import Jukebox, http_route
+            from meowdoku.nodus_radio_jukebox_runner import Runner
+            with sessions.radio_lock:
+                if sessions.radio_jukebox is None:
+                    sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
+                    sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs)
+                store, runner = sessions.radio_jukebox, sessions.radio_jukebox_runner
+            return http_route(self, method, store, runner)
 
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
         def _issues_route(self, path: str, method: str) -> None:
@@ -1963,6 +1975,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id else {"tickets": sessions.tickets.list()})
                 except (ValueError, FileNotFoundError):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
+            if path == "/api/radio/jukebox":
+                return self._radio_jukebox("GET")
             if path == "/api/radio/playback":
                 return self._radio_playback("GET")
             if path == "/api/radio":
@@ -1970,7 +1984,8 @@ def make_handler(sessions: Sessions):
                     return
                 from meowdoku import nodus_radio
                 try:
-                    return self._json(nodus_radio.snapshot(sessions.state.radio_json, sessions.accounts_db))
+                    return self._json(nodus_radio.snapshot(sessions.state.radio_json, sessions.accounts_db,
+                        station=sessions.radio_jukebox_runner.station() if sessions.radio_jukebox_runner else None))
                 except (OSError, ValueError, nodus_radio.sqlite3.Error, nodus_radio.relay.RelayError):
                     return self._json({"status": "unavailable", "title": "Nodus Radio", "bands": [], "audio": False}, 503)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
@@ -2416,6 +2431,8 @@ def make_handler(sessions: Sessions):
             path0 = self.path.split("?", 1)[0]
             if self._route_gate(path0):                           # [ROUTE]
                 return
+            if path0 == "/api/radio/jukebox":
+                return self._radio_jukebox("POST")
             if path0 == "/api/radio/playback":
                 return self._radio_playback("POST")
             if path0 == "/api/route":                             # [ROUTE]
@@ -2596,7 +2613,10 @@ def make_handler(sessions: Sessions):
                     return
                 try:
                     from meowdoku.trigger_grid_service import command
-                    return self._json(command(account["id"], body, sessions.marble_photos.spectral_root))
+                    from meowdoku.nodus_radio import snapshot
+                    return self._json(command(account["id"], body, sessions.marble_photos.spectral_root,
+                        radio_snapshot=lambda: snapshot(sessions.state.radio_json, sessions.accounts_db,
+                            station=sessions.radio_jukebox_runner.station() if sessions.radio_jukebox_runner else None)))
                 except (ValueError, TypeError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             if path0 == "/api/marble_photo/calibration_qr":
@@ -3309,6 +3329,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lc.stopping = True
+        if sessions.radio_jukebox_runner is not None:
+            sessions.radio_jukebox_runner.close()
         if sessions.radio_control is not None:
             sessions.radio_control.close()
         if sessions.mathlab_worker is not None:

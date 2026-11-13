@@ -167,6 +167,68 @@ function mountRadio(wrap, host, canControl = false) {
   const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
   panel.append(close, title, status, bands,
     el("p", {text: "Live spectrum from Nodus. This feed carries levels, not playable audio."}));
+  const queueStatus = el("p", {role: "status", text: "Jukebox: checking configuration"});
+  const songs = el("select", {"aria-label": "Song to request"});
+  const request = el("button", {class: "chip", type: "button", text: "Request song"});
+  const queue = el("div", {"aria-label": "Radio request lists"});
+  const charts = el("div", {"aria-label": "Radio billboard"});
+  const rating = el("select", {"aria-label": "Rate the playing song"});
+  rating.append(el("option", {value: "", text: "No rating"}));
+  for (let n = 0; n <= 5; n++) rating.append(el("option", {value: String(n), text: String(n)}));
+  const vote = el("button", {class: "chip", type: "button", text: "Vote 0–5"});
+  const adminButtons = [];
+  let jukeboxBusy = false, currentPlay = null;
+  request.disabled = vote.disabled = true;
+  panel.append(queueStatus, songs, request, rating, vote, queue, charts);
+  function showJukebox(data) {
+    const catalogue = data.catalogue || [];
+    const names = new Map(catalogue.map(s => [s.id, s.title]));
+    const selected = songs.value;
+    songs.replaceChildren(...catalogue.map(s => el("option", {value: s.id, text: s.title})));
+    if (names.has(selected)) songs.value = selected;
+    currentPlay = data.current?.id || null;
+    queueStatus.textContent = data.error || data.runner?.error || (data.paused ? "Jukebox paused" : "Jukebox running") +
+      (data.current ? ": " + (names.get(data.current.song_id) || data.current.song_id) : ": no song playing");
+    request.disabled = jukeboxBusy || !catalogue.length;
+    vote.disabled = jukeboxBusy || !currentPlay;
+    for (const button of adminButtons) button.disabled = jukeboxBusy || !!data.error;
+    queue.replaceChildren();
+    for (const row of (data.requests || [])) {
+      const line = el("div", {text: (row.mine ? "Your request: " : "Request: ") + (names.get(row.song_id) || row.song_id)});
+      if (row.mine || canControl) {
+        const remove = el("button", {type: "button", text: "Remove"});
+        remove.disabled = jukeboxBusy;
+        remove.addEventListener("click", () => commandJukebox({action: "remove", request_id: row.id}));
+        line.append(remove);
+      }
+      queue.append(line);
+    }
+    charts.replaceChildren(el("strong", {text: "Billboard · average rating, then vote count"}));
+    for (const row of (data.charts || [])) charts.append(el("p", {text:
+      (names.get(row.song_id) || row.song_id) + " · " + Number(row.average).toFixed(2) + "/5 · " + row.votes + " votes"}));
+  }
+  async function commandJukebox(body) {
+    if (jukeboxBusy) return;
+    jukeboxBusy = true; request.disabled = vote.disabled = true;
+    for (const button of adminButtons) button.disabled = true;
+    const epoch = generation;
+    try {
+      const response = await fetch("/api/radio/jukebox", {method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-Meowdoku-Radio": "1"}, body: JSON.stringify(body)});
+      const data = await response.json();
+      jukeboxBusy = false;
+      if (epoch === generation && !panel.hidden) showJukebox(data);
+    } catch (error) {jukeboxBusy = false; if (epoch === generation && !panel.hidden) showJukebox({error: "Request failed; refresh status before retrying"});}
+  }
+  request.addEventListener("click", () => commandJukebox({action: "request", song_id: songs.value}));
+  vote.addEventListener("click", () => {
+    if (rating.value !== "" && currentPlay) commandJukebox({action: "rate", play_id: currentPlay, rating: Number(rating.value)});
+  });
+  if (canControl) for (const [action, label] of [["resume", "Start / resume jukebox"], ["pause", "Pause after this song"], ["skip", "Skip current song"]]) {
+    const button = el("button", {class: "chip", type: "button", text: label});
+    button.disabled = true; button.addEventListener("click", () => commandJukebox({action}));
+    adminButtons.push(button); panel.append(button);
+  }
   let paTimer = null, paBusy = false;
   const paStatus = el("p", {role: "status", text: "Server speakers: checking configuration"});
   const play = el("button", {class: "chip", type: "button", text: "Play on server speakers"});
@@ -179,6 +241,14 @@ function mountRadio(wrap, host, canControl = false) {
   }
   async function pollPA(epoch) {
     try {
+      const data = await getJson("/api/radio/jukebox");
+      if (epoch !== generation || panel.hidden) return;
+      if (!jukeboxBusy) showJukebox(data);
+    } catch (error) {
+      if (epoch !== generation || panel.hidden) return;
+      showJukebox({error: "Jukebox unavailable"});
+    }
+    if (canControl) try {
       const data = await getJson("/api/radio/playback");
       if (epoch !== generation || panel.hidden) return;
       showPA(data);
@@ -210,6 +280,7 @@ function mountRadio(wrap, host, canControl = false) {
     try {
       const data = await getJson("/api/radio");
       if (epoch !== generation || panel.hidden) return;
+      window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: data}));
       title.textContent = data.title || "Nodus Radio";
       status.textContent = data.status === "live" ? "Live Â· RMS " + Number(data.rms).toFixed(3)
         : data.status === "stale" ? "Signal stopped Â· last packet " + Number(data.age_s).toFixed(1) + "s ago"
@@ -223,6 +294,7 @@ function mountRadio(wrap, host, canControl = false) {
       }
     } catch (error) {
       if (epoch !== generation || panel.hidden) return;
+      window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
       status.textContent = "Radio unavailable";
       bands.replaceChildren();
     }
@@ -232,8 +304,9 @@ function mountRadio(wrap, host, canControl = false) {
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
     generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
+    if (!open) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
-    if (open) {poll(generation); if (canControl) pollPA(generation);}
+    if (open) {poll(generation); pollPA(generation);}
   }
   chip.addEventListener("click", () => setOpen(panel.hidden));
   close.addEventListener("click", () => {setOpen(false); chip.focus();});
