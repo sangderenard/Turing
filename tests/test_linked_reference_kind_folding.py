@@ -168,3 +168,46 @@ def test_recursive_collection_edges_survive_abi_settlement(monkeypatch):
     assert len(receipts) == 1
     for node in receipts:
         assert {role for _, role in parents[node]} == {'value', 'control'}
+
+
+def optional_contract_graph(operator, receipt):
+    from src.transmogrifier.graph.graph_express2 import ProcessGraph
+    from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
+
+    program = ProcessGraph(materialize_memory=False)
+    program.build_from_ast(ast.parse(f"def probe(item):\n return item {operator} None\n"))
+    reduce_abstract_tensor_topology(program)
+    graph = program.function_table.entry("probe").graph
+    input_id = next(n for n, d in graph.G.nodes(data=True) if d.get("type") == "Input")
+    predicate = next(n for n, d in graph.G.nodes(data=True)
+                     if isinstance(d.get("expr_obj"), ast.Compare))
+    graph.G.graph["linked_value_abi"] = {input_id: receipt}
+    return graph, predicate
+
+
+@pytest.mark.parametrize("storage, dtype, identity", [
+    ("span", "int64", "builtins.list"),
+    ("scalar", "int64", "builtins.int"),
+    ("reference", "opaque_ref", "builtins.object"),
+])
+@pytest.mark.parametrize("operator", ["is", "is not"])
+def test_linked_optional_contract_keeps_none_test_runtime(storage, dtype, identity, operator):
+    graph, predicate = optional_contract_graph(operator, {
+        "storage": storage, "dtype": dtype, "rank": int(storage == "span"),
+        "python_types": ("builtins.NoneType", identity),
+    })
+    original_type = graph.G.nodes[predicate]["type"]
+    original_parents = tuple(graph.G.nodes[predicate]["parents"])
+    _fold_callsite_structural_values(graph)
+    assert graph.G.nodes[predicate]["type"] == original_type
+    assert tuple(graph.G.nodes[predicate]["parents"]) == original_parents
+
+
+@pytest.mark.parametrize("identity, expected", [("builtins.int", True), ("builtins.NoneType", False)])
+def test_linked_singleton_contract_still_proves_presence(identity, expected):
+    graph, predicate = optional_contract_graph("is not", {
+        "storage": "scalar", "dtype": "int64", "rank": 0,
+        "python_type": identity,
+    })
+    _fold_callsite_structural_values(graph)
+    assert graph.G.nodes[predicate]["attributes"]["value"] is expected

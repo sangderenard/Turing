@@ -31940,6 +31940,12 @@ def _fold_callsite_structural_values(
             linked_abi = (graph.G.graph.get("linked_value_abi") or {}).get(
                 int(data.get("value_id", node_id))
             )
+            linked_expectations = tuple(map(str, (
+                linked_abi.get("type_expectations")
+                or linked_abi.get("python_types")
+                or ((linked_abi["python_type"],)
+                    if linked_abi.get("python_type") is not None else ())
+            ))) if linked_abi is not None else ()
             if linked_abi is not None and linked_abi.get("storage") in {
                 "span", "scalar",
             }:
@@ -31961,6 +31967,12 @@ def _fold_callsite_structural_values(
                     "float32": "builtins.float",
                     "float64": "builtins.float",
                 }.get(dtype, dtype)
+                # Preserve the call-edge alternatives just as for the formal
+                # parameter receipt above. A list's int64 element storage is
+                # not evidence that an Optional[list] excludes None.
+                if linked_expectations:
+                    python_type = (linked_expectations[0]
+                                   if len(linked_expectations) == 1 else "unknown")
                 return _ProgramABIValueFact(
                     python_type,
                     str(linked_abi["storage"]),
@@ -31973,6 +31985,8 @@ def _fold_callsite_structural_values(
                         None if linked_abi.get("rank") is None
                         else int(linked_abi["rank"])
                     ),
+                    optional="builtins.NoneType" in linked_expectations,
+                    type_expectations=linked_expectations,
                 )
             if linked_abi is not None and linked_abi.get("storage") == "reference":
                 # root(value,memo)->visit(item): tuple(visit(child) for child
@@ -31983,10 +31997,13 @@ def _fold_callsite_structural_values(
                 # scalar handle does not prove its object's dynamic kind.
                 shape = linked_abi.get("shape")
                 return _ProgramABIValueFact(
-                    str(linked_abi.get("python_type") or "unknown"),
+                    (linked_expectations[0]
+                     if len(linked_expectations) == 1 else "unknown"),
                     "reference", linked_abi.get("dtype"),
                     shape=None if shape is None else tuple(map(int, shape)),
                     rank=linked_abi.get("rank"),
+                    optional="builtins.NoneType" in linked_expectations,
+                    type_expectations=linked_expectations,
                 )
             descriptor = fold_descriptor(int(node_id))
             if descriptor is not None:
