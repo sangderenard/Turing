@@ -1612,6 +1612,8 @@ class CorrelationTable:
         found.extend(source_field_sequence_element_findings(module))
         from .source_owned_record_projection import public_source_entry_findings
         found.extend(public_source_entry_findings(module))
+        from .source_owned_record_projection_validation import record_owned_return_projection_findings
+        found.extend(record_owned_return_projection_findings(module))
         from .source_sequence_lifetime import sequence_lifetime_findings
         found.extend(sequence_lifetime_findings(module))
         found.extend(self._source_owned_sequence_return_findings(module))
@@ -16711,7 +16713,7 @@ class CorrelationTable:
         """Check the source-owned return's native descriptor and owner."""
 
         from .concordance_declarations import (
-            PUBLIC_OWNED_SEQUENCE_RETURN, SEQUENCE_DESCRIPTOR,
+            PUBLIC_OWNED_SEQUENCE_RETURN, RECORD_OWNED_RETURN_PROJECTION, SEQUENCE_DESCRIPTOR,
             SOURCE_OWNED_SEQUENCE_RETURN, SSA_VALUE,
             PublicOwnedSequenceReturn, SourceOwnedSequenceReturn,
         )
@@ -16731,6 +16733,13 @@ class CorrelationTable:
             table = (getattr(module, "sequence_tables", {}) or {}).get(
                 str(row[0])
             )
+            if (isinstance(fact, PublicOwnedSequenceReturn)
+                    and fact.source_cell.page == RECORD_OWNED_RETURN_PROJECTION):
+                from .source_owned_record_projection_validation import validated_record_public_owned_return
+                if validated_record_public_owned_return(module, cell) is None:
+                    found.append(Finding('public-owned-sequence-return',str(row[0]),int(row[1]),
+                        'owned record return lacks exact source, writer, transfer or owner proof'))
+                continue
             valid = (
                 isinstance(fact, PublicOwnedSequenceReturn)
                 and function is not None and table is not None

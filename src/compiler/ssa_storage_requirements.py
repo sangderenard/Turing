@@ -275,7 +275,7 @@ def public_owned_sequence_returns(
     """Read the completed source return, descriptor, and heap owner chain."""
 
     from .concordance_declarations import (
-        PUBLIC_OWNED_SEQUENCE_RETURN, SOURCE_OWNED_SEQUENCE_RETURN,
+        PUBLIC_OWNED_SEQUENCE_RETURN, SOURCE_OWNED_SEQUENCE_RETURN, RECORD_OWNED_RETURN_PROJECTION,
         PublicOwnedSequenceReturn, SourceOwnedSequenceReturn,
     )
     from .identity_concordance import CorrelationTable
@@ -309,13 +309,24 @@ def public_owned_sequence_returns(
         fact = page.cell(cell.row, cell.column)
         if not isinstance(fact, PublicOwnedSequenceReturn):
             continue
-        source = book.page(SOURCE_OWNED_SEQUENCE_RETURN).cell(
-            fact.source_cell.row, fact.source_cell.column,
-        )
+        if fact.source_cell.page == RECORD_OWNED_RETURN_PROJECTION:
+            from .source_owned_record_projection_validation import validated_record_public_owned_return
+            validated = validated_record_public_owned_return(module, cell)
+            if validated is None:
+                continue
+            source_return_slot = validated[1].source_return_slot_cell
+        elif fact.source_cell.page == SOURCE_OWNED_SEQUENCE_RETURN:
+            source = book.page(SOURCE_OWNED_SEQUENCE_RETURN).cell(
+                fact.source_cell.row, fact.source_cell.column,
+            )
+            if not isinstance(source, SourceOwnedSequenceReturn):
+                continue
+            source_return_slot = source.return_slot_cell
+        else:
+            continue
         descriptor = table.sequences.get(int(row[1]))
         if (
-            not isinstance(source, SourceOwnedSequenceReturn)
-            or descriptor is None
+            descriptor is None
             or descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
             or descriptor.heap_owner_value_id is None
             or len(descriptor.column_value_ids) != 1
@@ -341,7 +352,7 @@ def public_owned_sequence_returns(
         result.append(PublicOwnedSequencePorts(
             data_id, length_id, capacity_id, owner_id,
             str(descriptor.column_dtypes[0]), cell, fact.source_cell,
-            fact.descriptor_cell, fact.owner_cell, source.return_slot_cell,
+            fact.descriptor_cell, fact.owner_cell, source_return_slot,
         ))
     return tuple(result)
 

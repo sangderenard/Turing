@@ -1631,6 +1631,54 @@ SOURCE_FIELD_SEQUENCE_ELEMENT = declare_page(
 
 
 @dataclass(frozen=True)
+class RecordOwnedReturnProjection:
+    """Exact source-to-public mapping and native transfer instruction witnesses.
+
+    Member order is columns, length, capacity, optional status, then owner.
+    Status is a mapped private frame cell, not a surviving public ABI port.
+    This record must be checked against the actual IR and source receipts;
+    its presence alone is never a permission to transfer ownership.
+    """
+
+    entry_cell: Ref
+    source_record_id: int
+    field_name: str
+    source_sequence_id: int
+    source_owner_id: int
+    source_return_slot_cell: Ref
+    source_constructor_operands_cell: Ref
+    source_cell: Ref
+    source_descriptor_cell: Ref
+    source_record_cell: Ref
+    source_return_layout_cell: Ref
+    element_declaration_cell: Ref
+    element_binding_cell: Ref
+    element_class_cell: Ref
+    public_descriptor_cell: Ref
+    public_record_cell: Ref
+    public_return_layout_cell: Ref
+    member_pairs: tuple[tuple[Ref, Ref], ...]
+    snapshot_cells: tuple[Ref, ...]
+    null_cell: Ref
+    block_geometry_cell: Ref
+    terminal_lifetime_cells: tuple[Ref, ...]
+    writer_cells: tuple[Ref, ...]
+
+
+RECORD_OWNED_RETURN_PROJECTION_VALUE = declare_transform(
+    "record_owned_return_projection_value", 1,
+)
+
+
+RECORD_OWNED_RETURN_PROJECTION = declare_page(
+    "record_owned_return_projection", (
+        RowField("function", K.NAME),
+        RowField("public_sequence_id", K.VALUE_ID),
+    ), RecordOwnedReturnProjection,
+)
+
+
+@dataclass(frozen=True)
 class SourceOwnedSequenceReturn:
     """An authored bytes concat returned from its exact source slot."""
 
