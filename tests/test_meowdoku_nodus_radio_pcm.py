@@ -49,6 +49,106 @@ class PcmTests(unittest.TestCase):
             for _ in range(100):
                 if sub.buffer.status()['received']:break
                 threading.Event().wait(.01)
-            self.assertEqual(sub.buffer.take(),decode_rtp(packet()).pcm_s16le)
+            self.assertEqual(sub.take_due(),decode_rtp(packet()).pcm_s16le)
         t.join(2);listener.close();self.assertFalse(t.is_alive());self.assertEqual(outcome,[(OPEN,49123)])
+class ReadbackTests(unittest.TestCase):
+    def test_high_resolution_clock_and_policy(self):
+        now = [0.]
+        b = JitterBuffer(ssrc=42, prefill=1, clock=lambda: now[0])
+        b.put(decode_rtp(packet(0, 0)))
+        self.assertIsNotNone(b.take_due())
+        self.assertIsNone(b.take_due())
+        now[0] = SAMPLES / RATE
+        self.assertEqual(b.take_due(), SILENCE)
+        self.assertEqual(b.lost, 1)
+        for value in (-1., float('nan'), float('inf')):
+            with self.assertRaises(ValueError): b.take_due(value)
+        for args in ({'max_rate_offset': 2}, {'slew_per_second': 0}, {'momentum_seconds': 0}):
+            with self.assertRaises(ValueError): JitterBuffer(ssrc=42, **args)
+        self.assertIs(JitterBuffer(ssrc=42).clock, time.perf_counter)
+
+    def test_slew_and_momentum_bounds(self):
+        b = JitterBuffer(ssrc=42, prefill=3)
+        for i in range(20): b.put(decode_rtp(packet(i, i * SAMPLES)))
+        prior, t = 1., 0.
+        for i in range(10):
+            self.assertIsNotNone(b.take_due(t))
+            rate = b.status()['read_rate']
+            dt = SAMPLES / RATE if i == 0 else t - last
+            self.assertLessEqual(abs(rate - prior), b.slew_per_second * dt + 1e-12)
+            self.assertLessEqual(abs(rate - 1), b.max_rate_offset)
+            self.assertGreater(rate, prior)
+            self.assertLess(b.filtered_error, 17)
+            prior, last = rate, t
+            t = b.status()['next_read_at']
+
+    def test_skew_and_jitter_preserve_every_block(self):
+        # Deterministic 60-second producer, +/-2000ppm and bounded arrival jitter.
+        # Sequence/timestamp wrap is exercised; no audio device or real sleep.
+        import random
+        for skew in (-.002, .002):
+            rng = random.Random(42)
+            count = 11250
+            b = JitterBuffer(ssrc=42, prefill=8)
+            events = sorted((i * SAMPLES / RATE / (1 + skew) +
+                             (0 if i == 0 else rng.uniform(0, .004)), i)
+                            for i in range(count))
+            at = emitted = 0
+            t = 0.
+            while not b.ended and t < 62:
+                while at < count and events[at][0] <= t:
+                    i = events[at][1]
+                    b.put(PcmPacket((65500 + i) & 65535,
+                                    (0xffffff00 + i * SAMPLES) & 0xffffffff,
+                                    42, struct.pack('<I', i)))
+                    at += 1
+                    if at == count: b.finish((65500 + count - 1) & 65535)
+                value = b.take_due(t)
+                if value is not None:
+                    self.assertEqual(value, struct.pack('<I', emitted))
+                    emitted += 1
+                t += .0005
+            self.assertEqual(emitted, count)
+            self.assertEqual((b.lost, b.late, b.resyncs), (0, 0, 0))
+            self.assertTrue(b.ended)
+
+    def test_actual_loss_is_counted_and_eof_stops_tail(self):
+        b = JitterBuffer(ssrc=42, prefill=8)
+        for i in (0, 2): b.put(decode_rtp(packet(i, i * SAMPLES)))
+        b.finish(3)  # Both an internal and final block genuinely missing.
+        b.finish(3)
+        outputs = []
+        t = 0.
+        for _ in range(4):
+            outputs.append(b.take_due(t)); t = b.deadline
+        self.assertEqual([x == SILENCE for x in outputs], [False, True, False, True])
+        self.assertEqual(b.lost, 2)
+        self.assertTrue(b.ended)
+        self.assertIsNone(b.take_due(t + 30))
+        self.assertEqual(b.lost, 2)
+        self.assertFalse(b.put(decode_rtp(packet(4, 4 * SAMPLES))))
+        with self.assertRaises(ValueError): b.finish(4)
+
+    def test_stalled_consumer_rebuffers_without_catchup_burst(self):
+        b = JitterBuffer(ssrc=42, prefill=2)
+        for i in range(3): b.put(decode_rtp(packet(i, i * SAMPLES)))
+        b.take_due(0)
+        self.assertIsNotNone(b.take_due(1))
+        self.assertIsNone(b.take_due(1))
+        self.assertEqual(b.clock_rebuffers, 1)
+        self.assertEqual(b.lost, 0)
+
+    def test_no_eof_guessed_from_silence_and_bad_eof_refused(self):
+        b = JitterBuffer(ssrc=42, prefill=1)
+        with self.assertRaises(ValueError): b.finish(0)
+        b.put(decode_rtp(packet(0, 0)))
+        b.put(decode_rtp(packet(1, SAMPLES)))
+        with self.assertRaises(ValueError): b.finish(0)
+        with self.assertRaises(ValueError): b.finish(400)
+        b.take_due(0)
+        b.take_due(b.deadline)
+        b.take_due(b.deadline)
+        self.assertEqual(b.lost, 1)
+        self.assertFalse(b.ended)
+
 if __name__=='__main__':unittest.main()
