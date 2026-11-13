@@ -310,6 +310,14 @@ def test_living_picture_console_wall_and_region_feed(server, fake):
         assert reply.read().startswith(b"\x89PNG")
         conn.close()
         assert UiFeed.requests[-1] == "/frame?x=2&y=3&width=4&height=5" or set(UiFeed.requests[-1].split("?")[1].split("&")) == {"x=2", "y=3", "width=4", "height=5"}
+        for frame in ("1", "2"):
+            conn = http.client.HTTPConnection("127.0.0.1", server.port)
+            conn.request("GET", f"/api/nodus/frame?instance=demo&frame={frame}", headers=h)
+            reply = conn.getresponse()
+            assert reply.status == 200 and reply.read().startswith(b"\x89PNG")
+            conn.close()
+            assert UiFeed.requests[-1] == "/frame"
+        assert _call(server.port, "/api/nodus/frame?instance=demo&frame=bad", headers=h)[0] == 400
         assert _call(server.port, "/api/nodus/frame?instance=demo&x=2", headers=h)[0] == 400
     finally:
         ui.shutdown()

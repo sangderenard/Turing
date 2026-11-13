@@ -1805,7 +1805,9 @@ def make_handler(sessions: Sessions):
                     if port is None:
                         return self._json({"error": "no Nodus UI feed is configured for this instance"}, HTTPStatus.SERVICE_UNAVAILABLE)
                     region_keys = {"x", "y", "width", "height"}
-                    if set(query) - {"instance"} not in (set(), region_keys):
+                    if "frame" in query and (not query["frame"].isdecimal() or len(query["frame"]) > 16):
+                        return self._json({"error": "invalid frame revision"}, HTTPStatus.BAD_REQUEST)
+                    if set(query) - {"instance", "frame"} not in (set(), region_keys):
                         return self._json({"error": "region requires x, y, width and height"}, HTTPStatus.BAD_REQUEST)
                     try:
                         region = {key: int(query[key]) for key in region_keys} if region_keys <= set(query) else None

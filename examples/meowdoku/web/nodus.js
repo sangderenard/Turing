@@ -1,7 +1,66 @@
 // /nodus.html: Living Data graph picture and read-only UI feeds from Nodus.
 const $ = (id) => document.getElementById(id);
 const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, busy: false };
-let feedImages = [];
+let feedQuads = [];
+
+function makeFrameQuad(canvas, status) {
+  const gl = canvas.getContext("webgl2", { alpha: false, antialias: false });
+  if (!gl) { status.textContent = "WebGL 2 is unavailable for this console."; return null; }
+  const shader = (kind, source) => {
+    const object = gl.createShader(kind);
+    gl.shaderSource(object, source); gl.compileShader(object);
+    if (!gl.getShaderParameter(object, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(object));
+    return object;
+  };
+  const program = gl.createProgram();
+  gl.attachShader(program, shader(gl.VERTEX_SHADER, `#version 300 es
+    out vec2 uv;
+    void main() {
+      vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID & 2) - 1);
+      uv = vec2((p.x + 1.0) * 0.5, 1.0 - (p.y + 1.0) * 0.5);
+      gl_Position = vec4(p, 0.0, 1.0);
+    }`));
+  gl.attachShader(program, shader(gl.FRAGMENT_SHADER, `#version 300 es
+    precision mediump float;
+    in vec2 uv; uniform sampler2D frame; out vec4 color;
+    void main() { color = texture(frame, uv); }`));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.useProgram(program);
+  gl.uniform1i(gl.getUniformLocation(program, "frame"), 0);
+  const quad = { url: "", busy: false, etag: null, abort: null, stopped: false,
+    stop() { this.stopped = true; this.abort?.abort(); },
+    setUrl(url) { this.abort?.abort(); this.url = url; this.etag = null; },
+    async update() {
+      if (this.stopped || this.busy || !this.url) return;
+      this.busy = true;
+      const abort = new AbortController(); this.abort = abort;
+      try {
+        const headers = this.etag ? { "If-None-Match": this.etag } : {};
+        const response = await fetch(this.url, { credentials: "same-origin", cache: "no-store", headers, signal: abort.signal });
+        if (response.status === 304) return;
+        if (!response.ok) throw new Error(`Frame unavailable (${response.status})`);
+        const bitmap = await createImageBitmap(await response.blob());
+        if (this.stopped || abort.signal.aborted) { bitmap.close(); return; }
+        canvas.width = bitmap.width; canvas.height = bitmap.height;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        bitmap.close();
+        this.etag = response.headers.get("ETag"); status.textContent = "Live Nodus frame";
+      } catch (error) { if (!abort.signal.aborted) status.textContent = error.message; }
+      finally { this.busy = false; if (this.abort === abort) this.abort = null; }
+    },
+  };
+  return quad;
+}
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -104,7 +163,8 @@ function drawMap() {
   $("maproot").textContent = map ? `${map.name} [${map.identity}]` : "Map unavailable.";
   const nodes = $("mapregions");
   const wall = $("console-wall");
-  nodes.replaceChildren(); wall.replaceChildren(); feedImages = [];
+  for (const quad of feedQuads) quad.stop();
+  nodes.replaceChildren(); wall.replaceChildren(); feedQuads = [];
   if (!map) return;
   const feeds = (map.tracks || []).filter((t) => t.relationship === "feeds");
   for (const region of map.regions || []) {
@@ -121,11 +181,12 @@ function drawMap() {
     const card = el("article", null, "console-device card");
     card.dataset.identity = consoleNode.identity;
     card.append(el("strong", consoleNode.name));
-    const image = el("img"); image.alt = consoleNode.name + " UI feed";
-    image.dataset.url = consoleNode.view.full;
-    image.src = image.dataset.url;
-    feedImages.push(image);
-    card.append(image);
+    const canvas = el("canvas"); canvas.width = 800; canvas.height = 600;
+    canvas.setAttribute("role", "img"); canvas.setAttribute("aria-label", consoleNode.name + " UI feed");
+    card.append(canvas);
+    const status = el("small", "Connecting to Nodus UI feed…", "mut"); card.append(status);
+    const quad = makeFrameQuad(canvas, status);
+    if (quad) { quad.setUrl(consoleNode.view.full); feedQuads.push(quad); quad.update(); }
     const full = el("a", "Open full view"); full.href = consoleNode.view.full; full.target = "_blank"; full.rel = "noopener";
     card.append(full);
     const form = el("form");
@@ -138,14 +199,16 @@ function drawMap() {
     }
     const select = el("button", "Show region"); select.type = "submit"; form.append(select);
     const reset = el("button", "Show whole UI"); reset.type = "button";
-    reset.addEventListener("click", () => { image.dataset.url = consoleNode.view.full; image.src = image.dataset.url; });
+    reset.addEventListener("click", () => { if (quad) { quad.setUrl(consoleNode.view.full); quad.update(); } });
     form.append(reset);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const values = Object.fromEntries(Object.entries(fields).map(([key, input]) => [key, Number(input.value)]));
       if (Object.values(values).some((value) => !Number.isInteger(value)) || values.width < 1 || values.height < 1) return;
-      image.dataset.url = consoleNode.view.region.replace(/\{(x|y|width|height)\}/g, (_, key) => String(values[key]));
-      image.src = image.dataset.url;
+      if (quad) {
+        quad.setUrl(consoleNode.view.region.replace(/\{(x|y|width|height)\}/g, (_, key) => String(values[key])));
+        quad.update();
+      }
     });
     card.append(form); wall.append(card);
   }
@@ -346,8 +409,7 @@ async function main() {
   await setupWalk();
   await loadInstances();
   setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 2000);
-  setInterval(() => { if (document.visibilityState === "visible") for (const img of feedImages)
-    img.src = img.dataset.url + (img.dataset.url.includes("?") ? "&" : "?") + "frame=" + Date.now(); }, 500);
+  setInterval(() => { if (document.visibilityState === "visible") for (const quad of feedQuads) quad.update(); }, 500);
 }
 
 if (typeof document !== "undefined" && document.getElementById("instance")) main();
