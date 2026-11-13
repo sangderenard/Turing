@@ -370,7 +370,13 @@ class Sessions:
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(self.state.content_dir)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(self.state.marble_objects_dir)
-        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer",
+        # Same explicit source-root convention as glyph_start; isolated dev
+        # instances must not accidentally import the shared production checkout.
+        spectral_override = os.environ.get("SPECTRAL_ANALYZER_ROOT")
+        self.spectral_root = Path(spectral_override).resolve() if spectral_override else ROOT.parent / "spectral-analyzer"
+        if spectral_override and not self.spectral_root.is_dir():
+            raise ValueError("SPECTRAL_ANALYZER_ROOT must name an existing checkout")
+        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, self.spectral_root,
                                                         users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
@@ -402,7 +408,7 @@ class Sessions:
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
         self.instance = ""                                                      # [INSTANCE] --instance NAME (account_instances binding)
         self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
-        self.obj_assets = obj_assets_mod.Store(self.state.obj_assets_dir, self.accounts, ROOT.parent / "spectral-analyzer")
+        self.obj_assets = obj_assets_mod.Store(self.state.obj_assets_dir, self.accounts, self.spectral_root)
         self.marble_objects.obj_assets = self.obj_assets
 
     # ---- [FEDERATE begin] what this instance promises a federating peer (see _contract_socket)
