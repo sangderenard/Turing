@@ -67,7 +67,7 @@ for the strategy's assigned bot and risk tier. Qualification is bound to the
 registered source hash, so changing a registration invalidates the proof. The
 internal judge stores the historical dataset digest, window net P&L, and sell
 fill counts. It requires at least three windows, positive net P&L and at least
-one sell fill in each, and average net P&L of at least 1% of the risk tier's
+one sell fill in each, a passing validation verdict, and average net P&L of at least 1% of the risk tier's
 maximum per-order capital. Registration and read-only market access remain
 possible without qualification. No public route accepts claimed backtest
 returns.
@@ -78,6 +78,27 @@ deployed admission service must bind those to immutable mock receipts. The
 can order without it. Thus this gate covers registered automated strategies,
 not every possible authenticated HTTP client. No autonomous runner or
 scheduled historical judge is deployed yet.
+
+## Qualification spectators across server instances
+
+`qualification_runs` stores server-owned worker progress in the same
+`paper_arena.sqlite` as the arena. Any Meowdoku instance using that state path
+serves the same bounded, sanitized run list at the public HTTPS GET
+`/api/paper/qualification/live`. The Markets page polls it every two seconds,
+and signed-in users can also use `look qualification` in the paper DM. Rows
+contain worker label, training phase, epoch count, validation checkpoints and
+final historical verdict; they contain no weights, credentials, source paths or account
+activity. A run with no update for 90 seconds is displayed as stalled. The
+runner publishes every five epochs and at validation/compile/holdout phases.
+
+The current Nodus historical trainer accepts `--publish-db` and `--worker` to
+publish to that shared arena file. A local scratch run completed 480 epochs in
+about 19 seconds and appeared as unqualified. This is cross-instance
+spectating, not distributed gradient training or a running server scheduler.
+`passed_historical` is a spectator result, not an automatic registration or
+permission to order. Training is bounded to three seeds and 160 epochs each; it does not continue
+until it finds a profit. The already-inspected AAPL holdout cannot be reused
+for a new admission decision.
 
 ## Modular strategy experiments
 

@@ -57,6 +57,42 @@ function renderer(canvas) {
 }
 
 const fmt = (number) => Number(number).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+function drawQualification(payload) {
+  const root = $("qualification-runs"); root.replaceChildren();
+  for (const run of payload.runs || []) {
+    const card = document.createElement("article"); card.className = "qualification-run";
+    const title = document.createElement("h3"); title.textContent = `${run.market} · ${run.status}`;
+    const meta = document.createElement("div"); meta.className = "metrics";
+    const last = (run.progress || []).at(-1);
+    const fields = [`${run.model} · ${run.worker}`, `phase ${run.phase}`,
+                    `${run.completed_epochs}/${run.planned_epochs} epochs`];
+    if (last?.loss != null) fields.push(`loss ${Number(last.loss).toFixed(5)}`);
+    if (last?.validation_mean != null) fields.push(`validation mean ${(Number(last.validation_mean) * 100).toFixed(2)}% of order cap`);
+    if (run.result?.holdout_mean_return_on_order_cap != null)
+      fields.push(`holdout mean ${(Number(run.result.holdout_mean_return_on_order_cap) * 100).toFixed(2)}% of order cap`);
+    for (const value of fields) { const item = document.createElement("span"); item.textContent = value; meta.append(item); }
+    const bar = document.createElement("progress"); bar.max = Math.max(1, run.planned_epochs);
+    bar.value = Math.min(bar.max, run.completed_epochs);
+    const checks = document.createElement("ol"); checks.className = "checks";
+    for (const check of (run.progress || []).filter((item) => item.phase === "validation").slice(-8)) {
+      const line = document.createElement("li");
+      line.textContent = `seed ${check.seed}, epoch ${check.epoch}: validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
+      checks.append(line);
+    }
+    card.append(title, meta, bar, checks); root.append(card);
+  }
+  $("qualification-state").textContent = root.childElementCount
+    ? `${root.childElementCount} recent run(s). Updated ${new Date(payload.asof * 1000).toLocaleTimeString()}.`
+    : "No qualification run has started on this shared arena.";
+}
+
+async function updateQualification() {
+  drawQualification(await api("/api/paper/qualification/live"));
+}
+setInterval(() => { if (!document.hidden) updateQualification().catch((error) => { $("qualification-state").textContent = error.message; }); }, 2000);
+updateQualification().catch((error) => { $("qualification-state").textContent = error.message; });
+
 const historyView = renderer($("history"));
 const bookView = renderer($("book"));
 let lastHistory = null, lastBook = null;
@@ -202,6 +238,7 @@ const dmTemplates = {
   "look:orders": () => ({}), "look:mock_orders": () => ({}),
   "look:mock_ledger": () => ({ strategy_id: "" }),
   "look:scoreboard": () => ({}), "look:map": () => ({}),
+  "look:qualification": () => ({}),
   "look:proposals": () => ({ stock: "AAPL", offset: 0, limit: 100 }),
   "examine:node": () => ({ radius: 1 }),
   "make:strategy": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Strategy", risk: "cautious", policy: "momentum", outcomes: ["fixed_horizon", "closed_trade", "fill_quality"] }),

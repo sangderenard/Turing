@@ -96,6 +96,7 @@ from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FI
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
 from meowdoku import paper_arena as paper_arena_mod
+from meowdoku import qualification_runs as qualification_runs_mod
 from meowdoku import paper_broker as paper_broker_mod
 from meowdoku import paper_mock as paper_mock_mod
 from meowdoku import paper_policies as paper_policies_mod
@@ -1305,6 +1306,14 @@ def make_handler(sessions: Sessions):
             self._set_cookie = []
             if not self._is_secure():
                 return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if path == "/api/paper/qualification/live":
+                if method != "GET":
+                    return self._json({"error": "read-only"}, HTTPStatus.METHOD_NOT_ALLOWED)
+                db = paper_arena_mod.connect(sessions.state.sql_dir / "paper_arena.sqlite")
+                try:
+                    return self._json(qualification_runs_mod.public_snapshot(db))
+                finally:
+                    db.close()
             account = self._account()
             if account is None:
                 return self._json({"error": "sign in to use paper trading"}, HTTPStatus.UNAUTHORIZED)
@@ -1336,6 +1345,7 @@ def make_handler(sessions: Sessions):
                             ("look", "mock_ledger"): ("/api/paper/mock/ledger", "GET"),
                             ("look", "scoreboard"): ("/api/paper/scoreboard", "GET"),
                             ("look", "proposals"): ("/api/paper/proposals", "GET"),
+                            ("look", "qualification"): ("/api/paper/qualification/live", "GET"),
                             ("look", "map"): ("/api/paper/map", "GET"),
                             ("examine", "node"): ("/api/paper/map/query", "GET"),
                             ("make", "strategy"): ("/api/paper/strategies", "POST"),
@@ -1419,6 +1429,8 @@ def make_handler(sessions: Sessions):
                     except ValueError:
                         raise paper_arena_mod.ArenaError("invalid trainer cursor")
                     return self._json(paper_arena_mod.trainer_events(db, after))
+                if path == "/api/paper/qualification/live" and method == "GET":
+                    return self._json(qualification_runs_mod.public_snapshot(db))
                 if path == "/api/paper/shared-account":
                     if not self._require("account_manage"):
                         return

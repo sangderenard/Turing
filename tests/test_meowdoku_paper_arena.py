@@ -123,9 +123,13 @@ def test_qualification_is_bound_to_bot_source_and_risk(db):
     bot = paper_arena.register_bot(db, 1, {
         "request_id": "qualified", "name": "Candidate", "kind": "compiled",
         "source": {"ref": "product:" + "a" * 64}})
+    rejected = paper_arena.record_historical_qualification(
+        db, 1, bot["id"], "cautious", "b" * 64,
+        ["0.10", "0.12", "0.08"], [1, 1, 1], validation_passed=False)
+    assert rejected["passed"] is False
     report = paper_arena.record_historical_qualification(
         db, 1, bot["id"], "cautious", "b" * 64,
-        ["0.10", "0.12", "0.08"], [1, 1, 1])
+        ["0.10", "0.12", "0.08"], [1, 1, 1], validation_passed=True)
     assert report["passed"] is True
     assert paper_arena.bot_qualified(db, 1, bot["id"], "cautious")
     assert not paper_arena.bot_qualified(db, 1, bot["id"], "standard")

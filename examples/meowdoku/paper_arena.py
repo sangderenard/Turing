@@ -207,13 +207,15 @@ def bot_qualified(db, owner: int, bot_id: str, risk: str) -> bool:
 def record_historical_qualification(db, owner: int, bot_id: str, risk: str,
                                     dataset_sha256: str, window_pnl_usd: list[str],
                                     sell_fill_counts: list[int],
-                                    *, margin: Decimal = Decimal("0.01")) -> dict:
+                                    *, validation_passed: bool, margin: Decimal = Decimal("0.01")) -> dict:
     """Internal judge entry; no client route accepts reported returns or calls this function."""
     bot = db.execute("SELECT source FROM paper_bots WHERE id=? AND owner_id=?", (bot_id, owner)).fetchone()
     if bot is None:
         raise ArenaError("bot not found", 404)
     if risk not in RISK:
         raise ArenaError("unknown qualification risk tier")
+    if type(validation_passed) is not bool:
+        raise ArenaError("validation verdict required")
     if not isinstance(dataset_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", dataset_sha256):
         raise ArenaError("invalid historical dataset digest")
     if not isinstance(window_pnl_usd, list) or len(window_pnl_usd) < 3:
@@ -229,13 +231,14 @@ def record_historical_qualification(db, owner: int, bot_id: str, risk: str,
         raise ArenaError("finite P&L and positive margin required")
     returns = [value / RISK[risk][0] for value in pnl]
     mean = sum(returns, Decimal(0)) / len(returns)
-    passed = mean >= margin and all(value > 0 for value in returns) and all(value >= 1 for value in sell_fill_counts)
+    passed = (validation_passed and mean >= margin and all(value > 0 for value in returns)
+              and all(value >= 1 for value in sell_fill_counts))
     report = {"window_net_pnl_usd": [str(value) for value in pnl],
               "window_net_returns": [str(value) for value in returns],
               "mean_net_return": str(mean), "required_margin": str(margin),
               "basis": "net P&L divided by maximum per-order capital at risk", "risk": risk,
               "sell_fill_counts": sell_fill_counts,
-              "windows": len(returns), "passed": passed}
+              "windows": len(returns), "validation_passed": validation_passed, "passed": passed}
     db.execute("INSERT INTO paper_bot_qualifications VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot_id,risk) DO UPDATE SET "
                "owner_id=excluded.owner_id,source_sha256=excluded.source_sha256,"
                "dataset_sha256=excluded.dataset_sha256,report=excluded.report,"

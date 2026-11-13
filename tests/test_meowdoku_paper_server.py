@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from meowdoku import alpaca_credentials, market_data, paper_arena, paper_broker
+from meowdoku import alpaca_credentials, market_data, paper_arena, paper_broker, qualification_runs
 
 TESTS = Path(__file__).with_name("test_meowdoku_server_authz.py")
 spec = importlib.util.spec_from_file_location("paper_http_helpers", TESTS)
@@ -82,13 +82,16 @@ def test_admin_shared_paper_account_and_dev_own_account(server, monkeypatch):
     assert submissions == []
     with paper_arena.connect(server.sessions.state.sql_dir / "paper_arena.sqlite") as db:
         failed = paper_arena.record_historical_qualification(
-            db, dev_id, bot_id, "cautious", "a" * 64, ["0.15", "-0.05", "0.20"], [1, 1, 1])
+            db, dev_id, bot_id, "cautious", "a" * 64, ["0.15", "-0.05", "0.20"], [1, 1, 1],
+            validation_passed=True)
         assert failed["passed"] is False
         no_closes = paper_arena.record_historical_qualification(
-            db, dev_id, bot_id, "cautious", "a" * 64, ["0.10", "0.15", "0.05"], [1, 0, 1])
+            db, dev_id, bot_id, "cautious", "a" * 64, ["0.10", "0.15", "0.05"], [1, 0, 1],
+            validation_passed=True)
         assert no_closes["passed"] is False
         passed = paper_arena.record_historical_qualification(
-            db, dev_id, bot_id, "cautious", "a" * 64, ["0.10", "0.15", "0.05"], [1, 1, 1])
+            db, dev_id, bot_id, "cautious", "a" * 64, ["0.10", "0.15", "0.05"], [1, 1, 1],
+            validation_passed=True)
         assert passed["passed"] is True
     assert helpers._call(port, "/api/paper/orders", "POST", bot_headers, command)[0] == 201
     assert helpers._call(port, "/api/paper/orders", "POST", bot_headers, command)[1]["replayed"] is True
@@ -123,3 +126,33 @@ def test_admin_shared_paper_account_and_dev_own_account(server, monkeypatch):
 
 # Reuse the tested ephemeral server fixture, rather than launching a second kind of server.
 server = helpers.server
+
+
+def test_public_qualification_spectator_reads_shared_worker_progress(server):
+    path = server.sessions.state.sql_dir / "paper_arena.sqlite"
+    with paper_arena.connect(path) as worker_db:
+        run_id = qualification_runs.begin(worker_db, market="AAPL + SPY + BTC/USD",
+                                          model="AbstractTensor 6→4→3", worker="test-worker",
+                                          planned_epochs=480)
+        qualification_runs.progress(worker_db, run_id, phase="validation", completed_epochs=20,
+                                    seed=0, epoch=20, loss=0.123, validation_mean=-0.01,
+                                    validation_passed=False)
+    observed = helpers._call(server.port, "/api/paper/qualification/live", headers=helpers.PUBLIC_XFF)
+    assert observed[0] == 200
+    run = observed[1]["runs"][0]
+    assert run["id"] == run_id and run["completed_epochs"] == 20
+    assert run["progress"][0]["validation_passed"] == 0
+    assert "key" not in json.dumps(run).lower()
+    assert helpers._call(server.port, "/api/paper/qualification/live", "POST",
+                         helpers.PUBLIC_XFF, {})[0] == 405
+    cookie = helpers._signup(server.port, "qualification_watcher")
+    dm = helpers._call(server.port, "/api/paper/dm", "POST",
+                       {**helpers.PUBLIC_XFF, "Cookie": cookie},
+                       {"verb": "look", "target": "qualification", "input": {}})
+    assert dm[0] == 200 and dm[1]["runs"][0]["id"] == run_id
+    with paper_arena.connect(path) as worker_db:
+        qualification_runs.finish(worker_db, run_id, status="unqualified", result={
+            "validation_passed": False, "holdout_passed": False,
+            "holdout_mean_return_on_order_cap": "-0.01"})
+    assert helpers._call(server.port, "/api/paper/qualification/live",
+                         headers=helpers.PUBLIC_XFF)[1]["runs"][0]["status"] == "unqualified"
