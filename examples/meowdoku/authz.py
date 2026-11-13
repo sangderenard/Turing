@@ -74,7 +74,8 @@ KIOSK.  ``intern`` is a read-only guest agent, like a kiosk at an amusement park
 its origin tier, takes no permission group (permission_groups.authority keeps it off the human ladder, like service), and the
 server answers it only on the catalog endpoints declared ``kiosk`` (speaktome_api.catalog.kiosk_endpoint): every other
 method and path is refused before any handler runs, failing closed when the catalog is not loaded.  An intern therefore
-cannot write, submit, message or touch the lifecycle even where a handler asks for no capability.
+cannot write, submit, message or touch the lifecycle even where a handler asks for no capability.  It keeps no personal
+storage (owner, 2026-11-13): no user_files folder, no reports, no relay addresses; what it reads is burned on delivery.
 
 CLI: ``python authz.py grant-admin <user> --db accounts.db --granted-by operator:<prefix>``; ``revoke-admin``; ``show``; ``caps``.
 """

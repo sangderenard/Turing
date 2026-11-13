@@ -244,6 +244,9 @@ def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
                                    ("POST", "/api/account/groups", {"name": "g"}), ("POST", "/api/messages/send", {}),
                                    ("POST", "/api/tickets", {}), ("POST", "/api/admin/lifecycle", {}), ("GET", "/api/log", None),
                                    ("GET", "/api/paper/account", None), ("POST", "/api/account/signup", {"username": "x"}),
+                                   # no personal storage: material is burned on delivery
+                                   ("GET", "/api/user-files", None), ("POST", "/api/user-files", {}),
+                                   ("POST", "/api/relay/open", {}),
                                    ("GET", "/", None)):
             status, out, _, _ = _call(port, path, method, headers, body)
             assert status == 403 and "kiosk" in out["error"], (method, path, status, out)
