@@ -1,0 +1,9 @@
+# Nested branch sequence aliases retain their actual descriptor
+
+Actual compile_nodes selected list 106 versus source Phi 97, where the nested conditional had already proved 97 aliases resident 104. The outer conditional was marked a sequence handle but its builder checked raw 97 in the descriptor table and skipped the existing handle merge. It emitted only a data-pointer Phi without length, capacity, or owner.
+
+The builder now resolves both arms through its durable concorded planning aliases and requires the emitted arena identity to equal the descriptor's first column. Only then does the existing handle merger select all descriptor members. Missing, divergent, or cyclic evidence cannot authorize a borrowed descriptor. No descriptor 97, new allocation, or guessed capacity was introduced.
+
+Verification: 3 focused tests pass, including native LLVM nested-branch length and indexed mutation with repeated execution, full identity concordance, and absent/divergent/cyclic evidence. Expanded test_precompile_to_ssa suite: 137 passed, 9 failed; identical HEAD baseline: 134 passed, 12 failed. The three new tests fail baseline; nine existing failures are unchanged. Mapping audit: 28 rows across 2 functions, zero findings or unsourced facts, latch CLOSED. No merge or deployment.
+
+Limits: append through this reduced nested merge exposes an existing DYNAMIC/FIXED arm contract disagreement; that refusal is preserved. Actual GraphSolver now has its selected descriptor and owner, but returned record output_node_keys is still published as a raw span with pointer-cell shape(1,), not a proven logical length/lifetime ABI. Its removed extent shortfall is NOT a runnable-result claim. LLVM still reports registry 103 capacity in this trace. Frame-owned selected sequence data must not escape after owner release; the owner-aware record return/public-result contract remains separate work.

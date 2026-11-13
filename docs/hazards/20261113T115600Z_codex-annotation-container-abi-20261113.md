@@ -1,0 +1,5 @@
+2026-11-13 ORDINARY ITERABLE TARGET CONTROL RECEIPT:
+
+ControlProgram already carries ordinary iterable_bindings but ControlProgramFact published only projected_iterable_bindings. Consumers could not independently verify the ordinary source iterable-to-target relationship. Append a default-empty fact field without changing prior positional fields, publish the existing source/target canonical identities and induction label, and include both identity cells in the program revision causes. This is descriptive source evidence, not child-view lifetime or ownership permission.
+
+The actual public source entry regression checks authored tuple identity, scope and direct causes; the legacy positional seed remains empty. Candidate new receipt plus incumbent control-source suite: 30 passed in 5.91s. Isolated process using current control_source with only the new iterable-binding publication removed: 29 passed, exactly the new receipt test failed in 9.44s. This is a producer-disabled comparison, not a whole-branch baseline. No shared source swaps, native execution, deployment, or public string-return claim.

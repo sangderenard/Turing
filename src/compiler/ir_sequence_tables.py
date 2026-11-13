@@ -213,7 +213,10 @@ class _Builder:
 
     def const(self, block: BasicBlock, literal: int, *, dtype: str = "int") -> SSAValue:
         result = self.fresh(dtype)
-        self.emit(block, "Const", [], result, attributes={"value": int(literal)})
+        # Preserve the declared boolean domain for its exact two values.
+        # In particular, do not rewrite native ``int`` (int32) to Python int64.
+        payload = bool(literal) if dtype == "bool" and type(literal) in (bool, int) and literal in (0, 1) else int(literal)
+        self.emit(block, "Const", [], result, attributes={"value": payload})
         return result
 
     def branch(self, block: BasicBlock, target: BasicBlock) -> None:
@@ -501,6 +504,11 @@ def hash_index_carrier(descriptor: SSASequenceDescriptor) -> int | None:
     """
 
     if descriptor.heap_owner_value_id is None or not descriptor.key_columns:
+        return None
+    # A child handle identifies storage, not the child contents. The scalar
+    # hash index cannot answer content-key equality or survive child reuse.
+    if (descriptor.child_table_pool is not None
+            and descriptor.child_table_pool.handle_column in descriptor.key_columns):
         return None
     dtypes = tuple(map(str, descriptor.column_dtypes))
     if len(dtypes) != len(descriptor.column_value_ids):
@@ -862,6 +870,12 @@ def _guard_hash_indexes(lowerer):
         return lowering
 
     return guarded
+
+
+def _reject_scalar_child_handle_keys(descriptor, operation):
+    pool = descriptor.child_table_pool
+    if pool is not None and pool.handle_column in descriptor.key_columns:
+        raise ValueError(f"{operation} does not support child-content keys or child-slot reuse")
 
 
 def _unsupported_destination(
@@ -1361,6 +1375,7 @@ def lower_sequence_insert(
     when a row is written, and 2 when fixed capacity is exhausted.
     """
 
+    _reject_scalar_child_handle_keys(descriptor, "lower_sequence_insert")
     unsupported = _unsupported_destination(descriptor, operation, allow_dynamic=True)
     if unsupported is not None:
         return unsupported
@@ -1605,6 +1620,7 @@ def lower_record_sequence_append_with_child_copy(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    raise_when_full: bool = True,
 ) -> SSASequenceLowering:
     """Append one outer row while snapshotting its single child sequence.
 
@@ -1614,7 +1630,7 @@ def lower_record_sequence_append_with_child_copy(
     not rewrite rows already appended to the destination.
     """
 
-    unsupported = _unsupported_destination(destination, "append_child_copy")
+    unsupported = _unsupported_destination(destination, "append_child_copy", allow_dynamic=True)
     if unsupported is not None:
         return unsupported
     pool = destination.child_table_pool
@@ -1633,6 +1649,29 @@ def lower_record_sequence_append_with_child_copy(
     if not pool.writable:
         raise ValueError("child-copy append requires a writable child pool")
 
+    return _lower_child_copy_after_admission(destination, source,
+        function_name=function_name, first_value_id=first_value_id,
+        raise_when_full=raise_when_full)
+
+
+def _lower_child_copy_after_admission(destination, source, *, function_name,
+                                     first_value_id, raise_when_full):
+    """Physical copy shared by admitted append and absent-only key insertion.
+
+    Callers retain the exact descriptor. This helper does not perform key
+    equality; keyed callers must first prove absence through content lookup.
+    """
+    pool = destination.child_table_pool
+    if destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        if any(source.column_shapes) or source.live_flags_value_id is not None:
+            raise ValueError("dynamic child copy requires a dense scalar leaf source")
+        if (source.heap_owner_value_id is not None
+                or {v.id for v in _storage_values(destination)}.intersection(
+                    v.id for v in _storage_values(source))):
+            raise ValueError("dynamic child copy requires disjoint borrowed source storage")
+        return _lower_dynamic_child_copy(destination, source,
+            function_name=function_name, first_value_id=first_value_id)
+
     destination_storage = _storage_values(destination)
     pool_storage = (
         *(SSAValue(value_id, dtype=dtype) for value_id, dtype in zip(
@@ -1647,6 +1686,11 @@ def lower_record_sequence_append_with_child_copy(
           if pool.live_flags_value_id is not None else ()),
     )
     source_storage = _storage_values(source)
+    # Preserve the incumbent formal ordering. Owned pools already declare
+    # their pointer cells in destination_storage; do not overwrite those with
+    # the fixed caller-arena view of the same child member.
+    destination_members = {value.id: value for value in destination_storage}
+    pool_storage = tuple(destination_members.get(value.id, value) for value in pool_storage)
     storage = tuple({
         int(value.id): value
         for value in (*destination_storage, *pool_storage, *source_storage)
@@ -1661,22 +1705,10 @@ def lower_record_sequence_append_with_child_copy(
         for index, dtype in enumerate(destination.column_dtypes)
         if index != handle_column
     )
-    destination_columns = tuple(
-        SSAValue(value_id, dtype=dtype)
-        for value_id, dtype in zip(
-            destination.column_value_ids, destination.column_dtypes
-        )
-    )
-    child_columns = tuple(
-        SSAValue(value_id, dtype=dtype)
-        for value_id, dtype in zip(pool.column_value_ids, pool.column_dtypes)
-    )
-    source_columns = tuple(
-        SSAValue(value_id, dtype=dtype)
-        for value_id, dtype in zip(
-            source.column_value_ids, source.column_dtypes
-        )
-    )
+    values = {value.id: value for value in storage}
+    destination_columns = tuple(values[value_id] for value_id in destination.column_value_ids)
+    child_columns = tuple(values[value_id] for value_id in pool.column_value_ids)
+    source_columns = tuple(values[value_id] for value_id in source.column_value_ids)
 
     entry = builder.block("entry")
     copy_header = builder.block("copy_header")
@@ -1755,9 +1787,9 @@ def lower_record_sequence_append_with_child_copy(
     builder.emit(copy_body, "Add", [
         row_offset, copy_index,
     ], destination_index)
-    for source_column, child_column in zip(source_columns, child_columns):
+    for column_index, (source_column, child_column) in enumerate(zip(source_columns, child_columns)):
         source_address = builder.fresh("ptr")
-        source_value = builder.fresh(source_column.dtype)
+        source_value = builder.fresh(source.column_dtypes[column_index])
         destination_address = builder.fresh("ptr")
         builder.emit(copy_body, "GetElementPtr", [
             source_column, copy_index,
@@ -1794,13 +1826,13 @@ def lower_record_sequence_append_with_child_copy(
 
     child_length_slot = builder.fresh("ptr")
     builder.emit(publish_child, "GetElementPtr", [
-        SSAValue(pool.length_value_id, dtype="int64"), outer_length,
+        values[pool.length_value_id], outer_length,
     ], child_length_slot)
     builder.emit(publish_child, "Store", [source_length, child_length_slot])
     if pool.status_value_id is not None:
         child_status_slot = builder.fresh("ptr")
         builder.emit(publish_child, "GetElementPtr", [
-            SSAValue(pool.status_value_id, dtype="int"), outer_length,
+            values[pool.status_value_id], outer_length,
         ], child_status_slot)
         builder.emit(publish_child, "Store", [status_zero, child_status_slot])
 
@@ -1825,7 +1857,8 @@ def lower_record_sequence_append_with_child_copy(
     builder.branch(publish_child, inserted)
 
     inserted_status = _status_branch(builder, inserted, 1, result_block)
-    _raise_fixed_capacity_exhausted(builder, full, "append_child_copy")
+    if raise_when_full:
+        _raise_fixed_capacity_exhausted(builder, full, "append_child_copy")
     full_status = _status_branch(builder, full, 2, result_block)
     status_result = builder.fresh("int")
     builder.emit(result_block, "Phi", [inserted_status, full_status],
@@ -1847,11 +1880,157 @@ def lower_record_sequence_append_with_child_copy(
             "child_source_sequence_id": int(source.sequence_id),
             "child_handle_column": handle_column,
             "fixed_capacity": True,
+            "sequence_array_argument_ids": _storage_array_ids(destination, storage),
             "status_values": {"inserted": 1, "capacity_exhausted": 2},
             "named_outputs": (("status", int(status_result.id)),),
         },
     )
     return SSASequenceLowering((function,))
+
+
+
+def _lower_dynamic_child_copy(destination, source, *, function_name, first_value_id):
+    """Reserve both pool dimensions before copying a borrowed span.
+
+    The low-level caller guarantees source buffers do not alias the owned
+    destination. Disjoint value IDs reject known aliases, not arbitrary host
+    pointer aliasing. Source-level admission must prove independent lifetime.
+    Existing heap allocation failure remains fatal, not a status-2 rollback.
+    """
+    name = function_name or f"ssa_sequence_{destination.sequence_id}_append_child_{source.sequence_id}"
+    fixed = _lower_child_copy_after_admission(
+        replace(destination, capacity_policy=SSASequenceCapacityPolicy.FIXED), source,
+        function_name=name + "__fixed", first_value_id=first_value_id, raise_when_full=False)
+    if not fixed.complete:
+        return fixed
+    insert = fixed.entry
+    reserve_lowering = lower_sequence_reserve(destination, function_name=name + "__reserve")
+    if not reserve_lowering.complete:
+        return reserve_lowering
+    reserve = reserve_lowering.entry
+    values = {v.id: SSAValue(v.id,v.dtype,shape=tuple(v.shape or ()),accounting=dict(v.accounting or {}))
+              for v in insert.args}
+    builder = _Builder(_first_fresh_identity(destination,source,values=tuple(values.values()),minimum=first_value_id))
+    entry, validate, grow, copy, invalid, result = (builder.block(n) for n in
+        ("entry","validate","grow","copy","invalid","result"))
+    zero = builder.const(entry,0,dtype="int64")
+    def length(block, value_id):
+        slot, value = builder.fresh("ptr"), builder.fresh("int64")
+        builder.emit(block,"GetElementPtr",[values[value_id],zero],slot)
+        builder.emit(block,"Load",[slot],value)
+        return value
+    count = length(entry,source.length_address_id)
+    nonnegative, fits, valid = (builder.fresh("bool") for _ in range(3))
+    builder.emit(entry,"Ge",[count,zero],nonnegative)
+    builder.emit(entry,"Le",[count,values[source.capacity_value_id]],fits)
+    builder.emit(entry,"LAnd",[nonnegative,fits],valid)
+    builder.cond(entry,valid,validate,invalid)
+    # Reserve validates length <= capacity <= its element-width maximum.
+    # Including int64 metadata bounds that maximum below INT64_MAX/8, so
+    # length+1 is representable even when the incumbent child stride is zero.
+    validation_args = {**values,reserve.metadata["required_capacity_value_id"]:zero,
+                       reserve.metadata["required_child_capacity_value_id"]:zero}
+    validation_status = builder.fresh("int")
+    builder.emit(validate,"Call",[validation_args[v.id] for v in reserve.args],validation_status,
+                 attributes={"callee":reserve.name})
+    two = builder.const(validate,2)
+    checked = builder.fresh("bool")
+    builder.emit(validate,"Lt",[validation_status,two],checked)
+    builder.cond(validate,checked,grow,result)
+    outer_length = length(grow,destination.length_address_id)
+    required = builder.fresh("int64")
+    builder.emit(grow,"Add",[outer_length,builder.const(grow,1,dtype="int64")],required)
+    reserve_args = {**values,reserve.metadata["required_capacity_value_id"]:required,
+                    reserve.metadata["required_child_capacity_value_id"]:count}
+    reserve_status = builder.fresh("int")
+    builder.emit(grow,"Call",[reserve_args[v.id] for v in reserve.args],reserve_status,
+                 attributes={"callee":reserve.name})
+    ready = builder.fresh("bool")
+    builder.emit(grow,"Lt",[reserve_status,two],ready)
+    builder.cond(grow,ready,copy,result)
+    copy_status = builder.fresh("int")
+    builder.emit(copy,"Call",[values[v.id] for v in insert.args],copy_status,
+                 attributes={"callee":insert.name})
+    builder.branch(copy,result)
+    invalid_status = _status_branch(builder,invalid,2,result)
+    status = builder.fresh("int")
+    builder.emit(result,"Phi",[validation_status,reserve_status,copy_status,invalid_status],status,
+        attributes={"incoming_blocks":(validate.name,grow.name,copy.name,invalid.name)})
+    builder.emit(result,"Ret",[status])
+    function = Function(name,list(values.values()),builder.blocks,metadata={**insert.metadata,
+        "fixed_capacity":False,"heap_owner_value_id":destination.heap_owner_value_id,
+        "named_outputs":(("status",status.id),)})
+    return SSASequenceLowering((function,*fixed.functions,*reserve_lowering.functions))
+
+def lower_glyph_key_add(
+    destination: SSASequenceDescriptor,
+    source: SSASequenceDescriptor,
+    *,
+    function_name: str | None = None,
+    first_value_id: int | None = None,
+) -> SSASequenceLowering:
+    """Add one copied glyph key only if complete contents are absent.
+
+    Initial scope is an owned dense single-column set. The borrowed source
+    must not physically alias destination storage: reserve can relocate it.
+    Disjoint IDs reject known aliases, not arbitrary raw-host pointer aliases;
+    source-level callers must prove independent borrowed lifetime.
+    """
+    _validate_glyph_key_query(destination, source)
+    pool = destination.child_table_pool
+    if (not destination.writable or not pool.writable
+            or destination.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
+            or len(destination.column_value_ids) != 1):
+        raise ValueError("glyph-key add requires an owned writable single-key set")
+    if {v.id for v in _storage_values(destination)}.intersection(
+            v.id for v in _storage_values(source)):
+        raise ValueError("glyph-key add requires disjoint borrowed source storage")
+    name = function_name or f"ssa_sequence_{destination.sequence_id}_glyph_add"
+    contains = lower_sequence_contains(destination, query_sequence=source,
+        function_name=name + "__contains", first_value_id=first_value_id)
+    copied = _lower_child_copy_after_admission(destination, source,
+        function_name=name + "__copy", first_value_id=first_value_id,
+        raise_when_full=False)
+    if not copied.complete:
+        return copied
+    # Registration owns accounting per helper scope. Do not share mutable
+    # SSAValue accounting with the composed copy function's formal objects.
+    values = {v.id: SSAValue(v.id, v.dtype, shape=tuple(v.shape or ()),
+                            accounting=dict(v.accounting or {}))
+              for v in copied.entry.args}
+    builder = _Builder(_first_fresh_identity(destination, source,
+        values=tuple(values.values()), minimum=first_value_id))
+    entry, probe, duplicate, absent, invalid, result = (builder.block(n) for n in
+        ("entry", "probe", "duplicate", "absent", "invalid", "result"))
+    zero = builder.const(entry, 0, dtype="int64")
+    slot, count = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [values[source.length_address_id], zero], slot)
+    builder.emit(entry, "Load", [slot], count)
+    nonnegative, fits, valid = (builder.fresh("bool") for _ in range(3))
+    builder.emit(entry, "Ge", [count, zero], nonnegative)
+    builder.emit(entry, "Le", [count, values[source.capacity_value_id]], fits)
+    builder.emit(entry, "LAnd", [nonnegative, fits], valid)
+    builder.cond(entry, valid, probe, invalid)
+    found = builder.fresh("bool")
+    builder.emit(probe, "Call", [values[v.id] for v in contains.entry.args], found,
+        attributes={"callee": contains.entry.name})
+    builder.cond(probe, found, duplicate, absent)
+    duplicate_status = _status_branch(builder, duplicate, 0, result)
+    copied_status = builder.fresh("int")
+    builder.emit(absent, "Call", [values[v.id] for v in copied.entry.args], copied_status,
+        attributes={"callee": copied.entry.name})
+    builder.branch(absent, result)
+    invalid_status = _status_branch(builder, invalid, 2, result)
+    status = builder.fresh("int")
+    builder.emit(result, "Phi", [duplicate_status, copied_status, invalid_status], status,
+        attributes={"incoming_blocks": (duplicate.name, absent.name, invalid.name)})
+    builder.emit(result, "Ret", [status])
+    function = Function(name, list(values.values()), builder.blocks, metadata={
+        **copied.entry.metadata, "ssa_sequence_operation": "glyph_key_add",
+        "key_columns": destination.key_columns,
+        "status_values": {"duplicate": 0, "inserted": 1, "invalid_or_full": 2},
+        "named_outputs": (("status", status.id),)})
+    return SSASequenceLowering((function, *contains.functions, *copied.functions))
 
 
 def lower_sequence_add(
@@ -3837,6 +4016,7 @@ def lower_sequence_prepend_packed_bytes(
 def lower_sequence_contains(
     descriptor: SSASequenceDescriptor,
     *,
+    query_sequence: SSASequenceDescriptor | None = None,
     function_name: str | None = None,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
@@ -3855,14 +4035,21 @@ def lower_sequence_contains(
         raise ValueError(
             "sequence membership requires keyed columns or one value column"
         )
-    storage = _storage_values(descriptor)
+    if (query_sequence is None and descriptor.child_table_pool is not None
+            and descriptor.child_table_pool.handle_column in descriptor.key_columns):
+        raise ValueError("child-handle membership requires an explicit resident query descriptor")
+    if query_sequence is not None:
+        _validate_glyph_key_query(descriptor, query_sequence)
+        storage = _glyph_query_storage(descriptor, query_sequence)
+    else:
+        storage = _storage_values(descriptor)
     builder = _Builder(_first_fresh_identity(
         descriptor, values=storage, minimum=first_value_id
     ))
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in membership_columns
     )
-    queries = tuple(builder.fresh(dtype) for dtype in key_dtypes)
+    queries = tuple(builder.fresh(dtype) for dtype in key_dtypes) if query_sequence is None else ()
     entry = builder.block("entry")
     header = builder.block("contains_header")
     body = builder.block("contains_body")
@@ -3894,7 +4081,12 @@ def lower_sequence_contains(
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, length], continues)
     builder.cond(header, continues, body, absent)
+    dependencies = ()
     matches = None
+    if query_sequence is not None:
+        key_match, dependencies = _glyph_key_row_match(builder, descriptor,
+            query_sequence, function_name or f"ssa_sequence_{descriptor.sequence_id}_contains")
+        matches = key_match(body, index)
     for key_column, key_dtype, query in zip(
         membership_columns, key_dtypes, queries
     ):
@@ -3956,14 +4148,19 @@ def lower_sequence_contains(
             "key_columns": descriptor.key_columns,
             "membership_columns": membership_columns,
             "sequence_array_argument_ids": tuple((
-                *map(int, descriptor.column_value_ids),
+                *(_storage_array_ids(descriptor, _storage_values(descriptor))
+                  if query_sequence is not None else map(int, descriptor.column_value_ids)),
+                *((int(descriptor.child_table_pool.column_value_ids[0]),
+                   int(descriptor.child_table_pool.length_value_id),
+                   int(query_sequence.column_value_ids[0]),
+                   int(query_sequence.length_address_id)) if query_sequence is not None else ()),
                 int(descriptor.length_address_id),
                 *((int(descriptor.live_flags_value_id),) if descriptor.live_flags_value_id is not None else ()),
             )),
             "named_outputs": (("contains", int(result.id)),),
         },
     )
-    return SSASequenceLowering((function,))
+    return SSASequenceLowering((function, *dependencies))
 
 
 def lower_sequence_live_length(
@@ -4187,15 +4384,137 @@ def lower_sequence_equal(
     return SSASequenceLowering((function,))
 
 
+def _validate_glyph_key_query(descriptor, query):
+    """Dense single glyph-key lookup, not insertion or ownership transfer.
+
+    As with the incumbent raw table ABI, callers provide valid initialized
+    handle/length/capacity buffers. Source dispatch must prove the exact
+    glyph layout/lifetime; this low-level constructor does not infer classes.
+    """
+    pool = descriptor.child_table_pool
+    owned = descriptor.heap_owner_value_id is not None
+    if owned != (descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC):
+        raise ValueError("glyph-key lookup requires fixed borrowed or dynamic owned storage")
+    storage_values = {value.id: value for value in _storage_values(descriptor)}
+    if len(descriptor.column_dtypes) != len(descriptor.column_value_ids):
+        raise ValueError("glyph-key lookup requires explicit outer column layouts")
+    if pool is not None:
+        # Read-only data aliasing is allowed only with the exact same role and
+        # physical declaration. Never overwrite a conflicting member by ID.
+        roles = {}
+        def admit(value_id, role, dtype, shape=()):
+            declaration = (role, str(dtype), tuple(shape))
+            incumbent = roles.get(int(value_id))
+            if incumbent is not None and incumbent != declaration:
+                raise ValueError("glyph-key storage identity has conflicting roles")
+            roles[int(value_id)] = declaration
+        for index, (value_id, dtype) in enumerate(zip(descriptor.column_value_ids, descriptor.column_dtypes)):
+            physical = storage_values[value_id]
+            admit(value_id, ("outer_column", index), physical.dtype, physical.shape)
+        admit(descriptor.length_address_id, "outer_length", "int64", (1,))
+        admit(descriptor.capacity_value_id, "outer_capacity", "int64")
+        if descriptor.status_address_id is not None:
+            admit(descriptor.status_address_id, "outer_status", "int", (1,))
+        for value_id in pool.column_value_ids:
+            admit(value_id, "glyph_data", "ptr" if owned else "int64")
+        admit(pool.length_value_id, "child_lengths", "ptr" if owned else "int64")
+        admit(pool.capacity_value_id, "child_capacity", "int64")
+        admit(pool.row_stride_value_id, "child_stride", "int64")
+        if pool.status_value_id is not None:
+            admit(pool.status_value_id, "child_status", "ptr" if owned else "int")
+        if owned:
+            admit(descriptor.heap_owner_value_id, "owner", "ptr", (1,))
+        for value_id, dtype in zip(query.column_value_ids, query.column_dtypes):
+            admit(value_id, "glyph_data", dtype)
+        admit(query.length_address_id, "query_length", "int64", (1,))
+        admit(query.capacity_value_id, "query_capacity", "int64")
+    if (pool is None or tuple(descriptor.key_columns) != (pool.handle_column,)
+            or descriptor.column_dtypes[pool.handle_column] != "int64"
+            or descriptor.live_flags_value_id is not None or any(descriptor.column_shapes)):
+        raise ValueError("glyph-key lookup requires a dense single-key child table")
+    if (tuple(pool.column_dtypes) != ("int64",) or len(pool.column_value_ids) != 1
+            or pool.key_columns or pool.live_flags_value_id is not None
+            or (pool.status_value_id is not None and not owned)
+            or any(getattr(pool, name) is not None for name in
+                   ("shape_value_id", "rank_value_id", "shape_stride_value_id"))):
+        raise ValueError("glyph-key lookup requires one dense scalar glyph child column")
+    if (query.column_dtypes != ("int64",) or len(query.column_value_ids) != 1
+            or query.key_columns or query.child_table_pool is not None
+            or query.live_flags_value_id is not None or query.heap_owner_value_id is not None
+            or query.status_address_id is not None
+            or query.capacity_policy is not SSASequenceCapacityPolicy.FIXED
+            or query.writable or any(query.column_shapes)):
+        raise ValueError("glyph-key lookup requires an exact borrowed leaf query descriptor")
+
+
+def _glyph_query_storage(descriptor, query):
+    # Called only after the complete role/type collision validator.
+    pool = descriptor.child_table_pool
+    borrowed = (() if descriptor.heap_owner_value_id is not None else (
+        SSAValue(pool.column_value_ids[0], "int64", accounting={"sequence_arena": True}),
+        SSAValue(pool.length_value_id, "int64", accounting={"sequence_arena": True}),
+        SSAValue(pool.capacity_value_id, "int64"),
+        SSAValue(pool.row_stride_value_id, "int64")))
+    return tuple({v.id: v for v in (*_storage_values(descriptor), *borrowed,
+                                   *_storage_values(query))}.values())
+
+
+def _glyph_key_row_match(builder, descriptor, query, helper_name):
+    """Compose the existing complete equality helper, not a handle comparison."""
+    pool = descriptor.child_table_pool
+    storage = {value.id: value for value in _storage_values(descriptor)}
+    # Preserve dynamic pointer-cell declarations and their heap owner. A new
+    # int64 spelling of the same ID would lose the arena dereference contract.
+    def arena(value_id):
+        if descriptor.heap_owner_value_id is not None:
+            if value_id not in storage:
+                raise ValueError("owned glyph-key arena lacks exact storage member")
+            return storage[value_id]
+        return storage.get(value_id, SSAValue(value_id, dtype="int64"))
+    selected_data = builder.fresh("ptr")
+    selected_length = builder.fresh("ptr")
+    selected = SSASequenceDescriptor(
+        selected_data.id, (selected_data.id,), selected_length.id,
+        pool.row_stride_value_id, column_dtypes=("int64",), writable=False)
+    equality = lower_sequence_equal(selected, query,
+        function_name=helper_name + "__glyph_equal")
+    equality_entry = equality.entry
+    def match(block, row):
+        handle_address = builder.fresh("ptr")
+        handle = builder.fresh("int64")
+        offset = builder.fresh("int64")
+        builder.emit(block, "GetElementPtr", [arena(
+            descriptor.column_value_ids[pool.handle_column]), row], handle_address)
+        builder.emit(block, "Load", [handle_address], handle)
+        builder.emit(block, "Mul", [handle, SSAValue(pool.row_stride_value_id, dtype="int64")], offset)
+        builder.emit(block, "GetElementPtr", [arena(pool.column_value_ids[0]), offset], selected_data)
+        builder.emit(block, "GetElementPtr", [arena(pool.length_value_id), handle], selected_length)
+        actuals = {v.id: v for v in _storage_values(query)}
+        actuals.update({selected_data.id: selected_data, selected_length.id: selected_length,
+                       pool.row_stride_value_id: SSAValue(pool.row_stride_value_id, dtype="int64")})
+        result = builder.fresh("bool")
+        builder.emit(block, "Call", [actuals[v.id] for v in equality_entry.args], result,
+                     attributes={"callee": equality_entry.name, "source_linked": True,
+                                 "ssa_sequence_operation": "equal"})
+        return result
+    return match, equality.functions
+
+
 def lower_table_lookup(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
     default_parameter: bool = False,
+    query_sequence: SSASequenceDescriptor | None = None,
     required: bool = False,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build key lookup and return every physical value column.
+
+    ``query_sequence`` opts into the existing full-content equality helper
+    for one fixed or owned-dynamic glyph key. Without it, a child-handle key cannot be
+    mistaken for a scalar token. This read-only operation neither inserts nor
+    reallocates keys; callers retain the incumbent valid-buffer ABI contract.
 
     ``default_parameter`` appends one trailing argument of the value column's
     dtype and returns it from the absent branch -- the ``d.get(key, default)``
@@ -4214,7 +4533,13 @@ def lower_table_lookup(
         )
     if descriptor.status_address_id is None:
         raise ValueError("table lookup requires a caller-visible status cell")
-    storage = _storage_values(descriptor)
+    if (query_sequence is None and descriptor.child_table_pool is not None
+            and descriptor.child_table_pool.handle_column in descriptor.key_columns):
+        raise ValueError("child-handle key lookup requires an explicit resident query descriptor")
+    if query_sequence is not None:
+        _validate_glyph_key_query(descriptor, query_sequence)
+    storage = (_glyph_query_storage(descriptor, query_sequence)
+               if query_sequence is not None else _storage_values(descriptor))
     status_arena = SSAValue(descriptor.status_address_id, dtype="int", shape=(1,))
     builder = _Builder(_first_fresh_identity(
         descriptor, values=(*storage, status_arena), minimum=first_value_id
@@ -4225,7 +4550,7 @@ def lower_table_lookup(
     value_dtypes = tuple(
         descriptor.column_dtypes[column] for column in value_columns
     )
-    queries = tuple(builder.fresh(dtype) for dtype in key_dtypes)
+    queries = tuple(builder.fresh(dtype) for dtype in key_dtypes) if query_sequence is None else ()
     entry = builder.block("entry")
     header = builder.block("lookup_header")
     body = builder.block("lookup_body")
@@ -4243,10 +4568,16 @@ def lower_table_lookup(
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
-    key_match = _key_row_match(builder, descriptor, key_dtypes, queries)
+    dependencies = ()
+    if query_sequence is None:
+        key_match = _key_row_match(builder, descriptor, key_dtypes, queries)
+    else:
+        key_match, dependencies = _glyph_key_row_match(
+            builder, descriptor, query_sequence,
+            function_name or f"ssa_sequence_{descriptor.sequence_id}_lookup")
     found_rows: list[tuple[SSAValue, BasicBlock]] = []
     scan = entry
-    if hash_index_carrier(descriptor) is not None:
+    if query_sequence is None and hash_index_carrier(descriptor) is not None:
         capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
         indexed, scan = _hash_index_valid(
             builder, entry, descriptor, capacity, length, label="lookup",
@@ -4281,9 +4612,9 @@ def lower_table_lookup(
         value_address = builder.fresh("ptr")
         found_value = builder.fresh(value_dtype)
         builder.emit(found, "GetElementPtr", [
-            SSAValue(
-                descriptor.column_value_ids[value_column], dtype=value_dtype,
-            ), row,
+            (next(value for value in storage if value.id == descriptor.column_value_ids[value_column])
+             if query_sequence is not None else SSAValue(
+                 descriptor.column_value_ids[value_column], dtype=value_dtype)), row,
         ], value_address)
         builder.emit(found, "Load", [value_address], found_value)
         found_values.append(found_value)
@@ -4335,7 +4666,12 @@ def lower_table_lookup(
             "sequence_id": descriptor.sequence_id,
             "key_columns": descriptor.key_columns,
             "sequence_array_argument_ids": tuple((
-                *map(int, descriptor.column_value_ids),
+                *(_storage_array_ids(descriptor, _storage_values(descriptor))
+                  if query_sequence is not None else map(int, descriptor.column_value_ids)),
+                *((int(descriptor.child_table_pool.column_value_ids[0]),
+                   int(descriptor.child_table_pool.length_value_id),
+                   int(query_sequence.column_value_ids[0]),
+                   int(query_sequence.length_address_id)) if query_sequence is not None else ()),
                 int(descriptor.length_address_id),
                 int(descriptor.status_address_id),
                 *((int(descriptor.live_flags_value_id),) if descriptor.live_flags_value_id is not None else ()),
@@ -4348,9 +4684,12 @@ def lower_table_lookup(
                 for index, result in enumerate(results)
             ),
             "required": bool(required),
+            **({"resident_key_query_sequence_id": int(query_sequence.sequence_id),
+                "resident_key_child_column": int(descriptor.child_table_pool.handle_column)}
+               if query_sequence is not None else {}),
         },
     )
-    return SSASequenceLowering((function,))
+    return SSASequenceLowering((function, *dependencies))
 
 
 def lower_glyph_token_copy(
@@ -4540,6 +4879,7 @@ def lower_table_store(
 ) -> SSASequenceLowering:
     """Build update-existing-or-insert for a fixed keyed row table."""
 
+    _reject_scalar_child_handle_keys(descriptor, "lower_table_store")
     unsupported = _unsupported_destination(descriptor, "table_store", allow_dynamic=True)
     if unsupported is not None:
         return unsupported
@@ -4806,6 +5146,7 @@ def lower_table_delete(
     Status is 4 when a live row was deleted and 0 when the key was absent.
     """
 
+    _reject_scalar_child_handle_keys(descriptor, "lower_table_delete")
     unsupported = _unsupported_destination(descriptor, "table_delete")
     if unsupported is not None:
         return unsupported
@@ -4926,6 +5267,7 @@ def lower_table_delete_first(
 ) -> SSASequenceLowering:
     """Delete the first live row, matching ``del table[next(iter(table))]``."""
 
+    _reject_scalar_child_handle_keys(descriptor, "lower_table_delete_first")
     unsupported = _unsupported_destination(descriptor, "table_delete_first")
     if unsupported is not None:
         return unsupported
@@ -5697,6 +6039,7 @@ __all__ = [
     "SSASequenceLoweringShortfall",
     "SSASequenceShortfallCode",
     "lower_sequence_add",
+    "lower_glyph_key_add",
     "lower_sequence_fill",
     "lower_sequence_aggregate_constants",
     "lower_sequence_append",

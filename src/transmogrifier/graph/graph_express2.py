@@ -1705,12 +1705,33 @@ def post_source_parameter_defaults(function):
         # creation.zeros declares dtype=None even if its Try body cannot yet
         # be lowered. Defaults belong to source declaration ingestion, so
         # consumers can prove omission without compiling that function body.
-        current_identity_book().post(
-            SOURCE_PARAMETER_DEFAULT, (scope, str(parameter.arg)),
-            SpecializationFact(value, SpecializationSource.DEFAULT),
-            stage=INGESTION,
-            provenance=Derived((definition_cell, parameter_cell, default_cell)),
-            mode=Mode.CONCORD,
+        book = current_identity_book()
+        row = (scope, str(parameter.arg))
+        fact = SpecializationFact(value, SpecializationSource.DEFAULT)
+        sources = (definition_cell, parameter_cell, default_cell)
+        previous = book.latest_ref(SOURCE_PARAMETER_DEFAULT, row)
+        mode = Mode.CONCORD
+        if previous is not None and book.page(SOURCE_PARAMETER_DEFAULT).latest(row) == fact:
+            # A body rewrite revises the FunctionDef span, not its default.
+            # CONCORD would append that fourth span to the old receipt. Keep
+            # a new exact triple and the old receipt as history instead.
+            from ...compiler.concordance_declarations import SOURCE_SPAN
+            old_spans = tuple(c for c, _ in book.edges_into(previous)
+                              if c.page == SOURCE_SPAN)
+            if set(old_spans) == set(sources):
+                continue
+            old_rows = {(c.page, c.row) for c in old_spans}
+            if old_rows != {(c.page, c.row) for c in sources} or any(
+                c.column < old.column for c in sources for old in old_spans
+                if (c.page, c.row) == (old.page, old.row)
+            ):
+                raise ValueError("authored parameter default changed source occurrence")
+            sources = (*sources, previous)
+            mode = Mode.REVISE
+        # A different default fact still uses CONCORD and refuses disagreement.
+        book.post(
+            SOURCE_PARAMETER_DEFAULT, row, fact,
+            stage=INGESTION, provenance=Derived(sources), mode=mode,
         )
 
 
@@ -2366,6 +2387,8 @@ def _map_ir_from_ast(tree):
         for definition in ast.walk(tree)
         if isinstance(definition, ast.ClassDef)
     )
+    from ...compiler.source_owned_record_elements import publish_field_sequence_elements
+    publish_field_sequence_elements(tree)
     # Recursive pursuit may first retain a declaration-only shell for a
     # method owner's fields and later retain executable methods from that same
     # source ClassDef.  Both views carry the exact class identity and span row;

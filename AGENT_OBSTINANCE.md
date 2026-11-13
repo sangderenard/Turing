@@ -860,3 +860,37 @@ lower_ast_source_to_ssa entry and its ExtractionContract. The first bounded
 loop compiled through that path; full traversal remains incomplete and must
 not be activated as if repaired. Reading the existing AST route and required
 public entry before implementing would have prevented this departure.
+
+## 2026-11-13 - changing collected tests during a frozen comparison
+
+While another agent was running a paired source-proof comparison, I added two
+native consumer cases to a test file that the pair also collected. The runs
+therefore collected different case sets and could not serve as a paired
+comparison. Both added cases stopped at source audit, before native execution.
+The concrete cost was an extra source-only rerun to restore comparable evidence.
+I disclosed the mismatch and held subsequent edits until the coordinated window
+was released. A test freeze includes test collection files, not only production
+source; I should have written the cases separately until the pair completed.
+
+## 2026-11-13 - omitting an active regression freeze from a worker assignment
+
+While the comprehension worker's incumbent regression was running, I assigned a
+runtime-copy extension without passing along that source/test freeze. The new
+worker edited runtime_abi.py and its test during the run. The completed 38-pass
+incumbent result therefore cannot certify one frozen final source state. The
+focused comprehension candidate/baseline pair had already completed and is not
+affected. I disclosed the overlap, stopped subsequent edits, and required an
+exact incumbent rerun on the fixed final source. The concrete cost is that extra
+regression run and delayed integration. I should have included the active freeze
+and an explicit release condition in the runtime assignment.
+
+
+## 2026-11-13 — assumed help flag on unrelated scanner
+
+While preparing the scoped owned-record declaration commit, the worker ran
+`python tools/scan_managed_duplicates.py --help` before reading its argument
+handling. The script does not parse that flag and began unrelated source
+lowering. The worker interrupted it, claimed no scan/native result, and kept
+the completed focused tests and mapping audit separate. Cost: approximately
+20 seconds of unrelated work. Prevention: inspect the scanner entry point and
+its actual scope before invoking it; use the named mapping audit for this slice.
