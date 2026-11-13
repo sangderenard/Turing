@@ -6,6 +6,7 @@ from .perforated import PerforatedLinear
 from .perforated_recurrent import PerforatedRecurrentTransition
 from .train import train_step, train_loop
 from .utils import set_seed
+from .module import Module, Parameter, ModuleDict, ParameterDict
 
 # Fused-program and completion-training imports pull in the compiler/repository
 # graph stack. Keep ordinary AbstractNN layers lightweight while preserving the
@@ -72,6 +73,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "Module", "Parameter", "ModuleDict", "ParameterDict",
     "Linear", "Sequential", "Model", "RectConv2d", "RectConv3d",
     "MaxPool2d", "Flatten", "wrap_module", "ReLU", "Sigmoid", "Tanh",
     "Identity", "MSELoss", "CrossEntropyLoss", "BCEWithLogitsLoss", "Adam",
