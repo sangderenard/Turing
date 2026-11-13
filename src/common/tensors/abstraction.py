@@ -1727,6 +1727,19 @@ class AbstractTensor:
 
     # --- Broadcasting helpers (abstract, backend-agnostic) ---
     @staticmethod
+    def broadcast_shapes(*shapes) -> tuple[int, ...]:
+        """Resolve shape metadata using the shared batched-matmul rules."""
+        from .batched_matmul import _broadcast_shapes
+
+        result = ()
+        for shape in shapes:
+            shape = tuple(shape)
+            if any(not isinstance(size, int) or size < 0 for size in shape):
+                raise ValueError('shape extents must be nonnegative integers')
+            result = _broadcast_shapes(result, shape)
+        return result
+
+    @staticmethod
     def broadcast_to(tensor, shape) -> "AbstractTensor":
         """Broadcast ``tensor`` to ``shape`` through the selected backend."""
         return AbstractTensor.get_tensor(tensor).expand(tuple(shape))
