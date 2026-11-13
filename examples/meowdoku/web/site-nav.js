@@ -425,6 +425,7 @@ async function main() {
     link("Home", "/"),
     link("Profile and servers", "/profile.html"),
     link("My files", "/files.html", caps.has("message")),
+    link("Paper markets", "/markets.html", caps.has("message")),
     link("Browse the site", "/browse"),
     link("Help: the manual", "/manual/", caps.has("view_site")),
     link("Repository world map", "/worldmap.html", caps.has("dev_ui")),

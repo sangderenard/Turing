@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper markets · Meowdoku</title>
+<style>
+  :root { color-scheme: dark; font: 15px/1.4 system-ui, sans-serif; }
+  body { margin: 0; background: #0d1420; color: #eef3fa; }
+  main { max-width: 78rem; margin: auto; padding: 1rem 1rem 4rem; }
+  a { color: #a7ceff; }
+  h1 { margin-bottom: .25rem; }
+  .muted { color: #acbad0; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; }
+  select, input, button { font: inherit; background: #1b2b40; color: inherit; padding: .35rem; border: 1px solid #60718e; border-radius: 5px; }
+  button { cursor: pointer; }
+  .panel { border: 1px solid #33445e; border-radius: 10px; background: #162238; padding: 1rem; margin: 1rem 0; }
+  canvas { display: block; width: 100%; height: 22rem; background: #101b2c; border-radius: 6px; }
+  #book { height: 16rem; }
+  #tickers { display: grid; grid-template-columns: repeat(auto-fit,minmax(10rem,1fr)); gap: .6rem; }
+  .ticker { padding: .7rem; background: #1b2b40; border-radius: 6px; }
+  .ticker strong, .ticker span { display: block; }
+  #legend { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: .6rem; }
+  #book-levels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .3rem 1rem; margin-top: .7rem; }
+  #book-levels span { font-variant-numeric: tabular-nums; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="/">← Meowdoku</a></p>
+  <h1>Paper market watch</h1>
+  <p class="muted">BTC/USD, broad ETFs, and one stock candidate in one view. Read-only market data; no orders or training run from this page.</p>
+  <section class="panel">
+    <h2>Your Alpaca paper key</h2>
+    <p class="muted">Enter the paper key ID and secret from your phone. They are stored for your signed-in account and never appear in shared files or messages.</p>
+    <p id="key-state">Checking connection…</p>
+    <form id="key-form" class="row">
+      <label>Key ID <input id="key-id" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+      <label>Secret <input id="key-secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+      <button type="submit">Save key</button>
+    </form>
+  </section>
+  <div class="row">
+    <label for="wildcard">Stock candidate</label>
+    <select id="wildcard"><option>AAPL</option><option>MSFT</option><option>NVDA</option><option>TSLA</option></select>
+  </div>
+  <p id="status" role="status">Checking account…</p>
+  <section class="panel"><h2>Latest minute bars</h2><div id="tickers"></div></section>
+  <section class="panel">
+    <h2>30-day price history</h2>
+    <p class="muted">Each line shows percentage change from its first available bar. Stock prices use Alpaca's IEX feed; free historical stock bars end 20 minutes before the request.</p>
+    <canvas id="history" aria-label="Price history chart"></canvas>
+    <div id="legend"></div>
+  </section>
+  <section class="panel">
+    <h2>Bitcoin order book</h2>
+    <p class="muted" id="book-state">Waiting for an available book…</p>
+    <canvas id="book" aria-label="Bitcoin order-book bid and ask sizes"></canvas>
+    <div id="book-levels" aria-label="Bitcoin bid and ask price levels"></div>
+  </section>
+  <p class="muted" id="rate"></p>
+</main>
+<script type="module" src="/markets.js"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body>
+</html>

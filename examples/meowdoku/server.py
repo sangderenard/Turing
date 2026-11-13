@@ -92,6 +92,7 @@ from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
+from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
@@ -1205,11 +1206,29 @@ def make_handler(sessions: Sessions):
             try:
                 alpaca_credentials_mod.save_paper(sessions.state.secrets_dir, account_id,
                                                    body["key_id"], body["secret_key"])
+                market_data_mod.invalidate(account_id)
                 return self._json({"configured": True})
             except alpaca_credentials_mod.CredentialError as error:
                 return self._json({"error": str(error)}, error.status)
             except OSError:
                 return self._json({"error": "credential storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+
+        def _markets_route(self, path: str) -> None:
+            from urllib.parse import parse_qs
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            account_id = self._principal().user_id
+            if account_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            stock = (parse_qs(self.path.partition("?")[2]).get("stock") or ["AAPL"])[0]
+            try:
+                action = market_data_mod.history if path.endswith("/history") else market_data_mod.now
+                return self._json(action(sessions.state.secrets_dir, account_id, stock))
+            except market_data_mod.MarketError as error:
+                return self._json({"error": str(error)}, error.status)
+            except alpaca_credentials_mod.CredentialError as error:
+                return self._json({"error": str(error)}, error.status)
 
         # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
         # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
@@ -2160,6 +2179,8 @@ def make_handler(sessions: Sessions):
                 return self._user_files_route(path, "GET")
             if path == "/api/user-secrets/alpaca-paper":
                 return self._paper_credentials_route("GET")
+            if path in ("/api/markets/history", "/api/markets/now"):
+                return self._markets_route(path)
             if path.startswith("/api/profile/"):                  # [PROFILE]
                 return self._profile_route(path, "GET")
             if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
