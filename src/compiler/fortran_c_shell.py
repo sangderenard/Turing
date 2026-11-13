@@ -7659,6 +7659,11 @@ def _authored_sequence_record_views(
             if isinstance(annotation.value, ast.Attribute)
             else ""
         )
+        identities = _authored_annotation_python_types(annotation)
+        if len(identities) == 1 and identities[0] in {
+            "builtins.list", "builtins.tuple",
+        }:
+            container = identities[0].removeprefix("builtins.")
         if container not in {"list", "tuple", "Sequence", "Iterable"}:
             return None
         element = annotation.slice
