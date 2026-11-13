@@ -63,6 +63,48 @@ def borrowed_record_string_layouts(graph, sequence_declarations):
     return borrowed_record_string_layouts_from_book(book, scope, sequence_declarations)
 
 
+def _borrowed_string_comprehension_publication(book, scope, control, mutation):
+    """Admit only the existing singleton retained-list publication recipe.
+
+    This surveys storage, not execution: the original mutation and its
+    predicate are never rewritten. Generator/set/dict and expanded records
+    remain outside this narrow route.
+    """
+    from .concordance_declarations import NATIVE_OBJECT_SOURCE
+    from .source_sequence_lifetime import _ast_kind, _local_birth
+    target, operation, arguments, effect, policy, kind, publication = mutation
+    if ((operation, policy, kind) != ('append', 'duplicates', 'value')
+            or len(arguments) != 1 or publication is None
+            or publication.page != NATIVE_OBJECT_SOURCE
+            or len(publication.row) != 3 or publication.row[0] != scope
+            or publication.row[-1] != 'publication'
+            or book.latest_ref(publication.page, publication.row) != publication):
+        return False
+    birth = _local_birth(book, target)
+    if len(birth) != 4:
+        return False
+    born_control, born_publication, materializer, loop = birth
+    if (born_control != control or born_publication != publication or loop != effect
+            or materializer.row != publication.row[:2]
+            or _ast_kind(book, materializer) != 'value:ListComp'):
+        return False
+    argument, = arguments
+    if argument.page != CANONICAL_VALUE or argument.row[0] != scope:
+        return False
+    # loop_composer publishes these exact two singleton mappings. Do not
+    # reinterpret an expanded record, guessed field, or unrelated source ID.
+    expected = (('projected_argument_value_ids', (int(argument.row[-1]),)),
+                ('source_argument_value_ids', (int(argument.row[-1]),)))
+    if _fact(book, publication) != expected:
+        return False
+    if {parent for parent, _ in book.edges_into(publication)} != {materializer, argument}:
+        return False
+    if not {target, effect, publication, argument} <= {
+            parent for parent, _ in book.edges_into(control)}:
+        return False
+    return True
+
+
 def borrowed_record_string_layouts_from_book(book, scope, sequence_declarations):
     """The same exact control survey at descriptor use, without cached IDs."""
     from .source_sequence_lifetime import _ast_kind
@@ -78,27 +120,34 @@ def borrowed_record_string_layouts_from_book(book, scope, sequence_declarations)
             if target.page != CANONICAL_VALUE or target.row[0] != scope:
                 continue
             sid = int(target.row[-1])
-            if sid not in declarations or _ast_kind(book, target) != 'value:List':
-                continue
-            writes.setdefault(sid, []).append(mutation)
+            if sid in declarations:
+                writes.setdefault(sid, []).append((control, mutation))
     layouts = {}
-    for sid, mutations in writes.items():
+    for sid, entries in writes.items():
+        target = entries[0][1][0]
+        plain_list = _ast_kind(book, target) == 'value:List'
+        if not plain_list and (len(entries) != 1 or not
+                _borrowed_string_comprehension_publication(book, scope, *entries[0])):
+            continue
         dtypes = []
-        for target, operation, arguments, effect, policy, kind, publication in mutations:
-            if operation == 'clear' and not arguments:
+        for control, mutation in entries:
+            target, operation, arguments, effect, policy, kind, publication = mutation
+            if plain_list and operation == 'clear' and not arguments:
                 continue
             if (operation != 'append' or policy != 'duplicates' or kind != 'value'
-                    or publication is not None or len(arguments) != 1):
+                    or (plain_list and publication is not None) or len(arguments) != 1):
                 break
-            source = borrowed_record_string_source(book, scope, int(arguments[0].row[-1]))
-            if source is None or source[2] != arguments[0]:
+            argument, = arguments
+            if argument.page != CANONICAL_VALUE or argument.row[0] != scope:
+                break
+            source = borrowed_record_string_source(book, scope, int(argument.row[-1]))
+            if source is None or source[2] != argument:
                 break
             dtypes.append(str(source[4][4]))
         else:
             if dtypes and len(set(dtypes)) == 1 and dtypes[0] not in {'unknown', 'None', ''}:
                 layouts[sid] = (0, (dtypes[0],), (), True)
     return layouts
-
 
 
 def publish_borrowed_record_span_role(builder, target_id, role, projection, handle_arena, contract):

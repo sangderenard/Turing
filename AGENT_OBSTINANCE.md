@@ -871,3 +871,15 @@ The concrete cost was an extra source-only rerun to restore comparable evidence.
 I disclosed the mismatch and held subsequent edits until the coordinated window
 was released. A test freeze includes test collection files, not only production
 source; I should have written the cases separately until the pair completed.
+
+## 2026-11-13 - omitting an active regression freeze from a worker assignment
+
+While the comprehension worker's incumbent regression was running, I assigned a
+runtime-copy extension without passing along that source/test freeze. The new
+worker edited runtime_abi.py and its test during the run. The completed 38-pass
+incumbent result therefore cannot certify one frozen final source state. The
+focused comprehension candidate/baseline pair had already completed and is not
+affected. I disclosed the overlap, stopped subsequent edits, and required an
+exact incumbent rerun on the fixed final source. The concrete cost is that extra
+regression run and delayed integration. I should have included the active freeze
+and an explicit release condition in the runtime assignment.
