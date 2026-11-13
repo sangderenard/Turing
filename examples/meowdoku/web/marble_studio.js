@@ -31,7 +31,7 @@ import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhys
   verifySavedMarbleObject } from "./marble_object.js";
 import { initCalibration } from "./marble_calibration.js";
 import { backdropFaces,tallMountedFabricLayer } from "./marble_backdrop.js";
-import {fabricWallMesh,fabricTableDrapePose,fabricLayerRowConfiguration} from './marble_backdrop_fabric.js';
+import {fabricWallMesh,fabricTableDrapePose,fabricCycloramaPose,fabricTableContact,fabricLayerRowConfiguration} from './marble_backdrop_fabric.js';
 import { setupStudioLighting, LIGHTING_PROFILE_FIELDS } from "./marble_studio_lighting.js";
 import { STUDIO_LIGHTS } from "./marble_light_strengths.js";
 import { studioRoomBounds } from "./marble_room.js";
@@ -1010,7 +1010,8 @@ function fabricSource(index,layer,layers){
     });
   if(!source||source.length!==2)throw Error('Fabric needs a rectangular backdrop wall');
   const wall=fabricWallMesh(source,{side:layer.fabricGridSide??9});
-  return layer.fabricPose==='table'?fabricTableDrapePose(wall,table):wall;
+  return layer.fabricPose==='table'?fabricTableDrapePose(wall,table):
+    lighting.controls['backdrop-sweep']?fabricCycloramaPose(wall,{floorY:bounds.floorY}):wall;
 }
 async function pollFabricMotion(session){
   while(fabricMotion===session){
@@ -1037,12 +1038,19 @@ async function startFabricMotion(){
     if(index<0)throw Error('Select a fabric backdrop layer first');
     const mesh=fabricSource(index,layers[index],layers);
     const packed=fabricLayerRowConfiguration(mesh,layers[index],{identity:1});
-    const started=await fabricRequest({action:'start',side:mesh.columns,configuration:Array.from(packed.data)});
+    const started=await fabricRequest({action:'start',side:mesh.columns,
+      configuration:Array.from(packed.data),
+      backend:$('fabric-compute-backend').value,
+      substeps:Number($('fabric-substeps').value),
+      gpuTargetMs:Number($('fabric-gpu-target-ms').value),
+      floorY:active.controls['backdrop-sweep']?studioRoomBounds(
+        Number(active.controls['room-scale']),tableFloorDrop(active.table)).floorY:null,
+      tableContact:active.table?.enabled?Array.from(fabricTableContact(active.table)):null});
     const session={...started,index,frame:0};fabricMotion=session;
     if(layers[index].fabricFrozen){await fabricRequest({action:'pause',token:session.token});session.frozen=true;}
     $('fabric-motion-pause').disabled=false;$('fabric-motion-stop').disabled=false;
     $('fabric-motion-pause').textContent=session.frozen?'Resume fabric':'Pause fabric';
-    fabricStatus('Nodus fabric row starting…');pollFabricMotion(session);
+    fabricStatus(`Nodus fabric row starting on ${started.backend} · up to ${started.substeps} substeps…`);pollFabricMotion(session);
   }catch(error){fabricStatus(`Fabric motion unavailable: ${error.message}`);}
 }
 // Pure (no WebGL calls) fixture-role builder, shared by the Phong frame()

@@ -485,6 +485,85 @@ def _find_region_call(wrapper: Function, module: IRModule):
     return None
 
 
+def emit_ssa_scalar_to_glsl_compute(
+    function: Function, *, name: str | None = None, local_size: int = 64,
+    feed_reads: Mapping[int, str] | None = None,
+    control_fields: tuple[str, ...] = (),
+) -> str:
+    """Emit a straight-line f64 scalar SSA function as one element per lane.
+
+    Feed, output and control bindings match the deployable SPIR-V scalar ABI.
+    This is a direct SSA lowering: no SPIR-V to GLSL decompilation occurs.
+    Unsupported instructions refuse emission rather than changing the law.
+    """
+    if set(function.blocks) != {"entry"} or local_size < 1:
+        raise ValueError("direct scalar GLSL requires one straight-line entry block")
+    feed_reads = dict(feed_reads or {})
+    if any(slot < 0 or slot >= len(function.args) for slot in feed_reads):
+        raise ValueError("direct scalar GLSL feed read names an absent slot")
+    lines = ["#version 450", "#extension GL_ARB_gpu_shader_fp64 : require",
+             f"// {name or function.name}: direct repository SSA scalar lowering",
+             f"layout(local_size_x = {local_size}, local_size_y = 1, local_size_z = 1) in;"]
+    for slot, argument in enumerate(function.args):
+        if str(argument.dtype) != "float64" or tuple(argument.shape or ()):
+            raise ValueError(f"scalar GLSL feed %{argument.id} is not f64 scalar")
+        lines.append(
+            f"layout(set = 0, binding = {slot}, std430) readonly buffer Feed{slot} "
+            f"{{ double data[]; }} feed{slot};")
+    returned = [item for item in function.blocks["entry"].instrs
+                if str(item.op) == "Ret"]
+    if len(returned) != 1 or not returned[0].args:
+        raise ValueError("scalar GLSL requires one return with outputs")
+    results = returned[0].args
+    for slot, result in enumerate(results):
+        if str(result.dtype) != "float64" or tuple(result.shape or ()):
+            raise ValueError(f"scalar GLSL output %{result.id} is not f64 scalar")
+        binding = len(function.args) + slot
+        lines.append(
+            f"layout(set = 0, binding = {binding}, std430) writeonly buffer Output{slot} "
+            f"{{ double data[]; }} output{slot};")
+    fields = " ".join(("uint element_count;", *control_fields))
+    lines.append(
+        f"layout(set = 0, binding = {len(function.args) + len(results)}, std430) "
+        f"readonly buffer Control {{ {fields} }} control;")
+    lines.extend(("void main() {", "    uint element = gl_GlobalInvocationID.x;",
+                  "    if (element >= control.element_count) return;"))
+    known = {int(argument.id) for argument in function.args}
+    for slot, argument in enumerate(function.args):
+        source = feed_reads.get(slot, f"feed{slot}.data[element]")
+        lines.append(f"    precise double t{argument.id} = {source};")
+    for instruction in function.blocks["entry"].instrs:
+        op = str(instruction.op)
+        if op == "Ret":
+            continue
+        if instruction.res is None or str(instruction.res.dtype) != "float64":
+            raise ValueError(f"scalar GLSL cannot lower {op} without f64 result")
+        result_id = int(instruction.res.id)
+        if op == "Const":
+            held = instruction.attributes.get("constant", instruction.attributes.get("value"))
+            expression = _double_literal(float(held))
+        else:
+            args = [int(value.id) for value in instruction.args]
+            if any(value_id not in known for value_id in args):
+                raise ValueError(f"scalar GLSL {op} has undefined operand")
+            values = [f"t{value_id}" for value_id in args]
+            if op in ("Add", "Mul", "Div") and len(values) == 2:
+                symbol = {"Add": "+", "Mul": "*", "Div": "/"}[op]
+                expression = f"({values[0]} {symbol} {values[1]})"
+            elif op == "maximum" and len(values) == 2:
+                expression = f"max({values[0]}, {values[1]})"
+            else:
+                raise ValueError(f"scalar GLSL has no spelling for {op}")
+        lines.append(f"    precise double t{result_id} = {expression};")
+        known.add(result_id)
+    for slot, result in enumerate(results):
+        if int(result.id) not in known:
+            raise ValueError(f"scalar GLSL output %{result.id} is undefined")
+        lines.append(f"    output{slot}.data[element] = t{result.id};")
+    lines.extend(("}", ""))
+    return "\n".join(lines)
+
+
 def _region_calls(block) -> list:
     return [
         instruction for instruction in block.instrs
@@ -1055,4 +1134,5 @@ __all__ = [
     "GLSLComputeArtifact",
     "GLSLComputeExecution",
     "emit_ssa_module_to_glsl_compute",
+    "emit_ssa_scalar_to_glsl_compute",
 ]

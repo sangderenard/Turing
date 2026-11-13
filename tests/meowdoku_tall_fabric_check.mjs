@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {writeFileSync} from 'node:fs';
 import {backdropFaces,defaultBackdropLayers,tallMountedFabricLayer,validateBackdropLayers} from '../examples/meowdoku/web/marble_backdrop.js';
-import {fabricWallMesh,fabricLayerRowConfiguration} from '../examples/meowdoku/web/marble_backdrop_fabric.js';
+import {fabricWallMesh,fabricCycloramaPose,fabricLayerRowConfiguration} from '../examples/meowdoku/web/marble_backdrop_fabric.js';
 
 const ids={fabric_muslin_white:43,white_plaster:1};
 const layers=defaultBackdropLayers();
@@ -28,6 +28,12 @@ assert.equal(packed.data[at(255,20)],0);
 const faces=backdropFaces({count:1,material:'fabric_muslin_white',sweep:false,
   layers:valid,wallZ:-18.6,floorY:-1.02,table},ids);
 assert.deepEqual(faces,mesh.faces);
+const swept=fabricCycloramaPose(mesh,{floorY:-1.02});
+assert.ok(swept.positions[0][2]>mesh.positions[0][2]+1.4);
+assert.equal(swept.positions[0][1],-1.02);
+assert.deepEqual(swept.positions.slice(240),mesh.positions.slice(240));
+assert.deepEqual(backdropFaces({count:1,material:'fabric_muslin_white',sweep:true,
+  layers:valid,wallZ:-18.6,floorY:-1.02,table},ids),swept.faces);
 if(process.env.FABRIC_HOST_CONFIG_PATH){
   const bytes=Buffer.alloc(packed.data.length*8);
   packed.data.forEach((value,i)=>bytes.writeDoubleLE(value,i*8));

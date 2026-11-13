@@ -72,4 +72,16 @@ const custom=fabricRowConfiguration(posed,{identity:44,attachments:[{node:40,anc
 assert.equal(custom.data[40*38+7],1);
 assert.deepEqual([...custom.data.slice(40*38+8,40*38+11)],[1,2,3]);
 assert.equal(custom.data[0*38+7],0);
+const ring=fabricRowConfiguration(posed,{identity:45,
+  attachments:[{node:40,kind:'ring',anchor:[1,2,3]}]});
+assert.equal(ring.data[40*38+7],2);
+assert.deepEqual([...ring.data.slice(40*38+8,40*38+11)],[1,2,3]);
+const tailored={...valid[0],fabricRingPoints:[40],
+  fabricTiebackPoints:[{node:41,anchor:[-3,0,1]}]};
+const tailoredPacked=fabricLayerRowConfiguration(mesh,tailored,{identity:46});
+assert.equal(tailoredPacked.data[40*38+7],2);
+assert.equal(tailoredPacked.data[41*38+7],1);
+assert.deepEqual([...tailoredPacked.data.slice(41*38+8,41*38+11)],[-3,0,1]);
+assert.throws(()=>validateBackdropLayers(valid.map((item,i)=>i?item:{...tailored,
+  fabricRingPoints:[41]}),Object.keys(ids)));
 console.log('Backdrop fabric: source wall triangulated, material preserved, 81-node Nodus row and freeze contract PASS');

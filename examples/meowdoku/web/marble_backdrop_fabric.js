@@ -78,6 +78,26 @@ export function fabricTableDrapePose(mesh,table,{lift=.8,backGap=.15,frontInset=
   return {...mesh,positions,faces:triangulate(positions,mesh.material,mesh.columns)};
 }
 
+export function fabricCycloramaPose(mesh,{floorY,extension=1.25,forward=1.5}={}){
+  if(!Number.isFinite(floorY)||!Number.isFinite(extension)||extension<1||
+     !Number.isFinite(forward)||forward<0)
+    throw new RangeError('Cyclorama pose needs a floor and positive extension');
+  const side=mesh?.columns;
+  if(!Number.isInteger(side)||side<2||mesh.rows!==side||mesh.positions?.length!==side**2)
+    throw new RangeError('Cyclorama pose needs a rectangular fabric mesh');
+  const highY=Math.max(...mesh.positions.map(point=>point[1]));
+  const lowY=Math.min(...mesh.positions.map(point=>point[1]));
+  if(highY<=floorY||highY<=lowY)throw new RangeError('Cyclorama mount must stand above floor');
+  const length=Math.max((highY-lowY)*extension,highY-floorY+forward);
+  const fall=highY-floorY;
+  const positions=mesh.positions.map((point,node)=>{
+    if(Math.floor(node/side)===side-1)return point.slice();
+    const down=length*(1-Math.floor(node/side)/(side-1));
+    return [point[0],Math.max(floorY,highY-down),point[2]+Math.max(0,down-fall)];
+  });
+  return {...mesh,positions,faces:triangulate(positions,mesh.material,side)};
+}
+
 export function fabricTableContact(table){
   if(!table?.enabled||!Number.isFinite(table.width)||!Number.isFinite(table.length)||
      table.width<=0||table.length<=0)throw new RangeError('Table contact needs an enabled stage table');
@@ -94,15 +114,16 @@ export function fabricRowConfiguration(mesh,{network=0,identity,stiffness=600,dr
   const side=mesh?.columns,count=side**2;
   if(!Number.isInteger(side)||side<2||side>FABRIC_GRID_MAX_SIDE||mesh.rows!==side||mesh.positions?.length!==count)
     throw new RangeError('Fabric mesh must fit the 256-node backdrop batch');
-  attachments??=[(side-1)*side,count-1];
+  attachments??=Array.from({length:side},(_,column)=>(side-1)*side+column);
   if(!Array.isArray(attachments)||attachments.length>count)throw new RangeError('Invalid fabric attachment points');
   const anchored=new Map();
   for(const item of attachments){
     const node=typeof item==='number'?item:item?.node,anchor=typeof item==='number'?mesh.positions[node]:item?.anchor;
+    const kind=typeof item==='number'?'fixed':item?.kind??'fixed';
     if(!Number.isInteger(node)||node<0||node>=count||anchored.has(node)||
-        !Array.isArray(anchor)||anchor.length!==3||!anchor.every(Number.isFinite))
+        !['fixed','ring'].includes(kind)||!Array.isArray(anchor)||anchor.length!==3||!anchor.every(Number.isFinite))
       throw new RangeError('Invalid fabric attachment point');
-    anchored.set(node,anchor);
+    anchored.set(node,{anchor,kind});
   }
   const data=new Float64Array(FABRIC_ROW_NETWORKS*FABRIC_ROW_NODES*FABRIC_ROW_FIELDS);
   const at=(node,field)=>(network*FABRIC_ROW_NODES+node)*FABRIC_ROW_FIELDS+field;
@@ -110,8 +131,8 @@ export function fabricRowConfiguration(mesh,{network=0,identity,stiffness=600,dr
   for(let y=0;y<side;y++)for(let x=0;x<side;x++){
     const node=y*side+x,point=mesh.positions[node];
     if(!Array.isArray(point)||point.length!==3||!point.every(Number.isFinite))throw new RangeError('Invalid fabric node');
-    for(let axis=0;axis<3;axis++){data[at(node,axis)]=point[axis];data[at(node,8+axis)]=anchored.get(node)?.[axis]??point[axis];}
-    data[at(node,6)]=1;data[at(node,7)]=anchored.has(node)?1:0;
+    for(let axis=0;axis<3;axis++){data[at(node,axis)]=point[axis];data[at(node,8+axis)]=anchored.get(node)?.anchor[axis]??point[axis];}
+    data[at(node,6)]=1;data[at(node,7)]=anchored.get(node)?.kind==='ring'?2:anchored.has(node)?1:0;
     data[at(node,11)]=1;data[at(node,12)]=stiffness;data[at(node,13)]=drag;data[at(node,15)]=gravity;
     for(const [edge,nx,ny] of [[0,x-1,y],[1,x+1,y],[2,x,y-1],[3,x,y+1]]){
       if(nx<0||nx>=side||ny<0||ny>=side)continue;
@@ -126,7 +147,14 @@ export function fabricRowConfiguration(mesh,{network=0,identity,stiffness=600,dr
 
 export function fabricLayerRowConfiguration(mesh,layer,settings={}){
   if(!layer||layer.surfaceBehavior!=='fabric')throw new RangeError('A fabric backdrop layer is required');
+  const rings=layer.fabricRingPoints??[],tiebacks=layer.fabricTiebackPoints??[];
+  const fixed=layer.fabricAttachmentPoints??(layer.fabricPose==='table'
+    ?Array.from({length:mesh.columns},(_,column)=>column)
+    :Array.from({length:mesh.columns},(_,column)=>(mesh.rows-1)*mesh.columns+column));
+  const replace=new Set([...rings,...tiebacks.map(item=>item.node)]);
   return fabricRowConfiguration(mesh,{...settings,
-    attachments:layer.fabricAttachmentPoints??(layer.fabricPose==='table'?[0,mesh.columns-1]:[(mesh.rows-1)*mesh.columns,mesh.positions.length-1]),
+    attachments:[...fixed.filter(node=>!replace.has(node)),
+      ...rings.map(node=>({node,kind:'ring',anchor:mesh.positions[node]})),
+      ...tiebacks.map(item=>({node:item.node,kind:'fixed',anchor:item.anchor}))],
     frozen:layer.fabricFrozen??false});
 }

@@ -7,12 +7,18 @@
 #include "tool_api.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
+#include "kernel_vulkan_runner.h"
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <vector>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -44,6 +50,34 @@ public:
     reset_=reinterpret_cast<void(*)()>(GetProcAddress(module_,"turing_validation_error_reset"));
     take_=reinterpret_cast<uint32_t(*)()>(GetProcAddress(module_,"turing_validation_error_take"));
     if(!entry_||((reset_==nullptr)!=(take_==nullptr))){FreeLibrary(module_);module_=nullptr;entry_=nullptr;}
+    const char* requested=std::getenv("NODUS_FABRIC_BACKEND");
+    if(requested&&std::strcmp(requested,"vulkan")==0&&nodus::kernels::vulkan_available()){
+      std::ifstream shader("@SPV@",std::ios::binary);
+      const std::vector<char> bytes((std::istreambuf_iterator<char>(shader)),{});
+      if(!bytes.empty()&&bytes.size()%sizeof(uint32_t)==0){
+        spirv_.resize(bytes.size()/sizeof(uint32_t));
+        std::memcpy(spirv_.data(),bytes.data(),bytes.size());
+        gpu_=true;
+      }
+    }
+    if(gpu_){
+      gpu_context_=gp_mem_backend_create_vulkan(nullptr);
+      gpu_vtable_=gpu_context_?gp_mem_backend_get_vtable(gpu_context_):nullptr;
+      if(!gpu_vtable_||!gpu_vtable_->alloc||!gpu_vtable_->copy_to_backend||
+         !gpu_vtable_->copy_from_backend)gpu_=false;
+      if(gpu_)for(int i=0;i<27;i++){
+        gpu_buffers_[i]=gpu_vtable_->alloc(gpu_context_,i==26?sizeof(uint32_t):kBatch*sizeof(double),0);
+        if(!gpu_buffers_[i]){gpu_=false;break;}
+      }
+      if(!gpu_)close_gpu();
+    }
+    if(requested&&std::strcmp(requested,"vulkan")==0&&!gpu_){
+      std::fputs("[spring] requested Vulkan unavailable before work\n",stderr);
+      if(module_)FreeLibrary(module_);module_=nullptr;entry_=nullptr;return;
+    }
+    if(gpu_)std::fprintf(stderr,"[spring] backend=vulkan device=%s\n",
+      nodus::kernels::vulkan_device_name().c_str());
+    else std::fputs("[spring] backend=llvm\n",stderr);
     for(auto& column:columns_)column.resize(kBatch);
     positions_.resize(kBatch);velocities_.resize(kBatch);neighbors_.resize(kNodeSlots);
     WSADATA wsa{};
@@ -65,7 +99,7 @@ public:
       }
     }
   }
-  void shutdown() override {if(module_)FreeLibrary(module_);module_=nullptr;entry_=nullptr;ready_=false;
+  void shutdown() override {close_gpu();if(module_)FreeLibrary(module_);module_=nullptr;entry_=nullptr;ready_=false;
     if(socket_!=INVALID_SOCKET){closesocket(socket_);socket_=INVALID_SOCKET;}
     if(winsock_){WSACleanup();winsock_=false;}}
   void tick(double,HostAPI&) override {}
@@ -125,7 +159,7 @@ private:
     for(int node=0;node<kNodeSlots;node++){
       const double* row=source.data()+node*kFields;
       for(int field=0;field<kFields;field++)if(!std::isfinite(row[field]))return false;
-      if((row[6]!=0&&row[6]!=1)||(row[7]!=0&&row[7]!=1)||row[11]<0||row[12]<0||row[13]<0)return false;
+      if((row[6]!=0&&row[6]!=1)||(row[7]!=0&&row[7]!=1&&row[7]!=2)||row[11]<0||row[12]<0||row[13]<0)return false;
       int degree=0;
       for(int edge=0;edge<4;edge++){
         if(row[33+edge]!=0&&row[33+edge]!=1)return false;
@@ -148,7 +182,7 @@ private:
         positions_[lane]=row[axis];velocities_[lane]=row[3+axis];
         columns_[0][lane]=row[8+axis];columns_[3][lane]=row[13];
         columns_[9][lane]=row[14+axis];columns_[10][lane]=row[11];
-        columns_[15][lane]=row[6];columns_[16][lane]=row[7];
+        columns_[15][lane]=row[6];columns_[16][lane]=(row[7]==2?(axis==0?0:1):row[7]);
         columns_[22][lane]=row[12];
         for(int edge=0;edge<4;edge++){
           columns_[5+edge][lane]=row[33+edge];
@@ -158,44 +192,115 @@ private:
     }
     if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
     fabric_ids_=fabric_ids;
-    frozen_=false;tabletop_enabled_=false;ready_=true;return true;
+    frozen_=false;tabletop_enabled_=false;floor_enabled_=false;ready_=true;return true;
   }
   bool advance(uint64_t input,uint64_t output){
     double dt=0;
-    if(nodus_tensor_read(input,0,&dt,sizeof(dt))!=sizeof(dt)||!std::isfinite(dt)||dt<=0||dt>max_dt_)return false;
+    int selected=substeps_;
+    if(gpu_&&target_ms_>0){
+      selected=1;
+      if(step_samples_){
+        double total=0;for(int i=0;i<step_samples_;i++)total+=recent_step_ms_[i];
+        const double average=total/step_samples_;
+        if(average>0)selected=std::clamp(static_cast<int>(target_ms_/average),1,substeps_);
+      }
+    }
+    if(nodus_tensor_read(input,0,&dt,sizeof(dt))!=sizeof(dt)||!std::isfinite(dt)||dt<=0||
+       dt/static_cast<double>(selected)>max_dt_)return false;
     if(frozen_)
       return nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))==
         kBatch*static_cast<int64_t>(sizeof(double));
-    std::fill(columns_[4].begin(),columns_[4].end(),dt);
-    std::fill(columns_[1].begin(),columns_[1].end(),0);
-    std::fill(columns_[2].begin(),columns_[2].end(),tabletop_y_);
-    std::copy(positions_.begin(),positions_.end(),columns_[17].begin());
-    std::copy(velocities_.begin(),velocities_.end(),columns_[23].begin());
-    if(tabletop_enabled_)for(int node=0;node<kNodeSlots;node++){
-      const int lane=node*kAxes;
-      if(positions_[lane]>=table_min_x_&&positions_[lane]<=table_max_x_&&
-         positions_[lane+2]>=table_min_z_&&positions_[lane+2]<=table_max_z_)
-        columns_[1][lane+1]=1;
+    std::vector<double> work_positions=positions_,work_velocities=velocities_;
+    const double slice_dt=dt/static_cast<double>(selected);
+    for(int step=0;step<selected;step++){
+      std::fill(columns_[4].begin(),columns_[4].end(),slice_dt);
+      std::fill(columns_[1].begin(),columns_[1].end(),0);
+      std::fill(columns_[2].begin(),columns_[2].end(),0);
+      std::copy(work_positions.begin(),work_positions.end(),columns_[17].begin());
+      std::copy(work_velocities.begin(),work_velocities.end(),columns_[23].begin());
+      if(floor_enabled_||tabletop_enabled_)for(int node=0;node<kNodeSlots;node++){
+        const int lane=node*kAxes;
+        if(floor_enabled_){
+          columns_[1][lane+1]=1;
+          columns_[2][lane+1]=floor_y_;
+        }
+        if(tabletop_enabled_&&work_positions[lane]>=table_min_x_&&work_positions[lane]<=table_max_x_&&
+           work_positions[lane+2]>=table_min_z_&&work_positions[lane+2]<=table_max_z_){
+          columns_[1][lane+1]=1;
+          columns_[2][lane+1]=tabletop_y_;
+        }
+      }
+      for(int node=0;node<kNodeSlots;node++)for(int edge=0;edge<4;edge++){
+        const int other=neighbors_[node][edge];
+        for(int axis=0;axis<kAxes;axis++)
+          columns_[11+edge][node*kAxes+axis]=columns_[5+edge][node*kAxes+axis]?work_positions[other*kAxes+axis]:0;
+      }
+      std::array<void*,26> buffers{};
+      for(int i=0;i<26;i++)buffers[i]=columns_[i].data();
+      if(gpu_){
+        uint32_t count=kBatch;
+        std::vector<nodus::kernels::VulkanBackendBinding> bindings;
+        bindings.reserve(27);
+        for(int i=0;i<26;i++){
+          if(i<24&&!gpu_vtable_->copy_to_backend(gpu_buffers_[i],0,columns_[i].data(),kBatch*sizeof(double)))return false;
+          bindings.push_back({gpu_buffers_[i],0,kBatch*sizeof(double)});
+        }
+        if(!gpu_vtable_->copy_to_backend(gpu_buffers_[26],0,&count,sizeof(count)))return false;
+        bindings.push_back({gpu_buffers_[26],0,sizeof(count)});
+        std::string error;
+        const auto dispatch_start=std::chrono::steady_clock::now();
+        // A submitted job may have executed before a failure is reported.
+        // Keep the old row state and refuse the tick; never replay it on CPU.
+        if(!nodus::kernels::dispatch_spirv_backends(spirv_,"main",bindings,(kBatch+63)/64,&error)){
+          std::fprintf(stderr,"[spring] Vulkan substep failed without CPU replay: %s\n",error.c_str());
+          return false;
+        }
+        const double elapsed=std::chrono::duration<double,std::milli>(
+          std::chrono::steady_clock::now()-dispatch_start).count();
+        recent_step_ms_[step_window_next_]=elapsed;
+        step_window_next_=(step_window_next_+1)%static_cast<int>(recent_step_ms_.size());
+        step_samples_=std::min(step_samples_+1,static_cast<int>(recent_step_ms_.size()));
+        for(int i=24;i<26;i++)
+          if(!gpu_vtable_->copy_from_backend(gpu_buffers_[i],0,columns_[i].data(),kBatch*sizeof(double)))return false;
+      }else{
+        if(reset_)reset_();entry_(buffers.data(),nullptr);
+        if(take_&&take_()!=0)return false;
+      }
+      for(int i=0;i<kBatch;i++)if(!std::isfinite(columns_[24][i])||!std::isfinite(columns_[25][i]))return false;
+      std::copy(columns_[24].begin(),columns_[24].end(),work_positions.begin());
+      std::copy(columns_[25].begin(),columns_[25].end(),work_velocities.begin());
     }
-    for(int node=0;node<kNodeSlots;node++)for(int edge=0;edge<4;edge++){
-      const int other=neighbors_[node][edge];
-      for(int axis=0;axis<kAxes;axis++)
-        columns_[11+edge][node*kAxes+axis]=columns_[5+edge][node*kAxes+axis]?positions_[other*kAxes+axis]:0;
-    }
-    std::array<void*,26> buffers{};
-    for(int i=0;i<26;i++)buffers[i]=columns_[i].data();
-    if(reset_)reset_();entry_(buffers.data(),nullptr);
-    if(take_&&take_()!=0)return false;
-    for(int i=0;i<kBatch;i++)if(!std::isfinite(columns_[24][i])||!std::isfinite(columns_[25][i]))return false;
     if(nodus_tensor_write(output,0,columns_[24].data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
-    std::copy(columns_[24].begin(),columns_[24].end(),positions_.begin());
-    std::copy(columns_[25].begin(),columns_[25].end(),velocities_.begin());
+    positions_.swap(work_positions);
+    velocities_.swap(work_velocities);
     return true;
   }
   bool control(uint64_t input,uint64_t output){
     double command[2]{};
-    if(nodus_tensor_read(input,0,command,sizeof(command))!=sizeof(command)||
-       command[0]!=1||(command[1]!=0&&command[1]!=1))return false;
+    if(nodus_tensor_read(input,0,command,sizeof(command))!=sizeof(command))return false;
+    if(command[0]==3){
+      if(!std::isfinite(command[1])||command[1]<1||command[1]>128||
+         command[1]!=std::floor(command[1]))return false;
+      if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=
+         kBatch*static_cast<int64_t>(sizeof(double)))return false;
+      substeps_=static_cast<int>(command[1]);
+      return true;
+    }
+    if(command[0]==4){
+      if(!std::isfinite(command[1])||command[1]<0||command[1]>8)return false;
+      if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=
+         kBatch*static_cast<int64_t>(sizeof(double)))return false;
+      target_ms_=command[1];step_samples_=0;step_window_next_=0;
+      return true;
+    }
+    if(command[0]==5){
+      if(!std::isfinite(command[1]))return false;
+      if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=
+         kBatch*static_cast<int64_t>(sizeof(double)))return false;
+      floor_y_=command[1];floor_enabled_=true;
+      return true;
+    }
+    if(command[0]!=1||(command[1]!=0&&command[1]!=1))return false;
     if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=
        kBatch*static_cast<int64_t>(sizeof(double)))return false;
     frozen_=command[1]==1;
@@ -246,15 +351,26 @@ private:
       }
     }
   }
+  void close_gpu(){
+    for(auto& buffer:gpu_buffers_)if(buffer){gp_mem_backend_release(buffer);buffer=nullptr;}
+    if(gpu_context_){gp_mem_backend_release(gpu_context_);gpu_context_=nullptr;}
+    gpu_vtable_=nullptr;gpu_=false;
+  }
   HMODULE module_=nullptr;
   Entry entry_=nullptr;void(*reset_)()=nullptr;uint32_t(*take_)()=nullptr;
-  bool ready_=false,frozen_=false;double max_dt_=0;
+  bool gpu_=false;std::vector<uint32_t> spirv_{};
+  gp_mem_backend_handle_t gpu_context_=nullptr;
+  const gp_mem_backend_vtable_t* gpu_vtable_=nullptr;
+  std::array<gp_mem_backend_handle_t,27> gpu_buffers_{};
+  bool ready_=false,frozen_=false;double max_dt_=0;int substeps_=1;
+  double target_ms_=0;std::array<double,8> recent_step_ms_{};
+  int step_samples_=0,step_window_next_=0;
   std::array<std::vector<double>,26> columns_{};
   std::vector<double> positions_,velocities_;
   std::vector<std::array<int,4>> neighbors_;
   std::array<uint64_t,kNetworks> fabric_ids_{};uint64_t frame_=0;
   bool winsock_=false;SOCKET socket_=INVALID_SOCKET;
-  bool tabletop_enabled_=false;
+  bool tabletop_enabled_=false,floor_enabled_=false;double floor_y_=0;
   double tabletop_y_=0,table_min_x_=0,table_max_x_=0,table_min_z_=0,table_max_z_=0;
   sockaddr_storage destination_{};int destination_bytes_=0;
 };

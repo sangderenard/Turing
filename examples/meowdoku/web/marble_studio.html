@@ -220,6 +220,9 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <label>Default backdrop material<select id="backdrop-material"><option value="calibration">Calibration (colour chart)</option></select></label>
     <label class="wide"><input id="backdrop-sweep" type="checkbox"> Sweep backdrop onto floor or table top (cyclorama)</label>
     <div id="backdrop-layer-controls" class="wide"></div>
+    <div class="wide"><label>Fabric compute<select id="fabric-compute-backend"><option value="cpu">Native CPU</option><option value="vulkan">Vulkan GPU (isolated row experiment)</option></select></label>
+      <label>Maximum substeps per row tick<input id="fabric-substeps" type="number" min="1" max="128" step="1" value="1"></label>
+      <label>GPU dispatch window target (ms, 0 = manual)<input id="fabric-gpu-target-ms" type="number" min="0" max="8" step="0.1" value="0"></label></div>
     <div class="wide"><button type="button" id="fabric-motion-start">Relax fabric in Nodus</button>
       <button type="button" id="fabric-motion-pause" disabled>Pause fabric</button>
       <button type="button" id="fabric-motion-stop" disabled>Stop fabric</button>

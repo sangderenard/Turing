@@ -48,7 +48,7 @@ class FabricMotion:
             raise FabricMotionError("only the selected sheet may occupy row nodes")
         for node in range(side*side):
             base = node*FIELDS
-            if (data[base+7] not in (0, 1) or not 0 <= data[base+12] <= 1000 or
+            if (data[base+7] not in (0, 1, 2) or not 0 <= data[base+12] <= 1000 or
                     not 0 <= data[base+13] <= 10 or
                     any(abs(data[base+axis]) > 64 for axis in range(3))):
                 raise FabricMotionError("fabric node exceeds the Studio row limits")
@@ -66,8 +66,23 @@ class FabricMotion:
             raise FabricMotionError("fabric session not found")
         return session
 
-    def start(self, owner, data, side):
+    def start(self, owner, data, side, *, backend="cpu", substeps=1, gpu_target_ms=0,
+              floor_y=None, table_contact=None):
         data = self._validate(data, side)
+        if backend not in ("cpu", "vulkan"):
+            raise FabricMotionError("fabric backend must be cpu or vulkan")
+        if type(substeps) is not int or not 1 <= substeps <= 128:
+            raise FabricMotionError("fabric substeps must be an integer from 1 to 128")
+        if not isinstance(gpu_target_ms, (float, int)) or not math.isfinite(gpu_target_ms) or not 0 <= gpu_target_ms <= 8:
+            raise FabricMotionError("GPU target must be 0–8 ms")
+        if floor_y is not None and (not isinstance(floor_y, (float, int)) or
+                                    not math.isfinite(floor_y) or not -64 <= floor_y <= 64):
+            raise FabricMotionError("floor contact must be a finite Studio height")
+        if table_contact is not None and (not isinstance(table_contact, list) or
+            len(table_contact) != 6 or table_contact[0] != 2 or
+            not all(isinstance(v, (float, int)) and math.isfinite(v) for v in table_contact) or
+            not (table_contact[2] < table_contact[3] and table_contact[4] < table_contact[5])):
+            raise FabricMotionError("invalid stage table contact")
         with self.lock:
             for token, session in list(self.sessions.items()):
                 if session["process"].poll() is not None or time.monotonic()-session["last_seen"]>600:
@@ -88,6 +103,7 @@ class FabricMotion:
             path = self.state_dir / (token + ".bin")
             path.write_bytes(struct.pack("<" + "d"*COUNT, *data))
             env = os.environ.copy()
+            env["NODUS_FABRIC_BACKEND"] = backend
             env["PATH"] = str(self.core_dir) + os.pathsep + env.get("PATH", "")
             try:
                 process = subprocess.Popen([str(self.host), str(self.plugin), str(path),
@@ -98,10 +114,26 @@ class FabricMotion:
             except OSError:
                 path.unlink(missing_ok=True)
                 raise FabricMotionError("native fabric host could not start") from None
+            try:
+                commands = f"substeps {substeps}\ntarget {gpu_target_ms}\n"
+                if floor_y is not None:
+                    commands += f"floor {floor_y}\n"
+                if table_contact is not None:
+                    commands += "table " + " ".join(map(str, table_contact[1:])) + "\n"
+                process.stdin.write(commands.encode())
+                process.stdin.flush()
+            except OSError:
+                process.terminate()
+                process.wait(timeout=1)
+                path.unlink(missing_ok=True)
+                raise FabricMotionError("native fabric host rejected settings") from None
             self.sessions[token] = {"owner": owner, "identity": identity, "process": process,
                                     "path": path, "side": side, "frozen": False,
+                                    "backend": backend, "substeps": substeps,
+                                    "gpu_target_ms": gpu_target_ms,
                                     "last_seen": time.monotonic()}
-            return {"token": token, "identity": identity, "side": side, "running": True}
+            return {"token": token, "identity": identity, "side": side, "running": True,
+                    "backend": backend, "substeps": substeps, "gpuTargetMs": gpu_target_ms}
 
     def state(self, owner, token):
         with self.lock:
@@ -116,6 +148,8 @@ class FabricMotion:
                 else:
                     frame["positions"] = [positions[node] for node in range(session["side"]**2)]
             return {"running": process.poll() is None, "frozen": session["frozen"],
+                    "backend": session["backend"], "substeps": session["substeps"],
+                    "gpuTargetMs": session["gpu_target_ms"],
                     "identity": session["identity"], "side": session["side"], "frame": frame}
 
     def command(self, owner, token, action):

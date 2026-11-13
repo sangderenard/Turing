@@ -101,6 +101,38 @@ int main(int argc,char** argv){
   okay=okay&&invoke(tool,table,output)&&std::abs(output[4]-.8)<1e-12;
   okay=okay&&invoke(tool,dt,output)&&std::abs(output[4]-.75)<1e-12;
   okay=okay&&receive(5,.75f,0);
+  // One row call with two hot substeps must equal two one-step calls from
+  // the same configured initial state, including neighbor and contact reads.
+  ITool* reference=create();reference->initialize(ToolInitContext{});
+  std::vector<double> expected,actual;
+  okay=okay&&invoke(tool,config,actual)&&invoke(reference,config,expected);
+  okay=okay&&invoke(tool,table,actual)&&invoke(reference,table,expected);
+  command[0]=3;command[1]=2;
+  okay=okay&&nodus_tensor_write(control,0,command,sizeof(command))==sizeof(command);
+  okay=okay&&invoke(tool,control,actual);
+  seconds=.1;
+  okay=okay&&nodus_tensor_write(dt,0,&seconds,sizeof(seconds))==sizeof(seconds);
+  okay=okay&&invoke(tool,dt,actual);
+  seconds=.05;
+  okay=okay&&nodus_tensor_write(dt,0,&seconds,sizeof(seconds))==sizeof(seconds);
+  okay=okay&&invoke(reference,dt,expected)&&invoke(reference,dt,expected);
+  if(okay)for(size_t i=0;i<actual.size();i++)
+    if(std::abs(actual[i]-expected[i])>1e-11){okay=false;break;}
+  command[0]=4;command[1]=2;
+  okay=okay&&nodus_tensor_write(control,0,command,sizeof(command))==sizeof(command);
+  okay=okay&&invoke(tool,control,actual)&&invoke(tool,dt,actual);
+  cell(1,0)=.5;cell(1,7)=2;cell(1,8)=.5;cell(1,9)=1;
+  okay=okay&&nodus_tensor_write(config,0,data.data(),data.size()*sizeof(double))==
+    static_cast<int64_t>(data.size()*sizeof(double));
+  okay=okay&&invoke(tool,config,actual);
+  seconds=.1;
+  okay=okay&&nodus_tensor_write(dt,0,&seconds,sizeof(seconds))==sizeof(seconds);
+  const bool ring_step=invoke(tool,dt,actual);
+  std::cerr<<"ring_step="<<ring_step<<" x="<<(actual.size()>5?actual[3]:-999)
+           <<" y="<<(actual.size()>5?actual[4]:-999)<<" z="<<(actual.size()>5?actual[5]:-999)<<"\n";
+  okay=okay&&ring_step&&actual[3]>.5&&
+    std::abs(actual[4]-1)<1e-12&&std::abs(actual[5])<1e-12;
+  reference->shutdown();destroy(reference);
   tool->shutdown();destroy(tool);FreeLibrary(module);
   nodus_tensor_destroy(config);nodus_tensor_destroy(dt);nodus_tensor_destroy(control);nodus_tensor_destroy(table);
   closesocket(receiver);WSACleanup();

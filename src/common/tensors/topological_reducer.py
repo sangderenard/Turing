@@ -8028,6 +8028,29 @@ def _normalize_lexical_values(
     #: a rebound name is carried.
     loop_field_entry_values: list[dict[tuple[int, str], tuple[str, int]]] = []
 
+    def loop_may_change_field(name: Any, attr: str, receiver: int) -> bool:
+        """Whether an open loop may rebind ``name.attr`` on a later iteration.
+
+        Program: YoungMan ``_build_triangle_map`` reads ``dtype=self.precision``
+        inside ``for bitmask in range(2 ** n)``.  The read-site stamps refused
+        every read in any loop, so the in-loop read had no field-state record.
+        Rule: a loop changes the field for a later iteration only when its body
+        assigns ``name.attr`` (``loop_body_field_writes``) or holds a call that
+        may store into the receiver (``loop_body_storing_receivers``); a read
+        with no Name receiver inside a loop is assumed changed.
+        """
+
+        if not loop_body_field_writes and not loop_body_storing_receivers:
+            return False
+        if not isinstance(name, str):
+            return True
+        return any(
+            (name, str(attr)) in writes for writes in loop_body_field_writes
+        ) or any(
+            name in names or int(receiver) in values
+            for names, values in loop_body_storing_receivers
+        )
+
     def concord_carried_field_read(
         expression: ast.Attribute, receiver: int, attribute_id: int,
     ) -> None:
@@ -12349,11 +12372,13 @@ def _normalize_lexical_values(
                     and not stable_method_lookup
                     and id(expression) not in method_lookup_ids
                     and int(receiver) not in storing_call_values
-                    and not loop_field_entry_values
-                    and not loop_body_storing_receivers
+                    and not loop_may_change_field(
+                        expression.value.id, expression.attr, int(receiver),
+                    )
                 ):
                     # The field's value on entry to this function: no write,
-                    # no storing call and no loop precede the read, so a copy
+                    # no storing call and no loop that may change it precede
+                    # or enclose the read, so a copy
                     # keyed on the caller's literal for this field (planner
                     # receiver-field specialization) reads that literal.
                     graph.G.nodes[attribute_id].setdefault(
@@ -12405,14 +12430,44 @@ def _normalize_lexical_values(
                         )
                         and not call_stored_field
                         and int(receiver) not in storing_call_values
-                        and not loop_field_entry_values
-                        and not loop_body_storing_receivers
+                        and not loop_may_change_field(
+                            getattr(expression.value, "id", None),
+                            expression.attr, int(receiver),
+                        )
                     ):
                         graph.G.nodes[attribute_id].setdefault(
                             "attributes", {},
                         )["observed_field_state_cell"] = field_state_cursor[
                             (int(receiver), str(expression.attr))
                         ]
+                # Program: YoungMan ``_build_triangle_map`` reads
+                # ``dtype=self.precision`` before its bitmask loop and again
+                # inside it.  Wrong record: only the first read posts its
+                # OBSERVED revision; the in-loop read (region value 56) named
+                # no field state, so the single-write literal posted at that
+                # revision never reached it and its dtype was unsettled.  Rule:
+                # a read whose cursor is an OBSERVED cell reads that same value
+                # (no write since) when no resolved call may store into the
+                # receiver and no open loop may change the field; it names the
+                # cell, and the fold reads the observing read's value.
+                if (
+                    isinstance(current_state, _FieldState)
+                    and current_state.kind is _FieldStateKind.OBSERVED
+                    and _cell_node_id(current_state.value) != int(attribute_id)
+                    and not call_stored_field
+                    and not stable_method_lookup
+                    and id(expression) not in method_lookup_ids
+                    and int(receiver) not in storing_call_values
+                    and not loop_may_change_field(
+                        getattr(expression.value, "id", None),
+                        expression.attr, int(receiver),
+                    )
+                ):
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {},
+                    )["observed_field_state_cell"] = field_state_cursor[
+                        (int(receiver), str(expression.attr))
+                    ]
                 _replace_inputs(
                     graph,
                     attribute_id,
@@ -29460,6 +29515,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if getattr(entry, "graph", None) is not None
         }
 
+        entries_by_scope = {
+            tuple(entry.graph.G.graph.get("authored_function_identity") or ()): entry
+            for entry in entries.values()
+        }
         changed = False
         formal_evidence: dict[
             tuple[str, int], dict[str, Any]
@@ -29601,6 +29660,34 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 callee_ref = call_attributes.get(
                     "callee_ref", call_attributes.get("method_ref")
                 )
+                # Program: ``Holder(geometry="tetrahedron", ...)`` whose
+                # ``__init__`` passes ``geometry`` on to ``self._load`` ->
+                # ``_configure`` -> ``configure_geometry``.  Wrong record: a class
+                # Call carries only ``class_ref`` here, so no reachability or
+                # actual/formal binding reached ``__init__``; its formals had no
+                # class, none flowed on, and ``configure_geometry``'s specialized
+                # ``self.geometry = geometry`` constant refused as a host scalar
+                # with missing_source_value_class.  Rule: a class Call runs the
+                # ``__init__`` that ``constructor_initializer`` proves (value class
+                # ``source class construction``, the class's ``__init__`` and no
+                # ``__new__``, the callee Name operand, the published address); its
+                # arguments bind ``__init__``'s formals after ``self`` exactly as a
+                # method call's do.  ``self`` itself is the constructed value
+                # (post_constructor_receiver_aliases).
+                constructed = False
+                constructor_cells: tuple = ()
+                if callee_ref is None and call_attributes.get("class_ref") is not None:
+                    from ...compiler.source_constructor_field_demand import (
+                        constructor_initializer,
+                    )
+                    initializer = constructor_initializer(
+                        caller_entry.graph, caller_scope, int(call_id),
+                        entries_by_scope, book=current_identity_book(),
+                    )
+                    if initializer is not None:
+                        callee_ref = int(initializer[0].reference.address)
+                        constructor_cells = tuple(initializer[2])
+                        constructed = True
                 if callee_ref is None or int(callee_ref) not in entries:
                     continue
                 callee_entry = entries[int(callee_ref)]
@@ -29638,6 +29725,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                                 _FUNCTION_ADDRESS,
                                 (function_address_identity(callee_entry),),
                             ),
+                            *constructor_cells,
                         )
                         if cell is not None
                     )
@@ -29650,461 +29738,465 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if not callee.graph.get("source_pursuit_active"):
                     callee.graph["source_pursuit_active"] = True
                     changed = True
-                output_histories = dict(
-                    callee.graph.get("identity_table") or {}
-                )
-                returned_value_ids = tuple(
-                    int(history[-1])
-                    for output_name in tuple(
+                # A class Call's value is the constructed instance, not what
+                # ``__init__`` returns: no call-result class, tuple member or
+                # record view is read from the initializer's outputs.
+                if not constructed:
+                    output_histories = dict(
+                        callee.graph.get("identity_table") or {}
+                    )
+                    returned_value_ids = tuple(
+                        int(history[-1])
+                        for output_name in tuple(
+                            callee.graph.get("function_outputs") or ()
+                        )
+                        for history in (tuple(
+                            output_histories.get(str(output_name)) or ()
+                        ),)
+                        if history and int(history[-1]) in callee
+                    )
+                    # Program: the AbstractTensor YoungMan's ``_load_map``
+                    # (claude/youngman-resident young_man_algorithm.py:561):
+                    # ``if os.path.exists(p): with open(p, 'rb') as f: return
+                    # AbstractTensor.tensor(pickle.load(f)).to(...)`` then
+                    # ``return None``.  Wrong record: the positional slot
+                    # ``result_0`` has history (22, 23) -- one value per return
+                    # site, alternatives, not versions (see
+                    # ``positional_output_names``) -- and this pass read
+                    # ``history[-1]``, the ``return None`` constant, as THE
+                    # returned value.  ``self._load_map(...)`` in
+                    # ``_load_geometry_maps`` was concorded ``builtins.NoneType``,
+                    # ``maps[map_name] = loaded_map`` stored a None-classed value,
+                    # and the planner refused ``maps = {}`` ("region value 6
+                    # (Dict ...) has no settled dtype").  Rule: a one-output
+                    # call's class is decided over EVERY return site's exact
+                    # value (``return_slot_values``): each site must carry a class
+                    # and all must agree, or the call gets no class here.
+                    site_slot_values = tuple(
+                        tuple(values)
+                        for values in (
+                            callee.graph.get("return_slot_values") or {}
+                        ).values()
+                        if isinstance(values, (tuple, list))
+                    )
+                    class_value_ids: tuple = returned_value_ids
+                    if site_slot_values and len(tuple(
                         callee.graph.get("function_outputs") or ()
-                    )
-                    for history in (tuple(
-                        output_histories.get(str(output_name)) or ()
-                    ),)
-                    if history and int(history[-1]) in callee
-                )
-                # Program: the AbstractTensor YoungMan's ``_load_map``
-                # (claude/youngman-resident young_man_algorithm.py:561):
-                # ``if os.path.exists(p): with open(p, 'rb') as f: return
-                # AbstractTensor.tensor(pickle.load(f)).to(...)`` then
-                # ``return None``.  Wrong record: the positional slot
-                # ``result_0`` has history (22, 23) -- one value per return
-                # site, alternatives, not versions (see
-                # ``positional_output_names``) -- and this pass read
-                # ``history[-1]``, the ``return None`` constant, as THE
-                # returned value.  ``self._load_map(...)`` in
-                # ``_load_geometry_maps`` was concorded ``builtins.NoneType``,
-                # ``maps[map_name] = loaded_map`` stored a None-classed value,
-                # and the planner refused ``maps = {}`` ("region value 6
-                # (Dict ...) has no settled dtype").  Rule: a one-output
-                # call's class is decided over EVERY return site's exact
-                # value (``return_slot_values``): each site must carry a class
-                # and all must agree, or the call gets no class here.
-                site_slot_values = tuple(
-                    tuple(values)
-                    for values in (
-                        callee.graph.get("return_slot_values") or {}
-                    ).values()
-                    if isinstance(values, (tuple, list))
-                )
-                class_value_ids: tuple = returned_value_ids
-                if site_slot_values and len(tuple(
-                    callee.graph.get("function_outputs") or ()
-                )) == 1:
-                    class_value_ids = tuple(dict.fromkeys(
-                        int(values[0])
-                        if len(values) == 1 and values[0] is not None
-                        and int(values[0]) in callee else None
-                        for values in site_slot_values
-                    ))
-                for value_id in class_value_ids:
-                    if value_id is not None:
+                    )) == 1:
+                        class_value_ids = tuple(dict.fromkeys(
+                            int(values[0])
+                            if len(values) == 1 and values[0] is not None
+                            and int(values[0]) in callee else None
+                            for values in site_slot_values
+                        ))
+                    for value_id in class_value_ids:
+                        if value_id is not None:
+                            _concord_aggregate_merge_class(callee, value_id)
+                    for value_id in returned_value_ids:
                         _concord_aggregate_merge_class(callee, value_id)
-                for value_id in returned_value_ids:
-                    _concord_aggregate_merge_class(callee, value_id)
-                site_facts = tuple(
-                    _resolved_source_value_class(callee, value_id)
-                    if value_id is not None else (None, 1)
-                    for value_id in class_value_ids
-                )
-                if class_value_ids is returned_value_ids:
-                    returned_facts = tuple(dict.fromkeys(
-                        fact for fact in site_facts if fact[0] is not None
-                    ))
-                elif all(fact[0] is not None for fact in site_facts):
-                    returned_facts = tuple(dict.fromkeys(site_facts))
-                else:
-                    returned_facts = ()
-                # Program: ``def compact(n) -> tuple[list[int], bool]:
-                # ... return out, len(out) > 2`` then ``t, big =
-                # compact(n)`` (A6 probe c984).  Wrong record: the call
-                # result took the class of the one member that had a class
-                # fact (``out``: list), so the tuple result was concorded
-                # as a list and its contract became a list/tuple union.
-                # Rule: a call result is a returned member's class only
-                # when the callee returns ONE value; several outputs are
-                # one tuple, never any member.
-                if len(returned_facts) == 1 and len(returned_value_ids) == 1:
-                    returned_class, returned_limbs = returned_facts[0]
-                    result_book = current_identity_book()
-                    result_page = result_book.page(
-                        _SOURCE_CALL_RESULT_IDENTITY
+                    site_facts = tuple(
+                        _resolved_source_value_class(callee, value_id)
+                        if value_id is not None else (None, 1)
+                        for value_id in class_value_ids
                     )
-                    result_row = (caller_scope, int(call_id))
-                    callee_identity = tuple(
-                        callee.graph.get("authored_function_identity") or ()
-                    )
-                    equivalent_entries = tuple(
-                        entry
-                        for entry in function_table
-                        if entry.graph is not None
-                        and tuple(entry.graph.G.graph.get(
-                            "authored_function_identity"
-                        ) or ()) == callee_identity
-                    )
-                    canonical_entry = min(
-                        equivalent_entries,
-                        key=lambda entry: int(entry.reference.address),
-                    ) if equivalent_entries else callee_entry
-                    result_fact = (
-                        int(canonical_entry.reference.address),
-                        str(returned_class),
-                        int(returned_limbs),
-                    )
-                    incumbent_result = result_page.latest(result_row)
-                    if incumbent_result is not None and tuple(
-                        incumbent_result
-                    ) != result_fact:
-                        raise ValueError(
-                            "source call result identity concordance "
-                            f"disagreement for {result_row!r}: "
-                            f"recorded={incumbent_result!r}, "
-                            f"proposed={result_fact!r}"
+                    if class_value_ids is returned_value_ids:
+                        returned_facts = tuple(dict.fromkeys(
+                            fact for fact in site_facts if fact[0] is not None
+                        ))
+                    elif all(fact[0] is not None for fact in site_facts):
+                        returned_facts = tuple(dict.fromkeys(site_facts))
+                    else:
+                        returned_facts = ()
+                    # Program: ``def compact(n) -> tuple[list[int], bool]:
+                    # ... return out, len(out) > 2`` then ``t, big =
+                    # compact(n)`` (A6 probe c984).  Wrong record: the call
+                    # result took the class of the one member that had a class
+                    # fact (``out``: list), so the tuple result was concorded
+                    # as a list and its contract became a list/tuple union.
+                    # Rule: a call result is a returned member's class only
+                    # when the callee returns ONE value; several outputs are
+                    # one tuple, never any member.
+                    if len(returned_facts) == 1 and len(returned_value_ids) == 1:
+                        returned_class, returned_limbs = returned_facts[0]
+                        result_book = current_identity_book()
+                        result_page = result_book.page(
+                            _SOURCE_CALL_RESULT_IDENTITY
                         )
-                    result_sources = tuple(dict.fromkeys(
-                        cell for cell in (
-                            node_identity_cell(
-                                caller_entry.graph, int(call_id)
-                            ),
-                            result_book.latest_ref(
-                                _FUNCTION_ADDRESS,
-                                (function_address_identity(canonical_entry),),
-                            ),
-                            *(
+                        result_row = (caller_scope, int(call_id))
+                        callee_identity = tuple(
+                            callee.graph.get("authored_function_identity") or ()
+                        )
+                        equivalent_entries = tuple(
+                            entry
+                            for entry in function_table
+                            if entry.graph is not None
+                            and tuple(entry.graph.G.graph.get(
+                                "authored_function_identity"
+                            ) or ()) == callee_identity
+                        )
+                        canonical_entry = min(
+                            equivalent_entries,
+                            key=lambda entry: int(entry.reference.address),
+                        ) if equivalent_entries else callee_entry
+                        result_fact = (
+                            int(canonical_entry.reference.address),
+                            str(returned_class),
+                            int(returned_limbs),
+                        )
+                        incumbent_result = result_page.latest(result_row)
+                        if incumbent_result is not None and tuple(
+                            incumbent_result
+                        ) != result_fact:
+                            raise ValueError(
+                                "source call result identity concordance "
+                                f"disagreement for {result_row!r}: "
+                                f"recorded={incumbent_result!r}, "
+                                f"proposed={result_fact!r}"
+                            )
+                        result_sources = tuple(dict.fromkeys(
+                            cell for cell in (
+                                node_identity_cell(
+                                    caller_entry.graph, int(call_id)
+                                ),
                                 result_book.latest_ref(
-                                    _SOURCE_VALUE_CLASS,
-                                    (_source_numeric_scope(callee), value_id),
-                                )
-                                # Every return site's class cell decided it.
-                                for value_id in class_value_ids
-                                if value_id is not None
-                            ),
-                        )
-                        if cell is not None
-                    ))
-                    result_book.post(
-                        _SOURCE_CALL_RESULT_IDENTITY,
-                        result_row,
-                        result_fact,
-                        stage=_REDUCTION,
-                        provenance=_Derived(result_sources),
-                        mode=_Mode.CONCORD,
-                    )
-                    call_result_attributes = caller.nodes[
-                        int(call_id)
-                    ].setdefault("attributes", {})
-                    prior_result = (
-                        call_result_attributes.get("result_class_ref"),
-                        int(call_result_attributes.get(
-                            "precision_limbs"
-                        ) or 1),
-                    )
-                    _concord_source_value_class(
-                        caller_scope,
-                        int(call_id),
-                        str(returned_class),
-                        precision_limbs=int(returned_limbs),
-                        source=f"call result {callee_scope}",
-                        provenance=_Derived((
-                            result_book.latest_ref(
-                                _SOURCE_CALL_RESULT_IDENTITY, result_row,
-                            ),
-                        )),
-                    )
-                    call_result_attributes.update({
-                        "result_class_ref": str(returned_class),
-                        "precision_limbs": int(returned_limbs),
-                        "numeric_identity_source": (
-                            f"call result {callee_scope}"
-                        ),
-                    })
-                    returned_descriptor = numeric_feature_descriptor(
-                        str(returned_class) + (
-                            f"[{int(returned_limbs)}]"
-                            if int(returned_limbs) > 1 else ""
-                        )
-                    )
-                    if returned_descriptor is not None:
-                        call_result_attributes[
-                            "numeric_feature_descriptor"
-                        ] = returned_descriptor.receipt()
-                    changed = changed or prior_result != (
-                        str(returned_class), int(returned_limbs),
-                    )
-                # The authored IfExp in key_of(flag) returns a tuple of two
-                # or three members. Root's call result inherits that closed
-                # source domain only through this exact callee output value,
-                # reached call and result-identity cell. The domain is not a
-                # native union layout and cannot be used as one.
-                if (len(returned_value_ids) == 1 and len(tuple(
-                    callee.graph.get("function_outputs") or ()
-                )) == 1):
-                    from ...compiler.concordance_declarations import (
-                        SOURCE_CALL_CLOSED_TUPLE_LENGTHS,
-                        SOURCE_CLOSED_AGGREGATE_LENGTHS,
-                    )
-                    domain_book = current_identity_book()
-                    returned_id = int(returned_value_ids[0])
-                    aggregate_scope = callee.graph.get(
-                        "source_aggregate_layout_scope"
-                    )
-                    domain_cell = domain_book.latest_ref(
-                        SOURCE_CLOSED_AGGREGATE_LENGTHS,
-                        (aggregate_scope, returned_id),
-                    )
-                    output_cell = domain_book.latest_ref(
-                        _SEMANTIC_OUTPUT, (aggregate_scope, 0),
-                    )
-                    returned_cell = node_identity_cell(
-                        callee_entry.graph, returned_id,
-                    )
-                    reach_cell = domain_book.latest_ref(
-                        _SOURCE_FUNCTION_REACHABILITY, reachability_row,
-                    )
-                    result_cell = domain_book.latest_ref(
-                        _SOURCE_CALL_RESULT_IDENTITY,
-                        (caller_scope, int(call_id)),
-                    )
-                    output_fact = (
-                        None if output_cell is None else
-                        domain_book.page(_SEMANTIC_OUTPUT).cell(
-                            output_cell.row, output_cell.column,
-                        )
-                    )
-                    if (output_fact == (
-                        str(callee.graph["function_outputs"][0]),
-                        returned_id,
-                    ) and all(isinstance(cell, _Ref) for cell in (
-                        output_cell, domain_cell, returned_cell,
-                        reach_cell, result_cell,
-                    ))):
-                        domain_book.post(
-                            SOURCE_CALL_CLOSED_TUPLE_LENGTHS,
-                            (caller_scope, int(call_id), callee_scope,
-                             returned_id),
-                            (output_cell, returned_cell, domain_cell, reach_cell,
-                             result_cell),
+                                    _FUNCTION_ADDRESS,
+                                    (function_address_identity(canonical_entry),),
+                                ),
+                                *(
+                                    result_book.latest_ref(
+                                        _SOURCE_VALUE_CLASS,
+                                        (_source_numeric_scope(callee), value_id),
+                                    )
+                                    # Every return site's class cell decided it.
+                                    for value_id in class_value_ids
+                                    if value_id is not None
+                                ),
+                            )
+                            if cell is not None
+                        ))
+                        result_book.post(
+                            _SOURCE_CALL_RESULT_IDENTITY,
+                            result_row,
+                            result_fact,
                             stage=_REDUCTION,
-                            provenance=_Derived((
-                                output_cell, returned_cell, domain_cell, reach_cell,
-                                result_cell,
-                            )),
+                            provenance=_Derived(result_sources),
                             mode=_Mode.CONCORD,
                         )
-                # choose(flag)'s IfExp has exact A/B source classes and no
-                # single SOURCE_VALUE_CLASS. Carry that closed semantic view
-                # to root's Call only when SEMANTIC_OUTPUT names the same
-                # returned value and the call has one reached callee. This
-                # does not mint a native tagged representation.
-                if len(tuple(callee.graph.get("function_outputs") or ())) == 1:
-                    from ...compiler.concordance_declarations import (
-                        SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
-                        SOURCE_CLOSED_CLASS_ALTERNATIVES,
-                    )
-                    class_book = current_identity_book()
-                    output_scope = callee.graph.get(
-                        "source_aggregate_layout_scope"
-                    )
-                    output_cell = class_book.latest_ref(
-                        _SEMANTIC_OUTPUT, (output_scope, 0),
-                    )
-                    output_fact = (
-                        None if output_cell is None else
-                        class_book.page(_SEMANTIC_OUTPUT).cell(
-                            output_cell.row, output_cell.column,
+                        call_result_attributes = caller.nodes[
+                            int(call_id)
+                        ].setdefault("attributes", {})
+                        prior_result = (
+                            call_result_attributes.get("result_class_ref"),
+                            int(call_result_attributes.get(
+                                "precision_limbs"
+                            ) or 1),
                         )
-                    )
-                    if (isinstance(output_fact, tuple)
-                            and len(output_fact) == 2):
-                        returned_id = int(output_fact[1])
-                        closed_cell = class_book.latest_ref(
-                            SOURCE_CLOSED_CLASS_ALTERNATIVES,
-                            (callee.graph.get("lexical_read_scope"),
-                             returned_id),
+                        _concord_source_value_class(
+                            caller_scope,
+                            int(call_id),
+                            str(returned_class),
+                            precision_limbs=int(returned_limbs),
+                            source=f"call result {callee_scope}",
+                            provenance=_Derived((
+                                result_book.latest_ref(
+                                    _SOURCE_CALL_RESULT_IDENTITY, result_row,
+                                ),
+                            )),
+                        )
+                        call_result_attributes.update({
+                            "result_class_ref": str(returned_class),
+                            "precision_limbs": int(returned_limbs),
+                            "numeric_identity_source": (
+                                f"call result {callee_scope}"
+                            ),
+                        })
+                        returned_descriptor = numeric_feature_descriptor(
+                            str(returned_class) + (
+                                f"[{int(returned_limbs)}]"
+                                if int(returned_limbs) > 1 else ""
+                            )
+                        )
+                        if returned_descriptor is not None:
+                            call_result_attributes[
+                                "numeric_feature_descriptor"
+                            ] = returned_descriptor.receipt()
+                        changed = changed or prior_result != (
+                            str(returned_class), int(returned_limbs),
+                        )
+                    # The authored IfExp in key_of(flag) returns a tuple of two
+                    # or three members. Root's call result inherits that closed
+                    # source domain only through this exact callee output value,
+                    # reached call and result-identity cell. The domain is not a
+                    # native union layout and cannot be used as one.
+                    if (len(returned_value_ids) == 1 and len(tuple(
+                        callee.graph.get("function_outputs") or ()
+                    )) == 1):
+                        from ...compiler.concordance_declarations import (
+                            SOURCE_CALL_CLOSED_TUPLE_LENGTHS,
+                            SOURCE_CLOSED_AGGREGATE_LENGTHS,
+                        )
+                        domain_book = current_identity_book()
+                        returned_id = int(returned_value_ids[0])
+                        aggregate_scope = callee.graph.get(
+                            "source_aggregate_layout_scope"
+                        )
+                        domain_cell = domain_book.latest_ref(
+                            SOURCE_CLOSED_AGGREGATE_LENGTHS,
+                            (aggregate_scope, returned_id),
+                        )
+                        output_cell = domain_book.latest_ref(
+                            _SEMANTIC_OUTPUT, (aggregate_scope, 0),
                         )
                         returned_cell = node_identity_cell(
                             callee_entry.graph, returned_id,
                         )
-                        call_cell = node_identity_cell(
-                            caller_entry.graph, int(call_id),
+                        reach_cell = domain_book.latest_ref(
+                            _SOURCE_FUNCTION_REACHABILITY, reachability_row,
                         )
-                        reach_cell = class_book.latest_ref(
-                            _SOURCE_FUNCTION_REACHABILITY,
-                            reachability_row,
+                        result_cell = domain_book.latest_ref(
+                            _SOURCE_CALL_RESULT_IDENTITY,
+                            (caller_scope, int(call_id)),
                         )
-                        reached = tuple(
-                            row for row in class_book.page(
-                                _SOURCE_FUNCTION_REACHABILITY
-                            ).rows()
-                            if row[:2] == (caller_scope, int(call_id))
-                            and class_book.page(
-                                _SOURCE_FUNCTION_REACHABILITY
-                            ).latest(row) is True
-                        )
-                        if (
-                            output_fact == (
-                                str(callee.graph["function_outputs"][0]),
-                                returned_id,
+                        output_fact = (
+                            None if output_cell is None else
+                            domain_book.page(_SEMANTIC_OUTPUT).cell(
+                                output_cell.row, output_cell.column,
                             )
-                            and reached == (reachability_row,)
-                            and all(isinstance(cell, _Ref) for cell in (
-                                output_cell, closed_cell, returned_cell,
-                                call_cell, reach_cell,
-                            ))
-                            and returned_cell in {
-                                source for source, _stage in
-                                class_book.edges_into(output_cell)
-                            }
-                        ):
-                            class_book.post(
-                                SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
+                        )
+                        if (output_fact == (
+                            str(callee.graph["function_outputs"][0]),
+                            returned_id,
+                        ) and all(isinstance(cell, _Ref) for cell in (
+                            output_cell, domain_cell, returned_cell,
+                            reach_cell, result_cell,
+                        ))):
+                            domain_book.post(
+                                SOURCE_CALL_CLOSED_TUPLE_LENGTHS,
                                 (caller_scope, int(call_id), callee_scope,
                                  returned_id),
-                                (output_cell, returned_cell, closed_cell,
-                                 reach_cell, call_cell),
+                                (output_cell, returned_cell, domain_cell, reach_cell,
+                                 result_cell),
                                 stage=_REDUCTION,
                                 provenance=_Derived((
-                                    output_cell, returned_cell, closed_cell,
-                                    reach_cell, call_cell,
+                                    output_cell, returned_cell, domain_cell, reach_cell,
+                                    result_cell,
                                 )),
                                 mode=_Mode.CONCORD,
                             )
-                # Program: ``high, low = limb_step(high, low, byte)`` with an
-                # unannotated ``limb_step`` returning ``next_high, next_low``
-                # (corpus c791).  Wrong record: only a ONE-value return gave
-                # its call a class, so each unpacked member of a tuple return
-                # had none, took the float64 domain default, and the merge of
-                # the loop's int seed with it refused as "a join of int and
-                # float arms".  Rule: an unpacked member ``Indexed(call, k)``
-                # at a literal position has the class of the callee's k-th
-                # returned value, DERIVED from that value's class cell and the
-                # member's node cell.
-                output_count = len(tuple(
-                    callee.graph.get("function_outputs") or ()
-                ))
-                # One returned value that is a tuple (``return (a, b)`` or
-                # the merge of several return sites) is its own members:
-                # the aggregate's recorded leaf ids.
-                member_value_ids = (
-                    returned_value_ids
-                    if 1 < output_count == len(returned_value_ids) else None
-                )
-                if member_value_ids is None and output_count == 1 == len(
-                    returned_value_ids
-                ):
-                    returned_attributes = callee.nodes[
-                        returned_value_ids[0]
-                    ].get("attributes") or {}
-                    if returned_attributes.get("aggregate_kind") == "tuple":
-                        member_value_ids = tuple(
-                            int(leaf) for leaf in returned_attributes.get(
-                                "aggregate_leaf_value_ids"
-                            ) or ()
-                            if int(leaf) in callee
-                        ) or None
-                if member_value_ids is not None:
-                    output_count = len(member_value_ids)
-                    member_book = current_identity_book()
-                    member_page = member_book.page(_SOURCE_VALUE_CLASS)
-                    # Program: ``f = pair(n, m) if m > 0 else None`` then
-                    # ``f[0]`` after an ``is None`` guard (corpus c306, c689).
-                    # The member's base is the conditional expression whose
-                    # one arm is this call and whose other arm is the literal
-                    # ``None``; the guard leaves only the call arm, so the
-                    # member is the callee's returned value at that position.
-                    # An arm pair that is anything else is no such wrapper.
-                    def _call_or_none_wrapper(wrapper_id):
-                        wrapper = caller.nodes[wrapper_id]
-                        if str(wrapper.get("type") or "").casefold() != "ifexp":
-                            return False
-                        arms = {
-                            str(role): int(parent)
-                            for parent, role in wrapper.get("parents") or ()
-                            if str(role) in {"body", "orelse"}
-                        }
-                        if set(arms) != {"body", "orelse"} or int(
-                            call_id
-                        ) not in arms.values():
-                            return False
-                        other = next(
-                            arm for arm in arms.values() if arm != int(call_id)
+                    # choose(flag)'s IfExp has exact A/B source classes and no
+                    # single SOURCE_VALUE_CLASS. Carry that closed semantic view
+                    # to root's Call only when SEMANTIC_OUTPUT names the same
+                    # returned value and the call has one reached callee. This
+                    # does not mint a native tagged representation.
+                    if len(tuple(callee.graph.get("function_outputs") or ())) == 1:
+                        from ...compiler.concordance_declarations import (
+                            SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
+                            SOURCE_CLOSED_CLASS_ALTERNATIVES,
                         )
-                        other_expression = caller.nodes[other].get("expr_obj")
-                        return (
-                            isinstance(other_expression, ast.Constant)
-                            and other_expression.value is None
+                        class_book = current_identity_book()
+                        output_scope = callee.graph.get(
+                            "source_aggregate_layout_scope"
                         )
-
-                    member_candidates = tuple(
-                        (member_id, int(base_id))
-                        for base_id in (
-                            int(call_id), *(
-                                wrapper_id
-                                for wrapper_id in caller.successors(int(call_id))
-                                if _call_or_none_wrapper(wrapper_id)
-                            ),
+                        output_cell = class_book.latest_ref(
+                            _SEMANTIC_OUTPUT, (output_scope, 0),
                         )
-                        for member_id in tuple(caller.successors(base_id))
-                    )
-                    for member_id, member_base in member_candidates:
-                        member = caller.nodes[member_id]
-                        if str(member.get("type") or "").casefold() != "indexed":
-                            continue
-                        member_parents = {
-                            str(role): int(parent)
-                            for parent, role in member.get("parents") or ()
-                        }
-                        if (
-                            member_parents.get("base") != member_base
-                            or member_parents.get("index") not in caller
-                        ):
-                            continue
-                        index_data = caller.nodes[member_parents["index"]]
-                        position = (index_data.get("attributes") or {}).get(
-                            "value",
-                            getattr(index_data.get("expr_obj"), "value", None),
+                        output_fact = (
+                            None if output_cell is None else
+                            class_book.page(_SEMANTIC_OUTPUT).cell(
+                                output_cell.row, output_cell.column,
+                            )
                         )
-                        if type(position) is not int or not (
-                            -output_count <= position < output_count
-                        ):
-                            continue
-                        returned_id = member_value_ids[position]
-                        member_class, member_limbs = (
-                            _resolved_source_value_class(callee, returned_id)
-                        )
-                        if member_class is None:
-                            continue
-                        member_row = (
-                            caller_scope,
-                            int(member.get("value_id", member_id)),
-                        )
-                        prior_member = member_page.latest(member_row)
-                        _concord_source_value_class(
-                            caller_scope, member_row[1], str(member_class),
-                            precision_limbs=int(member_limbs),
-                            source=f"call result member {callee_scope}",
-                            provenance=_Derived(tuple(
-                                cell for cell in (
-                                    node_identity_cell(
-                                        caller_entry.graph, int(member_id),
-                                    ),
-                                    node_identity_cell(
-                                        caller_entry.graph, int(member_base),
-                                    ),
-                                    member_book.latest_ref(
-                                        _SOURCE_VALUE_CLASS,
-                                        (callee_scope, int(returned_id)),
-                                    ),
+                        if (isinstance(output_fact, tuple)
+                                and len(output_fact) == 2):
+                            returned_id = int(output_fact[1])
+                            closed_cell = class_book.latest_ref(
+                                SOURCE_CLOSED_CLASS_ALTERNATIVES,
+                                (callee.graph.get("lexical_read_scope"),
+                                 returned_id),
+                            )
+                            returned_cell = node_identity_cell(
+                                callee_entry.graph, returned_id,
+                            )
+                            call_cell = node_identity_cell(
+                                caller_entry.graph, int(call_id),
+                            )
+                            reach_cell = class_book.latest_ref(
+                                _SOURCE_FUNCTION_REACHABILITY,
+                                reachability_row,
+                            )
+                            reached = tuple(
+                                row for row in class_book.page(
+                                    _SOURCE_FUNCTION_REACHABILITY
+                                ).rows()
+                                if row[:2] == (caller_scope, int(call_id))
+                                and class_book.page(
+                                    _SOURCE_FUNCTION_REACHABILITY
+                                ).latest(row) is True
+                            )
+                            if (
+                                output_fact == (
+                                    str(callee.graph["function_outputs"][0]),
+                                    returned_id,
                                 )
-                                if cell is not None
-                            )),
+                                and reached == (reachability_row,)
+                                and all(isinstance(cell, _Ref) for cell in (
+                                    output_cell, closed_cell, returned_cell,
+                                    call_cell, reach_cell,
+                                ))
+                                and returned_cell in {
+                                    source for source, _stage in
+                                    class_book.edges_into(output_cell)
+                                }
+                            ):
+                                class_book.post(
+                                    SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
+                                    (caller_scope, int(call_id), callee_scope,
+                                     returned_id),
+                                    (output_cell, returned_cell, closed_cell,
+                                     reach_cell, call_cell),
+                                    stage=_REDUCTION,
+                                    provenance=_Derived((
+                                        output_cell, returned_cell, closed_cell,
+                                        reach_cell, call_cell,
+                                    )),
+                                    mode=_Mode.CONCORD,
+                                )
+                    # Program: ``high, low = limb_step(high, low, byte)`` with an
+                    # unannotated ``limb_step`` returning ``next_high, next_low``
+                    # (corpus c791).  Wrong record: only a ONE-value return gave
+                    # its call a class, so each unpacked member of a tuple return
+                    # had none, took the float64 domain default, and the merge of
+                    # the loop's int seed with it refused as "a join of int and
+                    # float arms".  Rule: an unpacked member ``Indexed(call, k)``
+                    # at a literal position has the class of the callee's k-th
+                    # returned value, DERIVED from that value's class cell and the
+                    # member's node cell.
+                    output_count = len(tuple(
+                        callee.graph.get("function_outputs") or ()
+                    ))
+                    # One returned value that is a tuple (``return (a, b)`` or
+                    # the merge of several return sites) is its own members:
+                    # the aggregate's recorded leaf ids.
+                    member_value_ids = (
+                        returned_value_ids
+                        if 1 < output_count == len(returned_value_ids) else None
+                    )
+                    if member_value_ids is None and output_count == 1 == len(
+                        returned_value_ids
+                    ):
+                        returned_attributes = callee.nodes[
+                            returned_value_ids[0]
+                        ].get("attributes") or {}
+                        if returned_attributes.get("aggregate_kind") == "tuple":
+                            member_value_ids = tuple(
+                                int(leaf) for leaf in returned_attributes.get(
+                                    "aggregate_leaf_value_ids"
+                                ) or ()
+                                if int(leaf) in callee
+                            ) or None
+                    if member_value_ids is not None:
+                        output_count = len(member_value_ids)
+                        member_book = current_identity_book()
+                        member_page = member_book.page(_SOURCE_VALUE_CLASS)
+                        # Program: ``f = pair(n, m) if m > 0 else None`` then
+                        # ``f[0]`` after an ``is None`` guard (corpus c306, c689).
+                        # The member's base is the conditional expression whose
+                        # one arm is this call and whose other arm is the literal
+                        # ``None``; the guard leaves only the call arm, so the
+                        # member is the callee's returned value at that position.
+                        # An arm pair that is anything else is no such wrapper.
+                        def _call_or_none_wrapper(wrapper_id):
+                            wrapper = caller.nodes[wrapper_id]
+                            if str(wrapper.get("type") or "").casefold() != "ifexp":
+                                return False
+                            arms = {
+                                str(role): int(parent)
+                                for parent, role in wrapper.get("parents") or ()
+                                if str(role) in {"body", "orelse"}
+                            }
+                            if set(arms) != {"body", "orelse"} or int(
+                                call_id
+                            ) not in arms.values():
+                                return False
+                            other = next(
+                                arm for arm in arms.values() if arm != int(call_id)
+                            )
+                            other_expression = caller.nodes[other].get("expr_obj")
+                            return (
+                                isinstance(other_expression, ast.Constant)
+                                and other_expression.value is None
+                            )
+
+                        member_candidates = tuple(
+                            (member_id, int(base_id))
+                            for base_id in (
+                                int(call_id), *(
+                                    wrapper_id
+                                    for wrapper_id in caller.successors(int(call_id))
+                                    if _call_or_none_wrapper(wrapper_id)
+                                ),
+                            )
+                            for member_id in tuple(caller.successors(base_id))
                         )
-                        # The planner's view of that class cell, as a call
-                        # result carries ``result_class_ref``.
-                        member.setdefault("attributes", {})[
-                            "call_result_member_class_ref"
-                        ] = str(member_class)
-                        changed = changed or prior_member is None
+                        for member_id, member_base in member_candidates:
+                            member = caller.nodes[member_id]
+                            if str(member.get("type") or "").casefold() != "indexed":
+                                continue
+                            member_parents = {
+                                str(role): int(parent)
+                                for parent, role in member.get("parents") or ()
+                            }
+                            if (
+                                member_parents.get("base") != member_base
+                                or member_parents.get("index") not in caller
+                            ):
+                                continue
+                            index_data = caller.nodes[member_parents["index"]]
+                            position = (index_data.get("attributes") or {}).get(
+                                "value",
+                                getattr(index_data.get("expr_obj"), "value", None),
+                            )
+                            if type(position) is not int or not (
+                                -output_count <= position < output_count
+                            ):
+                                continue
+                            returned_id = member_value_ids[position]
+                            member_class, member_limbs = (
+                                _resolved_source_value_class(callee, returned_id)
+                            )
+                            if member_class is None:
+                                continue
+                            member_row = (
+                                caller_scope,
+                                int(member.get("value_id", member_id)),
+                            )
+                            prior_member = member_page.latest(member_row)
+                            _concord_source_value_class(
+                                caller_scope, member_row[1], str(member_class),
+                                precision_limbs=int(member_limbs),
+                                source=f"call result member {callee_scope}",
+                                provenance=_Derived(tuple(
+                                    cell for cell in (
+                                        node_identity_cell(
+                                            caller_entry.graph, int(member_id),
+                                        ),
+                                        node_identity_cell(
+                                            caller_entry.graph, int(member_base),
+                                        ),
+                                        member_book.latest_ref(
+                                            _SOURCE_VALUE_CLASS,
+                                            (callee_scope, int(returned_id)),
+                                        ),
+                                    )
+                                    if cell is not None
+                                )),
+                            )
+                            # The planner's view of that class cell, as a call
+                            # result carries ``result_class_ref``.
+                            member.setdefault("attributes", {})[
+                                "call_result_member_class_ref"
+                            ] = str(member_class)
+                            changed = changed or prior_member is None
                 receiver, positional, _all_parameters = (
                     _method_parameter_layout(callee)
                 )
@@ -30808,7 +30900,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # The transferred metadata field may feed a keyed read in consume.  Match
     # only the exact dict.get call, stored key/value members and a pure prefix;
     # the optional result and later borrowed use retain separate proofs.
-    from ...compiler.source_constructor_field_demand import post_constructor_field_demands
+    from ...compiler.source_constructor_field_demand import (
+        post_constructor_field_demands, post_constructor_receiver_aliases,
+    )
+    post_constructor_receiver_aliases(function_table, book=current_identity_book())
     post_constructor_field_demands(function_table, book=current_identity_book())
     from ...compiler.source_evidence_flush import flush_source_evidence
     flush_source_evidence(graph)

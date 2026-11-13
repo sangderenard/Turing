@@ -22,7 +22,14 @@ function harness(initial = complete()) {
   const requests = [], draws = [], images = [], events = [], timers = new Map(), elements = new Map();
   let timerId = 0, now = 0, current = initial, fetchHook = null, delayImages = false, scene = null, sceneReads = 0, prepare = null;
   class Element {
-    constructor(id = '') { this.id = id; this.value = '30'; this.hidden = true; this.textContent = ''; this.handlers = new Map(); this.children = []; }
+    constructor(id = '') {
+      this.id = id; this.value = '30'; this.hidden = true; this.textContent = ''; this.handlers = new Map(); this.children = [];
+      this.attributes = new Map(); const classes = new Set();
+      this.classList = {toggle: (name, on) => on ? classes.add(name) : classes.delete(name), contains: name => classes.has(name)};
+    }
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    getAttribute(name) { return this.attributes.get(name); }
+    focus() { doc.activeElement = this; }
     addEventListener(type, callback) { this.handlers.set(type, callback); }
     dispatchEvent(event) { events.push({target: this.id, type: event.type, bubbles: event.bubbles}); }
     fire(type) { return this.handlers.get(type)?.(); }
@@ -35,6 +42,8 @@ function harness(initial = complete()) {
     defaultView: {location: {search: `?photo=${A}`}, Event}};
   element('photo-transport').value = 'fixed:3'; element('photo-gamma').value = '100';
   element('photo-orbit-frames').value = '1'; element('photo-bounces').value = '4';
+  element('photo-iso').value = '100'; element('photo-highlight-clip').value = '25';
+  element('photo-substeps').value = '1800'; // Match the page's valid exposure default.
   element('photo-tile-size').value = 'auto';
   element('photo-oversampling').value = '1';
   element('photo-resolution').value = '256'; element('photo-bounce-mode').value = 'manual';
@@ -906,6 +915,79 @@ check('HDR getter rejects non-final orbit selection and playback', async h=>{
 }, complete({color_profile:profile,display_white:1,frames:[
   {index:0,image:'frame-old.png',hdr:'frame-old.npz'},
   {index:1,image:'frame-000000.png',hdr:'frame-000000.npz'}]}));
+
+
+check('preview starts hidden while waiting and first image opens it', async h => {
+  assert.equal(h.element('photo-panel').hidden, true);
+  assert.equal(h.element('photo-preview-show').hidden, true);
+  await flush();
+  assert.equal(h.element('photo-panel').hidden, false);
+  assert.equal(h.element('photo-preview-minimize').getAttribute('aria-expanded'), 'true');
+});
+check('minimize toggles restore and retains decoded photo and HDR', async h => {
+  await flush(); const image=h.draws.at(-1), link=h.element('photo-hdr').href;
+  assert.ok(h.photo.completedHdr());
+  h.element('photo-preview-minimize').fire('click');
+  assert.equal(h.element('photo-panel').hidden,false);
+  assert.ok(h.element('photo-panel').classList.contains('is-minimized'));
+  assert.equal(h.element('photo-preview-minimize').textContent,'Restore');
+  assert.equal(h.element('photo-preview-minimize').getAttribute('aria-expanded'),'false');
+  assert.equal(h.photo.completedHdr(),null,'hidden canvas cannot be sampled by the toolbox');
+  h.element('photo-preview-minimize').fire('click');
+  assert.equal(h.element('photo-panel').classList.contains('is-minimized'),false);
+  assert.equal(h.element('photo-preview-minimize').textContent,'Minimize');
+  assert.ok(h.photo.completedHdr());
+  assert.equal(h.draws.at(-1),image);assert.equal(h.element('photo-hdr').href,link);
+},complete({color_profile:profile,display_white:1}));
+check('closing is view-only, progressive polling does not reopen, and show restores', async h => {
+  await flush();const posts=()=>h.requests.filter(r=>r.method==='POST');
+  h.element('photo-preview-close').fire('click');
+  assert.equal(h.element('photo-panel').hidden,true);
+  assert.equal(h.element('photo-preview-show').hidden,false);
+  assert.equal(h.element('photo-cancel').disabled,false,'job continues');
+  h.status=complete({state:'exposing',image:'preview-new.png'});await h.tick(2000);
+  assert.equal(h.element('photo-panel').hidden,true,'poll cannot undo close');
+  assert.match(h.draws.at(-1),/preview-new/);
+  assert.equal(posts().length,0,'close makes no cancellation or deletion request');
+  h.element('photo-preview-show').fire('click');
+  assert.equal(h.element('photo-panel').hidden,false);
+  assert.equal(h.element('photo-preview-show').hidden,true);
+  h.element('photo-preview-close').fire('click');h.element('photo-preview-close').fire('click');
+  h.status=complete({image:'finished.png'});await h.tick(2000);
+  assert.equal(h.element('photo-panel').hidden,true,'completion cannot undo close');
+  assert.equal(h.element('photo-cancel').disabled,true);
+  assert.equal(posts().length,0);
+},complete({state:'exposing'}));
+check('minimization survives progressive completion and close stops orbit playback', async h => {
+  await flush();h.element('photo-preview-minimize').fire('click');
+  h.status=complete({frames:[{index:0,image:'first.png'},{index:1,image:'last.png'}]});await h.tick(2000);
+  assert.ok(h.element('photo-panel').classList.contains('is-minimized'));
+  h.element('photo-preview-minimize').fire('click');
+  h.element('photo-play').fire('click');assert.ok(h.timers.size);
+  h.element('photo-preview-close').fire('click');assert.equal(h.timers.size,0);
+  assert.equal(h.element('photo-play').textContent,'Play orbit');
+  h.element('photo-preview-show').fire('click');
+  assert.equal(h.element('photo-panel').classList.contains('is-minimized'),false);
+},complete({state:'exposing'}));
+check('late image decode cannot reopen a dismissed preview', async h => {
+  h.delayImages=true;await flush();h.element('photo-preview-close').fire('click');
+  for(const image of h.images)await image.onload?.();await flush();
+  assert.equal(h.element('photo-panel').hidden,true);
+  assert.ok(h.draws.length,'retained result remains available');
+});
+check('new explicitly started exposure reopens a closed preview', async h => {
+  await flush();h.element('photo-preview-close').fire('click');h.photo.saved(B);
+  h.status=complete({image:'new-photo.png'});
+  await h.photo.start({interior:[],glass:[],triangleCount:0});await flush();
+  assert.equal(h.element('photo-panel').hidden,false);
+  assert.equal(h.element('photo-panel').classList.contains('is-minimized'),false);
+  assert.equal(h.element('photo-preview-show').hidden,true);
+});
+for(const id of ['photo-preview-close','photo-preview-minimize','photo-preview-show']) {
+  assert.equal((html.match(new RegExp(`id="${id}"`,'g'))||[]).length,1);
+  assert.match(html,new RegExp(`<button[^>]*id="${id}"[^>]*>`));
+}
+assert.match(html,/\.photo-panel\.is-minimized > :not\(\.photo-panel-toolbar\)/);
 
 let failures = 0;
 for (const [name, body, initial] of cases) {

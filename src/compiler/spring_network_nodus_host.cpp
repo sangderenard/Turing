@@ -5,11 +5,14 @@
 #include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
 #include <windows.h>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,8 +50,10 @@ int main(int argc,char** argv){
   uint64_t dt=nodus_tensor_create(NODUS_DTYPE_F64,0,nullptr);
   uint64_t control_shape[1]={2};
   uint64_t control=nodus_tensor_create(NODUS_DTYPE_F64,1,control_shape);
+  uint64_t table_shape[1]={6};
+  uint64_t table=nodus_tensor_create(NODUS_DTYPE_F64,1,table_shape);
   const double seconds=.01;
-  if(!config||!dt||!control||
+  if(!config||!dt||!control||!table||
      nodus_tensor_write(config,0,data.data(),Count*sizeof(double))!=Count*sizeof(double)||
      nodus_tensor_write(dt,0,&seconds,sizeof(seconds))!=sizeof(seconds)||
      !invoke(tool,config))return 4;
@@ -56,7 +61,15 @@ int main(int argc,char** argv){
   HANDLE commands=GetStdHandle(STD_INPUT_HANDLE);
   std::string line;
   bool frozen=false,okay=true;
+  std::vector<double> step_us;
   auto next=std::chrono::steady_clock::now();
+  long long tick_us=10000;
+  if(const char* configured=std::getenv("NODUS_FABRIC_TICK_US")){
+    try{
+      const auto value=std::stoll(configured);
+      if(value>=0&&value<=100000)tick_us=value;
+    }catch(const std::exception&){}
+  }
   while(requested!=2&&okay){
     DWORD available=0;
     if(!PeekNamedPipe(commands,nullptr,0,nullptr,&available,nullptr))requested=2;
@@ -67,8 +80,43 @@ int main(int argc,char** argv){
         if(line=="pause")requested=1;
         else if(line=="resume")requested=0;
         else if(line=="quit")requested=2;
+        else if(line.rfind("substeps ",0)==0){
+          try{
+            const int count=std::stoi(line.substr(9));
+            if(count>=1&&count<=128&&line=="substeps "+std::to_string(count)){
+              const double value[2]={3,static_cast<double>(count)};
+              okay=nodus_tensor_write(control,0,value,sizeof(value))==sizeof(value)&&invoke(tool,control);
+            }
+          }catch(const std::exception&){okay=false;}
+        }
+        else if(line.rfind("target ",0)==0){
+          try{
+            const double target=std::stod(line.substr(7));
+            if(std::isfinite(target)&&target>=0&&target<=8){
+              const double value[2]={4,target};
+              okay=nodus_tensor_write(control,0,value,sizeof(value))==sizeof(value)&&invoke(tool,control);
+            }
+          }catch(const std::exception&){okay=false;}
+        }
+        else if(line.rfind("floor ",0)==0){
+          try{
+            const double floor=std::stod(line.substr(6));
+            if(std::isfinite(floor)){
+              const double value[2]={5,floor};
+              okay=nodus_tensor_write(control,0,value,sizeof(value))==sizeof(value)&&invoke(tool,control);
+            }
+          }catch(const std::exception&){okay=false;}
+        }
+        else if(line.rfind("table ",0)==0){
+          std::istringstream source(line.substr(6));
+          double bounds[6]={2};
+          if((source>>bounds[1]>>bounds[2]>>bounds[3]>>bounds[4]>>bounds[5])&&
+             nodus_tensor_write(table,0,bounds,sizeof(bounds))==sizeof(bounds))
+            okay=invoke(tool,table);
+          else okay=false;
+        }
         line.clear();
-      }else if(ch!='\r'&&line.size()<32)line.push_back(ch);
+      }else if(ch!='\r'&&line.size()<128)line.push_back(ch);
     }
     if(requested==2)break;
     const bool want_frozen=requested==1;
@@ -77,13 +125,29 @@ int main(int argc,char** argv){
       okay=nodus_tensor_write(control,0,value,sizeof(value))==sizeof(value)&&invoke(tool,control);
       frozen=want_frozen;
     }
-    if(!frozen&&okay)okay=invoke(tool,dt);
-    next+=std::chrono::milliseconds(10);
-    std::this_thread::sleep_until(next);
-    if(std::chrono::steady_clock::now()-next>std::chrono::milliseconds(100))
-      next=std::chrono::steady_clock::now();
+    if(!frozen&&okay){
+      const auto begin=std::chrono::steady_clock::now();
+      okay=invoke(tool,dt);
+      if(okay)step_us.push_back(std::chrono::duration<double,std::micro>(
+        std::chrono::steady_clock::now()-begin).count());
+    }
+    if(tick_us){
+      next+=std::chrono::microseconds(tick_us);
+      std::this_thread::sleep_until(next);
+      if(std::chrono::steady_clock::now()-next>std::chrono::milliseconds(100))
+        next=std::chrono::steady_clock::now();
+    }
   }
-  nodus_tensor_destroy(control);nodus_tensor_destroy(dt);nodus_tensor_destroy(config);
+  nodus_tensor_destroy(table);nodus_tensor_destroy(control);nodus_tensor_destroy(dt);nodus_tensor_destroy(config);
   tool->shutdown();destroy(tool);FreeLibrary(module);
+  if(!step_us.empty()){
+    std::sort(step_us.begin(),step_us.end());
+    double sum=0;for(double value:step_us)sum+=value;
+    std::cout<<"spring_host_steps="<<step_us.size()
+      <<" mean_us="<<sum/step_us.size()
+      <<" median_us="<<step_us[step_us.size()/2]
+      <<" p95_us="<<step_us[static_cast<size_t>(.95*(step_us.size()-1))]
+      <<" max_us="<<step_us.back()<<'\n';
+  }
   return okay?0:5;
 }

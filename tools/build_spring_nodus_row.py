@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.compiler.native_law_kernels import law_kernel
 from src.compiler.spring_network_law import INPUT_NAMES, compile_spring_network_step
+from build_spring_network_shader import build as build_shader
 
 
 NETWORKS = 8
@@ -53,14 +54,32 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
         raise RuntimeError("spring law was not linked")
     dll = directory / artifact.library_path.name
     shutil.copy2(artifact.library_path, dll)
+    shader_product = build_shader(directory / "shader")
+    shader_path = directory / "shader" / shader_product["glsl_compiled_spirv"]
+    scalar = compile_spring_network_step()
+    scalar_name_of_id = dict(zip(
+        (argument.id for argument in scalar.function.args),
+        scalar.function.metadata["argument_names"],
+    ))
+    gpu_feeds = [scalar_name_of_id[int(item["name"].removeprefix("feed_"))]
+                 for item in shader_product["deployment"]["resources"]
+                 if item["access"] == "read"]
+    if tuple(gpu_feeds) != tuple(kernel.argument_names):
+        raise RuntimeError("spring GPU feed order differs from the native row")
     template = Path(__file__).resolve().parents[1] / "src" / "compiler" / "spring_network_nodus_row.cpp.in"
     source = directory / "spring_network_nodus_row.cpp"
     runtime_kernel = deploy_dir / dll.name if deploy_dir is not None else dll
+    runtime_shader = deploy_dir / shader_path.name if deploy_dir is not None else shader_path
     source.write_text(template.read_text(encoding="utf-8").replace("@DLL@", str(runtime_kernel).replace("\\", "\\\\"))
+                      .replace("@SPV@", str(runtime_shader).replace("\\", "\\\\"))
                       .replace("@ENTRY@", artifact.name), encoding="utf-8")
     receipt = {"schema": "nodus.spring-network-row.v1", "source": str(source),
                "kernel": str(dll), "entry": artifact.name, "networks": NETWORKS,
-               "nodes_per_network": NODES, "axes": AXES, "batch": BATCH}
+               "nodes_per_network": NODES, "axes": AXES, "batch": BATCH,
+               "gpu_shader": str(shader_path),
+               "gpu_glsl": str(directory / "shader" / shader_product["glsl"]),
+               "gpu_backend": "vulkan/direct-glsl", "cpu_backend": "llvm",
+               "selection": "NODUS_FABRIC_BACKEND=vulkan before row initialization"}
     if nodus_root is not None and nodus_build is not None:
         core = nodus_build / "Release" / "nodus_tensor_core.lib"
         if not (nodus_root / "include" / "tool_api.h").is_file() or not core.is_file():
@@ -107,7 +126,7 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
         receipt["plugin"] = str(plugin)
         if deploy_dir is not None:
             deploy_dir.mkdir(parents=True, exist_ok=True)
-            for product in (dll, plugin, build / "bin" / "spring_network_nodus_host.exe",
+            for product in (dll, shader_path, plugin, build / "bin" / "spring_network_nodus_host.exe",
                             nodus_build / "Release" / "nodus_tensor_core.dll"):
                 shutil.copy2(product, deploy_dir / product.name)
             receipt["deployed"] = str(deploy_dir)

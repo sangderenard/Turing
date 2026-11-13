@@ -31622,6 +31622,25 @@ def _fold_callsite_structural_values(
         except KeyError:
             return unresolved
 
+    def field_read_book_literal(node_id: int) -> tuple[Any, tuple]:
+        """A field read's own proven literal on the book, and its cells."""
+
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from .concorded_literals import MISSING, literal_from_identity
+
+        try:
+            own = node_identity_cell(graph, int(node_id), book=fold_book)
+        except (KeyError, ValueError):
+            return unresolved, ()
+        if own is None:
+            return unresolved, ()
+        found, proof = literal_from_identity(fold_book, own)
+        if found is MISSING or not (
+            found is None or isinstance(found, (bool, int, float, str))
+        ):
+            return unresolved, ()
+        return found, tuple(dict.fromkeys((own, *proof)))
+
     def observed_field_state_literal(
         node_id: int, data: Mapping[str, Any],
     ) -> tuple[Any, tuple]:
@@ -31645,12 +31664,77 @@ def _fold_callsite_structural_values(
         state = fold_book.page(REDUCER_FIELD_STATE).cell(cell.row, cell.column)
         if not isinstance(state, FieldState) or state.kind not in (
             FieldStateKind.WRITTEN, FieldStateKind.MERGED,
+            FieldStateKind.OBSERVED,
         ):
             return unresolved, ()
         def names_value(candidate: int) -> Any:
             return _node_names_identity(
                 graph, int(candidate), state.value, fold_book,
             )
+
+        if state.kind is FieldStateKind.OBSERVED:
+            # An OBSERVED cell's value is the read that first observed the
+            # field (YoungMan ``_build_triangle_map``: the pre-loop
+            # ``self.precision``).  The candidate is a read of the same
+            # receiver whose own identity is that value -- matched by the
+            # book's identity derivation, not by attribute spelling.
+            receivers = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) == "value"
+            )
+            for candidate, candidate_data in graph.G.nodes(data=True):
+                if int(candidate) == int(node_id) or not any(
+                    str(role) == "value" and int(parent) in receivers
+                    for parent, role in candidate_data.get("parents") or ()
+                ):
+                    continue
+                value_cell = names_value(int(candidate))
+                if value_cell is None:
+                    continue
+                # The observing read's literal: the fold's own value, else
+                # the book's literal of that exact identity (the
+                # single-write transfer posts SOURCE_LITERAL_VALUE there,
+                # which the fold's map does not carry for a field read).
+                value = known.get(int(candidate), unresolved)
+                proof: tuple = ()
+                if value is unresolved:
+                    from .concorded_literals import MISSING, literal_from_identity
+
+                    found, proof = literal_from_identity(fold_book, value_cell)
+                    value = unresolved if found is MISSING else found
+                if value is unresolved or not (
+                    value is None
+                    or isinstance(value, (bool, int, float, str))
+                ):
+                    continue
+                return value, tuple(dict.fromkeys((cell, value_cell, *proof)))
+            # The observing read may itself have folded to its literal and
+            # left the graph; the value it observed is still an identity.
+            # Walk forward from that identity through the identity pages to
+            # its canonical values and read the book literal there; every
+            # literal found must agree.
+            from .concordance_declarations import CANONICAL_VALUE, INGESTION_VALUE
+            from .concorded_literals import MISSING, literal_from_identity
+
+            identity_pages = {INGESTION_VALUE.name, CANONICAL_VALUE.name}
+            frontier, seen = [state.value], {state.value}
+            found: dict[str, tuple] = {}
+            while frontier:
+                current = frontier.pop()
+                if current.page == CANONICAL_VALUE:
+                    literal, proof = literal_from_identity(fold_book, current)
+                    if literal is not MISSING:
+                        found.setdefault(repr(literal), (literal, current, proof))
+                for target, _stage in fold_book.edges_out_of(current):
+                    if (target.page.name in identity_pages and target not in seen
+                            and len(seen) < 64):
+                        seen.add(target)
+                        frontier.append(target)
+            if len(found) == 1:
+                literal, current, proof = next(iter(found.values()))
+                if literal is None or isinstance(literal, (bool, int, float, str)):
+                    return literal, tuple(dict.fromkeys((cell, current, *proof)))
+            return unresolved, ()
 
         for parent, role in data.get("parents") or ():
             if str(role) != "after_write" or int(parent) not in graph.G:
@@ -32521,6 +32605,19 @@ def _fold_callsite_structural_values(
             if observed_literal is not unresolved:
                 concordant_literal_sources[int(node_id)] = observed_cells
                 return observed_literal
+            # Program: a ``Baker`` whose ``__init__`` writes
+            # ``self.precision = precision`` once, and ``_build`` reads
+            # ``dtype=self.precision``.  Wrong record: the single-write
+            # transfer proved the read's literal (SOURCE_LITERAL_VALUE at its
+            # identity) and the dtype projection read it, but the fold left
+            # the field read live, so the copy still demanded the record's
+            # ``str`` slot ("record scalar slot ABI lacks dtype ... field
+            # 'precision'").  Rule: a field read whose own identity carries
+            # a book literal is that literal.
+            own_literal, own_cells = field_read_book_literal(int(node_id))
+            if own_literal is not unresolved:
+                concordant_literal_sources[int(node_id)] = own_cells
+                return own_literal
             entry_read = (data.get("attributes") or {}).get("entry_field_read")
             entry_key = tuple(entry_read) if isinstance(entry_read, tuple) else None
             entry_fields = graph.G.graph.get(

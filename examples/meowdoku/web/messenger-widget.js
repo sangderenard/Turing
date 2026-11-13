@@ -12,7 +12,7 @@
 // long poll that runs only while open.  All DOM is built with createElement/textContent (bodies are plain text: no links,
 // embeds or markup, and nothing is fetched or navigated from message content); all styles live in a closed Shadow DOM.
 // Global surface: window.MeowdokuMessenger = {open, close, version}.
-const VERSION = "2";
+const VERSION = "3";
 const MAX_IMAGE_BYTES = 2097152;
 function safeImageURL(image, id) {
   return image && image.locked === false && image.mime === "image/png" &&
@@ -461,6 +461,7 @@ async function start() {
   }
 
   window.MeowdokuMessenger = Object.freeze({ open, close, version: VERSION });
+  if (location.pathname === "/login.html" && new URLSearchParams(location.search).get("messages") === "1") open();
 }
 
 start();

@@ -16,8 +16,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_FUNCTION_REACHABILITY, SOURCE_CALL_OBJECT_ALIAS,
     SOURCE_CALL_ACTUAL_FORMAL, SOURCE_PARAMETER_MEMORY_CONTRACT,
     CLASS_FIELD_DECLARATION, SOURCE_ACTIVITY_NODE, SOURCE_FORMAL_ORDER,
-    SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND, CLASS_METHOD_DECLARATION,
-    FUNCTION_ADDRESS, CLASS_DECLARATION,
+    SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND,
     FieldStateKind,
 )
 from src.compiler.exception_graph import MissingResourceControlTopology
@@ -121,7 +120,7 @@ def test_direct_attribute_exit_audit_rejects_wrong_final_field_state():
         end_identity_book(token)
 
 
-def test_init_dict_class_has_exact_field_exit_but_no_constructor_transfer():
+def test_init_dict_class_constructor_alias_bridges_its_field_exit():
     book, token, graph = _reduced(COPY_SOURCE)
     try:
         init_graph = graph.function_table.entry('Module.__init__').graph.G
@@ -169,24 +168,29 @@ def test_init_dict_class_has_exact_field_exit_but_no_constructor_transfer():
         assert not CorrelationTable._source_function_exit_field_state_findings(
             SimpleNamespace(metadata={'identity_book': book},
                             function_table=graph.function_table))
-        for family in (SOURCE_FUNCTION_REACHABILITY,
-                       SOURCE_CALL_ACTUAL_FORMAL, SOURCE_CALL_OBJECT_ALIAS):
-            assert not any(init_scope in row for row in book.page(family).rows())
+        # The class Call ``Module()`` runs ``__init__`` (constructor_initializer):
+        # it reaches ``__init__``, which gives ``self`` its record-alias memory
+        # contract, and the constructor alias joins ``__init__``'s ``self`` to
+        # the Call's own value -- the bridge the constructor demand named.
+        # ``Module()`` binds no argument.
+        reached = tuple(
+            row for row in book.page(SOURCE_FUNCTION_REACHABILITY).rows()
+            if init_scope in row
+        )
+        assert len(reached) == 1 and reached[0][1:] == (2, init_scope)
+        assert not any(init_scope in row
+                       for row in book.page(SOURCE_CALL_ACTUAL_FORMAL).rows())
         assert book.latest_ref(SOURCE_PARAMETER_MEMORY_CONTRACT,
-                               (init_scope, 'self')) is None
-        demands = tuple(book.page(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND).rows())
-        assert len(demands) == 1
-        demand_row = demands[0]
-        assert demand_row[1:] == (2, init_scope, 'metadata')
-        demand_cell = book.latest_ref(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND,
-                                      demand_row)
-        demand = book.page(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND).cell(
-            demand_cell.row, demand_cell.column)
-        assert demand[0] == 'constructor_receiver_effect_unproved'
-        assert demand[3].page == CLASS_DECLARATION
-        assert demand[4].page == CLASS_METHOD_DECLARATION
-        assert demand[5].page == FUNCTION_ADDRESS
-        assert demand[6] == exit_cell
+                               (init_scope, 'self')) is not None
+        aliases = tuple(row for row in book.page(SOURCE_CALL_OBJECT_ALIAS).rows()
+                        if init_scope in row)
+        assert aliases == ((reached[0][0], 2, init_scope, 0),)
+        alias = book.page(SOURCE_CALL_OBJECT_ALIAS).latest(aliases[0])
+        assert alias[0].row[-1] == 2  # the Call's own value is the actual
+        assert not CorrelationTable._source_call_object_alias_findings(
+            SimpleNamespace(metadata={'identity_book': book},
+                            function_table=graph.function_table))
+        assert not tuple(book.page(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND).rows())
         assert not CorrelationTable._source_constructor_field_effect_demand_findings(
             SimpleNamespace(metadata={'identity_book': book},
                             function_table=graph.function_table))
@@ -269,18 +273,18 @@ def test_copy_state_demand_audit_rejects_wrong_get_operand():
         end_identity_book(token)
 
 
-def test_constructor_demand_audit_rejects_wrong_method_address():
+def test_constructor_alias_audit_rejects_wrong_memory_contract():
     book, token, graph = _reduced(COPY_SOURCE)
     try:
-        page = book.page(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND)
-        row = next(iter(page.rows()))
-        cell = book.latest_ref(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND, row)
+        page = book.page(SOURCE_CALL_OBJECT_ALIAS)
+        row = next(row for row in page.rows() if row[2][1] == 'Module.__init__')
+        cell = book.latest_ref(SOURCE_CALL_OBJECT_ALIAS, row)
         fact = page.cell(cell.row, cell.column)
-        wrong = (*fact[:5], fact[6], *fact[6:])
-        book.post(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND, row, wrong,
-                  stage=REDUCTION, provenance=Derived((cell, fact[6])),
+        wrong = (fact[0], fact[1], fact[4], fact[3], fact[4])
+        book.post(SOURCE_CALL_OBJECT_ALIAS, row, wrong,
+                  stage=REDUCTION, provenance=Derived((cell, fact[4])),
                   mode=Mode.REVISE)
-        assert CorrelationTable._source_constructor_field_effect_demand_findings(
+        assert CorrelationTable._source_call_object_alias_findings(
             SimpleNamespace(metadata={'identity_book': book},
                             function_table=graph.function_table))
     finally:

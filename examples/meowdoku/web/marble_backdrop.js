@@ -2,7 +2,7 @@
 // Preview and photo use these same faces; the saved marble mesh is untouched.
 import {validateStudioGrid,studioGridCells,createStudioGridControls,validateStudioArtwork,studioArtworkFaces} from './marble_studio_grid.js';
 import {TABLE_TOP_Y} from './marble_studio_table.js';
-import {fabricWallMesh,fabricTableDrapePose,fabricMeshAtPositions,FABRIC_GRID_SIDE,FABRIC_GRID_MAX_SIDE} from './marble_backdrop_fabric.js';
+import {fabricWallMesh,fabricTableDrapePose,fabricCycloramaPose,fabricMeshAtPositions,FABRIC_GRID_SIDE,FABRIC_GRID_MAX_SIDE} from './marble_backdrop_fabric.js';
 export const MAX_BACKDROP_LAYERS = 6;
 export const MAX_BACKDROP_SIZE = 64;
 export const BACKDROP_CIRCLE_SEGMENTS = 96;
@@ -18,7 +18,8 @@ export function tallMountedFabricLayer(layer) {
     width:14,height:18,heightOffGround:2.5,stageDistance:5,
     lockToBackWall:false,lockToTableBack:false,aspectLocked:false,pitch:0,
     surfaceBehavior:'fabric',fabricPose:'wall',fabricGridSide:16,
-    fabricAttachmentPoints:Array.from({length:16},(_,column)=>240+column),fabricFrozen:false};
+    fabricAttachmentPoints:Array.from({length:16},(_,column)=>240+column),
+    fabricRingPoints:[],fabricTiebackPoints:[],fabricFrozen:false};
 }
 
 export function validateBackdropLayers(value, materialNames) {
@@ -45,6 +46,16 @@ export function validateBackdropLayers(value, materialNames) {
        layer.fabricAttachmentPoints.length>fabricSide**2||new Set(layer.fabricAttachmentPoints).size!==layer.fabricAttachmentPoints.length||
        !layer.fabricAttachmentPoints.every(node=>Number.isInteger(node)&&node>=0&&node<fabricSide**2)))
       throw new RangeError(`Fabric attachment points must be distinct node IDs from 0 to ${fabricSide**2-1}`);
+    if(layer.fabricRingPoints!==undefined&&(!Array.isArray(layer.fabricRingPoints)||
+       new Set(layer.fabricRingPoints).size!==layer.fabricRingPoints.length||
+       !layer.fabricRingPoints.every(node=>Number.isInteger(node)&&node>=0&&node<fabricSide**2)))
+      throw new RangeError('Curtain rings must name distinct fabric nodes');
+    if(layer.fabricTiebackPoints!==undefined&&(!Array.isArray(layer.fabricTiebackPoints)||
+       new Set(layer.fabricTiebackPoints.map(item=>item?.node)).size!==layer.fabricTiebackPoints.length||
+       !layer.fabricTiebackPoints.every(item=>Number.isInteger(item?.node)&&item.node>=0&&item.node<fabricSide**2&&
+         Array.isArray(item.anchor)&&item.anchor.length===3&&item.anchor.every(Number.isFinite))||
+       layer.fabricTiebackPoints.some(item=>layer.fabricRingPoints?.includes(item.node))))
+      throw new RangeError('Tiebacks need distinct nodes and finite xyz anchors, separate from rings');
     if(layer.fabricFrozen!==undefined&&typeof layer.fabricFrozen!=='boolean')
       throw new RangeError('Invalid backdrop fabric freeze state');
     if(layer.surfaceBehavior==='fabric'&&(layer.shape==='ellipse'||layer.grid||layer.artwork))
@@ -69,6 +80,8 @@ export function validateBackdropLayers(value, materialNames) {
       ...(layer.fabricPose===undefined?{}:{fabricPose:layer.fabricPose}),
       ...(layer.fabricGridSide===undefined?{}:{fabricGridSide:layer.fabricGridSide}),
       ...(layer.fabricAttachmentPoints===undefined?{}:{fabricAttachmentPoints:[...layer.fabricAttachmentPoints]}),
+      ...(layer.fabricRingPoints===undefined?{}:{fabricRingPoints:[...layer.fabricRingPoints]}),
+      ...(layer.fabricTiebackPoints===undefined?{}:{fabricTiebackPoints:layer.fabricTiebackPoints.map(item=>({node:item.node,anchor:[...item.anchor]}))}),
       ...(layer.fabricFrozen===undefined?{}:{fabricFrozen:layer.fabricFrozen}),
       ...(layer.centerY === undefined ? {} : {centerY: layer.centerY}),
       ...Object.fromEntries(["heightOffGround", "stageDistance", "pitch", "curveRadius",
@@ -183,7 +196,8 @@ export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, flo
       if(layer.surfaceBehavior==='fabric'){
         transformWalls();
         const wall=fabricWallMesh(faces.slice(wallFirst),{side:layer.fabricGridSide??FABRIC_GRID_SIDE});
-        const posed=layer.fabricPose==='table'?fabricTableDrapePose(wall,table):wall;
+        const posed=layer.fabricPose==='table'?fabricTableDrapePose(wall,table):
+          sweep?fabricCycloramaPose(wall,{floorY}):wall;
         faces.splice(wallFirst,2,...(fabricPositions?.[i]
           ?fabricMeshAtPositions(posed,fabricPositions[i]):posed).faces);
       }
@@ -258,7 +272,9 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       layers[index].fabricPose=pose.value;
       if(layers[index].fabricAttachmentPoints===undefined){
         const side=layers[index].fabricGridSide??FABRIC_GRID_SIDE;
-        attachments.value=(pose.value==='table'?[0,side-1]:[(side-1)*side,side**2-1]).join(',');
+        attachments.value=(pose.value==='table'
+          ?Array.from({length:side},(_,column)=>column)
+          :Array.from({length:side},(_,column)=>(side-1)*side+column)).join(',');
       }
       onChange();
     });poseLabel.append(pose);panel.append(poseLabel);
@@ -273,6 +289,29 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       try{layers=validateBackdropLayers(candidate,names);attachments.setCustomValidity?.('');onChange();}
       catch(error){attachments.setCustomValidity?.(error.message);attachments.reportValidity?.();}
     });attachmentLabel.append(attachments);panel.append(attachmentLabel);
+    const ringLabel=doc.createElement('label'),rings=doc.createElement('input');
+    ringLabel.textContent='Curtain ring nodes (slide sideways on their mount)';
+    rings.type='text';rings.id=`backdrop-layer-${index}-fabricRingPoints`;
+    rings.value=(layer.fabricRingPoints??[]).join(',');
+    rings.addEventListener('change',()=>{
+      const text=rings.value.trim(),points=text?text.split(/[\s,]+/).map(Number):[];
+      try{layers=validateBackdropLayers(layers.map((item,i)=>i===index?{...item,fabricRingPoints:points}:item),names);
+        rings.setCustomValidity?.('');onChange();}
+      catch(error){rings.setCustomValidity?.(error.message);rings.reportValidity?.();}
+    });ringLabel.append(rings);panel.append(ringLabel);
+    const tiebackLabel=doc.createElement('label'),tiebacks=doc.createElement('input');
+    tiebackLabel.textContent='Tiebacks / hooks (node@x:y:z; …)';
+    tiebacks.type='text';tiebacks.id=`backdrop-layer-${index}-fabricTiebackPoints`;
+    tiebacks.value=(layer.fabricTiebackPoints??[]).map(item=>`${item.node}@${item.anchor.join(':')}`).join('; ');
+    tiebacks.addEventListener('change',()=>{
+      const text=tiebacks.value.trim(),points=text?text.split(';').map(part=>{
+        const [node,anchor]=part.trim().split('@');
+        return {node:Number(node),anchor:anchor?.split(':').map(Number)};
+      }):[];
+      try{layers=validateBackdropLayers(layers.map((item,i)=>i===index?{...item,fabricTiebackPoints:points}:item),names);
+        tiebacks.setCustomValidity?.('');onChange();}
+      catch(error){tiebacks.setCustomValidity?.(error.message);tiebacks.reportValidity?.();}
+    });tiebackLabel.append(tiebacks);panel.append(tiebackLabel);
     const gridSideLabel=doc.createElement('label'),gridSide=doc.createElement('select');
     gridSideLabel.textContent='Fabric grid';gridSide.id=`backdrop-layer-${index}-fabricGridSide`;
     for(const side of [9,16]){const option=doc.createElement('option');option.value=String(side);
@@ -280,8 +319,11 @@ export function createBackdropLayerControls(container, materialNames, onChange =
     gridSide.addEventListener('change',()=>{
       layers[index].fabricGridSide=Number(gridSide.value);
       delete layers[index].fabricAttachmentPoints;
-      attachments.value=(layers[index].fabricPose==='table'?[0,Number(gridSide.value)-1]:
-        [(Number(gridSide.value)-1)*Number(gridSide.value),Number(gridSide.value)**2-1]).join(',');
+      delete layers[index].fabricRingPoints;delete layers[index].fabricTiebackPoints;
+      rings.value='';tiebacks.value='';
+      attachments.value=(layers[index].fabricPose==='table'
+        ?Array.from({length:Number(gridSide.value)},(_,column)=>column)
+        :Array.from({length:Number(gridSide.value)},(_,column)=>(Number(gridSide.value)-1)*Number(gridSide.value)+column)).join(',');
       onChange();
     });gridSideLabel.append(gridSide);panel.append(gridSideLabel);
     const freezeLabel=doc.createElement('label'),freeze=doc.createElement('input');
@@ -326,7 +368,8 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       const next=tallMountedFabricLayer(layers[index]);
       layers=validateBackdropLayers(layers.map((layer,i)=>i===index?next:layer),names);
       select.value=next.material;shape.value=next.shape;behavior.value=next.surfaceBehavior;
-      pose.value=next.fabricPose;gridSide.value='16';attachments.value=next.fabricAttachmentPoints.join(',');freeze.checked=false;
+      pose.value=next.fabricPose;gridSide.value='16';attachments.value=next.fabricAttachmentPoints.join(',');
+      rings.value='';tiebacks.value='';freeze.checked=false;
       for(const [key,{input,output}] of Object.entries(sizes)){
         const value=next[key]??0;input.value=String(value);output.value=value.toFixed(2);
       }
@@ -349,20 +392,24 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       layers=validateBackdropLayers(candidate,names);onChange();
     });
     container.append(panel);
-    return {panel, select, shape, behavior, pose, gridSide, attachments, freeze, sizes,switches,grid};
+    return {panel, select, shape, behavior, pose, gridSide, attachments, rings, tiebacks, freeze, sizes,switches,grid};
   });
   return {
     getState: () => validateBackdropLayers(layers,names),
     setState(value) {
       layers = validateBackdropLayers(value, names);
-      editors.forEach(({select, shape, behavior, pose, gridSide, attachments, freeze, sizes,switches,grid}, i) => {
+      editors.forEach(({select, shape, behavior, pose, gridSide, attachments, rings, tiebacks, freeze, sizes,switches,grid}, i) => {
         select.value = layers[i].material;
         shape.value = layers[i].shape ?? "rectangle";
         behavior.value=layers[i].surfaceBehavior??'cardstock';freeze.checked=layers[i].fabricFrozen??false;
         pose.value=layers[i].fabricPose??'wall';
         const side=layers[i].fabricGridSide??FABRIC_GRID_SIDE;
         gridSide.value=String(side);
-        attachments.value=(layers[i].fabricAttachmentPoints??(pose.value==='table'?[0,side-1]:[(side-1)*side,side**2-1])).join(',');
+        attachments.value=(layers[i].fabricAttachmentPoints??(pose.value==='table'
+          ?Array.from({length:side},(_,column)=>column)
+          :Array.from({length:side},(_,column)=>(side-1)*side+column))).join(',');
+        rings.value=(layers[i].fabricRingPoints??[]).join(',');
+        tiebacks.value=(layers[i].fabricTiebackPoints??[]).map(item=>`${item.node}@${item.anchor.join(':')}`).join('; ');
         freeze.disabled=true;
         grid.setState(layers[i].grid);
         for (const [key, {input, output}] of Object.entries(sizes)) {

@@ -623,7 +623,13 @@ def make_handler(sessions: Sessions):
                     return
                 action = body.get("action")
                 if action == "start":
-                    return self._json(sessions.fabric_motion.start(owner, body.get("configuration"), body.get("side")))
+                    return self._json(sessions.fabric_motion.start(
+                        owner, body.get("configuration"), body.get("side"),
+                        backend=body.get("backend", "cpu"),
+                        substeps=body.get("substeps", 1),
+                        gpu_target_ms=body.get("gpuTargetMs", 0),
+                        floor_y=body.get("floorY"),
+                        table_contact=body.get("tableContact")))
                 return self._json(sessions.fabric_motion.command(owner, body.get("token"), action))
             except FabricMotionError as error:
                 return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)

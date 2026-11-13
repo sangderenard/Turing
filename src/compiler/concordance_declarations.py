@@ -4940,6 +4940,25 @@ SOURCE_CALL_FIELD_STATE_TRANSFER = declare_page(
         RowField("field", K.NAME),
     ), tuple,
 )
+#: One step of the single-program-write field transfer
+#: (source_field_state_transfer) that is not a call's actual -> formal alias:
+#: ``constructed`` -- from ``__init__``'s ``self`` to the constructed Call
+#: value through that Call's constructor SOURCE_CALL_OBJECT_ALIAS; or
+#: ``field_held`` -- from the one written value of a single-written object
+#: field to a read of that field the same transfer reached.  Row: the two
+#: canonical values (read scope, value id) and the transferred field.  Fact:
+#: (kind, the transferred field's WRITTEN cell, the receipt that reached the
+#: step's source or None, the step's proof cell -- the constructor alias, or
+#: the holding field's OBSERVED cell --, the transferred field's declaration,
+#: the holding field's WRITTEN cell or None, the receipt that reached the
+#: holding read's receiver or None).
+SOURCE_FIELD_TRANSFER_OBJECT_STEP = declare_page(
+    "source_field_transfer_object_step", (
+        RowField("from_scope", K.SCOPE), RowField("from_value", K.VALUE_ID),
+        RowField("to_scope", K.SCOPE), RowField("to_value", K.VALUE_ID),
+        RowField("field", K.NAME),
+    ), tuple,
+)
 #: One exact dict.get read of the field version transferred from a completed
 #: keyed store. A selected earlier store additionally cites each later
 #: unequal-key field revision; a later unknown key leaves a named demand.

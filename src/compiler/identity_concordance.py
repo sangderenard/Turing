@@ -1257,6 +1257,42 @@ def scope_local_accounting_ids(value: Any) -> tuple[int, ...]:
     )
 
 
+def _single_write_chain_valid(book: Any, write_cell: Any, incoming: Any, field_declaration: Any,
+                              field: str, sources: set) -> bool:
+    """The cells every single-program-write step cites (source_field_state_transfer)."""
+    from .concordance_declarations import (
+        CLASS_FIELD_DECLARATION, REDUCER_FIELD_STATE, SOURCE_CALL_FIELD_STATE_TRANSFER,
+        SOURCE_FIELD_TRANSFER_OBJECT_STEP, FieldState, FieldStateKind,
+    )
+    written = (book.page(REDUCER_FIELD_STATE).cell(write_cell.row, write_cell.column)
+               if isinstance(write_cell, Ref) and write_cell.page == REDUCER_FIELD_STATE else None)
+    return (
+        isinstance(written, FieldState) and written.kind is FieldStateKind.WRITTEN
+        and write_cell.column == 0 and str(write_cell.row[2]) == field
+        and isinstance(field_declaration, Ref) and field_declaration.page == CLASS_FIELD_DECLARATION
+        and str(field_declaration.row[-1]) == field
+        and (incoming is None or (isinstance(incoming, Ref) and incoming.page in (
+            SOURCE_CALL_FIELD_STATE_TRANSFER, SOURCE_FIELD_TRANSFER_OBJECT_STEP,
+        ) and str(incoming.row[-1]) == field and incoming in sources))
+        and {write_cell, field_declaration} <= sources
+    )
+
+
+def _single_write_transfer_valid(book: Any, row: Any, fact: Any, receipt: Any) -> bool:
+    """One alias step of the single-program-write transfer: its alias is the row's call edge."""
+    from .concordance_declarations import REDUCER_FIELD_STATE, SOURCE_CALL_OBJECT_ALIAS
+
+    _tag, write_cell, incoming, alias, field_declaration, observed = fact
+    sources = {source for source, _stage in book.edges_into(receipt)}
+    return (
+        _single_write_chain_valid(book, write_cell, incoming, field_declaration, str(row[5]), sources)
+        and isinstance(alias, Ref) and alias.page == SOURCE_CALL_OBJECT_ALIAS
+        and alias.row == (row[0], row[2], row[3], row[4]) and alias in sources
+        and (observed is None or (observed.page == REDUCER_FIELD_STATE and observed in sources
+                                  and str(observed.row[2]) == str(row[5])))
+    )
+
+
 class CorrelationTable:
     """Every identity claim the module makes, keyed by (function, value id)."""
 
@@ -1646,6 +1682,7 @@ class CorrelationTable:
         found.extend(self._source_call_field_effect_completion_findings(module))
         found.extend(self._source_call_activity_corridor_findings(module))
         found.extend(self._source_call_field_state_transfer_findings(module))
+        found.extend(self._source_field_transfer_object_step_findings(module))
         found.extend(self._source_mapping_get_read_findings(module))
         found.extend(self._source_mapping_get_key_version_demand_findings(module))
         found.extend(self._source_mapping_get_copy_state_demand_findings(module))
@@ -2800,6 +2837,71 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_field_transfer_object_step_findings(module: Any) -> list[Finding]:
+        """Check each constructed / field-held step of the single-program-write transfer."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, NAME_BINDING, REDUCER_FIELD_STATE, SOURCE_CALL_OBJECT_ALIAS,
+            SOURCE_FIELD_TRANSFER_OBJECT_STEP, FieldState, FieldStateKind,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_FIELD_TRANSFER_OBJECT_STEP)
+        states = book.page(REDUCER_FIELD_STATE)
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_FIELD_TRANSFER_OBJECT_STEP, row)
+            fact = page.cell(receipt.row, receipt.column)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            valid = isinstance(fact, tuple) and len(fact) == 7
+            if valid:
+                kind, write_cell, incoming, proof, field_declaration, holder_write, holder_receipt = fact
+                source_key = (tuple(row[0]), int(row[1]))
+                target_key = (tuple(row[2]), int(row[3]))
+                valid = (
+                    _single_write_chain_valid(book, write_cell, incoming, field_declaration, str(row[4]), sources)
+                    and isinstance(proof, Ref) and proof in sources
+                )
+                if valid and kind == "constructed":
+                    # The constructor alias: its actual is the class Call's own value (the target); its formal
+                    # binding is ``__init__``'s ``self`` (the source).
+                    alias_fact = (book.page(SOURCE_CALL_OBJECT_ALIAS).cell(proof.row, proof.column)
+                                  if proof.page == SOURCE_CALL_OBJECT_ALIAS else None)
+                    binding = (book.page(NAME_BINDING).cell(alias_fact[1].row, alias_fact[1].column)
+                               if isinstance(alias_fact, tuple) and len(alias_fact) == 5 else None)
+                    valid = (
+                        binding is not None and holder_write is None and holder_receipt is None
+                        and alias_fact[0].page == CANONICAL_VALUE
+                        and (tuple(alias_fact[0].row[0]), int(alias_fact[0].row[1])) == target_key
+                        and int(alias_fact[0].row[1]) == int(proof.row[1])
+                        and (tuple(alias_fact[1].row[0]), int(binding.value_id)) == source_key
+                    )
+                elif valid and kind == "field_held":
+                    # The holding field's read (target) of the holder's one written value (source).
+                    observed = (states.cell(proof.row, proof.column)
+                                if proof.page == REDUCER_FIELD_STATE else None)
+                    held = (states.cell(holder_write.row, holder_write.column)
+                            if isinstance(holder_write, Ref) and holder_write.page == REDUCER_FIELD_STATE
+                            else None)
+                    valid = (
+                        isinstance(observed, FieldState) and observed.kind is FieldStateKind.OBSERVED
+                        and isinstance(held, FieldState) and held.kind is FieldStateKind.WRITTEN
+                        and holder_write.column == 0 and str(holder_write.row[2]) == str(proof.row[2])
+                        and observed.value.page == CANONICAL_VALUE and held.value.page == CANONICAL_VALUE
+                        and (tuple(observed.value.row[0]), int(observed.value.row[1])) == target_key
+                        and (tuple(held.value.row[0]), int(held.value.row[1])) == source_key
+                        and isinstance(holder_receipt, Ref) and {holder_write, holder_receipt} <= sources
+                    )
+                elif valid:
+                    valid = False
+            if not valid:
+                found.append(Finding(
+                    "source-field-transfer-object-step", str(row[0]), row[1],
+                    "object step lost its write, incoming receipt, constructor alias or holding field read",
+                ))
+        return found
+
+    @staticmethod
     def _source_call_field_state_transfer_findings(module: Any) -> list[Finding]:
         """Check the source field cursor join without assigning payload class."""
         from .concordance_declarations import (
@@ -2830,9 +2932,18 @@ class CorrelationTable:
                 current = predecessors[0]
             return False
 
+        from .source_field_state_transfer import TAG as _SINGLE_WRITE_TAG
+
         for row in page.rows():
             receipt = book.latest_ref(SOURCE_CALL_FIELD_STATE_TRANSFER, row)
             fact = page.cell(receipt.row, receipt.column)
+            if isinstance(fact, tuple) and len(fact) == 6 and fact[0] == _SINGLE_WRITE_TAG:
+                if not _single_write_transfer_valid(book, row, fact, receipt):
+                    found.append(Finding(
+                        "source-call-field-state-transfer", str(row[0]), row[1],
+                        "single-write transfer lost its write, incoming receipt, alias, declaration or read",
+                    ))
+                continue
             if not isinstance(fact, tuple) or len(fact) != 9:
                 found.append(Finding(
                     "source-call-field-state-transfer", str(row[0]), row[1],
@@ -3073,7 +3184,7 @@ class CorrelationTable:
     def _source_call_object_alias_findings(module: Any) -> list[Finding]:
         """Check a call's record alias against the exact formal and class cells."""
         from .concordance_declarations import (
-            CLASS_DECLARATION, PARAMETER_ANNOTATION, SOURCE_CALL_ACTUAL_FORMAL,
+            CLASS_DECLARATION, NAME_BINDING, PARAMETER_ANNOTATION, SOURCE_CALL_ACTUAL_FORMAL,
             SOURCE_CALL_OBJECT_ALIAS, SOURCE_PARAMETER_MEMORY_CONTRACT,
             SOURCE_VALUE_CLASS,
         )
@@ -3086,12 +3197,58 @@ class CorrelationTable:
             return []
         found = []
         alias_page = book.page(SOURCE_CALL_OBJECT_ALIAS)
+        # A constructor alias binds ``__init__``'s ``self`` to the class Call's own value: it has no operand
+        # binding, and is checked against its recomputed proof
+        # (source_constructor_field_demand.candidate_constructor_receiver_aliases).
+        from .concordance_declarations import CANONICAL_VALUE as _CANONICAL_VALUE
+        from .source_constructor_field_demand import candidate_constructor_receiver_aliases
+        table = getattr(module, "function_table", None)
+        constructed = {} if table is None else {
+            row: (fact, set(causes))
+            for row, fact, causes in candidate_constructor_receiver_aliases(table, book=book)
+        }
         for row in alias_page.rows():
             alias = book.latest_ref(SOURCE_CALL_OBJECT_ALIAS, row)
             actual, formal_binding, memory, actual_class, declaration = (
                 alias_page.cell(alias.row, alias.column)
             )
             sources = {source for source, _stage in book.edges_into(alias)}
+            if actual.page == _CANONICAL_VALUE and int(actual.row[1]) == int(row[1]):
+                # Without the table: every fact cell cited, the class cell is this Call's own class
+                # construction of the declared class, the binding is ``__init__``'s authored ``self`` Input,
+                # and its contract is the caller's record alias.
+                class_fact = (book.page(SOURCE_VALUE_CLASS).cell(actual_class.row, actual_class.column)
+                              if actual_class.page == SOURCE_VALUE_CLASS else None)
+                self_fact = (book.page(NAME_BINDING).cell(formal_binding.row, formal_binding.column)
+                             if formal_binding.page == NAME_BINDING else None)
+                memory_fact = (book.page(SOURCE_PARAMETER_MEMORY_CONTRACT).cell(memory.row, memory.column)
+                               if memory.page == SOURCE_PARAMETER_MEMORY_CONTRACT else None)
+                contract = (memory_fact[0] if isinstance(memory_fact, tuple)
+                            and len(memory_fact) == 1 else None)
+                table_free = (
+                    {actual, formal_binding, memory, actual_class, declaration} <= sources
+                    and actual_class.row == (row[0], int(row[1]))
+                    and isinstance(class_fact, tuple) and len(class_fact) == 3
+                    and class_fact[2] == "source class construction"
+                    and declaration.page == CLASS_DECLARATION and class_fact[0] == declaration.row[1]
+                    and self_fact is not None and formal_binding.row[1] == "self" and self_fact.authored
+                    and int(self_fact.value_id) == int(row[3])
+                    and memory.row == (row[2], "self")
+                    and isinstance(contract, ParameterContract)
+                    and contract.transfer is ParameterTransfer.ALIAS
+                    and contract.access is ParameterAccess.INOUT
+                    and contract.storage is ParameterStorage.RECORD
+                    and contract.scope is ParameterScope.CALLER
+                )
+                expected = constructed.get(row) if table is not None else None
+                if (not table_free or (table is not None and (
+                        expected is None or alias_page.cell(alias.row, alias.column) != expected[0]
+                        or not expected[1] <= sources))):
+                    found.append(Finding(
+                        "source-call-object-alias", str(row[0]), row[1],
+                        "constructor alias lost its class Call, initializer, self binding or memory contract",
+                    ))
+                continue
             binding = book.latest_ref(SOURCE_CALL_ACTUAL_FORMAL, row)
             binding_fact = (None if binding is None else
                             book.page(SOURCE_CALL_ACTUAL_FORMAL).cell(
