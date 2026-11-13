@@ -1,0 +1,160 @@
+"""Owned Studio sessions backed by the persistent native Nodus spring row host."""
+
+from __future__ import annotations
+
+import math
+import os
+from pathlib import Path
+import secrets
+import struct
+import subprocess
+import threading
+import time
+
+from .fabric_udp import FabricUdpReceiver
+
+
+NETWORKS, NODES, FIELDS = 8, 256, 38
+COUNT = NETWORKS * NODES * FIELDS
+
+
+class FabricMotionError(ValueError):
+    pass
+
+
+class FabricMotion:
+    def __init__(self, host: Path, plugin: Path, core_dir: Path, state_dir: Path,
+                 port: int = 48768):
+        self.host, self.plugin, self.core_dir = map(Path, (host, plugin, core_dir))
+        for path in (self.host, self.plugin):
+            if not path.is_file():
+                raise FabricMotionError(f"native fabric component missing: {path}")
+        self.state_dir = Path(state_dir) / "fabric-motion"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.port = port
+        self.receiver = FabricUdpReceiver(port=port).start()
+        self.lock = threading.Lock()
+        self.sessions = {}
+
+    def _validate(self, data, side):
+        if not isinstance(side, int) or not 2 <= side <= 16:
+            raise FabricMotionError("grid side must be 2–16")
+        if not isinstance(data, list) or len(data) != COUNT:
+            raise FabricMotionError("expected one 8×256×38 row configuration")
+        if not all(isinstance(v, (float, int)) and math.isfinite(v) for v in data):
+            raise FabricMotionError("row configuration must be finite")
+        if any(data[node*FIELDS+6] != (1 if node < side*side else 0)
+               for node in range(NETWORKS*NODES)):
+            raise FabricMotionError("only the selected sheet may occupy row nodes")
+        for node in range(side*side):
+            base = node*FIELDS
+            if (data[base+7] not in (0, 1) or not 0 <= data[base+12] <= 1000 or
+                    not 0 <= data[base+13] <= 10 or
+                    any(abs(data[base+axis]) > 64 for axis in range(3))):
+                raise FabricMotionError("fabric node exceeds the Studio row limits")
+            for edge in range(4):
+                if data[base+33+edge] not in (0, 1):
+                    raise FabricMotionError("invalid edge mask")
+                if data[base+33+edge] and (data[base+17+edge] != int(data[base+17+edge]) or
+                                           not 0 <= data[base+17+edge] < side*side):
+                    raise FabricMotionError("invalid neighbor")
+        return data
+
+    def _owner_session(self, owner, token):
+        session = self.sessions.get(token)
+        if session is None or session["owner"] != owner:
+            raise FabricMotionError("fabric session not found")
+        return session
+
+    def start(self, owner, data, side):
+        data = self._validate(data, side)
+        with self.lock:
+            for token, session in list(self.sessions.items()):
+                if session["process"].poll() is not None or time.monotonic()-session["last_seen"]>600:
+                    if session["process"].poll() is None:
+                        session["process"].stdin.close()
+                        try:
+                            session["process"].wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            session["process"].terminate()
+                            session["process"].wait(timeout=1)
+                    self.sessions.pop(token)
+                    session["path"].unlink(missing_ok=True)
+            if len(self.sessions) >= 4:
+                raise FabricMotionError("fabric service is at its four-session limit")
+            token = secrets.token_urlsafe(24)
+            identity = secrets.randbelow(2**53-1) + 1
+            data[37] = identity
+            path = self.state_dir / (token + ".bin")
+            path.write_bytes(struct.pack("<" + "d"*COUNT, *data))
+            env = os.environ.copy()
+            env["PATH"] = str(self.core_dir) + os.pathsep + env.get("PATH", "")
+            try:
+                process = subprocess.Popen([str(self.host), str(self.plugin), str(path),
+                                            "127.0.0.1", str(self.port)],
+                                           stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, env=env,
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except OSError:
+                path.unlink(missing_ok=True)
+                raise FabricMotionError("native fabric host could not start") from None
+            self.sessions[token] = {"owner": owner, "identity": identity, "process": process,
+                                    "path": path, "side": side, "frozen": False,
+                                    "last_seen": time.monotonic()}
+            return {"token": token, "identity": identity, "side": side, "running": True}
+
+    def state(self, owner, token):
+        with self.lock:
+            session = self._owner_session(owner, token)
+            session["last_seen"] = time.monotonic()
+            process = session["process"]
+            frame = self.receiver.latest(session["identity"])
+            if frame is not None:
+                positions = frame["positions"]
+                if len(positions) != session["side"]**2 or any(node not in positions for node in range(session["side"]**2)):
+                    frame = None
+                else:
+                    frame["positions"] = [positions[node] for node in range(session["side"]**2)]
+            return {"running": process.poll() is None, "frozen": session["frozen"],
+                    "identity": session["identity"], "side": session["side"], "frame": frame}
+
+    def command(self, owner, token, action):
+        if action not in ("pause", "resume", "stop"):
+            raise FabricMotionError("unknown fabric action")
+        with self.lock:
+            session = self._owner_session(owner, token)
+            session["last_seen"] = time.monotonic()
+            process = session["process"]
+            if process.poll() is not None:
+                raise FabricMotionError("native fabric host exited")
+            try:
+                process.stdin.write(("quit" if action == "stop" else action).encode() + b"\n")
+                process.stdin.flush()
+            except OSError:
+                raise FabricMotionError("native fabric host is unavailable") from None
+            if action == "stop":
+                self.sessions.pop(token)
+                process.stdin.close()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    process.wait(timeout=1)
+                session["path"].unlink(missing_ok=True)
+            else:
+                session["frozen"] = action == "pause"
+            return {"running": action != "stop", "frozen": session["frozen"]}
+
+    def close(self):
+        with self.lock:
+            for session in self.sessions.values():
+                process = session["process"]
+                process.stdin.close()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    process.wait(timeout=1)
+                session["path"].unlink(missing_ok=True)
+            self.sessions.clear()
+        self.receiver.close()

@@ -51,9 +51,34 @@ async function load() {
     const open = reviews.filter(r => OPEN.has(r.standing)).length;
     status(`${open} change${open === 1 ? "" : "s"} in play. Lock: ${result.lock}.` +
       (who.role === "admin" ? "" : " Only an admin account can approve or reject; you can agree or object."));
+    const approvable = reviews.filter(r => r.standing === "waiting" || r.standing === "accepted");
+    byId("approve-all").hidden = who.role !== "admin" || !approvable.length;
+    byId("approve-all").textContent = `Approve all ${approvable.length} waiting`;
     render();
     if (selected && reviews.some(r => r.id === selected)) show(selected);
   } catch (error) { status(error.message); }
+}
+
+// Approve every change that is waiting or already accepted by its time-out, each at exactly the commit listed. A change
+// with a standing objection is left for a decision of its own, and the confirmation names every branch and commit.
+async function approveAll() {
+  const approvable = reviews.filter(r => r.standing === "waiting" || r.standing === "accepted");
+  const objected = reviews.filter(r => r.standing === "objected").length;
+  if (!approvable.length) return;
+  const listing = approvable.map(r => `  ${r.repository} ${r.branch} at ${r.head.slice(0, 12)}`).join("\n");
+  if (!confirm(`Approve these ${approvable.length} changes at exactly these commits?\n\n${listing}` +
+               (objected ? `\n\n${objected} with an objection are left for you to decide one by one.` : ""))) return;
+  const button = byId("approve-all");
+  button.disabled = true;
+  const failed = [];
+  for (const review of approvable) {
+    try { await request("/api/reviews/decide", { id: review.id, head: review.head, decision: "approved", note: "approved with approve all" }); }
+    catch (error) { failed.push(`${review.branch}: ${error.message}`); }
+  }
+  button.disabled = false;
+  await load();
+  status(`Approved ${approvable.length - failed.length} of ${approvable.length}.` +
+         (failed.length ? " Not approved: " + failed.join("; ") : "") + " The admin tool lands them; a branch behind its base is held.");
 }
 
 function logLines(output) {
@@ -191,6 +216,7 @@ async function main() {
   if (!caps.has("dev_ui")) { status("Reviews need the dev_ui capability."); return; }
   byId("content").hidden = false;
   byId("refresh").onclick = load;
+  byId("approve-all").onclick = approveAll;
   byId("settled").onchange = render;
   await load();
 }

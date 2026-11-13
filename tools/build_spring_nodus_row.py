@@ -28,7 +28,7 @@ BATCH = NETWORKS * NODES * AXES
 
 
 def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | None = None,
-          accept: bool = False) -> dict[str, str]:
+          accept: bool = False, deploy_dir: Path | None = None) -> dict[str, str]:
     directory.mkdir(parents=True, exist_ok=True)
     kernel = law_kernel(compile_spring_network_step(), "spring_network_step", BATCH, "llvm")
     artifact = kernel.artifact
@@ -55,7 +55,8 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
     shutil.copy2(artifact.library_path, dll)
     template = Path(__file__).resolve().parents[1] / "src" / "compiler" / "spring_network_nodus_row.cpp.in"
     source = directory / "spring_network_nodus_row.cpp"
-    source.write_text(template.read_text(encoding="utf-8").replace("@DLL@", str(dll).replace("\\", "\\\\"))
+    runtime_kernel = deploy_dir / dll.name if deploy_dir is not None else dll
+    source.write_text(template.read_text(encoding="utf-8").replace("@DLL@", str(runtime_kernel).replace("\\", "\\\\"))
                       .replace("@ENTRY@", artifact.name), encoding="utf-8")
     receipt = {"schema": "nodus.spring-network-row.v1", "source": str(source),
                "kernel": str(dll), "entry": artifact.name, "networks": NETWORKS,
@@ -67,6 +68,7 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
         cmake = directory / "CMakeLists.txt"
         acceptance = Path(__file__).resolve().parents[1] / "tests" / "spring_nodus_row_acceptance.cpp"
         demo = Path(__file__).resolve().parents[1] / "tests" / "spring_nodus_row_demo.cpp"
+        host = Path(__file__).resolve().parents[1] / "src" / "compiler" / "spring_network_nodus_host.cpp"
         cmake.write_text("\n".join((
             "cmake_minimum_required(VERSION 3.20)",
             "project(spring_network_nodus_row LANGUAGES CXX)",
@@ -88,6 +90,12 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
             'set_target_properties(spring_nodus_row_demo PROPERTIES CXX_STANDARD 17 '
             'RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin" '
             'RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin")',
+            f'add_executable(spring_network_nodus_host "{host.as_posix()}")',
+            f'target_include_directories(spring_network_nodus_host PRIVATE "{(nodus_root / "include").as_posix()}")',
+            f'target_link_libraries(spring_network_nodus_host PRIVATE "{core.as_posix()}")',
+            'set_target_properties(spring_network_nodus_host PROPERTIES CXX_STANDARD 17 '
+            'RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin" '
+            'RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin")',
             "",
         )), encoding="utf-8")
         build = directory / "build"
@@ -97,6 +105,12 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
         if not plugin.is_file():
             raise RuntimeError("Nodus spring row did not link")
         receipt["plugin"] = str(plugin)
+        if deploy_dir is not None:
+            deploy_dir.mkdir(parents=True, exist_ok=True)
+            for product in (dll, plugin, build / "bin" / "spring_network_nodus_host.exe",
+                            nodus_build / "Release" / "nodus_tensor_core.dll"):
+                shutil.copy2(product, deploy_dir / product.name)
+            receipt["deployed"] = str(deploy_dir)
         if accept:
             environment = os.environ.copy()
             environment["PATH"] = str(nodus_build / "Release") + os.pathsep + environment.get("PATH", "")
@@ -113,12 +127,15 @@ def main() -> None:
     parser.add_argument("--nodus-root", type=Path)
     parser.add_argument("--nodus-build", type=Path)
     parser.add_argument("--accept", action="store_true")
+    parser.add_argument("--deploy-dir", type=Path, help="copy linked runtime products to the service area; compilation remains in --output")
     args = parser.parse_args()
     if (args.nodus_root is None) != (args.nodus_build is None):
         parser.error("--nodus-root and --nodus-build must be supplied together")
     if args.accept and args.nodus_root is None:
         parser.error("--accept requires --nodus-root and --nodus-build")
-    print(json.dumps(stage(args.output, args.nodus_root, args.nodus_build, args.accept), indent=2))
+    if args.deploy_dir and args.nodus_root is None:
+        parser.error("--deploy-dir requires --nodus-root and --nodus-build")
+    print(json.dumps(stage(args.output, args.nodus_root, args.nodus_build, args.accept, args.deploy_dir), indent=2))
 
 
 if __name__ == "__main__":

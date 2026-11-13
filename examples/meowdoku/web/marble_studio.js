@@ -30,7 +30,8 @@ import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhys
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256, analyticSpheresForDesign,
   verifySavedMarbleObject } from "./marble_object.js";
 import { initCalibration } from "./marble_calibration.js";
-import { backdropFaces } from "./marble_backdrop.js";
+import { backdropFaces,tallMountedFabricLayer } from "./marble_backdrop.js";
+import {fabricWallMesh,fabricTableDrapePose,fabricLayerRowConfiguration} from './marble_backdrop_fabric.js';
 import { setupStudioLighting, LIGHTING_PROFILE_FIELDS } from "./marble_studio_lighting.js";
 import { STUDIO_LIGHTS } from "./marble_light_strengths.js";
 import { studioRoomBounds } from "./marble_room.js";
@@ -54,6 +55,7 @@ import {PhotographicCameraBinding,mountPhotographicCameraBinding,linkedPhotoOrbi
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
+let fabricMotion=null,fabricPositions=[];
 let triggerGrid = null;
 let opticalControls = null;
 let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null;
@@ -786,8 +788,14 @@ function fieldMaterialRows() {
   return {data,stride,lookupData:fieldMaterialProjection.lookupData};
 }
 function studioBuilderOptions(channel="studio",saved=false) {
-  return {lighting:studioBuilderLighting(channel),subject:studioSubjectTransform(saved,channel),geometrySubject:studioSubjectTransform(false,channel),
-    materials:{ids,fixtureMaterialBase:FIXTURE_MAT_BASE,pbr:{data:tables.pbr.data,stride:tables.pbr.table.floats_per_record}}};
+  const lighting=studioBuilderLighting(channel);
+  const preview=channel==='studio'||(fabricMotion&&
+    JSON.stringify(lighting.backdrops?.[fabricMotion.index])===JSON.stringify(studioLighting?.backdrops?.getState()?.[fabricMotion.index])&&
+    JSON.stringify(lighting.table)===JSON.stringify(studioTableState('studio'))&&
+    Number(lighting.controls['backdrop-layers'])===Number(studioControlValue('backdrop-layers','studio')));
+  return {lighting,subject:studioSubjectTransform(saved,channel),geometrySubject:studioSubjectTransform(false,channel),
+    materials:{ids,fixtureMaterialBase:FIXTURE_MAT_BASE,pbr:{data:tables.pbr.data,stride:tables.pbr.table.floats_per_record}},
+    fabricPositions:preview?fabricPositions:undefined};
 }
 function studioRoomScale(channel="studio") { return Number(studioControlValue("room-scale",channel) || 3); }
 function studioTableState(channel="studio") { return studioRenderState(channel)?.table ?? studioLighting?.table?.getState() ?? defaultStudioTable(); }
@@ -979,6 +987,63 @@ function backdropRollFaces(channel="studio",onPart) {
   return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropRollFaces(responsePartCallback('backdrop',onPart));
 }
 function backdropRoll() { return mesh(backdropRollFaces()); }
+function fabricStatus(message){const output=$('fabric-motion-status');if(output)output.textContent=message;}
+async function fabricRequest(body){
+  const response=await fetch('/api/studio/fabric',{method:'POST',headers:{'Content-Type':'application/json'},
+    credentials:'same-origin',body:JSON.stringify(body)});
+  const result=await response.json();if(!response.ok)throw Error(result.error||`fabric service ${response.status}`);
+  return result;
+}
+async function stopFabricMotion(){
+  const old=fabricMotion;fabricMotion=null;fabricPositions=[];
+  $('fabric-motion-pause').disabled=true;$('fabric-motion-stop').disabled=true;
+  if(old)try{await fabricRequest({action:'stop',token:old.token});}catch(error){fabricStatus(error.message);}
+}
+function fabricSource(index,layer,layers){
+  const options=studioBuilderOptions(),lighting=options.lighting,table=lighting.table;
+  const bounds=studioRoomBounds(Number(lighting.controls['room-scale']),tableFloorDrop(table));
+  let source=null;
+  backdropFaces({count:index+1,material:lighting.controls['backdrop-material'],
+    sweep:false,layers:layers.map((item,i)=>i===index?{...item,surfaceBehavior:'cardstock'}:item),
+    wallZ:bounds.backZ,floorY:bounds.floorY,table},ids,part=>{
+      if(part.id===`layer-${index}-wall`)source=part.faces;
+    });
+  if(!source||source.length!==2)throw Error('Fabric needs a rectangular backdrop wall');
+  const wall=fabricWallMesh(source,{side:layer.fabricGridSide??9});
+  return layer.fabricPose==='table'?fabricTableDrapePose(wall,table):wall;
+}
+async function pollFabricMotion(session){
+  while(fabricMotion===session){
+    try{
+      const response=await fetch(`/api/studio/fabric?token=${encodeURIComponent(session.token)}`,{credentials:'same-origin'});
+      const state=await response.json();if(!response.ok)throw Error(state.error||`fabric service ${response.status}`);
+      if(!state.running){fabricStatus('Native fabric row stopped.');break;}
+      if(state.frame&&state.frame.frame!==session.frame){
+        session.frame=state.frame.frame;
+        fabricPositions[session.index]=state.frame.positions;
+        dispose(backdropMesh);backdropMesh=backdropRoll();
+        fabricStatus(`Nodus fabric frame ${session.frame} · ${state.frozen?'paused':'reacting'}`);
+      }
+    }catch(error){fabricStatus(`Fabric stream: ${error.message}`);break;}
+    await new Promise(resolve=>setTimeout(resolve,100));
+  }
+}
+async function startFabricMotion(){
+  if(fabricMotion)await stopFabricMotion();
+  try{
+    const layers=studioLighting.backdrops.getState(),count=Number($('backdrop-layers').value);
+    const index=layers.findIndex((layer,i)=>i<count&&layer.surfaceBehavior==='fabric');
+    if(index<0)throw Error('Select a fabric backdrop layer first');
+    const mesh=fabricSource(index,layers[index],layers);
+    const packed=fabricLayerRowConfiguration(mesh,layers[index],{identity:1});
+    const started=await fabricRequest({action:'start',side:mesh.columns,configuration:Array.from(packed.data)});
+    const session={...started,index,frame:0};fabricMotion=session;
+    if(layers[index].fabricFrozen){await fabricRequest({action:'pause',token:session.token});session.frozen=true;}
+    $('fabric-motion-pause').disabled=false;$('fabric-motion-stop').disabled=false;
+    $('fabric-motion-pause').textContent=session.frozen?'Resume fabric':'Pause fabric';
+    fabricStatus('Nodus fabric row starting…');pollFabricMotion(session);
+  }catch(error){fabricStatus(`Fabric motion unavailable: ${error.message}`);}
+}
 // Pure (no WebGL calls) fixture-role builder, shared by the Phong frame()
 // draw loop AND the ray-traced photo bridge (marble_photo.js), so both are
 // built from the same validated profile. A owns exposure; B resolves explicit
@@ -1879,10 +1944,33 @@ async function boot() {
         return buildFixtureFaces([role],0).flatMap(face=>face.slice(0,3));
       },
       onChange:()=>{photo.sceneChanged();liveRay?.sceneChanged();},
-      onBackdropChange:()=>{dispose(backdropMesh);backdropMesh=backdropRoll();},
+      onBackdropChange:()=>{if(fabricMotion)stopFabricMotion();dispose(backdropMesh);backdropMesh=backdropRoll();},
       onGoboChange:()=>rebuildTable(),
       onRoomChange:()=>{dispose(checkerMesh);checkerMesh=checkerboard();rebuildTable();},
     });
+    $('fabric-tall-preset').addEventListener('click',()=>{
+      const layers=studioLighting.backdrops.getState();
+      layers[0]=tallMountedFabricLayer(layers[0]);
+      studioLighting.backdrops.setState(layers);
+      $('backdrop-material').value='fabric_muslin_white';
+      $('backdrop-layers').value='1';
+      studioLighting.invalidateRenderState();
+      $('backdrop-layers').dispatchEvent(new Event('input',{bubbles:true}));
+      photo.sceneChanged();liveRay?.sceneChanged();
+      fabricStatus('Tall 16 × 16 fabric mounted. Save the lighting profile to keep it.');
+    });
+    $('fabric-motion-start').addEventListener('click',startFabricMotion);
+    $('fabric-motion-pause').addEventListener('click',async()=>{
+      if(!fabricMotion)return;
+      const next=fabricMotion.frozen?'resume':'pause';
+      try{await fabricRequest({action:next,token:fabricMotion.token});
+        fabricMotion.frozen=next==='pause';
+        $('fabric-motion-pause').textContent=fabricMotion.frozen?'Resume fabric':'Pause fabric';
+        fabricStatus(fabricMotion.frozen?'Nodus fabric paused.':'Nodus fabric reacting.');
+      }catch(error){fabricStatus(error.message);}
+    });
+    $('fabric-motion-stop').addEventListener('click',async()=>{await stopFabricMotion();
+      dispose(backdropMesh);backdropMesh=backdropRoll();fabricStatus('Fabric motion stopped.');});
     triggerGrid=mountMarbleTriggerGrid({doc:document,getReceivers:()=>[
       ...STUDIO_LIGHTS.map((_,i)=>`studio:${i}`),
       ...shopLightState().fixtures.map(fixture=>`shop:${fixture.id}`),

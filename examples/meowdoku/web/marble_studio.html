@@ -216,9 +216,14 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <label>Ceiling material A<select id="ceiling-material-a"></select></label>
     <label>Ceiling material B<select id="ceiling-material-b"></select></label>
     <label>Backdrop layers <output id="backdrop-layers-out"></output><input id="backdrop-layers" type="range" min="0" max="6" value="0"></label>
+    <button type="button" id="fabric-tall-preset">New tall mounted fabric backdrop</button>
     <label>Default backdrop material<select id="backdrop-material"><option value="calibration">Calibration (colour chart)</option></select></label>
     <label class="wide"><input id="backdrop-sweep" type="checkbox"> Sweep backdrop onto floor or table top (cyclorama)</label>
     <div id="backdrop-layer-controls" class="wide"></div>
+    <div class="wide"><button type="button" id="fabric-motion-start">Relax fabric in Nodus</button>
+      <button type="button" id="fabric-motion-pause" disabled>Pause fabric</button>
+      <button type="button" id="fabric-motion-stop" disabled>Stop fabric</button>
+      <span id="fabric-motion-status" role="status">Fabric motion is idle.</span></div>
     <p class="wide">Each backdrop layer has its own height, stage distance, wall or table-back lock, pitch, sweep radius, size and aspect link. Table-back lock uses the enabled product table's rear edge and puts the sweep just above its top material. Circular mats do not sweep. Quick scale multiplies both dimensions. Lighting profiles save these settings in this browser.</p>
     <details id="studio-gobo-advanced" class="wide"><summary>Gobos</summary><div id="studio-gobo-controls"></div></details>
     </div></details>

@@ -379,6 +379,7 @@ class Sessions:
         from meowdoku.living_data_static import StaticWorlds
         self.living_data_static = StaticWorlds()
         self.studio_pictures = None             # [SHOW] set by main() when a Studio Nodus destination is configured
+        self.fabric_motion = None               # [FABRIC] native row host plus complete UDP frame receiver
         from meowdoku.living_data_query import GraphView
         from meowdoku import rest_api as shared_rest_loader
         # [SITE] a map as pages: rendered on first look and kept under products/site; the maps this host declares
@@ -600,6 +601,32 @@ def make_handler(sessions: Sessions):
                 self._set_cookie = []
                 self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
                 return None
+
+        def _fabric_route(self, method: str) -> None:
+            from urllib.parse import parse_qs
+            from meowdoku.fabric_motion import FabricMotionError
+            if not self._require("studio_write"):
+                return
+            if sessions.fabric_motion is None:
+                return self._json({"error": "native fabric service is not configured"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            owner = self._principal().user_id
+            if owner is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.FORBIDDEN)
+            try:
+                if method == "GET":
+                    token = (parse_qs(self.path.partition("?")[2]).get("token") or [""])[0]
+                    return self._json(sessions.fabric_motion.state(owner, token))
+                if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "same-origin request required"}, HTTPStatus.FORBIDDEN)
+                body = self._body_json(limit=2_000_000)
+                if body is None:
+                    return
+                action = body.get("action")
+                if action == "start":
+                    return self._json(sessions.fabric_motion.start(owner, body.get("configuration"), body.get("side")))
+                return self._json(sessions.fabric_motion.command(owner, body.get("token"), action))
+            except FabricMotionError as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
         def _login_post(self) -> None:
             """[LOGIN] POST /api/account/login: JSON only, rate-limited per client/username (login_guard.py), uniform failure body."""
@@ -1921,6 +1948,8 @@ def make_handler(sessions: Sessions):
                 return
             if path == "/api/route":                              # [ROUTE]
                 return self._route_get()
+            if path == "/api/studio/fabric":
+                return self._fabric_route("GET")
             if path == "/browse" or path.startswith("/browse/"):  # [LISTING] gated per root inside; the shader tier gets 403, never the shader page
                 return self._browse_get()
             if self._tier == "shader" and self._shader_request(path, "GET"):
@@ -2397,6 +2426,8 @@ def make_handler(sessions: Sessions):
                 return
             if path0 == "/api/route":                             # [ROUTE]
                 return self._route_post()
+            if path0 == "/api/studio/fabric":
+                return self._fabric_route("POST")
             # Worker-only payload mailbox: credentials are process-local and
             # distinct from browser ray credentials. Never accepts browser Origin.
             if path0.startswith("/api/client_rays/engine/"):
@@ -3165,6 +3196,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
     parser.add_argument("--studio-defaults", default=None,
                         help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
+    parser.add_argument("--fabric-row-host", default=None, help="persistent native Nodus spring-row host executable")
+    parser.add_argument("--fabric-row-plugin", default=None, help="native Nodus spring-row plugin DLL")
+    parser.add_argument("--fabric-core-dir", default=None, help="directory containing the Nodus tensor-core DLL")
+    parser.add_argument("--fabric-udp-port", type=int, default=48768, help="loopback NFAB receiver port")
     parser.add_argument("--no-mathlab", action="store_true",
                         help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
     parser.add_argument('--site-compiler-config', default=None,
@@ -3226,6 +3261,11 @@ def main(argv: list[str] | None = None) -> int:
     sessions.jobs = service_jobs.Registry(sessions.accounts_db, sessions.instance)
     sessions.marble_photos.registry = sessions.jobs
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
+    if args.fabric_row_host and args.fabric_row_plugin and args.fabric_core_dir:
+        from meowdoku.fabric_motion import FabricMotion
+        sessions.fabric_motion = FabricMotion(Path(args.fabric_row_host), Path(args.fabric_row_plugin),
+                                             Path(args.fabric_core_dir), state.run_dir, args.fabric_udp_port)
+        print(f"[fabric] native Nodus row UDP receiver on loopback:{args.fabric_udp_port}", flush=True)
     if args.studio_nodus_port and args.studio_assets:               # [SHOW] settings -> Nodus -> owned photo job
         from meowdoku import studio_agent, studio_pictures
         sessions.studio_pictures = studio_pictures.StudioPictures(
@@ -3290,6 +3330,8 @@ def main(argv: list[str] | None = None) -> int:
             sessions.mathlab_worker.stop()
         if site_compiler is not None:
             site_compiler.stop()
+        if sessions.fabric_motion is not None:
+            sessions.fabric_motion.close()
         sessions.marble_photos.close()
         if not lc.exit_code:
             lc.save_all()                                   # LIFECYCLE: a Ctrl-C keeps the sessions too

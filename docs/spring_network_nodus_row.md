@@ -82,3 +82,9 @@ python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\tab
 ## Collision-service handoff
 
 The tabletop contact in this cloth row is a local, height-and-bounds projection for the drape demo. The planned Nodus collision service is a continuously running, hot-batched service based on the YoungMan algorithm currently being developed. When that service is ready, examine whether cloth contact should be extracted from this row and supplied by the shared collision service. Preserve the present cloth behavior as a measured baseline; this note does not designate the tabletop projection as the general collision algorithm or change the current row contract.
+
+## Marble Studio motion service
+
+The tall mounted fabric preset uses the existing 256-node batch as a 16×16 sheet (450 triangles), 14 Studio units wide and 18 tall. Its bottom starts 2.5 units above the floor, 5 units behind the stage, with all 16 top-row nodes attached. A saved backdrop profile retains `fabricGridSide` and `fabricAttachmentPoints`. The native `spring_network_nodus_host` holds one row instance and supplies 10 ms ticks; pause and resume use the row's own freeze command. The host is a persistent row host, not yet a Free canvas table.
+
+The Meowdoku server owns the host process and subscribes to its NFAB UDP publication on loopback. It only serves complete, sequenced frames to the signed-in owner through `GET /api/studio/fabric?token=...`; `POST /api/studio/fabric` starts, pauses, resumes or stops an owned session. Marble Studio sends the configured row once, then displays received positions; it does not integrate fabric motion in JavaScript. The service caps concurrent sessions at four and releases an idle session after ten minutes when another starts. Exported runtime DLLs are copied to the service products directory after compilation in user space, and the supervised Meowdoku instances receive those paths through `instances.json`.
