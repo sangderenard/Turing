@@ -78,3 +78,7 @@ node tools/export_backdrop_fabric.mjs build/meowdoku/web/assets.json C:\Users\al
 & 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_nodus_row_demo.exe' 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_network_nodus_row.dll' 'C:\Users\alber\nodus-build\spring-row\table_drape_udp.csv' 'C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv' freeze 'C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv.contact.csv'
 python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\table_drape_udp.csv C:\Users\alber\nodus-build\spring-row\table_drape.gif --pins 0,8 --assets build/meowdoku/web/assets.json --material fabric_muslin_white --contact C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv.contact.csv
 ```
+
+## Collision-service handoff
+
+The tabletop contact in this cloth row is a local, height-and-bounds projection for the drape demo. The planned Nodus collision service is a continuously running, hot-batched service based on the YoungMan algorithm currently being developed. When that service is ready, examine whether cloth contact should be extracted from this row and supplied by the shared collision service. Preserve the present cloth behavior as a measured baseline; this note does not designate the tabletop projection as the general collision algorithm or change the current row contract.
