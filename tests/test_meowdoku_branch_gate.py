@@ -564,3 +564,67 @@ def test_the_notices_of_removal_are_kept_in_git_as_well_as_sql(world):
     assert "Removal notices: 1 records" in run(work, "log", "-1", "--format=%s")
     assert run(world["remote"], "rev-parse", "refs/heads/main") == run(work, "rev-parse", "HEAD"), "the record is on the remote"
     assert branch_gate.publish_notices(policy, db, commit=True, log=lambda line: None).endswith("already recorded in Git")
+
+
+# ---- the record on GitHub: a pull request per landed review, and each account's declared Git identity ----
+
+def test_a_landing_on_github_opens_a_pull_request_naming_submitter_approver_and_authors(world, monkeypatch):
+    db, policy = world["db"], world["policy"]
+    calls = []
+
+    def gh(*args):
+        calls.append(args)
+        if args[:2] == ("pr", "list"):
+            return 0, "[]"
+        if args[:2] == ("pr", "create"):
+            return 0, "https://github.com/owner/work/pull/7"
+        return 1, "unexpected"
+
+    monkeypatch.setattr(branch_gate, "github_slug", lambda path, remote="origin": "owner/work")
+    branch_review.set_identity(db, user_id=ANN, name="t", email="t@example.invalid", now=1.0)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head, timeout_s=0)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved", note="fine")
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, gh=gh)
+    assert done[0]["action"] == "landed" and remote_has(world, "main") == head
+    create = next(args for args in calls if args[:2] == ("pr", "create"))
+    body = create[create.index("--body") + 1]
+    assert create[create.index("--head") + 1] == "feature" and create[create.index("--base") + 1] == "main"
+    assert "submitted by **ann**, approved by admin" in body and head in body and "- t <t@example.invalid>" in body
+    assert "every commit is by ann's declared identity" in body and "Decision note: fine" in body
+    detail = branch_review.get(db, made["id"])["landed_detail"]
+    assert "https://github.com/owner/work/pull/7" in detail and "every commit is by ann's declared identity" in detail
+
+
+def test_a_github_that_cannot_answer_never_holds_a_landing_and_an_open_pull_request_is_updated(world, monkeypatch):
+    db, policy = world["db"], world["policy"]
+    monkeypatch.setattr(branch_gate, "github_slug", lambda path, remote="origin": "owner/work")
+    head = branch(world, "feature")
+    made = submit(world, "feature", head, timeout_s=0)
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, gh=lambda *a: (1, "not logged in"))
+    assert done[0]["action"] == "landed" and remote_has(world, "main") == head
+    record = branch_review.get(db, made["id"])["landed_detail"]
+    assert "no pull request (GitHub did not answer: not logged in)" in record and "ann has declared no Git identity" in record
+    edits = []
+
+    def gh(*args):
+        edits.append(args)
+        return (0, '[{"number": 3, "url": "https://github.com/owner/work/pull/3"}]') if args[1] == "list" else (0, "")
+
+    assert branch_gate.record_pull_request("owner/work", {**branch_review.get(db, made["id"]), "remarks": []}, [], gh=gh) \
+        == "https://github.com/owner/work/pull/3"
+    assert edits[-1][:3] == ("pr", "edit", "3")
+
+
+def test_an_account_declares_its_own_git_identity_and_mismatches_are_named(world):
+    db = world["db"]
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.set_identity(db, user_id=ANN, name="a <b>", email="a@b")
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.set_identity(db, user_id=ANN, name="ann", email="not an address")
+    branch_review.set_identity(db, user_id=ANN, name="Ann", email="ann@example.invalid", now=2.0)
+    assert branch_review.identity(db, ANN) == {"name": "Ann", "email": "ann@example.invalid", "declared_at": 2.0}
+    review = {"owner_id": ANN, "owner_name": "ann"}
+    assert branch_review.authorship(db, review, ["Ann <ann@example.invalid>"]) == "every commit is by ann's declared identity"
+    assert branch_review.authorship(db, review, ["Albert <albert@example.invalid>"]) == \
+        "commits not by ann's declared identity: Albert <albert@example.invalid>"

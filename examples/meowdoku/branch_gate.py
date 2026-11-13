@@ -179,6 +179,52 @@ def github_rules(slug, branch) -> list | None:
     return rules if isinstance(rules, list) else None
 
 
+def run_gh(*args) -> tuple[int, str]:
+    """One ``gh`` call: (exit code, output). The only place this tool asks GitHub for anything but rules."""
+    try:
+        done = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        return 1, str(error)
+    return done.returncode, (done.stdout if done.returncode == 0 else done.stderr or done.stdout).strip()
+
+
+def pull_request_body(review, authors, authorship="") -> str:
+    """What GitHub keeps about one landed review: who submitted it, who accepted it, at which commit, by whom written."""
+    decided = (f"approved by {review['reviewer_name']}" if review.get("reviewer_name")
+               else "accepted after its time-out with no objection")
+    lines = [f"Review `{review['id']}` of `{review['repository']}`, submitted by **{review['owner_name']}**, {decided}.",
+             f"Commit `{review['head']}` lands on `{review['base']}` as a fast-forward; GitHub marks this pull request merged",
+             "when that push arrives. Nothing here is rebased or squashed.", "", "Commit authors:"]
+    lines += [f"- {author}" for author in authors] or ["- (none recorded)"]
+    if authorship:
+        lines.append(f"- {authorship}")
+    for remark in review.get("remarks") or ():
+        lines.append(f"- remark by {remark['username']}: {remark['verdict']}" + (f" ({remark['note']})" if remark.get("note") else ""))
+    if review.get("note"):
+        lines += ["", f"Decision note: {review['note']}"]
+    return "\n".join(lines)
+
+
+def record_pull_request(slug, review, authors, *, authorship="", gh=run_gh) -> str:
+    """Open (or update) the pull request that records one review on GitHub, before its commit lands. Returns its URL,
+    or a sentence saying why there is none; never raises, so a GitHub that cannot answer does not hold a landing."""
+    body = pull_request_body(review, authors, authorship)
+    code, out = gh("pr", "list", "--repo", slug, "--head", review["branch"], "--state", "open", "--json", "number,url")
+    if code != 0:
+        return f"no pull request (GitHub did not answer: {out[-200:]})"
+    try:
+        found = json.loads(out or "[]")
+    except ValueError:
+        found = []
+    if found:
+        number, url = found[0]["number"], found[0]["url"]
+        code, out = gh("pr", "edit", str(number), "--repo", slug, "--body", body)
+        return url if code == 0 else f"pull request {url} not updated ({out[-200:]})"
+    code, out = gh("pr", "create", "--repo", slug, "--base", review["base"], "--head", review["branch"],
+                   "--title", f"{review['branch']} (review {review['id'][:8]})", "--body", body)
+    return out.splitlines()[-1] if code == 0 and out else f"no pull request ({out[-200:]})"
+
+
 def deletion_forbidden(path, remote, branch) -> str | None:
     """The reason GitHub would refuse to delete this branch, or None when no rule says so (or nothing could be asked)."""
     slug = github_slug(path, remote)
@@ -472,7 +518,7 @@ def clean(policy, db, *, apply, actor=None, now=None, log=print) -> list:
     return actions
 
 
-def land(policy, db, *, apply, now=None, log=print) -> list:
+def land(policy, db, *, apply, now=None, log=print, gh=run_gh) -> list:
     now = time.time() if now is None else now
     results = []
     for review in branch_review.landable(db, now):
@@ -494,11 +540,21 @@ def land(policy, db, *, apply, now=None, log=print) -> list:
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
                               capture_output=True).returncode != 0:
                 raise GateError(f"not a fast-forward of {review['base']}; merge {review['base']} into the branch and submit again")
+            authors = [line for line in git(path, "log", "--format=%an <%ae>", f"{base}..{review['head']}").splitlines() if line]
+            authors = list(dict.fromkeys(authors))
+            authorship = branch_review.authorship(db, review, authors)
             if not apply:
                 entry.update(action="would land", reason=f"{review['standing']}; a fast-forward of {review['base']}")
             else:
+                # The record on GitHub: a pull request naming who submitted and who accepted, opened before the push
+                # so that GitHub marks it merged when the fast-forward arrives. A remote that is not GitHub has none.
+                slug = github_slug(path, remote)
+                pull = record_pull_request(slug, review, authors, authorship=authorship, gh=gh) if slug else None
                 git(path, "push", remote, f"{review['head']}:refs/heads/{review['base']}")
                 detail = f"{review['base']} is at {review['head'][:12]}"
+                if pull:
+                    detail += f"; {pull}"
+                detail += f"; authors {', '.join(authors) or 'none'}; {authorship}"
                 branch_review.mark_landed(db, review["id"], detail, now)
                 if not review["delete_branch"]:
                     detail += "; branch kept as its author asked"

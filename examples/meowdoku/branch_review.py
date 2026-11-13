@@ -64,6 +64,9 @@ DDL = (
     "removed_at REAL NOT NULL, reason TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS worktree_verdicts (path TEXT PRIMARY KEY, verdict TEXT NOT NULL CHECK(verdict IN "
     "('trash','archive','keep')), note TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL, decided_at REAL NOT NULL)",
+    # The Git author identity an account declares for its own commits (identity()/set_identity()).
+    "CREATE TABLE IF NOT EXISTS account_git_identity (user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, "
+    "declared_at REAL NOT NULL)",
 )
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
             "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail")
@@ -80,6 +83,39 @@ def ensure(db) -> None:
         db.execute(statement)
     if "removed_by" not in {row[1] for row in db.execute("PRAGMA table_info(branch_removed)")}:
         db.execute("ALTER TABLE branch_removed ADD COLUMN removed_by TEXT")      # notices made before the cleanup account
+
+
+_EMAIL = re.compile(r"^[^@\s<>]+@[^@\s<>]+$")
+
+
+def set_identity(db, *, user_id, name, email, now=None) -> dict:
+    """An account declares the Git author name and email its commits carry. Its own; one row, replaced."""
+    _account(user_id)
+    if not isinstance(name, str) or not name.strip() or len(name) > 100 or any(c in name for c in "<>\r\n"):
+        raise ReviewError("name must be a short author name without < > or line breaks")
+    if not isinstance(email, str) or not _EMAIL.match(email) or len(email) > 200:
+        raise ReviewError("email must be one address")
+    ensure(db)
+    db.execute("INSERT OR REPLACE INTO account_git_identity VALUES (?,?,?,?)",
+               (user_id, name.strip(), email.strip(), time.time() if now is None else now))
+    return identity(db, user_id)
+
+
+def identity(db, user_id) -> dict | None:
+    ensure(db)
+    row = db.execute("SELECT name, email, declared_at FROM account_git_identity WHERE user_id = ?", (int(user_id),)).fetchone()
+    return None if row is None else {"name": row[0], "email": row[1], "declared_at": row[2]}
+
+
+def authorship(db, review, authors) -> str:
+    """Whether a review's commit authors are its submitter's declared identity: one sentence for the record."""
+    declared = identity(db, review["owner_id"])
+    if declared is None:
+        return f"{review['owner_name']} has declared no Git identity"
+    mine = f"<{declared['email']}>".lower()
+    others = [a for a in authors if not a.lower().endswith(mine)]
+    return (f"every commit is by {review['owner_name']}'s declared identity" if not others
+            else f"commits not by {review['owner_name']}'s declared identity: {', '.join(others)}")
 
 
 def is_service(db, username) -> bool:
@@ -398,6 +434,8 @@ def http_route(self, path, method, *, policy, accounts_db):
         POST /api/reviews/decide          {id, head, decision, note?}                         an admin
         POST /api/reviews/withdraw        {id}                                                the author
         POST /api/reviews/checkout        {repository, branch}      register a branch to yourself; answers the steps
+        GET  /api/reviews/identity        the Git author identity this account declared
+        POST /api/reviews/identity        {name, email}             declare it (each account its own)
         GET  /api/reviews/removed         the notices of removal: what left this computer, at which commit, by whom
         GET  /api/reviews/standing?repository=NAME&head=COMMIT      open: {"accepted", "lock", "advice"}
 
@@ -428,6 +466,8 @@ def http_route(self, path, method, *, policy, accounts_db):
         who = {"user_id": principal.user_id, "username": principal.username}
         if method == "GET" and path == "/api/reviews/removed":
             return self._json({"removed": removed(db), "cleaner": policy.get("cleaner")})
+        if method == "GET" and path == "/api/reviews/identity":
+            return self._json({"identity": identity(db, principal.user_id)})
         if method == "GET" and path == "/api/reviews":
             return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
                                "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock")})
@@ -451,6 +491,9 @@ def http_route(self, path, method, *, policy, accounts_db):
             base = known[repository]["default"] if isinstance(repository, str) and repository in known else ""
             made = submit(db, **who, repository=repository, branch=body.get("branch"), base=base, head=body.get("head"),
                           timeout_s=hours * 3600.0, delete_branch=not keep, known=list(known))
+        elif path == "/api/reviews/identity":
+            return self._json({"identity": set_identity(db, user_id=principal.user_id, name=body.get("name"),
+                                                        email=body.get("email"))})
         elif path == "/api/reviews/checkout":
             held = register(db, **who, repository=body.get("repository"), branch=body.get("branch"), known=list(known))
             print(f"[reviews] {principal.username} checkout {held['repository']} {held['branch']}", flush=True)

@@ -34,7 +34,20 @@
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
-      "studio_prefix": "studio.product"
+      "studio_prefix": "studio.product",
+      "env": {
+        "GIT_CONFIG_COUNT": "5",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "C:/dev/Powershell",
+        "GIT_CONFIG_KEY_1": "safe.directory",
+        "GIT_CONFIG_VALUE_1": "C:/dev/Powershell/turing",
+        "GIT_CONFIG_KEY_2": "safe.directory",
+        "GIT_CONFIG_VALUE_2": "C:/dev/Powershell/nodus",
+        "GIT_CONFIG_KEY_3": "safe.directory",
+        "GIT_CONFIG_VALUE_3": "C:/dev/Powershell/speaktome",
+        "GIT_CONFIG_KEY_4": "safe.directory",
+        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer"
+      }
     },
     {
       "name": "meowdoku-dev",
@@ -68,7 +81,20 @@
         "48771"
       ],
       "leases": [],
-      "python": "C:/dev/Powershell/srv/python/python.exe"
+      "python": "C:/dev/Powershell/srv/python/python.exe",
+      "env": {
+        "GIT_CONFIG_COUNT": "5",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "C:/dev/Powershell",
+        "GIT_CONFIG_KEY_1": "safe.directory",
+        "GIT_CONFIG_VALUE_1": "C:/dev/Powershell/turing",
+        "GIT_CONFIG_KEY_2": "safe.directory",
+        "GIT_CONFIG_VALUE_2": "C:/dev/Powershell/nodus",
+        "GIT_CONFIG_KEY_3": "safe.directory",
+        "GIT_CONFIG_VALUE_3": "C:/dev/Powershell/speaktome",
+        "GIT_CONFIG_KEY_4": "safe.directory",
+        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer"
+      }
     },
     {
       "name": "nodus-messenger",
@@ -143,7 +169,20 @@
         "--branch-policy",
         "C:/dev/Powershell/turing/examples/meowdoku/deploy/branch_policy.json"
       ],
-      "userlist_prefix": "userlist"
+      "userlist_prefix": "userlist",
+      "env": {
+        "GIT_CONFIG_COUNT": "5",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "C:/dev/Powershell",
+        "GIT_CONFIG_KEY_1": "safe.directory",
+        "GIT_CONFIG_VALUE_1": "C:/dev/Powershell/turing",
+        "GIT_CONFIG_KEY_2": "safe.directory",
+        "GIT_CONFIG_VALUE_2": "C:/dev/Powershell/nodus",
+        "GIT_CONFIG_KEY_3": "safe.directory",
+        "GIT_CONFIG_VALUE_3": "C:/dev/Powershell/speaktome",
+        "GIT_CONFIG_KEY_4": "safe.directory",
+        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer"
+      }
     },
     {
       "name": "udp-router",

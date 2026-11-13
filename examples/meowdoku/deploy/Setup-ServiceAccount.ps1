@@ -105,6 +105,22 @@ if (-not $WhatIf) { Remove-Item -LiteralPath $exportInf, $applyInf, $sdb -Force 
 Step "(c) NTFS ACLs for $Name"
 Write-Host 'Read+execute with inheritance (the whole tree must be loadable):'
 foreach ($d in @($Apache, $Repo, $Nodus, $Srv)) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)RX") }
+# Git reads every repository the branch policy names (the reviews page's commits and diffs, core Git, the task
+# worker's landing). A repository inside another one's tree is covered by that grant. The workspace root holds every
+# other project in its working tree, so there the service reads only the folder itself and its .git, never the tree.
+# git's safe.directory for these paths reaches each Git-running instance through its own environment
+# (instances.json "env", GIT_CONFIG_* command-scope config), not through any machine-wide or profile config.
+$Policy = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'branch_policy.json') | ConvertFrom-Json
+$Workspace = (Resolve-Path (Join-Path $Repo '..')).Path.Replace('\', '/')
+foreach ($p in $Policy.repositories.PSObject.Properties) {
+    $path = ([string]$p.Value.path).Replace('\', '/').TrimEnd('/')
+    if ($path -eq $Workspace) {
+        Run 'icacls.exe' @($path, '/grant', "${Name}:RX")
+        Run 'icacls.exe' @("$path/.git", '/grant', "${Name}:(OI)(CI)RX")
+    } elseif (@($Apache, $Repo, $Nodus, $Srv) -notcontains $path) {
+        Run 'icacls.exe' @($path, '/grant', "${Name}:(OI)(CI)RX")
+    }
+}
 Write-Host 'Modify (logs, state, build output):'
 foreach ($d in (@("$Apache/logs") + $ModifyDirs + @("$Nodus/out"))) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)M") }
 Write-Host 'Secrets the service must read (explicit file-level grants; build/ already gives Modify by inheritance):'
