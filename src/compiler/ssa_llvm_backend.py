@@ -4401,7 +4401,26 @@ def _emit_repository_call_module(
                             f"{stored_type} element of %t{int(address_argument.id)}; "
                             "explicit conversion required"))
                         continue
+                    # A native pointer VALUE is distinct from an aggregate
+                    # address alias. Require the exact scalar physical receipt;
+                    # raw ptr spelling and shape alone historically mean both.
+                    scalar_pointer_snapshot = False
+                    if loaded_type == "ptr" and not tuple(result.shape or ()):
+                        from .concordance_declarations import SSA_VALUE, SSAValueFact
+                        from .ssa_record_return_state import function_scope_of
+                        physical_book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+                        cell = (None if physical_book is None else physical_book.latest_ref(
+                            SSA_VALUE, (function_scope_of(function), result_id)))
+                        fact = (None if cell is None else physical_book.page(SSA_VALUE).cell(
+                            cell.row, cell.column))
+                        scalar_pointer_snapshot = (
+                            isinstance(fact, SSAValueFact)
+                            and fact.physical_dtype == "ptr"
+                            and fact.storage == "scalar" and fact.rank == 0
+                            and tuple(fact.shape or ()) == () and not fact.arena
+                        )
                     if (loaded_type in {"double", "float", *_INTEGER_LLVM_TYPES}
+                            or scalar_pointer_snapshot
                             or int(address_argument.id) in owned_heap_addresses
                             or (result.dtype in {'int64', 'uint64', 'opaque_ref'} and not result.shape)):
                         # Pin the loaded scalar to its own slot.
