@@ -1641,8 +1641,18 @@ class CorrelationTable:
         found.extend(self._source_private_dynamic_sequence_findings(module))
         found.extend(self._source_sequence_constructor_snapshot_findings(module))
         found.extend(self._source_sequence_capacity_bound_findings(module))
+        from .source_comprehension_capacity import source_comprehension_capacity_findings
+        found.extend(source_comprehension_capacity_findings(module))
         found.extend(self._source_bytes_concat_class_findings(module))
         found.extend(self._source_eager_bytes_return_findings(module))
+        from .source_owned_record_elements import source_field_sequence_element_findings
+        found.extend(source_field_sequence_element_findings(module))
+        from .source_owned_record_projection import public_source_entry_findings
+        found.extend(public_source_entry_findings(module))
+        from .source_owned_record_projection_validation import record_owned_return_projection_findings
+        found.extend(record_owned_return_projection_findings(module))
+        from .source_sequence_lifetime import sequence_lifetime_findings
+        found.extend(sequence_lifetime_findings(module))
         found.extend(self._source_owned_sequence_return_findings(module))
         found.extend(self._public_owned_sequence_return_findings(module))
         found.extend(self._runtime_result_abi_findings(module))
@@ -10503,6 +10513,12 @@ class CorrelationTable:
                 cell = Ref(FORMAL_ACTUAL_OCCURRENCE, row, column)
                 causes = tuple(parent for parent, _stage in book.edges_into(cell))
                 previous = Ref(FORMAL_ACTUAL_OCCURRENCE, row, old_column)
+                if isinstance(current, Unresolved):
+                    from .source_formal_occurrence_pruning import occurrence_retirement_sources
+                    if occurrence_retirement_sources(book, cell, module.functions) is None:
+                        found.append(Finding("formal-actual-retirement-disagreement", str(caller), int(formal),
+                                             "positional occurrence retirement lacks exact pruning/replacement proof"))
+                    continue
                 transition_key = (scope, block, index, position)
                 transitions = tuple(parent for parent in causes
                     if parent.page == LOOP_RESULT_USE_REBINDING and parent.row == transition_key)
@@ -10968,6 +10984,13 @@ class CorrelationTable:
                     ))
                 continue
             if type(literal) is not int:
+                continue
+            # Native sequence helper literals retain the exact declared width
+            # chosen by the existing scalar-width producer, not Python's int
+            # default. Source/block/value/width causes and the live Const must
+            # all agree; an arbitrary dtype or historical width is not enough.
+            from .source_sequence_helper_heap import registered_helper_integer_materialization
+            if registered_helper_integer_materialization(module, row, materialization_cell):
                 continue
             try:
                 expected_dtype = python_int_literal_dtype(literal)
@@ -17029,7 +17052,7 @@ class CorrelationTable:
         """Check the source-owned return's native descriptor and owner."""
 
         from .concordance_declarations import (
-            PUBLIC_OWNED_SEQUENCE_RETURN, SEQUENCE_DESCRIPTOR,
+            PUBLIC_OWNED_SEQUENCE_RETURN, RECORD_OWNED_RETURN_PROJECTION, SEQUENCE_DESCRIPTOR,
             SOURCE_OWNED_SEQUENCE_RETURN, SSA_VALUE,
             PublicOwnedSequenceReturn, SourceOwnedSequenceReturn,
         )
@@ -17049,6 +17072,13 @@ class CorrelationTable:
             table = (getattr(module, "sequence_tables", {}) or {}).get(
                 str(row[0])
             )
+            if (isinstance(fact, PublicOwnedSequenceReturn)
+                    and fact.source_cell.page == RECORD_OWNED_RETURN_PROJECTION):
+                from .source_owned_record_projection_validation import validated_record_public_owned_return
+                if validated_record_public_owned_return(module, cell) is None:
+                    found.append(Finding('public-owned-sequence-return',str(row[0]),int(row[1]),
+                        'owned record return lacks exact source, writer, transfer or owner proof'))
+                continue
             valid = (
                 isinstance(fact, PublicOwnedSequenceReturn)
                 and function is not None and table is not None
@@ -17145,12 +17175,12 @@ class CorrelationTable:
                 "runtime-result-abi", str(entry), None, detail,
             ))
             if (
-                backend is not Backend.C_MODULE
+                backend not in {Backend.C_MODULE, Backend.LLVM_MODULE}
                 or not isinstance(fact, ArtifactFact)
                 or len(fact.location) != 1
                 or not isinstance(fact.location[0], dict)
             ):
-                issue("runtime ABI lacks an exact C entry and description")
+                issue("runtime ABI lacks an exact native entry and description")
                 continue
             description = fact.location[0]
             payload = repr(description).encode("utf-8")
@@ -17158,7 +17188,12 @@ class CorrelationTable:
                 fact.sha256 != hashlib.sha256(payload).hexdigest()
                 or fact.byte_length != len(payload)
                 or description.get("entry") != str(entry)
-                or description.get("backend") != "c"
+                or description.get("backend") != (
+                    "c" if backend is Backend.C_MODULE else "llvm"
+                )
+                or description.get("extents", {}).get("type") != (
+                    "int64_t" if backend is Backend.C_MODULE else "int32_t"
+                )
                 or description.get("schema") not in {
                     "turing-runtime-abi-v2", "turing-runtime-abi-v3",
                 }
@@ -22970,19 +23005,20 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
     return tuple(receipts)
 
 
-def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
-    """Account for hidden formals proved to be compiler-owned at every call.
+def publish_formal_actual_occurrences(
+    functions: Mapping[str, Any], *, book: Any, call_table: Any = None,
+) -> None:
+    """Publish exact incoming call positions without classifying hidden formals.
 
-    A structural value such as a tensor dtype can survive specialization as a
-    scalar formal even when it is not an authored parameter.  If every exact
-    incoming call position supplies linked frame storage, the concordance can
-    classify that formal without guessing from its numerical dtype or use.
+    Program: the structural full-content string equality helper borrows its
+    caller's descriptor storage. Its early physical-layout demand needs the
+    real call occurrence before late hidden-formal classification. This is
+    the existing occurrence census, with the same source and rebind checks;
+    it does not create storage or classify any formal.
     """
 
-    functions = getattr(module, "functions", {}) or {}
-    book = identity_book(module)
     from .concordance_declarations import (
-        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION,
+        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE,
         FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, REGION_SIGNATURE, SSA_VALUE,
     )
     # Persisted books own their vocabulary. Add this scoped relation through
@@ -23063,7 +23099,6 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                         callsite_id = instruction.attributes.get(
                             "plan_callsite_id"
                         )
-                        call_table = getattr(module, "call_table", None)
                         records = (
                             () if call_table is None
                             else call_table.get(str(caller_name), ())
@@ -23110,6 +23145,35 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                                     else Unsourced(FRAME_SOURCE_CELL_ABSENT)),
                         mode=occurrence_mode,
                     )
+
+
+def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
+    """Account for hidden formals proved to be compiler-owned at every call.
+
+    A structural value such as a tensor dtype can survive specialization as a
+    scalar formal even when it is not an authored parameter.  If every exact
+    incoming call position supplies linked frame storage, the concordance can
+    classify that formal without guessing from its numerical dtype or use.
+    """
+
+    functions = getattr(module, "functions", {}) or {}
+    book = identity_book(module)
+    publish_formal_actual_occurrences(
+        functions, book=book, call_table=getattr(module, "call_table", None),
+    )
+    from .concordance_declarations import (
+        FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION, FRAME_BINDING,
+        SSA_VALUE,
+    )
+
+    occurrence_page = FORMAL_ACTUAL_OCCURRENCE
+    incoming_page = book.page(occurrence_page)
+
+    def caller_scope(function: Any) -> str:
+        return str(
+            function.metadata.get("tensor_shape_concordance_scope")
+            or function.name
+        )
 
     receipts: list[dict] = []
     for function_name, function in functions.items():
@@ -23158,6 +23222,8 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                 and str(row[2]) in functions
                 and row[6] == caller_scope(functions[str(row[2])])
             )
+            from .source_formal_occurrence_pruning import live_occurrence_rows
+            source_rows = live_occurrence_rows(book, source_rows, functions)
             source_facts = tuple(
                 incoming_page.latest(row) for row in source_rows
             )

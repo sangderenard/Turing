@@ -167,9 +167,14 @@ def test_continuous_qualification_progress_and_stop(server):
         qualification_runs.progress(db, run_id, phase="training", completed_epochs=1000001,
                                     epoch=1000001, loss=0.1)
         qualification_runs.progress(db, run_id, phase="autosaving", completed_epochs=1000001)
+        qualification_runs.live_state(db, run_id, source="current",
+                                      observed_at="2026-11-13T19:56:00Z", matured_frames=7,
+                                      historical_batch=32, live_batch=32)
         active = qualification_runs.public_snapshot(db)["runs"][0]
         assert active["status"] == "running" and active["planned_epochs"] == 0
         assert active["phase"] == "autosaving" and active["completed_epochs"] == 1000001
+        assert active["live"]["matured_frames"] == 7
+        assert (active["live"]["historical_batch"], active["live"]["live_batch"]) == (32, 32)
         qualification_runs.finish(db, run_id, status="stopped", result={})
         stopped = qualification_runs.public_snapshot(db)["runs"][0]
         assert stopped["status"] == "stopped" and stopped["finished"] is not None

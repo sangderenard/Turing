@@ -12901,8 +12901,8 @@ def _normalize_lexical_values(
                         ),
                     )
                 if refined_annotation == "str":
-                    # A declared string field is a runtime string-token value,
-                    # even though its physical column is int64.  Publish the
+                    # A declared string field retains its semantic class;
+                    # its physical glyph carrier is a separate fact. Publish the
                     # semantic class from the field declaration at the read
                     # itself so method results and formatting follow the same
                     # exact receiver edge instead of rediscovering the type
@@ -12927,6 +12927,15 @@ def _normalize_lexical_values(
                     "int": "int64", "bool": "bool", "float": "float64",
                 }.get(refined_annotation)
                 if (
+                    field_storage.get("storage") == "span"
+                    and int(field_storage.get("rank", 0)) > 0
+                ):
+                    graph.G.nodes[attribute_id]["tensor"] = {
+                        "shape": (), "dtype": str(field_storage["dtype"]),
+                        "rank": int(field_storage["rank"]),
+                        "metadata_state": "dynamic",
+                    }
+                elif (
                     field_storage.get("dtype") is not None
                     and field_storage.get("record") is None
                     and field_storage.get("aggregate_kind") is None
@@ -23617,11 +23626,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             else annotation.attr if isinstance(annotation, ast.Attribute)
             else ""
         )
+        if name == "str":
+            # Authored strings are glyph spans. Vocabulary-token carriers
+            # have their own scalar declaration and are not inferred here.
+            return {"dtype": "int64", "aggregate_kind": "str",
+                    "storage": "span", "rank": 1}
         dtype = {
             "bool": "bool", "int": "int64", "float": "float64",
-            # Source strings are repository string-table tokens at this
-            # boundary, not Python objects.
-            "str": "int64",
         }.get(str(name))
         if dtype is not None:
             return {"dtype": dtype}

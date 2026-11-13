@@ -275,7 +275,7 @@ def public_owned_sequence_returns(
     """Read the completed source return, descriptor, and heap owner chain."""
 
     from .concordance_declarations import (
-        PUBLIC_OWNED_SEQUENCE_RETURN, SOURCE_OWNED_SEQUENCE_RETURN,
+        PUBLIC_OWNED_SEQUENCE_RETURN, SOURCE_OWNED_SEQUENCE_RETURN, RECORD_OWNED_RETURN_PROJECTION,
         PublicOwnedSequenceReturn, SourceOwnedSequenceReturn,
     )
     from .identity_concordance import CorrelationTable
@@ -309,13 +309,24 @@ def public_owned_sequence_returns(
         fact = page.cell(cell.row, cell.column)
         if not isinstance(fact, PublicOwnedSequenceReturn):
             continue
-        source = book.page(SOURCE_OWNED_SEQUENCE_RETURN).cell(
-            fact.source_cell.row, fact.source_cell.column,
-        )
+        if fact.source_cell.page == RECORD_OWNED_RETURN_PROJECTION:
+            from .source_owned_record_projection_validation import validated_record_public_owned_return
+            validated = validated_record_public_owned_return(module, cell)
+            if validated is None:
+                continue
+            source_return_slot = validated[1].source_return_slot_cell
+        elif fact.source_cell.page == SOURCE_OWNED_SEQUENCE_RETURN:
+            source = book.page(SOURCE_OWNED_SEQUENCE_RETURN).cell(
+                fact.source_cell.row, fact.source_cell.column,
+            )
+            if not isinstance(source, SourceOwnedSequenceReturn):
+                continue
+            source_return_slot = source.return_slot_cell
+        else:
+            continue
         descriptor = table.sequences.get(int(row[1]))
         if (
-            not isinstance(source, SourceOwnedSequenceReturn)
-            or descriptor is None
+            descriptor is None
             or descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
             or descriptor.heap_owner_value_id is None
             or len(descriptor.column_value_ids) != 1
@@ -341,12 +352,12 @@ def public_owned_sequence_returns(
         result.append(PublicOwnedSequencePorts(
             data_id, length_id, capacity_id, owner_id,
             str(descriptor.column_dtypes[0]), cell, fact.source_cell,
-            fact.descriptor_cell, fact.owner_cell, source.return_slot_cell,
+            fact.descriptor_cell, fact.owner_cell, source_return_slot,
         ))
     return tuple(result)
 
 
-def _sequence_descriptor_identity(table: Any, sequence_id: int):
+def _sequence_descriptor_identity(table: Any, sequence_id: int, *, ingestion_origin: bool = True):
     """Follow one descriptor through its contract to one ingestion origin."""
 
     from .concordance_declarations import (
@@ -379,7 +390,7 @@ def _sequence_descriptor_identity(table: Any, sequence_id: int):
         for parent, _stage in book.edges_into(contract):
             if parent.page == CANONICAL_VALUE:
                 try:
-                    identities.add(origin_cell(book, parent))
+                    identities.add(origin_cell(book, parent) if ingestion_origin else parent)
                 except ValueError:
                     return None
             elif parent.page == SEQUENCE_CONTRACT_CONCORDANCE:
@@ -461,7 +472,7 @@ def public_sequence_input_ports(
 def public_sequence_capacity_sources(
     module: Any, function_name: str,
 ) -> tuple[PublicSequenceCapacitySource, ...]:
-    """Read bytes-slice capacity from the source bound and both SSA views.
+    """Read bounded result capacity from source proof and both SSA views.
 
     `sequence_capacity_sources` is only a forwarding index. The authority is
     the source bound joined by unique canonical origins to the two sequence
@@ -542,6 +553,91 @@ def public_sequence_capacity_sources(
             int(source_descriptor.capacity_value_id),
             candidates[0], output_cell, source_cell,
         ))
+    return (*relations, *_public_comprehension_capacity_sources(module, function_name))
+
+
+
+def _public_comprehension_capacity_sources(module: Any, function_name: str):
+    """Join a proved one-row publication to returned scalar table columns.
+
+    Every column shares a capacity bound, but its visible length is the
+    producer's separately written length. No borrowed input is returned or
+    made writable by this relation.
+    """
+    from .concordance_declarations import (
+        SOURCE_COMPREHENSION_CAPACITY_BOUND, SourceComprehensionCapacityBound,
+    )
+    from .source_comprehension_capacity import source_comprehension_capacity_findings
+
+    function = module.functions.get(str(function_name))
+    table = (getattr(module, "sequence_tables", {}) or {}).get(str(function_name))
+    book = None if table is None else table.book
+    if function is None or book is None or source_comprehension_capacity_findings(module):
+        return ()
+    page = book.page(SOURCE_COMPREHENSION_CAPACITY_BOUND)
+    returned = {int(value.id) for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op == "Ret" and not instruction.attributes.get("fault_exit")
+                for value in instruction.args}
+    arguments = {int(value.id): value for value in function.args}
+    relations = []
+    for output_id, input_id in function.metadata.get("sequence_capacity_sources", ()):
+        output = _sequence_descriptor_identity(table, int(output_id), ingestion_origin=False)
+        source = _sequence_descriptor_identity(table, int(input_id), ingestion_origin=False)
+        if output is None or source is None:
+            continue
+        destination, destination_cell, _, destination_origin = output
+        incoming, incoming_cell, _, incoming_origin = source
+        if (not incoming.column_value_ids or not destination.column_value_ids
+                or any(destination.column_shapes or ())
+                or any(incoming.column_shapes or ())
+                or not {*map(int, destination.column_value_ids), int(destination.length_address_id)} <= returned):
+            continue
+        # Source cardinality is not permission to expose a buffer that a
+        # later unknown callee or aliased write can grow. Admit only the
+        # exact existing table publication and direct returned columns.
+        columns = tuple(map(int, destination.column_value_ids))
+        publications = []
+        closed_uses = True
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if not set(columns).intersection(int(value.id) for value in instruction.args):
+                    continue
+                if instruction.op == "Ret":
+                    continue
+                attrs = instruction.attributes or {}
+                if (instruction.op == "Call"
+                        and attrs.get("ssa_sequence_operation") == "table_store"
+                        and attrs.get("sequence_id") == int(output_id)
+                        and tuple(int(value.id) for value in instruction.args[:len(columns)]) == columns):
+                    publications.append(instruction)
+                else:
+                    closed_uses = False
+        if not closed_uses or len(publications) != 1:
+            continue
+        input_data_id = int(incoming.column_value_ids[0])
+        argument = arguments.get(input_data_id)
+        if argument is None or not (argument.accounting or {}).get("program_abi_parameter"):
+            continue
+        candidates = []
+        for row in page.rows():
+            bound = book.latest_ref(SOURCE_COMPREHENSION_CAPACITY_BOUND, row)
+            fact = page.cell(bound.row, bound.column)
+            if not isinstance(fact, SourceComprehensionCapacityBound):
+                continue
+            matches = (fact.destination_cell == destination_origin
+                       and fact.source_cell == incoming_origin)
+            if matches:
+                candidates.append(bound)
+        if len(candidates) != 1:
+            continue
+        for column in destination.column_value_ids:
+            relations.append(PublicSequenceCapacitySource(
+                int(output_id), int(input_id), int(column),
+                int(destination.length_address_id), int(destination.capacity_value_id),
+                input_data_id, int(incoming.length_address_id), int(incoming.capacity_value_id),
+                candidates[0], destination_cell, incoming_cell,
+            ))
     return tuple(relations)
 
 

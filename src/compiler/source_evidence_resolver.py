@@ -193,17 +193,76 @@ def _descriptor_span_proof(book: Any, subject: Ref, fact: SSAValueFact) -> tuple
     return tuple(dict.fromkeys((previous[0], sequence[0], cell_set, *causes)))
 
 
-def require_physical_layout(scope: Any, value_id: int, *, book: Any = None):
+def _bound_formal_span_layout(book, subject, fact, seen):
+    """Follow exact call occurrences for a registered borrowed helper formal."""
+    from .concordance_declarations import FORMAL_ACTUAL_OCCURRENCE
+
+    page = book.pages.get(FORMAL_ACTUAL_OCCURRENCE.name)
+    if page is None:
+        return None
+    # Registration may have subsequent ownership revisions. Only same-row
+    # predecessors may lead to the copied caller row; a matching ID is not proof.
+    pending, visited, copied = [subject], set(), set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for source in _source_cells(book, current):
+            if source.page == SSA_VALUE:
+                if source.row == subject.row:
+                    pending.append(source)
+                else:
+                    copied.add(source)
+    rows = tuple(row for row in page.scope_rows(subject.row[0])
+                 if len(row) == 7 and int(row[1]) == int(subject.row[1]))
+    from .source_formal_occurrence_pruning import live_occurrence_rows
+    try:
+        rows = live_occurrence_rows(book, rows)
+    except ValueError:
+        return None
+    if not rows:
+        return None
+    proof = []
+    for row in rows:
+        occurrence = book.latest_ref(FORMAL_ACTUAL_OCCURRENCE, row)
+        actual_id = page.latest(row)
+        actual = book.latest_ref(SSA_VALUE, (row[6], actual_id))
+        if (actual is None or actual not in copied
+                or actual not in _source_cells(book, occurrence)):
+            return None
+        layout = require_physical_layout(row[6], actual_id, book=book, _seen=seen)
+        if not isinstance(layout, PhysicalLayoutEvidence):
+            return None
+        if (layout.physical_dtype, layout.storage, layout.rank, layout.shape,
+                layout.arena, layout.device) != (
+                fact.physical_dtype, fact.storage, fact.rank, tuple(fact.shape),
+                fact.arena, fact.device):
+            return None
+        proof.extend((occurrence, actual, *layout.proof_cells))
+    return PhysicalLayoutEvidence(
+        subject.row[0], int(subject.row[1]), fact.physical_dtype, fact.storage,
+        fact.rank, tuple(fact.shape), fact.arena, fact.device, subject,
+        tuple(dict.fromkeys(proof)), subject.row[0],
+    )
+
+
+def require_physical_layout(scope: Any, value_id: int, *, book: Any = None, _seen=frozenset()):
     """Read a posted scalar or exact ABI-backed span physical layout.
 
     The SSA_VALUE row owns the physical fields. A span additionally requires
-    its exact VALUE_TYPE_ABI view in the same SSA predecessor chain.
+    its exact ABI or descriptor proof. Registered borrowed helper formals may
+    follow a proven actual occurrence to that owner's physical contract.
     Source class and semantic dtype cannot fill an absent physical field.
     The returned scope is the exact SSA function scope that owns the row.
     """
 
     book = current_identity_book() if book is None else book
     value_id = int(value_id)
+    key = (scope, value_id)
+    if key in _seen:
+        return UnresolvedSourceDemand(scope, value_id, "physical_layout", "cyclic_formal_layout")
+    _seen = _seen | {key}
     subject = book.latest_ref(SSA_VALUE, (scope, value_id))
     if subject is None:
         return UnresolvedSourceDemand(
@@ -268,6 +327,10 @@ def require_physical_layout(scope: Any, value_id: int, *, book: Any = None):
                 tuple(fact.shape), fact.arena, fact.device, subject,
                 descriptor_proof, scope,
             )
+    if not abi_cells:
+        bound = _bound_formal_span_layout(book, subject, fact, _seen)
+        if bound is not None:
+            return bound
     if len(set(abi_cells)) != 1:
         return UnresolvedSourceDemand(
             scope, value_id, "physical_layout", "missing_unique_span_abi",

@@ -85,6 +85,32 @@ def _authored_sequence_annotation_contract(
         expression = ast.parse(str(annotation), mode="eval").body
     except SyntaxError:
         return None
+    while isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+        try:
+            expression = ast.parse(expression.value, mode="eval").body
+        except SyntaxError:
+            return None
+    # A nullable collection keeps the existing union discriminator, while
+    # its one material alternative has the same caller-owned row contract.
+    # Do not flatten two different material alternatives into one arena.
+    def union_members(node):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return (*union_members(node.left), *union_members(node.right))
+        if isinstance(node, ast.Subscript):
+            head = ast.unparse(node.value)
+            if head in {"Optional", "typing.Optional"}:
+                return (*union_members(node.slice), ast.Constant(None))
+            if head in {"Union", "typing.Union"}:
+                members = node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+                return tuple(part for member in members for part in union_members(member))
+        return (node,)
+    members = union_members(expression)
+    present = tuple(member for member in members
+                    if not (isinstance(member, ast.Constant) and member.value is None))
+    if len(members) != len(present):
+        if len(present) != 1:
+            return None
+        expression = present[0]
     if not isinstance(expression, ast.Subscript):
         return None
     container = (

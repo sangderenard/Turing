@@ -4725,6 +4725,10 @@ def _prune_unused_callee_formals_once(
             PRUNED_CALLEE_FORMAL as _PRUNED_CALLEE_FORMAL,
         )
 
+        from .source_formal_occurrence_pruning import capture_pruned_occurrences, retire_pruned_occurrences
+        occurrence_captures = capture_pruned_occurrences(
+            functions, callee, keep_indices, current_identity_book())
+
         # A formal no instruction references (or a superseded placeholder):
         # DERIVED from its own ``ssa_value`` cell in the callee.
         removed_ids = {
@@ -4816,6 +4820,7 @@ def _prune_unused_callee_formals_once(
                     )
             _refresh_frame_aliased_result(call, callee)
         callee.args = [callee.args[index] for index in keep_indices]
+        retire_pruned_occurrences(functions, occurrence_captures, current_identity_book())
         integral = dict(metadata.get("source_region_integral") or {})
         if integral.get("capture_value_ids") is not None:
             integral["capture_value_ids"] = tuple(
@@ -6439,6 +6444,20 @@ def _authored_annotation_field_receipt(
                 "mutable": False, "token_vocabulary": vocabulary,
             }
         return None
+    if container == "Union":
+        members = (tuple(annotation.slice.elts)
+                   if isinstance(annotation.slice, ast.Tuple)
+                   else (annotation.slice,))
+        concrete = tuple(member for member in members
+                         if not (isinstance(member, ast.Constant)
+                                 and member.value is None))
+        if len(concrete) == 1 and len(concrete) != len(members):
+            receipt = _authored_annotation_field_receipt(
+                concrete[0], python_bindings, authored_record_identities,
+                authored_scalar_identities,
+            )
+            return None if receipt is None else {**dict(receipt), "optional": True}
+        return None
     if container == "Optional":
         receipt = _authored_annotation_field_receipt(
             annotation.slice, python_bindings, authored_record_identities,
@@ -6744,6 +6763,14 @@ def _authored_annotation_python_types(annotation: ast.AST) -> tuple[str, ...]:
             *_authored_annotation_python_types(annotation.slice),
             "builtins.NoneType",
         ))))
+    if container == "Union":
+        members = (tuple(annotation.slice.elts)
+                   if isinstance(annotation.slice, ast.Tuple)
+                   else (annotation.slice,))
+        return tuple(sorted(dict.fromkeys(
+            identity for member in members
+            for identity in _authored_annotation_python_types(member)
+        )))
     concrete = {
         "Dict": "dict", "FrozenSet": "frozenset", "List": "list",
         "Set": "set", "Tuple": "tuple",
@@ -13658,6 +13685,11 @@ def _graph_control_expression(
     if node_id in resident or node_id in _carried:
         return ControlExpression("value", value_id=node_id, read=read)
     data = graph_obj.nodes[node_id]
+    # Full-content string equality is a structural operation with its own
+    # sequence helper, not a scalar predicate over pointers or truth values.
+    from .glsl_deployment_strategy import _resident_string_comparison_cells
+    if _resident_string_comparison_cells(SimpleNamespace(G=graph_obj), node_id):
+        return ControlExpression("value", value_id=node_id, read=read)
     expression = data.get("expr_obj")
     attributes = data.get("attributes") or {}
     literal = attributes.get("value", data.get("constant"))
@@ -13900,6 +13932,10 @@ def _attach_graph_control_expressions(
             and str(expression.op) != "value"
         ):
             return ControlExpression("value", value_id=int(expression.value_id))
+        if expression.value_id is not None and int(expression.value_id) in graph_obj:
+            from .glsl_deployment_strategy import _resident_string_comparison_cells
+            if _resident_string_comparison_cells(SimpleNamespace(G=graph_obj), int(expression.value_id)):
+                return ControlExpression("value", value_id=int(expression.value_id), read=expression.read)
         operands = tuple(read_merges(operand) for operand in expression.operands)
         if operands == tuple(expression.operands):
             return expression
@@ -14394,6 +14430,8 @@ def _attach_graph_control_expressions(
                 predicate_expression=predicate,
             )
 
+        if isinstance(block, SequenceMutationBlock):
+            return replace(block, mutation=merged_mutation(block.mutation))
         if isinstance(block, LoopBlock):
             return replace(
                 block, body=attach(block.body),
@@ -15165,12 +15203,16 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
     def insert_in_conditional(block, owner_id, arm):
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
-                if str(arm) == "body":
-                    return replace(block, body=insert_ordered(block.body, item)), True
-                return replace(
-                    block,
-                    orelse=insert_ordered(block.orelse or SequenceBlock(()), item),
-                ), True
+                branch = block.body if str(arm) == "body" else (block.orelse or SequenceBlock(()))
+                # A branch can itself contain the comprehension that owns
+                # the query's operand. Stay in this arm, but descend into
+                # that exact loop before reading its current target value.
+                inserted = False
+                if len(binding_owners) == 1:
+                    branch, inserted = insert_into_loop(branch, binding_owners[0])
+                if not inserted:
+                    branch = insert_ordered(branch, item)
+                return replace(block, **{"body" if str(arm) == "body" else "orelse": branch}), True
             body, inserted = insert_in_conditional(block.body, owner_id, arm)
             if inserted:
                 return replace(block, body=body), True
@@ -15226,17 +15268,6 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
             return (replace(block, callee=callee), True) if inserted else (block, False)
         return block, False
 
-    memberships = _branch_compartments(graph)
-    guards = [
-        (int(owner), str(arm))
-        for owner, arm in memberships.get(int(node_id), ())
-        if str(arm) in {"body", "orelse"} and int(owner) in present
-    ]
-    if guards:
-        owner, arm = max(guards, key=lambda entry: node_position(entry[0]))
-        root, inserted = insert_in_conditional(root, owner, arm)
-        if inserted:
-            return root, True
     # ``ast.comprehension`` nodes do not carry source spans, so the fallback
     # span survey below cannot discover that a call consuming one of their
     # target bindings belongs inside that generator loop.  The reducer's
@@ -15250,7 +15281,8 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
         for parent, role in graph.G.nodes.get(int(node_id), {}).get(
             "parents", ()
         )
-        if str(role).startswith("arg:") and int(parent) in graph.G
+        if (str(role).startswith("arg:") or str(role) in {"lhs", "rhs"})
+        and int(parent) in graph.G
     }
     binding_owners = tuple(
         int(candidate_id)
@@ -15262,6 +15294,17 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
             ).values())
         )
     )
+    memberships = _branch_compartments(graph)
+    guards = [
+        (int(owner), str(arm))
+        for owner, arm in memberships.get(int(node_id), ())
+        if str(arm) in {"body", "orelse"} and int(owner) in present
+    ]
+    if guards:
+        owner, arm = max(guards, key=lambda entry: node_position(entry[0]))
+        root, inserted = insert_in_conditional(root, owner, arm)
+        if inserted:
+            return root, True
     if len(binding_owners) == 1:
         root, inserted = insert_into_loop(root, binding_owners[0])
         if inserted:
@@ -18753,15 +18796,35 @@ def _record_sequence_projection_bindings(
             if attribute not in field_columns:
                 continue
             result_id = int(data.get("value_id", node_id))
+            field_owner = record
+            field_receipt = {}
+            optional_path = False
+            repository_records = dict((graph_obj.graph.get("program_abi") or {}).get("records") or {})
+            for segment in attribute.split("."):
+                field_receipt = dict(dict(field_owner.get("fields") or {}).get(segment) or {})
+                optional_path |= bool(field_receipt.get("optional"))
+                field_owner = repository_records.get(str(field_receipt.get("record")), {})
+            dynamic_span = (
+                field_receipt.get("storage") == "span"
+                and field_receipt.get("shape") is None
+                and field_receipt.get("fixed_length") is None
+            )
+            if dynamic_span and optional_path:
+                raise ValueError(
+                    "optional borrowed record span requires a presence-aware "
+                    f"projection: {record['identity']}.{attribute}"
+                )
+            projection = (
+                ("record_span", int(field_columns[attribute]),
+                 int(target_id) if derived else None,
+                 f"{record['identity']}.{attribute}", str(field_dtypes[attribute]),
+                 int(target_id), str(record["identity"]))
+                if dynamic_span else
+                (("column_at_value", int(field_columns[attribute]), int(target_id))
+                 if derived else int(field_columns[attribute]))
+            )
             bindings.append((
-                int(origin_sequence_id), result_id, str(induction),
-                (
-                    (
-                        "column_at_value", int(field_columns[attribute]),
-                        int(target_id),
-                    )
-                    if derived else int(field_columns[attribute])
-                ),
+                int(origin_sequence_id), result_id, str(induction), projection,
             ))
             fields.append((
                 result_id, attribute, str(field_dtypes[attribute])
@@ -19809,9 +19872,10 @@ def _sequence_child_table_layout_contracts(
         )
         return matches[0] if len(matches) == 1 else None
 
+    from .source_borrowed_record_spans import borrowed_record_string_layouts
     result: dict[
         int, tuple[int, tuple[str, ...], tuple[int, ...], bool]
-    ] = {}
+    ] = borrowed_record_string_layouts(graph_obj, sequence_declarations)
     declarations = {int(sid): int(width) for sid, _policy, width, _writable in sequence_declarations}
     field_kinds = dict(graph_obj.graph.get("class_field_value_aggregate_kinds") or {})
     field_contracts = dict(graph_obj.graph.get("class_field_mapping_contracts") or {})
@@ -32815,6 +32879,14 @@ def _class_surface_ssa_program(
                 .get("aggregate_kind") == "list"
             ),
         }
+        from .source_borrowed_record_spans import borrowed_record_string_layouts
+        borrowed_string_child_layouts = borrowed_record_string_layouts(
+            graph_obj, sequence_declarations,
+        )
+        # A bound on input rows does not bound their runtime glyph widths.
+        # Only these proven fresh local list destinations acquire owned
+        # dynamic child storage; incoming spans retain their borrowed ABI.
+        dynamic_sequence_ids.update(borrowed_string_child_layouts)
         dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
         from types import SimpleNamespace as _GraphView
         from .glsl_deployment_strategy import (
@@ -32827,6 +32899,11 @@ def _class_surface_ssa_program(
         from ..common.tensors.topological_reducer import (
             _int_range_scopes as _int_range_scope,
         )
+
+        # The final control ledger, not a copied graph attribute, proves
+        # one publication per exact input row for bounded comprehensions.
+        from .source_comprehension_capacity import publish_source_comprehension_capacity
+        publish_source_comprehension_capacity(graph_obj, control)
 
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
@@ -33099,6 +33176,7 @@ def _class_surface_ssa_program(
                         )
                     },
                     **nested_descriptor_sequence_dtypes,
+                    **{int(sid): ("int64",) for sid in borrowed_string_child_layouts},
                 },
                 sequence_record_identities=(
                     _sequence_record_identity_contracts(
@@ -33912,7 +33990,7 @@ def _class_surface_ssa_program(
                     argument.accounting = {
                         **dict(argument.accounting or {}),
                         "caller_provided_workspace": True,
-                        "workspace_operation": "source_bytes_slice_result",
+                        "workspace_operation": "source_sequence_bounded_result",
                         "source_sequence_capacity_bound": relation.bound_cell,
                     }
             source_output_value_ids = tuple(
@@ -34132,6 +34210,8 @@ def _class_surface_ssa_program(
             )
         ):
             export_symbols.append(symbol)
+            from .source_owned_record_projection import publish_public_source_entry
+            publish_public_source_entry(module_ir.functions[symbol])
         report(
             f"function {shell_index}/{len(planned_shells)} {function_name}: "
             f"local lowering complete; module_functions={len(module_ir.functions)} "
@@ -44663,8 +44743,22 @@ def _class_surface_ssa_program(
                 constructor_anchors[(str(symbol), int(node_id))] = None
                 continue
             if fields:
+                # A record's fields alone do not identify the constructor
+                # which assembled them. Preserve that exact source call and
+                # its declared field/operand evidence for return ownership
+                # proofs; identical numeric ids in other scopes are not proof.
+                from .concordance_declarations import PROCESS_GRAPH_OPERANDS
+                constructor_cell = _frame_graph_cell(graph, int(node_id))
+                constructor_operands = (
+                    None if constructor_cell is None else book.latest_ref(
+                        PROCESS_GRAPH_OPERANDS, constructor_cell.row,
+                    )
+                )
                 field_cells = identity_cells(
                     function,
+                    constructor_cell, constructor_operands,
+                    *(field_declaration_cell(record, field_name)
+                      for field_name, _field in field_contracts),
                     *literal_source_cells,
                     *(value_id for field in fields for value_id in field.value_ids),
                     *(
@@ -50865,15 +50959,36 @@ def _class_surface_ssa_program(
                                          sequences.by_id(int(field.sequence_id)))
                     member_bindings = {}
                     if _bind_sequence_storage_members(member_bindings, projected, resident_sequence):
+                        # A selected child view has a logical descriptor id
+                        # distinct from its GEP-produced arena. Keep that
+                        # table identity out of the physical SSA alias page.
+                        logical_pair = (int(projected.sequence_id), int(resident_sequence.sequence_id))
+                        defined_values = {int(argument.id) for argument in function.args}
+                        defined_values.update(
+                            int(instruction.res.id)
+                            for block in function.blocks.values()
+                            for instruction in block.instrs
+                            if instruction.res is not None
+                        )
+                        if not (set(logical_pair) & defined_values):
+                            member_bindings.pop(logical_pair[0], None)
                         additions = {old: new for old, new in member_bindings.items()
                                      if old != new and aliases.get(old) != new}
                         if additions:
                             # Clock.clock GetAttr occurrences carry the same
                             # list descriptor as the constructed receiver's
                             # exact record field, including its counters.
+                            from .concordance_declarations import SEQUENCE_DESCRIPTOR
+                            projection_sources = _frame_cells(
+                                _frame_graph_cell(graph, projection_id),
+                                _frame_graph_cell(graph, int(receiver_origin_id)),
+                                _frame_table_cell(sequences, int(projected.sequence_id), SEQUENCE_DESCRIPTOR),
+                                _frame_table_cell(sequences, int(resident_sequence.sequence_id), SEQUENCE_DESCRIPTOR),
+                            )
                             aliases = _publish_concordant_function_aliases(
                                 function, additions,
                                 provenance="linked_call_record_sequence_projection",
+                                sources={identity: projection_sources for identity in additions},
                             )
                             changed = True
                     continue
@@ -58868,15 +58983,39 @@ def _class_surface_ssa_program(
                         # shape; the planner's graph extent (1,) would
                         # contradict the storage this row now posts.
                         formal_shape = tuple(formal.shape or ())
+                        formal_sources = (_frame_value_cell(caller, fed.id),)
                         if (formal_physical.get("storage") == "scalar"
-                                and formal_physical.get("rank") == 0
-                                and not tuple(fed.shape or ())):
-                            formal_shape = ()
+                                and formal_physical.get("rank") == 0):
+                            if not tuple(fed.shape or ()):
+                                formal_shape = ()
+                            elif tuple(fed.shape or ()) == (1,):
+                                # The caller's declared scalar record slot is
+                                # authoritative even before the completed-
+                                # module record-shape normalizer runs.  Do not
+                                # infer scalar storage from a singleton array:
+                                # require the exact descriptor field identity,
+                                # and retain its receipt on the formal row.
+                                from .concordance_declarations import RECORD_DESCRIPTOR
+                                record_table = all_record_tables.get(caller.name)
+                                scalar_descriptors = () if record_table is None else tuple(
+                                    record_table.book.current_ref(
+                                        RECORD_DESCRIPTOR, (record_table.owner, record_id),
+                                    )
+                                    for record_id, descriptor in record_table.records.items()
+                                    if any(
+                                        str(getattr(field.storage, "value", field.storage)) == "scalar"
+                                        and int(fed.id) in field.value_ids
+                                        for field in descriptor.fields
+                                    )
+                                )
+                                if scalar_descriptors:
+                                    formal_shape = ()
+                                    formal_sources = (*formal_sources, *scalar_descriptors)
                         _revise_ssa_value(
                             callee, formal.id, dtype=formal.dtype,
                             shape=formal_shape,
                             stage=FRAME_BINDING,
-                            sources=(_frame_value_cell(caller, fed.id),),
+                            sources=formal_sources,
                             physical=formal_physical,
                         )
                         formal.shape = formal_shape
@@ -68293,6 +68432,12 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
 
             publish_module_structures(module)
             module.metadata["identity_book"].settle_derivations()
+            # Public owned-record transfers are final root ABI projections,
+            # after call/loop/frame settlement and before the final audit.
+            # Their source proof independently excludes private/internal roots.
+            if isinstance(result, tuple) and len(result) == 3:
+                from .source_owned_record_transfer import integrate_owned_record_public_returns
+                integrate_owned_record_public_returns(module, result[1], result[2])
             try:
                 from .identity_concordance import CorrelationTable
                 _bars.substage("build final concordance correlation table")
