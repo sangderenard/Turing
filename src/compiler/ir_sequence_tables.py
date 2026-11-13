@@ -1990,7 +1990,11 @@ def lower_glyph_key_add(
         raise_when_full=False)
     if not copied.complete:
         return copied
-    values = {v.id: v for v in copied.entry.args}
+    # Registration owns accounting per helper scope. Do not share mutable
+    # SSAValue accounting with the composed copy function's formal objects.
+    values = {v.id: SSAValue(v.id, v.dtype, shape=tuple(v.shape or ()),
+                            accounting=dict(v.accounting or {}))
+              for v in copied.entry.args}
     builder = _Builder(_first_fresh_identity(destination, source,
         values=tuple(values.values()), minimum=first_value_id))
     entry, probe, duplicate, absent, invalid, result = (builder.block(n) for n in

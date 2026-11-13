@@ -1,0 +1,7 @@
+2026-11-13 COMPOSED GLYPH COPY FORMAL SCOPE INDEPENDENCE
+
+The new glyph-key add wrapper reused SSAValue objects directly from the composed copy helper formal list. Source registration and physical-layout propagation legitimately mutate accounting in each function scope. Sharing those mutable objects caused one scope to overwrite another: the reduced SetComp source then failed final structural concordance because the copy helper recorded reference storage while the same object carried span accounting.
+
+The wrapper now clones each SSAValue and its accounting dictionary using the same convention already present in _lower_dynamic_child_copy. Numeric identities and physical layout are preserved; there is no metadata rewrite, new alias permission or boundary suppression. A new regression mutates each caller formal's accounting and proves the callee remains independent.
+
+Candidate direct helper suite13passed6.86s. Exact HEAD kernel imported in an isolated baseline process12passed1failed7.88s, only the new object/accounting independence assertion. Existing C/LLVM copied-key semantics remain passing. Public reduced source len(SetComp) now passes final concordance; planned source-native tests still stop before emission at the separate keyed child-storage proof limit, so no source-native success is claimed here. Source dispatch changes remain uncommitted and separate. Changed source/test legacy scans and staged diff check clean; existing Nodus DLL read-only, build outputs in scratch.

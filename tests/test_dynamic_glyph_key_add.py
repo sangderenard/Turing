@@ -131,3 +131,17 @@ def test_absent_only_glyph_set_copy(backend, tmp_path):
     finally:
         run(release,{6:buffers[6]})
     assert buffers[6][0]==0
+
+
+def test_composed_add_and_copy_formals_have_independent_accounting():
+    table, source = descriptors()
+    lowering = lower_glyph_key_add(replace(table, key_columns=(0,)), source,
+                                  function_name="accounting_probe")
+    copied = next(f for f in lowering.functions if f.name == "accounting_probe__copy")
+    caller_args = {v.id:v for v in lowering.entry.args}
+    for formal in copied.args:
+        actual = caller_args[formal.id]
+        assert actual is not formal
+        assert actual.accounting is not formal.accounting
+        actual.accounting["scope_test_marker"] = "caller"
+        assert "scope_test_marker" not in formal.accounting
