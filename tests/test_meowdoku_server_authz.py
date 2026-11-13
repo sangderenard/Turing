@@ -129,6 +129,27 @@ def test_admin_bootstrap_then_owner_tools_from_a_dns_origin(server):
     assert _call(port, "/api/account/admin/grant", "POST", admin_headers, {"username": "nobody"})[0] == 404
 
 
+def test_ranked_authority_endpoint_and_admin_grant(server):
+    port = server.port
+    boss, member = _signup(port, "rank_boss"), _signup(port, "rank_member")
+    local = {"Host": "127.0.0.1"}
+    assert _call(port, "/api/account/authority")[0] == 401
+    assert _call(port, "/api/admin/account/grant", "POST", {**local, "X-Meowdoku-Admin": TOKEN},
+                 {"username": "rank_boss"})[0] == 200
+    admin_headers = {**PUBLIC_XFF, "Cookie": boss}
+    member_headers = {**PUBLIC_XFF, "Cookie": member}
+    assert _call(port, "/api/account/authority", headers=member_headers)[1]["groups"] == ["member"]
+    body = {"username": "rank_member", "group": "dev", "enabled": True}
+    assert _call(port, "/api/account/authority/grant", "POST", member_headers, body)[0] == 403
+    assert _call(port, "/api/account/authority/grant", "POST", {**admin_headers, "Origin": "https://elsewhere.example"}, body)[0] == 403
+    status, result, _, _ = _call(port, "/api/account/authority/grant", "POST", admin_headers, body)
+    assert status == 200 and result["authority"]["groups"] == ["member", "dev"]
+    assert _call(port, "/api/account/authority", headers=member_headers)[1]["highest"] == "dev"
+    assert _call(port, "/api/whoami", headers=member_headers)[1]["role"] == "dev"
+    assert _call(port, "/api/account/authority/grant", "POST", admin_headers, {**body, "enabled": False})[0] == 200
+    assert _call(port, "/api/account/authority", headers=member_headers)[1]["groups"] == ["member"]
+
+
 def test_route_flag_sets_the_route_cookie_on_cookie_setting_responses(server):
     server.sessions.route = "a"
     status, _, cookies, _ = _call(server.port, "/api/account/signup", "POST", body={"username": "route_one", "password": "correcthorse1"})

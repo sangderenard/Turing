@@ -81,6 +81,7 @@ from meowdoku import login_guard as login_guard_mod  # noqa: E402  [LOGIN] brute
 from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real password login, SQLite-backed, separate from profiles.py
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
+from meowdoku import permission_groups as permission_groups_mod
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
@@ -706,7 +707,7 @@ def make_handler(sessions: Sessions):
             """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
             # Content routes enforce session/group/public policy themselves. This
             # grants no other shader-tier capability or access to other APIs.
-            if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/"):
+            if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/") or path in ("/api/account/authority", "/api/account/authority/grant"):
                 return False
             if method == "GET" and path in ("/reports.html", "/reports.js"):
                 return False
@@ -2183,6 +2184,15 @@ def make_handler(sessions: Sessions):
                 return self._issues_route(path, "GET")
             if path == "/api/account/groups" or path.startswith("/api/account/groups/"):
                 return self._groups_route(path, "GET")
+            if path == "/api/account/authority":
+                account = self._account()
+                if account is None:
+                    return self._json({"error": "sign in to view authority"}, HTTPStatus.UNAUTHORIZED)
+                conn = authz_mod._connect(sessions.accounts_db)
+                try:
+                    return self._json(permission_groups_mod.authority(conn, account["id"]))
+                finally:
+                    conn.close()
             if path == "/api/reports" or path.startswith("/api/reports/"):
                 return self._reports_route(path, "GET")
             if path == "/api/tickets":
@@ -2717,6 +2727,31 @@ def make_handler(sessions: Sessions):
                 return self._issues_route(path0, "POST")
             if path0 == "/api/account/groups" or path0.startswith("/api/account/groups/"):
                 return self._groups_route(path0, "POST")
+            if path0 == "/api/account/authority/grant":
+                if not self._require("account_manage"):
+                    return
+                expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                if self.headers.get("Origin") not in (None, expected_origin) or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "cross-origin authority writes are not allowed"}, HTTPStatus.FORBIDDEN)
+                body = self._body_json()
+                if body is None:
+                    return
+                if not isinstance(body, dict) or set(body) != {"username", "group", "enabled"} or not isinstance(body["username"], str):
+                    return self._json({"error": "expected username, group and enabled"}, HTTPStatus.BAD_REQUEST)
+                conn = authz_mod._connect(sessions.accounts_db)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    target = conn.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (body["username"],)).fetchone()
+                    if target is None:
+                        raise LookupError("account not found")
+                    result = permission_groups_mod.set_grant(conn, self._account()["id"], target[0], body["group"], body["enabled"])
+                    conn.commit()
+                    return self._json({"username": body["username"], "authority": result})
+                except (ValueError, LookupError, PermissionError) as error:
+                    conn.rollback()
+                    return self._json({"error": str(error)}, HTTPStatus.FORBIDDEN if isinstance(error, PermissionError) else HTTPStatus.BAD_REQUEST)
+                finally:
+                    conn.close()
             if path0 == "/api/reports" or path0.startswith("/api/reports/"):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
