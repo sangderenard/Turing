@@ -1683,6 +1683,7 @@ class CorrelationTable:
         found.extend(self._source_call_activity_corridor_findings(module))
         found.extend(self._source_call_field_state_transfer_findings(module))
         found.extend(self._source_field_transfer_object_step_findings(module))
+        found.extend(self._source_gradient_tracking_mark_findings(module))
         found.extend(self._source_mapping_get_read_findings(module))
         found.extend(self._source_mapping_get_key_version_demand_findings(module))
         found.extend(self._source_mapping_get_copy_state_demand_findings(module))
@@ -2833,6 +2834,37 @@ class CorrelationTable:
                 found.append(Finding(
                     "source-mapping-get-read", str(row[0]), row[1],
                     "mapping get lost its transferred store, key, call, or pure-prefix proof",
+                ))
+        return found
+
+    @staticmethod
+    def _source_gradient_tracking_mark_findings(module: Any) -> list[Finding]:
+        """Check each ``requires_grad_`` mark the gradient-tracking filter recorded."""
+        from .concordance_declarations import SOURCE_GRADIENT_TRACKING_MARK, SOURCE_SPAN
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_GRADIENT_TRACKING_MARK)
+        spans = book.page(SOURCE_SPAN)
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_GRADIENT_TRACKING_MARK, row)
+            fact = page.cell(receipt.row, receipt.column)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            call = row[0]
+            valid = (
+                isinstance(fact, tuple) and len(fact) == 2
+                and (fact[0] is None or isinstance(fact[0], bool))
+                and isinstance(call, Ref) and call.page == SOURCE_SPAN
+                and isinstance(fact[1], Ref) and fact[1].page == SOURCE_SPAN
+                and {call, fact[1]} <= sources
+                and getattr(spans.cell(call.row, call.column), "kind", None) == "Call"
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-gradient-tracking-mark", str(call), 0,
+                    "requires_grad_ mark lost its call span, receiver span or flag",
                 ))
         return found
 

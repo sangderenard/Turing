@@ -665,6 +665,17 @@ SOURCE_RESOURCE_CONTROL = declare_page("source_resource_control", (
 SOURCE_EXCEPTION_INGESTION = declare_page("source_exception_ingestion", (
     RowField("source", K.PAGE_REF),
 ), tuple)  # exact source body, proposed primitive/control body, check count
+#: One authored ``x.requires_grad_(flag)`` the gradient-tracking filter
+#: (ast_control_normalization._filter_gradient_tracking_marks) replaced by its
+#: receiver ``x``.  Row: the call's SOURCE_SPAN cell.  Fact: (the requires-grad
+#: flag -- the literal bool, or None when the argument is not a literal --, the
+#: receiver's SOURCE_SPAN cell).  ``requires_grad_`` returns its receiver and
+#: only marks gradient ownership (operator_catalog.NON_OPERATOR_PUBLIC_API); a
+#: reverse graph selects its differentiation inputs from these marks, as
+#: abstract_nn.reverse_program selects ``wrt`` from ``requires_grad`` feeds.
+SOURCE_GRADIENT_TRACKING_MARK = declare_page("source_gradient_tracking_mark", (
+    RowField("call", K.PAGE_REF),
+), tuple)
 SOURCE_EXCEPTION_NORMAL_BINDING = declare_page(
     "source_exception_normal_binding", (
         RowField("read_scope", K.SCOPE),

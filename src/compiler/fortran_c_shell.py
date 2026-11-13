@@ -97,6 +97,7 @@ from .ast_control_normalization import (
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _filter_torch_device_placement as _filter_torch_device_placement,
+    _filter_gradient_tracking_marks as _filter_gradient_tracking_marks,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
     _single_exit_tuple_arity as _single_exit_tuple_arity,
 )
@@ -65714,6 +65715,12 @@ def _lower_ast_source_to_ssa_impl(
             "ssa-source: torch device filter removed "
             f"{len(device_placement_receipts)} device placement(s)"
         )
+    gradient_mark_receipts = list(_filter_gradient_tracking_marks(tree))
+    if gradient_mark_receipts:
+        report(
+            "ssa-source: gradient-tracking filter recorded "
+            f"{len(gradient_mark_receipts)} requires_grad_ mark(s)"
+        )
 
     tail_recursion_receipts = _normalize_direct_tail_recursion(tree)
     if tail_recursion_receipts:
@@ -66283,6 +66290,10 @@ def _lower_ast_source_to_ssa_impl(
             # entry tree (the deployment section is to own placement).
             lambda discovered: device_placement_receipts.extend(
                 _filter_torch_device_placement(discovered)
+            ),
+            # Pursued definitions get the same gradient-tracking filter.
+            lambda discovered: gradient_mark_receipts.extend(
+                _filter_gradient_tracking_marks(discovered)
             ),
             _normalize_direct_tail_recursion,
             normalize_discovered_destructuring,

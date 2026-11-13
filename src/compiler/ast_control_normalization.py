@@ -534,6 +534,103 @@ def _filter_torch_device_placement(
     return tuple(receipts)
 
 
+def _filter_gradient_tracking_marks(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """The gradient-tracking filter: ``x.requires_grad_(flag)`` is ``x``.
+
+    ``AbstractTensor.requires_grad_`` (src/common/tensors/autograd.py) sets the
+    tensor's gradient flag, registers it on the tape, and returns the tensor
+    itself.  The operator catalog keeps it out of the numerical operators
+    (``NON_OPERATOR_PUBLIC_API``: it controls autograd, it is not a node of the
+    program).  The compiled analog of the flag is a differentiation input of a
+    reverse graph (``process_graph_autograd`` differentiates with respect to
+    explicit values; ``abstract_nn.reverse_program`` selects ``wrt`` from the
+    ``requires_grad`` feeds), not a tape.  So the call is its receiver in the
+    program, and the flag is recorded on SOURCE_GRADIENT_TRACKING_MARK, keyed
+    by the call's span, with the receiver's span.
+
+    Program: the AbstractTensor YoungMan's ``configure_geometry`` returns
+    ``offsets.requires_grad_(True)`` as a tuple member; the unrecognised call
+    produced no value, so ``vertex_offsets`` reached ``_build_triangle_map``
+    with no tensor descriptor ("region value 119 (Indexed ...) has no settled
+    dtype").  Not applied when a class in the source defines its own
+    ``requires_grad_`` (the name would not be AbstractTensor's), or to a call
+    with more than one argument or any keyword.
+    """
+
+    from ..transmogrifier.graph.graph_express2 import (
+        _annotate_visual_source_owners, _source_module_identity,
+        post_source_span,
+    )
+    from .concordance_declarations import (
+        INGESTION, SOURCE_GRADIENT_TRACKING_MARK,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    if not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "requires_grad_"
+        for node in ast.walk(tree)
+    ) or any(
+        isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and member.name == "requires_grad_"
+        for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+        for member in node.body
+    ):
+        return ()
+    # The mark is keyed by the authored call's span: fix the module identity
+    # and stamp spans before rewriting, as exception ingestion does.
+    module_name = _source_module_identity(tree, None)
+    tree._turing_source_module = module_name
+    _annotate_visual_source_owners(tree, module_name=module_name)
+    receipts: list[dict[str, Any]] = []
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Call(self, call):  # noqa: N802
+            call = self.generic_visit(call)
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "requires_grad_"
+                and len(call.args) <= 1
+                and not call.keywords
+            ):
+                return call
+            receiver = call.func.value
+            if not call.args:
+                flag = True
+            elif isinstance(call.args[0], ast.Constant) and isinstance(
+                call.args[0].value, bool,
+            ):
+                flag = bool(call.args[0].value)
+            else:
+                flag = None
+            call_cell = post_source_span(None, call)
+            receiver_cell = post_source_span(None, receiver)
+            if call_cell is None or receiver_cell is None:
+                # No span, no record: the call stays as authored.
+                return call
+            current_identity_book().post(
+                SOURCE_GRADIENT_TRACKING_MARK, (call_cell,),
+                (flag, receiver_cell), stage=INGESTION,
+                provenance=Derived((call_cell, receiver_cell)),
+                mode=Mode.CONCORD,
+            )
+            receipts.append({
+                "operation": "requires_grad_",
+                "line": int(getattr(call, "lineno", -1)),
+                "column": int(getattr(call, "col_offset", -1)),
+                "requires_grad": flag,
+                "mark_cell": None if call_cell is None else (call_cell,),
+            })
+            return receiver
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _normalize_none_default_assignments(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:
