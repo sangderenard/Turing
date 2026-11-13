@@ -60,6 +60,25 @@ increase on reconciliation. Trainer processes can register as bots and use
 the same strategy/order APIs; no autonomous tensor trainer is started by this
 feature.
 
+## Historical admission gate
+
+Automated mock and Alpaca paper order routes require a historical qualification
+for the strategy's assigned bot and risk tier. Qualification is bound to the
+registered source hash, so changing a registration invalidates the proof. The
+internal judge stores the historical dataset digest, window net P&L, and sell
+fill counts. It requires at least three windows, positive net P&L and at least
+one sell fill in each, and average net P&L of at least 1% of the risk tier's
+maximum per-order capital. Registration and read-only market access remain
+possible without qualification. No public route accepts claimed backtest
+returns.
+
+The judge entry trusts the in-process replay caller's P&L and fill counts; a
+deployed admission service must bind those to immutable mock receipts. The
+`X-Meowdoku-Bot` header is client supplied, and an unassigned manual strategy
+can order without it. Thus this gate covers registered automated strategies,
+not every possible authenticated HTTP client. No autonomous runner or
+scheduled historical judge is deployed yet.
+
 ## Modular strategy experiments
 
 Each strategy stores a policy module and a nonempty selection of outcome

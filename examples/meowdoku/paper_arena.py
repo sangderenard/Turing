@@ -50,6 +50,10 @@ def connect(path) -> sqlite3.Connection:
     db.execute("CREATE INDEX IF NOT EXISTS paper_activity_recent ON paper_activity(created DESC)")
     db.execute("CREATE TABLE IF NOT EXISTS paper_bot_strategies ("
                "strategy_id TEXT PRIMARY KEY, bot_id TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS paper_bot_qualifications ("
+               "bot_id TEXT NOT NULL, risk TEXT NOT NULL, owner_id INTEGER NOT NULL, source_sha256 TEXT NOT NULL, "
+               "dataset_sha256 TEXT NOT NULL, report TEXT NOT NULL, passed INTEGER NOT NULL, "
+               "created REAL NOT NULL, PRIMARY KEY(bot_id,risk))")
     db.execute("CREATE TABLE IF NOT EXISTS paper_strategy_modules ("
                "strategy_id TEXT PRIMARY KEY, policy TEXT NOT NULL, outcomes TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS paper_shared_account ("
@@ -181,7 +185,77 @@ def bots(db, owner: int) -> dict:
                       "WHERE owner_id=? ORDER BY created DESC LIMIT 3000", (owner,))
     return {"bots": [{"id": row["id"], "name": row["name"], "kind": row["kind"],
                       "source": json.loads(row["source"])["registration"],
-                      "created": row["created"], "last_seen": row["last_seen"]} for row in rows]}
+                      "created": row["created"], "last_seen": row["last_seen"],
+                      "qualified_risks": [risk for risk in RISK if bot_qualified(db, owner, row["id"], risk)]}
+                     for row in rows]}
+
+
+def _bot_source_hash(source: str) -> str:
+    registration = json.loads(source)["registration"]
+    return hashlib.sha256(json.dumps(registration, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def bot_qualified(db, owner: int, bot_id: str, risk: str) -> bool:
+    row = db.execute("SELECT source FROM paper_bots WHERE id=? AND owner_id=?", (bot_id, owner)).fetchone()
+    if row is None:
+        return False
+    proof = db.execute("SELECT source_sha256,passed FROM paper_bot_qualifications "
+                       "WHERE bot_id=? AND risk=? AND owner_id=?", (bot_id, risk, owner)).fetchone()
+    return bool(proof and proof["passed"] == 1 and proof["source_sha256"] == _bot_source_hash(row["source"]))
+
+
+def record_historical_qualification(db, owner: int, bot_id: str, risk: str,
+                                    dataset_sha256: str, window_pnl_usd: list[str],
+                                    sell_fill_counts: list[int],
+                                    *, margin: Decimal = Decimal("0.01")) -> dict:
+    """Internal judge entry; no client route accepts reported returns or calls this function."""
+    bot = db.execute("SELECT source FROM paper_bots WHERE id=? AND owner_id=?", (bot_id, owner)).fetchone()
+    if bot is None:
+        raise ArenaError("bot not found", 404)
+    if risk not in RISK:
+        raise ArenaError("unknown qualification risk tier")
+    if not isinstance(dataset_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", dataset_sha256):
+        raise ArenaError("invalid historical dataset digest")
+    if not isinstance(window_pnl_usd, list) or len(window_pnl_usd) < 3:
+        raise ArenaError("at least three independent historical windows required")
+    if (not isinstance(sell_fill_counts, list) or len(sell_fill_counts) != len(window_pnl_usd)
+            or any(type(value) is not int or value < 0 for value in sell_fill_counts)):
+        raise ArenaError("sell fill count required for every historical window")
+    try:
+        pnl = [Decimal(value) for value in window_pnl_usd]
+    except (InvalidOperation, TypeError):
+        raise ArenaError("invalid historical P&L") from None
+    if any(not value.is_finite() for value in pnl) or not margin.is_finite() or margin <= 0:
+        raise ArenaError("finite P&L and positive margin required")
+    returns = [value / RISK[risk][0] for value in pnl]
+    mean = sum(returns, Decimal(0)) / len(returns)
+    passed = mean >= margin and all(value > 0 for value in returns) and all(value >= 1 for value in sell_fill_counts)
+    report = {"window_net_pnl_usd": [str(value) for value in pnl],
+              "window_net_returns": [str(value) for value in returns],
+              "mean_net_return": str(mean), "required_margin": str(margin),
+              "basis": "net P&L divided by maximum per-order capital at risk", "risk": risk,
+              "sell_fill_counts": sell_fill_counts,
+              "windows": len(returns), "passed": passed}
+    db.execute("INSERT INTO paper_bot_qualifications VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot_id,risk) DO UPDATE SET "
+               "owner_id=excluded.owner_id,source_sha256=excluded.source_sha256,"
+               "dataset_sha256=excluded.dataset_sha256,report=excluded.report,"
+               "passed=excluded.passed,created=excluded.created",
+               (bot_id, risk, owner, _bot_source_hash(bot["source"]), dataset_sha256,
+                json.dumps(report, separators=(",", ":")), int(passed), time.time()))
+    return report
+
+
+def require_qualified_order(db, owner: int, strategy_id: str, bot_id: str | None) -> None:
+    """Automated strategy orders require a qualified, matching bot identity."""
+    _strategy(db, owner, strategy_id)
+    row = db.execute("SELECT b.bot_id,m.policy,s.risk FROM paper_strategies s "
+                     "LEFT JOIN paper_bot_strategies b ON b.strategy_id=s.id "
+                     "LEFT JOIN paper_strategy_modules m ON m.strategy_id=s.id WHERE s.id=?", (strategy_id,)).fetchone()
+    assigned = row["bot_id"]
+    if assigned is None and (row["policy"] or "manual") == "manual" and bot_id is None:
+        return
+    if assigned is None or bot_id != assigned or not bot_qualified(db, owner, assigned, row["risk"]):
+        raise ArenaError("bot must pass server-judged historical qualification before ordering", 403)
 
 
 def trainer_events(db, after: int, limit: int = 200) -> dict:

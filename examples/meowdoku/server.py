@@ -1471,9 +1471,16 @@ def make_handler(sessions: Sessions):
                     except (ValueError, QueryError) as error:
                         return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
                 if path == "/api/paper/mock/orders" and method == "POST":
+                    if not isinstance(body, dict):
+                        raise paper_arena_mod.ArenaError("mock order object required")
+                    paper_arena_mod.require_qualified_order(db, account["id"], body.get("strategy_id"), bot_id)
                     prior = paper_mock_mod.replay(db, account["id"], body)
                     if prior is not None:
                         return self._json(prior)
+                if path == "/api/paper/orders" and method == "POST":
+                    if not isinstance(body, dict):
+                        raise paper_arena_mod.ArenaError("paper order object required")
+                    paper_arena_mod.require_qualified_order(db, account["id"], body.get("strategy_id"), bot_id)
                 authority_db = authz_mod._connect(sessions.accounts_db)
                 try:
                     credential_owner = permission_groups_mod.paper_credential_owner(

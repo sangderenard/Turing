@@ -119,6 +119,22 @@ def test_bot_registry_presence_and_trainer_cursor(db):
         paper_arena.record_activity(db, 2, created["id"], "rest", "look")
 
 
+def test_qualification_is_bound_to_bot_source_and_risk(db):
+    bot = paper_arena.register_bot(db, 1, {
+        "request_id": "qualified", "name": "Candidate", "kind": "compiled",
+        "source": {"ref": "product:" + "a" * 64}})
+    report = paper_arena.record_historical_qualification(
+        db, 1, bot["id"], "cautious", "b" * 64,
+        ["0.10", "0.12", "0.08"], [1, 1, 1])
+    assert report["passed"] is True
+    assert paper_arena.bot_qualified(db, 1, bot["id"], "cautious")
+    assert not paper_arena.bot_qualified(db, 1, bot["id"], "standard")
+    assert not paper_arena.bot_qualified(db, 2, bot["id"], "cautious")
+    db.execute("UPDATE paper_bots SET source=? WHERE id=?",
+               ('{"registration":{"ref":"product:' + "c" * 64 + '"}}', bot["id"]))
+    assert not paper_arena.bot_qualified(db, 1, bot["id"], "cautious")
+
+
 def test_presence_pages_every_active_bot(db):
     now = time.time()
     db.executemany("INSERT INTO paper_bots VALUES(?,?,?,?,?,?,?,?)", [

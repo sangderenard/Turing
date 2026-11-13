@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from meowdoku import alpaca_credentials, market_data, paper_broker
+from meowdoku import alpaca_credentials, market_data, paper_arena, paper_broker
 
 TESTS = Path(__file__).with_name("test_meowdoku_server_authz.py")
 spec = importlib.util.spec_from_file_location("paper_http_helpers", TESTS)
@@ -78,6 +78,18 @@ def test_admin_shared_paper_account_and_dev_own_account(server, monkeypatch):
     assert proposals[1]["execution"].startswith("dry-run")
     command = {"request_id": "decision1", "strategy_id": created[1]["id"],
                "symbol": "BTC/USD", "side": "buy", "amount": "5"}
+    assert helpers._call(port, "/api/paper/orders", "POST", bot_headers, command)[0] == 403
+    assert submissions == []
+    with paper_arena.connect(server.sessions.state.sql_dir / "paper_arena.sqlite") as db:
+        failed = paper_arena.record_historical_qualification(
+            db, dev_id, bot_id, "cautious", "a" * 64, ["0.15", "-0.05", "0.20"], [1, 1, 1])
+        assert failed["passed"] is False
+        no_closes = paper_arena.record_historical_qualification(
+            db, dev_id, bot_id, "cautious", "a" * 64, ["0.10", "0.15", "0.05"], [1, 0, 1])
+        assert no_closes["passed"] is False
+        passed = paper_arena.record_historical_qualification(
+            db, dev_id, bot_id, "cautious", "a" * 64, ["0.10", "0.15", "0.05"], [1, 1, 1])
+        assert passed["passed"] is True
     assert helpers._call(port, "/api/paper/orders", "POST", bot_headers, command)[0] == 201
     assert helpers._call(port, "/api/paper/orders", "POST", bot_headers, command)[1]["replayed"] is True
     assert len(submissions) == 1 and submissions[0][0] == "dev-key-id"
