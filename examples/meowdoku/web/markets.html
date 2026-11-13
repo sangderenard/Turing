@@ -70,6 +70,16 @@
     <p class="muted">Watch server training workers test candidates on historical mock markets. Checkpoints show validation progress; only an untouched holdout can qualify a bot. A positive checkpoint is not a paper fill or a profit guarantee.</p>
     <div id="qualification-runs" aria-live="polite"></div>
     <p id="qualification-state" class="muted">Checking training runs…</p>
+    <div id="training-controls" hidden>
+      <h3>Training service · admin</h3>
+      <p class="muted">Controls only the shared Nodus trainer, not trading or the rest of the site. Stop asks the worker to save and exit; the supervisor may force it after its shutdown timeout. Start resumes its saved checkpoint.</p>
+      <div class="row">
+        <button id="training-toggle" type="button" disabled>Checking training…</button>
+        <button id="training-cancel" type="button" hidden>Cancel pending request</button>
+        <button id="training-refresh" type="button">Refresh status</button>
+      </div>
+      <p id="training-control-state" role="status" aria-live="polite">Checking supervisor…</p>
+    </div>
     <h3>Nodus training canvas</h3>
     <p class="muted">The graph view updates while the continuous worker runs. Training pauses briefly to save weights. Historical validation is a tuning signal, not an unseen qualification.</p>
     <iframe id="training-canvas" title="Live Nodus training canvas" src="/nodus.html?instance=nodus-training&amp;picture=1" loading="lazy"></iframe>

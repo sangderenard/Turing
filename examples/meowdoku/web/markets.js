@@ -99,6 +99,78 @@ async function updateQualification() {
 setInterval(() => { if (!document.hidden) updateQualification().catch((error) => { $("qualification-state").textContent = error.message; }); }, 2000);
 updateQualification().catch((error) => { $("qualification-state").textContent = error.message; });
 
+// Use the existing audited supervisor request queue, never a second trainer runner.
+// This page exposes the shortcut to admins only; the control API rechecks authority.
+const TRAINING_INSTANCE = "nodus-training";
+let trainingBusy = false, trainingReading = false, trainingAction = null, trainingPending = null;
+async function refreshTrainingControl() {
+  if (trainingReading || trainingBusy) return;
+  trainingReading = true;
+  $("training-toggle").disabled = true;
+  $("training-cancel").disabled = true;
+  trainingAction = null; trainingPending = null;
+  try {
+    const who = await api("/api/whoami");
+    const allowed = who.role === "admin" && (who.capabilities || []).includes("account_manage");
+    $("training-controls").hidden = !allowed;
+    if (!allowed) return;
+    const data = await api("/api/control/instances");
+    const instance = (data.instances || []).find((item) => item.name === TRAINING_INSTANCE);
+    const requests = (data.requests || []).filter((item) => item.instance === TRAINING_INSTANCE || item.instance === "*");
+    trainingPending = requests.find((item) => item.state === "pending") || null;
+    $("training-cancel").hidden = !trainingPending || trainingPending.instance !== TRAINING_INSTANCE;
+    $("training-cancel").disabled = !trainingPending || trainingPending.instance !== TRAINING_INSTANCE;
+    if (!instance) {
+      $("training-toggle").textContent = "Trainer unavailable";
+      $("training-control-state").textContent = "The supervisor has no registered nodus-training instance.";
+      return;
+    }
+    const active = ["running", "starting", "backoff"].includes(instance.state);
+    const stopped = ["stopped", "failed"].includes(instance.state);
+    trainingAction = active ? "shutdown" : stopped && instance.enabled !== false ? "start" : null;
+    $("training-toggle").textContent = active ? "Stop training" : stopped ? "Start training" : "Training " + instance.state;
+    $("training-toggle").disabled = !trainingAction || !!trainingPending;
+    const last = requests[0];
+    $("training-control-state").textContent = `Supervisor: ${instance.state}. ` + (trainingPending
+      ? `Request ${trainingPending.id}: ${trainingPending.action} pending. ${trainingPending.detail || "Waiting for the supervisor; this is not yet completed."}`
+      : last ? `Last request ${last.id}: ${last.state}. ${last.detail || ""}` : "No recent control request.");
+  } catch (error) {
+    $("training-control-state").textContent = `Could not verify training state: ${error.message}. Refresh before acting.`;
+    $("training-toggle").textContent = "Training status unavailable";
+  } finally { trainingReading = false; }
+}
+async function requestTrainingControl(cancel = false) {
+  if (trainingBusy || trainingReading || (cancel ? !trainingPending || trainingPending.instance !== TRAINING_INSTANCE : !trainingAction)) return;
+  const action = trainingAction, pending = trainingPending;
+  trainingBusy = true;
+  $("training-toggle").disabled = true; $("training-cancel").disabled = true;
+  $("training-refresh").disabled = true;
+  try {
+    const response = await fetch("/api/control/instances" + (cancel ? "/cancel" : ""), {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cancel ? { id: pending.id } : {
+        instance: TRAINING_INSTANCE, action, after_jobs: true,
+        reason: "Paper market watch admin training control",
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Control refused (${response.status})`);
+    $("training-control-state").textContent = `Request ${result.request.id}: ${result.request.state}. Waiting for supervisor state.`;
+  } catch (error) {
+    // A lost response is not proof the request failed. Never resend automatically.
+    $("training-control-state").textContent = `${error.message}. Check supervisor status before retrying; the request may have reached it.`;
+  } finally {
+    trainingBusy = false; trainingAction = null; trainingPending = null;
+    $("training-refresh").disabled = false;
+  }
+}
+$("training-toggle").addEventListener("click", () => requestTrainingControl());
+$("training-cancel").addEventListener("click", () => requestTrainingControl(true));
+$("training-refresh").addEventListener("click", refreshTrainingControl);
+setInterval(() => { if (!document.hidden) refreshTrainingControl(); }, 3000);
+refreshTrainingControl();
+
 const historyView = renderer($("history"));
 const bookView = renderer($("book"));
 let lastHistory = null, lastBook = null;
