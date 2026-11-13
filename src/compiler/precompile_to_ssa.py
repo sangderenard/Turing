@@ -6206,6 +6206,29 @@ class _ControlSSABuilder(TiledObject):
             return ()
         return effect, control
 
+    def _sequence_helper_call_sources(self, helper) -> tuple[Ref, ...]:
+        """Name the registered native helper, not a convenient Call label.
+
+        Generated helpers have SSA_BLOCK identities rather than authored
+        FUNCTION_ADDRESS rows. Their exact block inventory is already posted by registration;
+        retain it here. Shared helper formals may be reminted on later
+        registration, so final positional binding uses the existing live
+        formal/actual occurrence census instead of stale formal IDs.
+        """
+        from .concordance_declarations import SSA_BLOCK, SSABlockKind
+
+        if self.sequence_helper_functions.get(helper.name) is not helper or not helper.blocks:
+            return ()
+        book = self._book()
+        sources = []
+        for label in helper.blocks:
+            cell = book.latest_ref(SSA_BLOCK, (helper.name, helper.name, str(label)))
+            if (cell is None or book.page(SSA_BLOCK).cell(cell.row, cell.column)
+                    != SSABlockKind.SEQUENCE_HELPER):
+                return ()
+            sources.append(cell)
+        return tuple(dict.fromkeys(sources))
+
     def _register_sequence_lowering(self, lowering) -> None:
         """Install helpers through ``register_sequence_lowering``, caused by
         the innermost control cell (else this lowering's root)."""
@@ -19503,6 +19526,7 @@ class _ControlSSABuilder(TiledObject):
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(*call_arguments, *self._sequence_mutation_call_sources(mutation),
+                      *self._sequence_helper_call_sources(lowering.entry),
                       *((mutation.snapshot_cell,)
                         if mutation.snapshot_cell is not None else ())),
         )
