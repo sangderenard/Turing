@@ -1031,7 +1031,8 @@ async function pollFabricMotion(session){
 async function startFabricMotion(){
   if(fabricMotion)await stopFabricMotion();
   try{
-    const layers=studioLighting.backdrops.getState(),count=Number($('backdrop-layers').value);
+    const active=studioBuilderLighting('studio');
+    const layers=active.backdrops,count=Number(active.controls['backdrop-layers']);
     const index=layers.findIndex((layer,i)=>i<count&&layer.surfaceBehavior==='fabric');
     if(index<0)throw Error('Select a fabric backdrop layer first');
     const mesh=fabricSource(index,layers[index],layers);
