@@ -156,3 +156,20 @@ def test_public_qualification_spectator_reads_shared_worker_progress(server):
             "holdout_mean_return_on_order_cap": "-0.01"})
     assert helpers._call(server.port, "/api/paper/qualification/live",
                          headers=helpers.PUBLIC_XFF)[1]["runs"][0]["status"] == "unqualified"
+
+
+def test_continuous_qualification_progress_and_stop(server):
+    path = server.sessions.state.sql_dir / "paper_arena.sqlite"
+    with paper_arena.connect(path) as db:
+        run_id = qualification_runs.begin(db, market="AAPL + SPY + BTC/USD",
+                                          model="AbstractTensor continuous", worker="test-continuous",
+                                          planned_epochs=0)
+        qualification_runs.progress(db, run_id, phase="training", completed_epochs=1000001,
+                                    epoch=1000001, loss=0.1)
+        qualification_runs.progress(db, run_id, phase="autosaving", completed_epochs=1000001)
+        active = qualification_runs.public_snapshot(db)["runs"][0]
+        assert active["status"] == "running" and active["planned_epochs"] == 0
+        assert active["phase"] == "autosaving" and active["completed_epochs"] == 1000001
+        qualification_runs.finish(db, run_id, status="stopped", result={})
+        stopped = qualification_runs.public_snapshot(db)["runs"][0]
+        assert stopped["status"] == "stopped" and stopped["finished"] is not None

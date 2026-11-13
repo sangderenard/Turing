@@ -17,8 +17,8 @@ from meowdoku import paper_arena
 
 
 RUN_ID = re.compile(r"^[0-9a-f]{32}$")
-PHASES = frozenset(("training", "validation", "compiling", "holdout", "complete"))
-STATUSES = frozenset(("running", "passed_historical", "unqualified", "failed"))
+PHASES = frozenset(("training", "validation", "compiling", "holdout", "autosaving", "complete"))
+STATUSES = frozenset(("running", "stopped", "passed_historical", "unqualified", "failed"))
 
 
 def _tables(db) -> None:
@@ -40,7 +40,7 @@ def begin(db, *, market: str, model: str, worker: str, planned_epochs: int) -> s
     if not (isinstance(market, str) and 1 <= len(market) <= 24
             and isinstance(model, str) and 1 <= len(model) <= 80
             and isinstance(worker, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", worker)
-            and type(planned_epochs) is int and 1 <= planned_epochs <= 1000000):
+            and type(planned_epochs) is int and 0 <= planned_epochs <= 1000000):
         raise ValueError("invalid qualification run metadata")
     run_id = uuid.uuid4().hex
     now = time.time()
@@ -64,7 +64,9 @@ def progress(db, run_id: str, *, phase: str, completed_epochs: int,
     try:
         run = db.execute("SELECT status,planned_epochs,completed_epochs FROM paper_qualification_runs WHERE id=?",
                          (run_id,)).fetchone()
-        if run is None or run["status"] != "running" or not run["completed_epochs"] <= completed_epochs <= run["planned_epochs"]:
+        if (run is None or run["status"] != "running"
+                or completed_epochs < run["completed_epochs"]
+                or (run["planned_epochs"] and completed_epochs > run["planned_epochs"])):
             raise ValueError("qualification run is not active or progress moved backward")
         now = time.time()
         db.execute("UPDATE paper_qualification_runs SET phase=?,completed_epochs=?,updated=? WHERE id=?",
@@ -74,6 +76,10 @@ def progress(db, run_id: str, *, phase: str, completed_epochs: int,
                    "VALUES(?,?,?,?,?,?,?,?)",
                    (run_id, phase, seed, epoch, loss, validation_mean,
                     None if validation_passed is None else int(validation_passed), now))
+        if run["planned_epochs"] == 0:
+            db.execute("DELETE FROM paper_qualification_progress WHERE run_id=? AND id NOT IN "
+                       "(SELECT id FROM paper_qualification_progress WHERE run_id=? ORDER BY id DESC LIMIT 1024)",
+                       (run_id, run_id))
         db.execute("COMMIT")
     except BaseException:
         db.execute("ROLLBACK")

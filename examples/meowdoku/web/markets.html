@@ -42,6 +42,7 @@
   .qualification-run progress { width: 100%; height: .8rem; accent-color: #67c5a3; }
   .qualification-run .metrics { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-variant-numeric: tabular-nums; }
   .qualification-run .checks { margin: .5rem 0 0; padding-left: 1.3rem; max-height: 9rem; overflow: auto; font-variant-numeric: tabular-nums; }
+  #training-canvas { display:block; width:100%; height: min(68vh, 40rem); border:1px solid #425d77; border-radius:8px; background:#17171a; }
 </style>
 </head>
 <body>
@@ -69,6 +70,9 @@
     <p class="muted">Watch server training workers test candidates on historical mock markets. Checkpoints show validation progress; only an untouched holdout can qualify a bot. A positive checkpoint is not a paper fill or a profit guarantee.</p>
     <div id="qualification-runs" aria-live="polite"></div>
     <p id="qualification-state" class="muted">Checking training runs…</p>
+    <h3>Nodus training canvas</h3>
+    <p class="muted">The graph view updates while the continuous worker runs. Training pauses briefly to save weights. Historical validation is a tuning signal, not an unseen qualification.</p>
+    <iframe id="training-canvas" title="Live Nodus training canvas" src="/nodus.html?instance=nodus-training&amp;picture=1" loading="lazy"></iframe>
   </section>
   <section class="panel"><h2>Latest minute bars</h2><div id="tickers"></div></section>
   <section class="panel">
