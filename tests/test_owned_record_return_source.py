@@ -76,3 +76,52 @@ def test_keyword_constructor_source_is_exact_but_not_a_transfer_grant():
         assert owned_record_return_sources(module, name) == ()
     finally:
         page.cells[key] = original
+
+
+def test_captured_source_proof_survives_only_ret_projection_not_identity_changes():
+    from dataclasses import replace
+    from src.compiler.source_owned_record_returns import (
+        owned_record_return_sources, validate_owned_record_return_source,
+    )
+    module, _, exports = lower_ast_source_to_ssa(
+        SOURCE, 'root', extraction_contract=ExtractionContract(
+            Path(__file__).resolve().parents[1]/'extraction_contracts/program_extraction.yaml'),
+        progress=lambda _: None, progress_bars=False)
+    name = exports[0]
+    proof, = owned_record_return_sources(module, name)
+    valid = lambda p: validate_owned_record_return_source(module, name, p)
+    assert valid(proof)
+    assert not validate_owned_record_return_source(module, 'missing', proof)
+    for bad in (
+        replace(proof, field_name='other'),
+        replace(proof, record_id=proof.record_id+1),
+        replace(proof, sequence_id=proof.sequence_id+1),
+        replace(proof, owner_id=proof.owner_id+1),
+        replace(proof, source_cell=proof.constructor_operands_cell),
+    ):
+        assert not valid(bad)
+    # Simulate only the later boundary rewriting Ret. Captured source lineage
+    # remains true; the ordinary reader still refuses to call it a live return.
+    rets = [op for block in module.functions[name].blocks.values()
+            for op in block.instrs if op.op == 'Ret']
+    saved = [list(op.args) for op in rets]
+    try:
+        for op in rets:
+            op.args = []
+        assert valid(proof)
+        assert owned_record_return_sources(module, name) == ()
+        assert public_owned_sequence_returns(module, name) == ()
+    finally:
+        for op, args in zip(rets, saved):
+            op.args = args
+    book = module.sequence_tables[name].book
+    page = book.page(proof.constructor_operands_cell.page)
+    key = (proof.constructor_operands_cell.row, proof.constructor_operands_cell.column)
+    original = page.cells[key]
+    try:
+        page.cells[key] = tuple((cell, 'kw:other' if role == 'kw:items' else role)
+                                for cell, role in original)
+        assert not valid(proof)
+    finally:
+        page.cells[key] = original
+    assert valid(proof)
