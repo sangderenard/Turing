@@ -66551,10 +66551,10 @@ def _lower_ast_source_to_ssa_impl(
                     f"{module_name}.{qualified_name}"
                 )
 
-    def authored_tensor_boundary_values(
+    def authored_span_boundary_values(
         entry: Any, function_graph: Any,
     ) -> dict[str, dict[str, Any]]:
-        """Tensor annotations are ABI declarations only at source entries.
+        """Tensor and primitive span annotations declare source-entry storage.
 
         An entry selected by the caller or supplied as a compositional tensor
         source owns an external call frame. Nested helpers instead receive
@@ -66572,7 +66572,29 @@ def _lower_ast_source_to_ssa_impl(
         }
         if not spellings.intersection(tensor_parameter_boundary_names):
             return {}
-        return _authored_tensor_parameter_value_abi(function_graph)
+        selected = _authored_tensor_parameter_value_abi(function_graph)
+        # An authored text/bytes source entry owns a borrowed glyph/octet
+        # span just as its record-field annotation declares. Publishing only
+        # tensor entry annotations left parameter_abi_kind unresolved while
+        # the physical str row was already span/int64/rank1; its length and
+        # capacity were then misclassified as private frame storage. Reuse
+        # the existing annotation receipt at this boundary, not at nested
+        # helpers where exact call edges may carry a scalar key token.
+        for parameter, spelling in _current_authored_parameter_annotations(
+            function_graph
+        ).items():
+            try:
+                annotation = ast.parse(str(spelling), mode="eval").body
+            except SyntaxError:
+                continue
+            receipt = _authored_annotation_field_receipt(annotation)
+            if receipt is not None and (
+                receipt.get("storage") == "span"
+                and receipt.get("aggregate_kind") in {"str", "bytes", "bytearray"}
+                and not receipt.get("optional")
+            ):
+                selected[str(parameter)] = dict(receipt)
+        return selected
 
     def numeric_parameter_record_views(
         function_graph: Any,
@@ -66660,7 +66682,7 @@ def _lower_ast_source_to_ssa_impl(
         extraction_policy.program_abi.receipt()
     )
     has_authored_tensor_parameters = any(
-        authored_tensor_boundary_values(entry, function_graph)
+        authored_span_boundary_values(entry, function_graph)
         for entry in graph.function_table
         for function_graph in (
             getattr(getattr(entry, "graph", None), "G", None),
@@ -66786,7 +66808,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
-                authored_tensor_boundary_values(
+                authored_span_boundary_values(
                     entry, function_graph,
                 ).items()
                 if parameter in parameters
@@ -66970,7 +66992,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
-                authored_tensor_boundary_values(
+                authored_span_boundary_values(
                     entry, function_graph,
                 ).items()
                 if parameter in parameters
