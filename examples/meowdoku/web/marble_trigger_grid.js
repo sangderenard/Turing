@@ -98,6 +98,7 @@ export function mountMarbleTriggerGrid({doc,getReceivers}) {
   };
   const enqueue=body=>{chain=chain.then(()=>request(body).then(show)).catch(error=>{status.textContent=error.message;});return chain;};
   const open=()=>{
+    radioEpoch++;radioLevels=null;
     graph=null;opened=false;fire.disabled=true;
     const receivers=getReceivers();
     const buses=LIGHTING_BUSES.map(bus=>`rack:${bus.id}`);
