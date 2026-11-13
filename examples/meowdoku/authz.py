@@ -68,7 +68,7 @@ service and admin, so a guest never messages.
 
 SCRIPT ACCESS.  ``deploy_scripts`` is granted by no tier, only by role admin/operator.  deploy/*.ps1 run ``script-auth``: the account must
 verify, be in ``script_access`` (explicit allow-list) and hold deploy_scripts; every attempt is a ``script_audit`` row (exit 3 refuses).
-CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude/guest_agent.
+CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude.
 
 KIOSK.  ``intern`` is a read-only guest agent, like a kiosk at an amusement park.  It holds view_site and photo_read whatever
 its origin tier, takes no permission group (permission_groups.authority keeps it off the human ladder, like service), and the
