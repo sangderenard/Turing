@@ -7,7 +7,7 @@ import logging
 import socket
 import sys
 import threading
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -267,6 +267,61 @@ def test_abstract_endpoint(server, fake):
     h = _cookie(server, "dev1", "operator")
     status, _, body = _call(server.port, "/api/nodus/abstract?instance=demo", headers=h)
     assert status == 200 and body["revision"] == 7 and body["nodes"] == ns.as_generic_graph({**GRAPH, "canvas": "demo.nodus.txt"}, "demo")
+
+
+def test_living_picture_console_wall_and_region_feed(server, fake):
+    class UiFeed(BaseHTTPRequestHandler):
+        requests = []
+
+        def do_GET(self):
+            self.__class__.requests.append(self.path)
+            body = b"\x89PNG\r\n\x1a\nframe"
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    ui = ThreadingHTTPServer(("127.0.0.1", 0), UiFeed)
+    threading.Thread(target=ui.serve_forever, daemon=True).start()
+    try:
+        _register(server, fake.port)
+        server.sessions.nodus_ui_ports["demo"] = ui.server_address[1]
+        h = _cookie(server, "map_viewer", "operator")
+        status, _, picture = _call(server.port, "/api/nodus/picture?instance=demo", headers=h)
+        assert status == 200 and picture["map"]["schema"] == "abstract-ui-div-map-v0"
+        assert picture["view"] == "/nodus.html?instance=demo#living-map"
+        regions = picture["map"]["regions"]
+        wall = next(r for r in regions if r["kind"] == "console-wall")
+        console = next(r for r in regions if r["kind"] == "console")
+        assert any(t == {"source": console["identity"], "target": wall["identity"], "relationship": "contained-by"}
+                   for t in picture["map"]["tracks"])
+        assert console["view"]["full"] == "/api/nodus/frame?instance=demo"
+        status, _, dm = _call(server.port, "/api/paper/dm", "POST", {**h, **OUTSIDE},
+                              {"verb": "look", "target": "picture", "input": {}})
+        assert status == 200 and dm["map"] == picture["map"]
+        conn = http.client.HTTPConnection("127.0.0.1", server.port)
+        conn.request("GET", "/api/nodus/frame?instance=demo&x=2&y=3&width=4&height=5", headers=h)
+        reply = conn.getresponse()
+        assert reply.status == 200 and reply.getheader("Content-Type") == "image/png"
+        assert reply.read().startswith(b"\x89PNG")
+        conn.close()
+        assert UiFeed.requests[-1] == "/frame?x=2&y=3&width=4&height=5" or set(UiFeed.requests[-1].split("?")[1].split("&")) == {"x=2", "y=3", "width=4", "height=5"}
+        for frame in ("1", "2"):
+            conn = http.client.HTTPConnection("127.0.0.1", server.port)
+            conn.request("GET", f"/api/nodus/frame?instance=demo&frame={frame}", headers=h)
+            reply = conn.getresponse()
+            assert reply.status == 200 and reply.read().startswith(b"\x89PNG")
+            conn.close()
+            assert UiFeed.requests[-1] == "/frame"
+        assert _call(server.port, "/api/nodus/frame?instance=demo&frame=bad", headers=h)[0] == 400
+        assert _call(server.port, "/api/nodus/frame?instance=demo&x=2", headers=h)[0] == 400
+    finally:
+        ui.shutdown()
+        ui.server_close()
 
 
 # ---- share ----

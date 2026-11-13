@@ -23,7 +23,7 @@ USERS_DDL = """
                 created_at REAL NOT NULL
             );
 """
-ALL = set(authz.CAPS) - {"compile_unstable"}
+ALL = set(authz.CAPS) - {"compile_unstable", "nodus_edit"}
 
 
 @pytest.fixture
@@ -62,7 +62,15 @@ def test_admin_lan_everything():
 
 def test_member_lan_edit_has_no_admin_caps():
     caps = authz.capabilities(P("member", "lan", "edit"), authz.DEFAULT_POLICY)
-    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git"}
+    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git", "paper_train"}
+
+
+def test_higher_permission_group_inherits_lower_capabilities():
+    dev = authz.capabilities(P("dev"), authz.DEFAULT_POLICY)
+    operator = authz.capabilities(P("operator"), authz.DEFAULT_POLICY)
+    admin = authz.capabilities(P("admin"), authz.DEFAULT_POLICY)
+    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) <= dev <= operator <= admin
+    assert "dev_ui" in operator
 
 
 def test_policy_override_after_mtime_bump(tmp_path):
@@ -100,6 +108,83 @@ def test_principal_from(db):
     assert authz.principal_from(None, "dns", "shader", db).role == "guest"
     pr = authz.principal_from({"id": 1, "username": "alice"}, "lan", "edit", db)
     assert (pr.role, pr.username) == ("admin", "alice")
+
+
+def test_permission_group_rank_and_cumulative_membership(db):
+    assert authz.role_of(db, 2) == "member"
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        dev = groups.set_grant(conn, 1, 2, "dev", True)
+        assert dev["highest"] == "dev"
+        assert dev["groups"] == ["member", "dev"]
+        operator = groups.set_grant(conn, 1, 2, "operator", True)
+        assert operator["highest"] == "operator"
+        assert operator["groups"] == ["member", "dev", "operator"]
+        assert conn.execute("SELECT COUNT(*) FROM account_permission_audit WHERE actor_id=1 AND user_id=2").fetchone()[0] == 2
+    assert authz.role_of(db, 2) == "operator"
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "operator", False)
+    assert authz.role_of(db, 2) == "dev"
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "dev", False)
+    assert authz.role_of(db, 2) == "member"
+
+
+def test_permission_groups_require_admin_and_ignore_flat_sharing_groups(db):
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        conn.execute("CREATE TABLE account_content_groups (id TEXT, owner_id INTEGER, name TEXT)")
+        conn.execute("INSERT INTO account_content_groups VALUES ('place', 2, 'admin')")
+        assert groups.authority(conn, 2)["highest"] == "member"
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 1, "dev", True)
+        with pytest.raises(ValueError):
+            groups.set_grant(conn, 2, 1, "admin", True)
+
+
+def test_service_is_separate_from_human_rank(db):
+    authz.grant_role(db, "bob", "service", "supervisor")
+    with authz._connect(db) as conn:
+        effective = authz._permission_groups.authority(conn, 2)
+    assert effective["service"] is True
+    assert effective["highest"] == "member"
+    assert authz.role_of(db, 2) == "service"
+
+
+def test_paper_credential_boundary_uses_rank_and_service_status(db):
+    groups = authz._permission_groups
+    with authz._connect(db) as conn:
+        assert groups.paper_credential_owner(conn, 2, None) == 2
+        with pytest.raises(PermissionError):
+            groups.paper_credential_owner(conn, None, 1)
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "dev", True)
+        assert groups.paper_credential_owner(conn, 2, 1) == 2
+        assert groups.paper_credential_owner(conn, 1, 1) == 1
+    authz.grant_role(db, "bob", "service", "supervisor")
+    with authz._connect(db) as conn:
+        assert groups.paper_credential_owner(conn, 2, 1) == 1
+        with pytest.raises(RuntimeError):
+            groups.paper_credential_owner(conn, 2, None)
+
+
+def test_nodus_grant_is_admin_controlled_and_independent_of_rank(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 2, "nodus", True)
+        granted = groups.set_grant(conn, 1, 2, "nodus", True)
+        assert granted["highest"] == "member"
+        assert granted["groups"] == ["member", "nodus"]
+    member = authz.principal_from({"id": 2, "username": "bob"}, "dns", "shader", db)
+    assert "nodus_edit" in authz.capabilities(member, authz.DEFAULT_POLICY)
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "nodus", False)
+    member = authz.principal_from({"id": 2, "username": "bob"}, "dns", "shader", db)
+    assert "nodus_edit" not in authz.capabilities(member, authz.DEFAULT_POLICY)
 
 
 def test_require_raises_403_with_cap():
