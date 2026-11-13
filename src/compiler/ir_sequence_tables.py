@@ -1605,6 +1605,7 @@ def lower_record_sequence_append_with_child_copy(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    raise_when_full: bool = True,
 ) -> SSASequenceLowering:
     """Append one outer row while snapshotting its single child sequence.
 
@@ -1614,7 +1615,7 @@ def lower_record_sequence_append_with_child_copy(
     not rewrite rows already appended to the destination.
     """
 
-    unsupported = _unsupported_destination(destination, "append_child_copy")
+    unsupported = _unsupported_destination(destination, "append_child_copy", allow_dynamic=True)
     if unsupported is not None:
         return unsupported
     pool = destination.child_table_pool
@@ -1633,6 +1634,16 @@ def lower_record_sequence_append_with_child_copy(
     if not pool.writable:
         raise ValueError("child-copy append requires a writable child pool")
 
+    if destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        if any(source.column_shapes) or source.live_flags_value_id is not None:
+            raise ValueError("dynamic child copy requires a dense scalar leaf source")
+        if (source.heap_owner_value_id is not None
+                or {v.id for v in _storage_values(destination)}.intersection(
+                    v.id for v in _storage_values(source))):
+            raise ValueError("dynamic child copy requires disjoint borrowed source storage")
+        return _lower_dynamic_child_copy(destination, source,
+            function_name=function_name, first_value_id=first_value_id)
+
     destination_storage = _storage_values(destination)
     pool_storage = (
         *(SSAValue(value_id, dtype=dtype) for value_id, dtype in zip(
@@ -1647,6 +1658,11 @@ def lower_record_sequence_append_with_child_copy(
           if pool.live_flags_value_id is not None else ()),
     )
     source_storage = _storage_values(source)
+    # Preserve the incumbent formal ordering. Owned pools already declare
+    # their pointer cells in destination_storage; do not overwrite those with
+    # the fixed caller-arena view of the same child member.
+    destination_members = {value.id: value for value in destination_storage}
+    pool_storage = tuple(destination_members.get(value.id, value) for value in pool_storage)
     storage = tuple({
         int(value.id): value
         for value in (*destination_storage, *pool_storage, *source_storage)
@@ -1661,22 +1677,10 @@ def lower_record_sequence_append_with_child_copy(
         for index, dtype in enumerate(destination.column_dtypes)
         if index != handle_column
     )
-    destination_columns = tuple(
-        SSAValue(value_id, dtype=dtype)
-        for value_id, dtype in zip(
-            destination.column_value_ids, destination.column_dtypes
-        )
-    )
-    child_columns = tuple(
-        SSAValue(value_id, dtype=dtype)
-        for value_id, dtype in zip(pool.column_value_ids, pool.column_dtypes)
-    )
-    source_columns = tuple(
-        SSAValue(value_id, dtype=dtype)
-        for value_id, dtype in zip(
-            source.column_value_ids, source.column_dtypes
-        )
-    )
+    values = {value.id: value for value in storage}
+    destination_columns = tuple(values[value_id] for value_id in destination.column_value_ids)
+    child_columns = tuple(values[value_id] for value_id in pool.column_value_ids)
+    source_columns = tuple(values[value_id] for value_id in source.column_value_ids)
 
     entry = builder.block("entry")
     copy_header = builder.block("copy_header")
@@ -1755,9 +1759,9 @@ def lower_record_sequence_append_with_child_copy(
     builder.emit(copy_body, "Add", [
         row_offset, copy_index,
     ], destination_index)
-    for source_column, child_column in zip(source_columns, child_columns):
+    for column_index, (source_column, child_column) in enumerate(zip(source_columns, child_columns)):
         source_address = builder.fresh("ptr")
-        source_value = builder.fresh(source_column.dtype)
+        source_value = builder.fresh(source.column_dtypes[column_index])
         destination_address = builder.fresh("ptr")
         builder.emit(copy_body, "GetElementPtr", [
             source_column, copy_index,
@@ -1794,13 +1798,13 @@ def lower_record_sequence_append_with_child_copy(
 
     child_length_slot = builder.fresh("ptr")
     builder.emit(publish_child, "GetElementPtr", [
-        SSAValue(pool.length_value_id, dtype="int64"), outer_length,
+        values[pool.length_value_id], outer_length,
     ], child_length_slot)
     builder.emit(publish_child, "Store", [source_length, child_length_slot])
     if pool.status_value_id is not None:
         child_status_slot = builder.fresh("ptr")
         builder.emit(publish_child, "GetElementPtr", [
-            SSAValue(pool.status_value_id, dtype="int"), outer_length,
+            values[pool.status_value_id], outer_length,
         ], child_status_slot)
         builder.emit(publish_child, "Store", [status_zero, child_status_slot])
 
@@ -1825,7 +1829,8 @@ def lower_record_sequence_append_with_child_copy(
     builder.branch(publish_child, inserted)
 
     inserted_status = _status_branch(builder, inserted, 1, result_block)
-    _raise_fixed_capacity_exhausted(builder, full, "append_child_copy")
+    if raise_when_full:
+        _raise_fixed_capacity_exhausted(builder, full, "append_child_copy")
     full_status = _status_branch(builder, full, 2, result_block)
     status_result = builder.fresh("int")
     builder.emit(result_block, "Phi", [inserted_status, full_status],
@@ -1847,12 +1852,87 @@ def lower_record_sequence_append_with_child_copy(
             "child_source_sequence_id": int(source.sequence_id),
             "child_handle_column": handle_column,
             "fixed_capacity": True,
+            "sequence_array_argument_ids": _storage_array_ids(destination, storage),
             "status_values": {"inserted": 1, "capacity_exhausted": 2},
             "named_outputs": (("status", int(status_result.id)),),
         },
     )
     return SSASequenceLowering((function,))
 
+
+
+def _lower_dynamic_child_copy(destination, source, *, function_name, first_value_id):
+    """Reserve both pool dimensions before copying a borrowed span.
+
+    The low-level caller guarantees source buffers do not alias the owned
+    destination. Disjoint value IDs reject known aliases, not arbitrary host
+    pointer aliasing. Source-level admission must prove independent lifetime.
+    Existing heap allocation failure remains fatal, not a status-2 rollback.
+    """
+    name = function_name or f"ssa_sequence_{destination.sequence_id}_append_child_{source.sequence_id}"
+    fixed = lower_record_sequence_append_with_child_copy(
+        replace(destination, capacity_policy=SSASequenceCapacityPolicy.FIXED), source,
+        function_name=name + "__fixed", first_value_id=first_value_id, raise_when_full=False)
+    if not fixed.complete:
+        return fixed
+    insert = fixed.entry
+    reserve_lowering = lower_sequence_reserve(destination, function_name=name + "__reserve")
+    if not reserve_lowering.complete:
+        return reserve_lowering
+    reserve = reserve_lowering.entry
+    values = {v.id: SSAValue(v.id,v.dtype,shape=tuple(v.shape or ()),accounting=dict(v.accounting or {}))
+              for v in insert.args}
+    builder = _Builder(_first_fresh_identity(destination,source,values=tuple(values.values()),minimum=first_value_id))
+    entry, validate, grow, copy, invalid, result = (builder.block(n) for n in
+        ("entry","validate","grow","copy","invalid","result"))
+    zero = builder.const(entry,0,dtype="int64")
+    def length(block, value_id):
+        slot, value = builder.fresh("ptr"), builder.fresh("int64")
+        builder.emit(block,"GetElementPtr",[values[value_id],zero],slot)
+        builder.emit(block,"Load",[slot],value)
+        return value
+    count = length(entry,source.length_address_id)
+    nonnegative, fits, valid = (builder.fresh("bool") for _ in range(3))
+    builder.emit(entry,"Ge",[count,zero],nonnegative)
+    builder.emit(entry,"Le",[count,values[source.capacity_value_id]],fits)
+    builder.emit(entry,"LAnd",[nonnegative,fits],valid)
+    builder.cond(entry,valid,validate,invalid)
+    # Reserve validates length <= capacity <= its element-width maximum.
+    # Including int64 metadata bounds that maximum below INT64_MAX/8, so
+    # length+1 is representable even when the incumbent child stride is zero.
+    validation_args = {**values,reserve.metadata["required_capacity_value_id"]:zero,
+                       reserve.metadata["required_child_capacity_value_id"]:zero}
+    validation_status = builder.fresh("int")
+    builder.emit(validate,"Call",[validation_args[v.id] for v in reserve.args],validation_status,
+                 attributes={"callee":reserve.name})
+    two = builder.const(validate,2)
+    checked = builder.fresh("bool")
+    builder.emit(validate,"Lt",[validation_status,two],checked)
+    builder.cond(validate,checked,grow,result)
+    outer_length = length(grow,destination.length_address_id)
+    required = builder.fresh("int64")
+    builder.emit(grow,"Add",[outer_length,builder.const(grow,1,dtype="int64")],required)
+    reserve_args = {**values,reserve.metadata["required_capacity_value_id"]:required,
+                    reserve.metadata["required_child_capacity_value_id"]:count}
+    reserve_status = builder.fresh("int")
+    builder.emit(grow,"Call",[reserve_args[v.id] for v in reserve.args],reserve_status,
+                 attributes={"callee":reserve.name})
+    ready = builder.fresh("bool")
+    builder.emit(grow,"Lt",[reserve_status,two],ready)
+    builder.cond(grow,ready,copy,result)
+    copy_status = builder.fresh("int")
+    builder.emit(copy,"Call",[values[v.id] for v in insert.args],copy_status,
+                 attributes={"callee":insert.name})
+    builder.branch(copy,result)
+    invalid_status = _status_branch(builder,invalid,2,result)
+    status = builder.fresh("int")
+    builder.emit(result,"Phi",[validation_status,reserve_status,copy_status,invalid_status],status,
+        attributes={"incoming_blocks":(validate.name,grow.name,copy.name,invalid.name)})
+    builder.emit(result,"Ret",[status])
+    function = Function(name,list(values.values()),builder.blocks,metadata={**insert.metadata,
+        "fixed_capacity":False,"heap_owner_value_id":destination.heap_owner_value_id,
+        "named_outputs":(("status",status.id),)})
+    return SSASequenceLowering((function,*fixed.functions,*reserve_lowering.functions))
 
 def lower_sequence_add(
     descriptor: SSASequenceDescriptor,
