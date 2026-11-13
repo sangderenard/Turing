@@ -3261,7 +3261,10 @@ def _sequence_append_call_mutations(graph_obj: Any):
         # source-effect snapshot. Keep its value on the mutation itself so
         # control lowering emits a local constant rather than inventing an
         # unexplained function formal for the vanished node id.
-        return (ControlExpression("const", literal=literal),)
+        argument_ids = tuple(record.get("argument_value_ids", ()))
+        return (ControlExpression("const",
+            value_id=(int(argument_ids[0]) if len(argument_ids) == 1 else None),
+            literal=literal),)
 
     sequence_kinds = {"list", "set", "bytes", "bytearray", "array"}
     mutations = []
@@ -3991,7 +3994,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                         string_token(literal) if isinstance(literal, str)
                         else literal
                     )
-                    expressions = (ControlExpression("const", literal=literal),)
+                    expressions = (ControlExpression("const", value_id=int(row_id), literal=literal),)
                 rows.append(ControlSequenceMutation(
                     sequence_value_id=sequence_id,
                     operator="add" if is_set else "append",
@@ -4204,7 +4207,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             )
             if isinstance(literal, (bool, int, float, str)):
                 literal = string_token(literal) if isinstance(literal, str) else literal
-                expressions = (ControlExpression("const", literal=literal),)
+                expressions = (ControlExpression("const", value_id=int(value_id), literal=literal),)
             rows.append(ControlSequenceMutation(
                 sequence_value_id=sequence_id,
                 operator="add" if is_set else "append",
