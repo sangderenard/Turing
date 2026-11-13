@@ -1,3 +1,4 @@
+import * as fileCrypto from "/file-crypto.js";
 const $ = (id) => document.getElementById(id);
 const status = (message) => { $("status").textContent = message; };
 const node = (tag, text) => { const out = document.createElement(tag); out.textContent = text; return out; };
@@ -13,15 +14,6 @@ async function post(url, data) {
   return json(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
 }
 
-async function upload(name, body) {
-  return json("/api/user-files", {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream", "X-Meowdoku-Upload": "1",
-               "X-Meowdoku-Filename": encodeURIComponent(name) },
-    body,
-  });
-}
-
 async function refresh() {
   const { files } = await json("/api/user-files");
   const conversations = await json("/api/messages/conversations");
@@ -32,11 +24,21 @@ async function refresh() {
     const item = document.createElement("li");
     const line = document.createElement("div");
     line.className = "row";
-    const link = node("a", file.name);
+    let fileName = "Encrypted file";
+    if (fileCrypto.unlocked()) {
+      try { fileName = await fileCrypto.decryptName(file.envelope); }
+      catch (error) { fileName = "Encrypted file (key unavailable)"; }
+    }
+    const link = node("a", fileName);
     link.href = "/api/user-files/" + encodeURIComponent(file.id);
+    link.addEventListener("click", async (event) => {
+      event.preventDefault();
+      try { status("Decrypting file…"); const name = await fileCrypto.download(file.id); status(`Downloaded ${name}.`); }
+      catch (error) { status(error.message); }
+    });
     line.append(link, node("small", `${(file.bytes / 1024).toFixed(1)} KiB`));
     const select = document.createElement("select");
-    select.setAttribute("aria-label", `Share ${file.name} with a contact`);
+    select.setAttribute("aria-label", `Share ${fileName} with a contact`);
     select.append(new Option("Choose a contact", ""));
     const share = node("button", "Send in Messages");
     share.type = "button";
@@ -50,13 +52,15 @@ async function refresh() {
           const current = await json("/api/messages/conversations");
           const contact = (current.contacts || []).find((c) => c.username === select.value);
           if (!contact) throw new Error("This contact is no longer available.");
+          const original = await fileCrypto.openFile(file.id);
+          const encrypted = await fileCrypto.upload(original.name, original.data, contact.username);
           await post("/api/messages/send", {
-            body: `Shared file: ${file.name}`,
-            subject: { kind: "file", ref: file.id },
+            body: "Shared an encrypted file",
+            subject: { kind: "file", ref: encrypted.id },
             conversation_handle: contact.conversation_handle,
             idempotency_key: crypto.randomUUID(),
           });
-          status(`Sent ${file.name} to ${contact.username}.`);
+          status(`Sent ${original.name} to ${contact.username}.`);
         } catch (error) { status(error.message); }
         finally { share.disabled = false; }
       });
@@ -75,7 +79,7 @@ $("upload-form").addEventListener("submit", async (event) => {
   button.disabled = true;
   status("Uploading…");
   try {
-    const response = await upload(file.name, file);
+    const response = await fileCrypto.upload(file.name, await file.arrayBuffer());
     $("upload-form").reset();
     status(`Stored ${response.name} privately.`);
     await refresh();
@@ -83,25 +87,14 @@ $("upload-form").addEventListener("submit", async (event) => {
   finally { button.disabled = false; }
 });
 
-$("paper-key-form").addEventListener("submit", async (event) => {
+$("unlock-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const keyId = $("paper-id").value.trim();
-  const secret = $("paper-secret").value.trim();
-  if (!keyId || !secret || /[\r\n]/.test(keyId + secret)) { status("Enter both paper key values without line breaks."); return; }
-  const button = $("paper-key-button");
-  button.disabled = true;
-  status("Saving privately…");
   try {
-    await json("/api/user-secrets/alpaca-paper", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Meowdoku-Secret": "1" },
-      body: JSON.stringify({ key_id: keyId, secret_key: secret }),
-    });
-    $("paper-key-form").reset();
-    $("paper-key-state").textContent = "Paper key configured for this account.";
-    status("Paper key saved. Its value is not shown or available for download.");
+    await fileCrypto.unlock($("unlock-passphrase").value);
+    $("unlock-form").reset();
+    status("File key unlocked for this page.");
+    await refresh();
   } catch (error) { status(error.message); }
-  finally { button.disabled = false; }
 });
 
 try {
@@ -114,8 +107,6 @@ try {
     $("identity").textContent = `Signed in as ${who.username}.`;
     $("upload-box").hidden = false;
     $("files-box").hidden = false;
-    const connection = await json("/api/user-secrets/alpaca-paper");
-    $("paper-key-state").textContent = connection.configured ? "Paper key configured for this account." : "No paper key configured yet.";
     await refresh();
   }
 } catch (error) { status(error.message); }

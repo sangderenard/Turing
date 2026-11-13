@@ -1129,7 +1129,8 @@ def make_handler(sessions: Sessions):
         # ---- end [MESSAGES]
 
         def _user_files_route(self, path: str, method: str) -> None:
-            from urllib.parse import quote, unquote
+            import base64
+            import binascii
             import sqlite3
             self._set_cookie = []
             if not self._require("message"):
@@ -1149,7 +1150,8 @@ def make_handler(sessions: Sessions):
                                                          path[len("/api/user-files/"):])
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(item["name"], safe=""))
+                    self.send_header("Content-Disposition", "attachment; filename=encrypted-file.bin")
+                    self.send_header("X-Meowdoku-File-Meta", base64.urlsafe_b64encode(item["envelope"].encode()).decode().rstrip("="))
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Cache-Control", "private, no-store")
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -1167,18 +1169,60 @@ def make_handler(sessions: Sessions):
                     if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "application/octet-stream":
                         return self._json({"error": "binary upload required"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
                     length = int(self.headers["Content-Length"])
-                    if not 0 < length <= user_files_mod.MAX_FILE_BYTES:
-                        return self._json({"error": "file must be between 1 byte and 8 MiB"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                    name = unquote(self.headers.get("X-Meowdoku-Filename", ""), errors="strict")
+                    if not 17 <= length <= user_files_mod.MAX_BLOB_BYTES:
+                        return self._json({"error": "encrypted file must be at most 8 MiB"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    meta_header = self.headers.get("X-Meowdoku-File-Meta", "")
+                    if len(meta_header) > 4000:
+                        return self._json({"error": "encrypted file metadata too large"}, HTTPStatus.BAD_REQUEST)
+                    envelope = json.loads(base64.urlsafe_b64decode(meta_header + "=" * (-len(meta_header) % 4)))
                     return self._json(user_files_mod.put(db, sessions.state.users_dir, owner_id,
-                                                          name, self.rfile.read(length)), HTTPStatus.CREATED)
+                                                          envelope, self.rfile.read(length)), HTTPStatus.CREATED)
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             except user_files_mod.FileError as error:
                 return self._json({"error": str(error)}, error.status)
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError, binascii.Error):
                 return self._json({"error": "invalid upload request"}, HTTPStatus.BAD_REQUEST)
             except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
                 return self._json({"error": "file storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _file_keys_route(self, path: str, method: str) -> None:
+            from urllib.parse import parse_qs
+            import sqlite3
+            self._set_cookie = []
+            if not self._require("message"):
+                return
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            me = self._principal().user_id
+            if me is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            db = None
+            try:
+                db = user_files_mod.connect(sessions.accounts_db)
+                if method == "GET" and path == "/api/file-keys/me":
+                    return self._json(user_files_mod.key_bundle(db, me))
+                if method == "GET" and path == "/api/file-keys/peer":
+                    username = (parse_qs(self.path.partition("?")[2]).get("username") or [""])[0]
+                    peer = user_files_mod.peer_key(db, me, username)
+                    return self._json({"username": peer["username"], "public_spki": peer["public_spki"],
+                                       "fingerprint": peer["fingerprint"]})
+                if method == "POST" and path == "/api/file-keys/me":
+                    if self.headers.get("Origin") != "https://" + self.headers.get("Host", "") or self.headers.get("X-Meowdoku-Key") != "1":
+                        return self._json({"error": "same-origin key setup required"}, HTTPStatus.FORBIDDEN)
+                    if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                        return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    body = self._body_json(8192)
+                    if body is None:
+                        return
+                    return self._json(user_files_mod.register_key(db, me, body), HTTPStatus.CREATED)
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except user_files_mod.FileError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "file key storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -2177,6 +2221,8 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path, "GET")
             if path == "/api/user-files" or path.startswith("/api/user-files/"):
                 return self._user_files_route(path, "GET")
+            if path in ("/api/file-keys/me", "/api/file-keys/peer"):
+                return self._file_keys_route(path, "GET")
             if path == "/api/user-secrets/alpaca-paper":
                 return self._paper_credentials_route("GET")
             if path in ("/api/markets/history", "/api/markets/now"):
@@ -2671,6 +2717,8 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path0, "POST")
             if path0 == "/api/user-files":
                 return self._user_files_route(path0, "POST")
+            if path0 == "/api/file-keys/me":
+                return self._file_keys_route(path0, "POST")
             if path0 == "/api/user-secrets/alpaca-paper":
                 return self._paper_credentials_route("POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]

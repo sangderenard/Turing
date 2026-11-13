@@ -1,4 +1,4 @@
-// Meowdoku messenger widget: ONE self-contained ES module (no imports).  HAND-AUTHORED, not produced by the Turing compiler;
+// Meowdoku messenger widget. HAND-AUTHORED, not produced by the Turing compiler;
 // "compiled" here only means this single built artifact that a page opts into.
 //
 // MESSAGING IS SERVER-MEDIATED AND OPERATOR-READABLE: every message passes through and is stored by the server (/api/messages/*),
@@ -12,7 +12,8 @@
 // long poll that runs only while open.  All DOM is built with createElement/textContent. Message bodies are plain text;
 // validated file subjects render as download links. Styles live in a closed Shadow DOM.
 // Global surface: window.MeowdokuMessenger = {open, close, version}.
-const VERSION = "4";
+import * as fileCrypto from "/file-crypto.js";
+const VERSION = "5";
 const MAX_IMAGE_BYTES = 2097152;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 function safeImageURL(image, id) {
@@ -28,16 +29,9 @@ async function pngAttachment(file) {
   return { data: btoa(binary) };
 }
 
-async function uploadPrivateFile(file) {
+async function uploadPrivateFile(file, recipient) {
   if (!file || file.size < 1 || file.size > MAX_FILE_BYTES) throw new Error("Choose a file from 1 byte to 8 MiB.");
-  const response = await fetch("/api/user-files", { method: "POST", credentials: "same-origin", cache: "no-store",
-    redirect: "error", headers: { "Content-Type": "application/octet-stream", "X-Meowdoku-Upload": "1",
-      "X-Meowdoku-Filename": encodeURIComponent(file.name) }, body: file });
-  let result;
-  try { result = await response.json(); } catch (error) { throw new Error("File upload response was invalid."); }
-  if (!response.ok) throw new Error(result.error || "File upload failed.");
-  if (!result || !/^[0-9a-f]{32}$/.test(result.id)) throw new Error("File upload receipt was invalid.");
-  return { id: result.id, name: result.name };
+  return fileCrypto.upload(file.name, await file.arrayBuffer(), recipient);
 }
 
 function allowed() {
@@ -215,7 +209,13 @@ async function start() {
     if (!m.removed && m.subject) {
       if (m.subject.kind === "file" && /^[0-9a-f]{32}$/.test(m.subject.ref)) {
         node.appendChild(el("a", { class: "note", href: "/api/user-files/" + m.subject.ref,
-                                   text: "Download shared file" }));
+          text: "Decrypt and download shared file", on: { click: async (event) => {
+            event.preventDefault();
+            try { await fileCrypto.download(m.subject.ref); }
+            catch (error) { note(error.message); }
+          } } }));
+        node.appendChild(el("a", { class: "note", href: "/keys.html?import=" + m.subject.ref,
+          text: "Open as secret on Keys page" }));
       } else node.appendChild(el("div", { class: "note", text: m.subject.kind + ": " + m.subject.ref }));
     }
     node.appendChild(document.createTextNode(m.removed ? "[removed by an administrator]" : (m.type && m.type !== "note" ? "[" + m.type + "] " : "") + m.body));
@@ -270,6 +270,14 @@ async function start() {
     const fileChooser = el("input", { type: "file", "aria-label": "Attach a file (up to 8 MiB)" });
     const fileStatus = el("span", { class: "note" });
     const removeFile = el("button", { type: "button", text: "Clear file" });
+    const keyPassphrase = el("input", { type: "password", autocomplete: "off", placeholder: "File recovery passphrase",
+      "aria-label": "File recovery passphrase" });
+    const unlockFileKey = el("button", { type: "button", text: "Unlock files", on: { click: async () => {
+      unlockFileKey.disabled = true;
+      try { await fileCrypto.unlock(keyPassphrase.value); viewNote("File encryption unlocked for this page."); updateControls(); }
+      catch (error) { viewNote(error.message); }
+      finally { keyPassphrase.value = ""; unlockFileKey.disabled = false; }
+    } } });
     const updateControls = () => {
       const setting = view.imageState;
       const busy = !!pendingSends.get(peer) || choosing || uploading || view.toggling;
@@ -278,7 +286,7 @@ async function start() {
       removeImage.disabled = busy || !image;
       toggle.textContent = setting && setting.enabled ? "Disable images" : "Enable images";
       selected.textContent = image ? "PNG attached" : "";
-      fileChooser.disabled = busy;
+      fileChooser.disabled = busy || !fileCrypto.unlocked();
       removeFile.disabled = busy || !fileAttachment;
       fileStatus.textContent = uploading ? "Uploading privately…" : fileAttachment ? "Ready to send: " + fileAttachment.name : "File: none selected";
       imageStatus.textContent = "Images are server-readable. Both people must opt in. " +
@@ -332,7 +340,7 @@ async function start() {
       if (!file) return;
       uploading = true; updateControls();
       try {
-        const stored = await uploadPrivateFile(file);
+        const stored = await uploadPrivateFile(file, peer);
         if (active()) { fileAttachment = stored; draft.file = stored; viewNote("File stored privately. Send the message to share it with " + peer + "."); }
       } catch (error) { viewNote(error.message); }
       finally { uploading = false; fileChooser.value = ""; if (active()) updateControls(); }
@@ -345,6 +353,8 @@ async function start() {
     footEl.appendChild(imageStatus);
     footEl.appendChild(el("div", { class: "row" }, toggle, chooser));
     footEl.appendChild(el("div", { class: "row" }, selected, removeImage));
+    footEl.appendChild(el("div", { class: "row" }, keyPassphrase, unlockFileKey));
+    footEl.appendChild(el("div", { class: "note" }, el("a", { href: "/keys.html", text: "Set up file keys" })));
     footEl.appendChild(el("div", { class: "row" }, fileChooser));
     footEl.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
     let sending = false;

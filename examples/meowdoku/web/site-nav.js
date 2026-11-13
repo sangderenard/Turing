@@ -429,6 +429,7 @@ async function main() {
   for (const item of [
     link("Home", "/"),
     link("Profile and servers", "/profile.html"),
+    link("Keys", "/keys.html", caps.has("message")),
     link("My files", "/files.html", caps.has("message")),
     link("Paper markets", "/markets.html", caps.has("message")),
     link("Browse the site", "/browse"),

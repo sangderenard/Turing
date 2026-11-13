@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keys · Meowdoku</title>
+<style>
+  :root { color-scheme: dark; font: 15px/1.45 system-ui, sans-serif; }
+  body { margin: 0; color: #eef2fa; background: #111823; }
+  main { max-width: 50rem; margin: auto; padding: 1rem 1rem 5rem; }
+  a { color: #a9ceff; } .card { background: #1c2939; border: 1px solid #44536a; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  input, select, textarea, button { box-sizing: border-box; font: inherit; color: inherit; background: #111c2b; border: 1px solid #647792; border-radius: 5px; padding: .45rem; }
+  input, textarea { width: 100%; } textarea { min-height: 7rem; } button { cursor: pointer; } button:disabled { opacity: .5; }
+  .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; } .row > * { flex: 1 1 12rem; }
+  .muted { color: #bac7d8; } code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
+</style>
+</head>
+<body><main>
+  <p><a href="/">← Meowdoku</a></p><h1>Keys</h1>
+  <p id="identity">Checking account…</p>
+  <section class="card">
+    <h2>File-sharing key</h2>
+    <p class="muted">A separate key for encrypted files. The server stores your public key and a passphrase-encrypted recovery copy of your private key. Keep the recovery passphrase: losing it makes old encrypted files unreadable. Keys are held in this page's memory only while it is open.</p>
+    <p id="file-key-state">Checking file key…</p><p>Fingerprint: <code id="fingerprint">—</code></p>
+    <form id="setup-form" hidden>
+      <p><label>New recovery passphrase (12 characters or more)<input id="setup-pass" type="password" autocomplete="new-password" minlength="12" required></label></p>
+      <p><label>Repeat passphrase<input id="setup-confirm" type="password" autocomplete="new-password" minlength="12" required></label></p>
+      <button type="submit">Generate file key</button>
+    </form>
+    <form id="unlock-form" class="row" hidden>
+      <label>Recovery passphrase<input id="unlock-pass" type="password" autocomplete="off" required></label>
+      <button type="submit">Unlock for this page</button>
+    </form>
+  </section>
+  <section class="card" id="paper-box" hidden>
+    <h2>Alpaca paper key</h2>
+    <p class="muted">Paste the paper key ID and secret from Alpaca. Connect it to your own market page, or make a recipient-encrypted credential file for an accepted contact. Connecting a key lets Meowdoku's backend use its plaintext for Alpaca requests.</p>
+    <p id="paper-state">Checking paper connection…</p>
+    <form id="paper-form">
+      <p><label>Paper key ID<input id="paper-id" autocomplete="off" autocapitalize="none" spellcheck="false" required></label></p>
+      <p><label>Paper secret<input id="paper-secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label></p>
+      <div class="row"><button id="paper-connect" type="button">Connect to my paper market</button>
+        <button id="paper-store" type="button">Encrypt and store privately</button>
+        <select id="paper-recipient" aria-label="Friend to receive encrypted paper key"><option value="">Choose a contact</option></select>
+        <button id="paper-share" type="button">Encrypt and send</button></div>
+    </form>
+  </section>
+  <section class="card" id="general-box" hidden>
+    <h2>Purpose-specific secret file</h2>
+    <p class="muted">Create an encrypted file from pasted content without saving a plaintext file on your phone. Only the selected accepted contact gets a wrapped decryption key.</p>
+    <form id="general-form">
+      <p><label>Purpose<input id="secret-purpose" maxlength="60" placeholder="For example: test account credential" required></label></p>
+      <p><label>Secret content<textarea id="secret-content" required></textarea></label></p>
+      <div class="row"><button id="general-store" type="button">Encrypt and store privately</button>
+        <select id="general-recipient" aria-label="Friend to receive encrypted secret"><option value="">Choose a contact</option></select>
+        <button type="submit">Encrypt and send</button></div>
+    </form>
+  </section>
+  <section class="card" id="import-box" hidden>
+    <h2>Received secret</h2><p id="import-state">Waiting for file key…</p>
+    <button id="import-connect" type="button" hidden>Connect this paper key to my account</button>
+    <button id="import-reveal" type="button" hidden>Reveal secret content</button>
+    <textarea id="import-content" readonly hidden aria-label="Decrypted secret content"></textarea>
+  </section>
+  <p id="status" role="status"></p><p><a href="/files.html">My encrypted files</a></p>
+</main>
+<script type="module" src="/keys.js"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body></html>
