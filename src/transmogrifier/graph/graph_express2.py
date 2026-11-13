@@ -2387,6 +2387,8 @@ def _map_ir_from_ast(tree):
         for definition in ast.walk(tree)
         if isinstance(definition, ast.ClassDef)
     )
+    from ...compiler.source_owned_record_elements import publish_field_sequence_elements
+    publish_field_sequence_elements(tree)
     # Recursive pursuit may first retain a declaration-only shell for a
     # method owner's fields and later retain executable methods from that same
     # source ClassDef.  Both views carry the exact class identity and span row;

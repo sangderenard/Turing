@@ -1608,6 +1608,8 @@ class CorrelationTable:
         found.extend(source_comprehension_capacity_findings(module))
         found.extend(self._source_bytes_concat_class_findings(module))
         found.extend(self._source_eager_bytes_return_findings(module))
+        from .source_owned_record_elements import source_field_sequence_element_findings
+        found.extend(source_field_sequence_element_findings(module))
         from .source_owned_record_projection import public_source_entry_findings
         found.extend(public_source_entry_findings(module))
         from .source_sequence_lifetime import sequence_lifetime_findings

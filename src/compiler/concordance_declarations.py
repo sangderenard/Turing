@@ -1612,6 +1612,25 @@ PUBLIC_SOURCE_ENTRY = declare_page(
 
 
 @dataclass(frozen=True)
+class SourceFieldSequenceElement:
+    """One declared field annotation bound to exact admitted builtin symbols."""
+
+    annotation_cell: Ref
+    module_cell: Ref
+    field_occurrence_cell: Ref
+    container_cell: Ref
+    element_cell: Ref
+    rebound_names: tuple[str, ...]
+
+
+SOURCE_FIELD_SEQUENCE_ELEMENT = declare_page(
+    "source_field_sequence_element", (
+        RowField("field_declaration", K.PAGE_REF),
+    ), SourceFieldSequenceElement,
+)
+
+
+@dataclass(frozen=True)
 class SourceOwnedSequenceReturn:
     """An authored bytes concat returned from its exact source slot."""
 
