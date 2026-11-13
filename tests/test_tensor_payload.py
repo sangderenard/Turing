@@ -105,3 +105,61 @@ def test_the_store_receives_the_same_payload_memory_holds(tmp_path):
     tensor = AbstractTensor.tensor([7, 8, 9], dtype="int32")
     tensor_payload.save(tmp_path / "x.tp", tensor, store=lambda path, payload: seen.update({str(path): payload}))
     assert seen == {str(tmp_path / "x.tp"): tensor_payload.retained(tmp_path / "x.tp")}
+
+
+def test_the_handle_is_read_without_the_region_and_sizes_the_callers_region(tmp_path):
+    import numpy as np
+
+    target = tmp_path / "vertex_offsets.tp"
+    tensor_payload.save(target, np.arange(12, dtype=np.float64).reshape(4, 3))
+    assert tensor_payload.read_handle(target) == ("float64", (4, 3))
+    assert tensor_payload.c_strides((4, 3)) == (3, 1)
+    assert tensor_payload.region_length((4, 3)) == 12
+    assert tensor_payload.region_length((4, 3), (1, 4)) == 12          # column-major
+    assert tensor_payload.region_length((4, 3), (8, 2)) == 29          # padded rows: last offset 3*8 + 2*2, plus one
+    assert tensor_payload.region_length(()) == 1                       # a scalar is one element
+    assert tensor_payload.region_length((0, 3)) == 0
+    with pytest.raises(ValueError):
+        tensor_payload.region_length((4, 3), (1,))
+
+
+def test_load_into_fills_the_callers_region_in_the_saved_or_the_stated_layout(tmp_path):
+    import numpy as np
+
+    saved = np.arange(12, dtype=np.float64).reshape(4, 3)
+    target = tmp_path / "vertex_offsets.tp"
+    tensor_payload.save(target, saved)
+
+    region, handle = np.zeros(12, dtype=np.float64), np.zeros(5, dtype=np.int64)
+    assert tensor_payload.load_into(target, region, handle) == tensor_payload.STATUS_COMPLETE
+    assert (region == saved.ravel()).all() and handle.tolist() == [2, 4, 3, 3, 1]
+
+    region, handle = np.full(29, -1.0), np.zeros(5, dtype=np.int64)  # the caller's padded-row layout
+    assert tensor_payload.load_into(target, region, handle, strides=(8, 2)) == tensor_payload.STATUS_COMPLETE
+    laid = np.lib.stride_tricks.as_strided(region, shape=(4, 3), strides=(64, 16))
+    assert (laid == saved).all() and handle.tolist() == [2, 4, 3, 8, 2]
+    assert region[1] == -1.0                                          # a gap the layout skips is not written
+
+    scalar = tmp_path / "vertex_count.tp"
+    tensor_payload.save(scalar, np.asarray(np.int64(4)))
+    region, handle = np.zeros(1, dtype=np.int64), np.zeros(1, dtype=np.int64)
+    assert tensor_payload.load_into(scalar, region, handle) == tensor_payload.STATUS_COMPLETE
+    assert region.tolist() == [4] and handle.tolist() == [0]
+
+
+def test_load_into_reports_capacity_and_failure_and_writes_nothing(tmp_path):
+    import numpy as np
+
+    target = tmp_path / "edge_pairs.tp"
+    tensor_payload.save(target, np.arange(12, dtype=np.int64).reshape(6, 2))
+    small = np.zeros(11, dtype=np.int64)
+    assert tensor_payload.load_into(target, small, np.zeros(5, dtype=np.int64)) == tensor_payload.STATUS_OVER_CAPACITY
+    assert not small.any()
+    assert tensor_payload.load_into(target, np.zeros(12, dtype=np.int64), np.zeros(4, dtype=np.int64)) \
+        == tensor_payload.STATUS_OVER_CAPACITY                         # the handle buffer holds 1 + 2 * rank
+    assert tensor_payload.load_into(target, np.zeros(12, dtype=np.float64), np.zeros(5, dtype=np.int64)) \
+        == tensor_payload.STATUS_FAILED                                # another dtype than the payload
+    assert tensor_payload.load_into(target, np.zeros(12, dtype=np.int64), np.zeros(5, dtype=np.int64),
+                                    strides=(1,)) == tensor_payload.STATUS_FAILED
+    assert tensor_payload.load_into(tmp_path / "missing.tp", np.zeros(12, dtype=np.int64),
+                                    np.zeros(5, dtype=np.int64)) == tensor_payload.STATUS_FAILED

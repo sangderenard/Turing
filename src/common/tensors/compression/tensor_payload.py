@@ -64,7 +64,9 @@ def _region(value: Any) -> np.ndarray:
         raise TypeError(f"a tensor payload holds tensors, not {type(value).__name__}")
     if not isinstance(array, np.ndarray):
         raise TypeError(f"{type(value).__name__} gave no host data region")
-    return np.ascontiguousarray(array)
+    # ``ascontiguousarray`` returns at least one axis: a rank-0 tensor (YoungMan's ``vertex_count``) was saved with
+    # the handle ``(1,)``.  The handle is the tensor's own shape, so the copy keeps it.
+    return np.ascontiguousarray(array).reshape(array.shape)
 
 
 def dumps(value: Any) -> bytes:
@@ -82,6 +84,14 @@ def dumps(value: Any) -> bytes:
 def loads(data: bytes) -> Any:
     """The AbstractTensor a payload holds: its handle restored, its region laid under it."""
 
+    from ..abstraction import AbstractTensor
+
+    return AbstractTensor.tensor(_decoded_region(data))
+
+
+def _decoded_region(data: bytes) -> np.ndarray:
+    """A payload's region as a C-ordered NumPy array of its handle's dtype and shape."""
+
     data = bytes(data)
     if not data.startswith(MAGIC):
         raise ValueError("not a tensor payload")
@@ -95,10 +105,7 @@ def loads(data: bytes) -> Any:
         count *= int(extent)
     if len(raw) != count * dtype.itemsize:
         raise ValueError("tensor payload region disagrees with its handle")
-    region = np.frombuffer(raw, dtype=dtype).astype(np.dtype(name), copy=True).reshape(tuple(shape))
-    from ..abstraction import AbstractTensor
-
-    return AbstractTensor.tensor(region)
+    return np.frombuffer(raw, dtype=dtype).astype(np.dtype(name), copy=True).reshape(tuple(shape))
 
 
 def _key(path: Any) -> str:
@@ -139,14 +146,115 @@ def save(path: Any, value: Any, *, store: Callable[[Any, bytes], None] | None = 
     return len(payload)
 
 
-def load(path: Any) -> Any:
-    """The tensor saved under ``path``: from memory inside the minute, else from the file."""
+def _payload(path: Any) -> bytes:
+    """The payload saved under ``path``: from memory inside the minute, else from the file."""
 
     payload = retained(path)
     if payload is None:
         with open(os.fspath(path), "rb") as stream:
             payload = stream.read()
-    return loads(payload)
+    return payload
 
 
-__all__ = ["DTYPES", "MAGIC", "RETAIN_SECONDS", "dtype_name", "dumps", "load", "loads", "retained", "save", "write_file"]
+def load(path: Any) -> Any:
+    """The tensor saved under ``path``: from memory inside the minute, else from the file."""
+
+    return loads(_payload(path))
+
+
+# Caller-owned results.  A compiled caller provides all the memory a load needs (the SSA and backend ethos), so the
+# region is sized before the load from a layout: the handle saved in the payload, or a stride tuple the caller states
+# in its place.  The status is the shell's external-result convention (``utf8_sequence``): 1 complete, 2 over the
+# caller's capacity, 3 failed.
+STATUS_COMPLETE = 1
+STATUS_OVER_CAPACITY = 2
+STATUS_FAILED = 3
+
+
+def read_handle(source: Any) -> tuple[str, tuple[int, ...]]:
+    """A payload's handle, ``(dtype name, shape)``, read without decompressing its region.
+
+    ``source`` is a payload (``bytes``) or the path it was saved under.
+    """
+
+    data = bytes(source) if isinstance(source, (bytes, bytearray, memoryview)) else _payload(source)
+    if not data.startswith(MAGIC):
+        raise ValueError("not a tensor payload")
+    (name, shape), _packed = tile_row_codec.decode_rows(data[len(MAGIC):])
+    if name not in DTYPES:
+        raise ValueError(f"tensor payload records unknown dtype {name!r}")
+    return str(name), tuple(int(extent) for extent in shape)
+
+
+def c_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The element strides of a C-ordered region of ``shape`` (the layout a payload is saved in)."""
+
+    strides, step = [], 1
+    for extent in reversed(tuple(shape)):
+        strides.append(step)
+        step *= max(int(extent), 1)
+    return tuple(reversed(strides))
+
+
+def region_length(shape: tuple[int, ...], strides: tuple[int, ...] | None = None) -> int:
+    """The elements a region of ``shape`` laid out by ``strides`` spans: what the caller provides.
+
+    ``strides`` (in elements, one per axis) overrides the saved C order; the length is the last element's offset plus
+    one, ``1 + sum((extent - 1) * stride)``, or 0 for an empty tensor.
+    """
+
+    shape = tuple(int(extent) for extent in shape)
+    strides = c_strides(shape) if strides is None else tuple(int(stride) for stride in strides)
+    if len(strides) != len(shape):
+        raise ValueError(f"a stride tuple of {len(strides)} axes cannot lay out a rank-{len(shape)} tensor")
+    if any(stride < 0 for stride in strides):
+        raise ValueError("a region's strides are not negative")
+    if any(extent == 0 for extent in shape):
+        return 0
+    return 1 + sum((extent - 1) * stride for extent, stride in zip(shape, strides))
+
+
+def load_into(path: Any, region: Any, handle: Any, strides: tuple[int, ...] | None = None) -> int:
+    """Fill the caller's ``region`` with the tensor saved under ``path``; the status.
+
+    ``region`` is the caller's writable one-dimensional buffer of the tensor's dtype, its length the capacity.  The
+    elements are laid out by ``strides`` (in elements, one per axis) when the caller states them, else in the saved
+    C order.  ``handle`` is the caller's writable int64 buffer; it receives ``rank, *shape, *strides`` (the layout
+    the region now holds), so its capacity is ``1 + 2 * rank``.  Nothing is allocated for the caller.  A region or
+    handle too small is :data:`STATUS_OVER_CAPACITY` with nothing written; a payload that is unreadable, of another
+    dtype than the region, or of another rank than the stride tuple is :data:`STATUS_FAILED`.
+    """
+
+    try:
+        name, shape = read_handle(path)
+        layout = c_strides(shape) if strides is None else tuple(int(stride) for stride in strides)
+        length = region_length(shape, layout)
+        region_array = np.asarray(region)
+        handle_array = np.asarray(handle)
+        if (
+            region_array.ndim != 1 or region_array.dtype != np.dtype(name)
+            or handle_array.ndim != 1 or handle_array.dtype != np.dtype("int64")
+        ):
+            return STATUS_FAILED
+        if length > region_array.shape[0] or 1 + 2 * len(shape) > handle_array.shape[0]:
+            return STATUS_OVER_CAPACITY
+        values = _decoded_region(_payload(path))
+        if length:
+            itemsize = region_array.dtype.itemsize
+            view = np.lib.stride_tricks.as_strided(
+                region_array, shape=shape, strides=tuple(stride * itemsize for stride in layout),
+            )
+            view[...] = values.reshape(shape)
+        handle_array[0] = len(shape)
+        handle_array[1:1 + len(shape)] = shape
+        handle_array[1 + len(shape):1 + 2 * len(shape)] = layout
+        return STATUS_COMPLETE
+    except (OSError, ValueError, TypeError):
+        return STATUS_FAILED
+
+
+__all__ = [
+    "DTYPES", "MAGIC", "RETAIN_SECONDS", "STATUS_COMPLETE", "STATUS_FAILED", "STATUS_OVER_CAPACITY", "c_strides",
+    "dtype_name", "dumps", "load", "load_into", "loads", "read_handle", "region_length", "retained", "save",
+    "write_file",
+]
