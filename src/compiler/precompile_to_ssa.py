@@ -6733,28 +6733,61 @@ class _ControlSSABuilder(TiledObject):
             attributes={"value": int(literal)},
         )
         if exact_integer:
-            book = self._book()
-            row = (self._scope(), int(value.id))
-            prior = book.latest_ref(SSA_VALUE, row)
-            literal_cell = book.post(
-                SSA_CONSTANT_MATERIALIZATION,
-                (self._scope(), str(self.function_name),
-                 str(self.current.name), int(value.id)),
-                ("Const", selected_dtype, repr(literal)),
-                stage=self._stage(), provenance=Derived((prior,)),
-                mode=Mode.CONCORD,
-            )
-            prior_fact = book.page(SSA_VALUE).cell(prior.row, prior.column)
-            book.post(
-                SSA_VALUE, row,
-                rebuilt_ssa_value_fact(
-                    prior_fact, selected_dtype, (), prior_fact.origin,
-                    physical={"physical_dtype": selected_dtype,
-                              "storage": "scalar", "rank": 0}),
-                stage=self._stage(),
-                provenance=Derived((prior, literal_cell)), mode=Mode.REVISE,
-            )
+            self._publish_scalar_constant_layout(value, literal)
         return value
+
+    def _publish_scalar_constant_layout(self, value: SSAValue, literal: Any) -> bool:
+        """Publish an emitted numeric literal's exact native scalar domain.
+
+        Explicitly narrower/different source domains are not inferred from
+        the host literal here; they require their own source ABI receipt.
+        """
+        if getattr(self, "_captured_instruction_sink", None) is not None:
+            return False
+        if type(literal) is int:
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+            literal_dtype = python_int_literal_dtype(literal)
+        elif type(literal) is bool:
+            literal_dtype = "bool"
+        elif type(literal) is float:
+            literal_dtype = "float64"
+        else:
+            return False
+        if value.dtype != literal_dtype or tuple(value.shape):
+            return False
+        book = self._book()
+        row = (self._scope(), int(value.id))
+        prior = book.latest_ref(SSA_VALUE, row)
+        literal_cell = book.post(
+            SSA_CONSTANT_MATERIALIZATION,
+            (self._scope(), str(self.function_name), str(self.current.name), int(value.id)),
+            ("Const", literal_dtype, repr(literal)),
+            stage=self._stage(), provenance=Derived((prior,)), mode=Mode.CONCORD,
+        )
+        prior_fact = book.page(SSA_VALUE).cell(prior.row, prior.column)
+        book.post(
+            SSA_VALUE, row,
+            rebuilt_ssa_value_fact(prior_fact, literal_dtype, (), prior_fact.origin,
+                physical={"physical_dtype": literal_dtype, "storage": "scalar", "rank": 0}),
+            stage=self._stage(), provenance=Derived((prior, literal_cell)), mode=Mode.REVISE,
+        )
+        return True
+
+    def _publish_folded_seed_layout(self, value: SSAValue, literal: Any, seed_id: int, abi_cell: Ref | None) -> None:
+        """Retain an exact folded seed ABI, then its literal materialization."""
+        if getattr(self, "_captured_instruction_sink", None) is not None:
+            return
+        canonical = self._canonical_cell(seed_id)
+        declared = _contract_physical(
+            self._book(), SSAValue(seed_id, dtype=value.dtype, shape=()), canonical,
+        ) if canonical is not None and abi_cell is not None else None
+        if declared is not None:
+            physical, source_abi = declared
+            if (source_abi != abi_cell or physical.get("storage") != "scalar"
+                    or physical.get("rank") != 0 or physical.get("physical_dtype") != value.dtype):
+                raise ConcordanceRefusal("folded seed differs from its exact scalar source ABI")
+            self._revise_value(value, canonical, source_abi, physical=physical)
+        self._publish_scalar_constant_layout(value, literal)
 
     def indexed_load(
         self,
@@ -21613,6 +21646,7 @@ class _ControlSSABuilder(TiledObject):
                 Handler.Const, [], seed_value,
                 attributes={"value": seed_literal},
             )
+            self._publish_folded_seed_layout(seed_value, seed_literal, seed_id, seed_abi_cell)
             # LOOP_SEED: the folded seed's own identity cell is the cause.
             self._bind(
                 seed_id, seed_value, BindingKind.LOOP_SEED,
@@ -22954,6 +22988,7 @@ class _ControlSSABuilder(TiledObject):
                 Handler.Const, [], seed_value,
                 attributes={"value": seed_literal},
             )
+            self._publish_folded_seed_layout(seed_value, seed_literal, seed_id, seed_abi_cell)
             # LOOP_SEED: the folded seed's own identity cell is the cause.
             self._bind(
                 seed_id, seed_value, BindingKind.LOOP_SEED,
