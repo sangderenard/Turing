@@ -4410,15 +4410,58 @@ class _ControlSSABuilder(TiledObject):
             f"{operation}{suffix}"
         )
 
+    def _refuse_resident_glyph_keys(self, value_ids) -> None:
+        """Do not pass a resident string span to scalar keyed kernels.
+
+        This is not a ban on string vocabulary tokens: only an exact source
+        glyph projection, or a string with actual resident span storage,
+        establishes the unsupported content-key operation.
+        """
+        from .source_borrowed_record_spans import (
+            borrowed_record_string_source, exact_string_classes,
+            borrowed_record_string_layouts_from_book,
+        )
+        book = self._book()
+        glyph_layouts = borrowed_record_string_layouts_from_book(
+            book, self.lexical_read_scope,
+            ((sid, "duplicates", len(d.column_value_ids), d.writable)
+             for sid, d in self.sequence_descriptors.items() if not d.key_columns),
+        )
+        glyph_pools = {
+            tuple(self.sequence_descriptors[sid].child_table_pool.column_value_ids)
+            for sid in glyph_layouts
+            if self.sequence_descriptors[sid].child_table_pool is not None
+        }
+        for value_id in value_ids:
+            sid = int(value_id)
+            source = borrowed_record_string_source(book, self.lexical_read_scope, sid)
+            selected = self.child_table_selections.get(sid)
+            actual = self.external_value(sid)
+            resident_id = self._conditional_sequence_descriptor_id(sid, actual)
+            # Authored literal constants are still provisional root values at
+            # this stage. The existing finish materializer and string-token
+            # normalization own them, even when a glyph descriptor also exists.
+            # That exact inventory is not runtime resident string storage.
+            resident = (sid not in self.constant_value_ids and
+                        resident_id not in self.constant_value_ids and
+                        resident_id is not None and
+                        exact_string_classes(book, self._canonical_cell(sid)))
+            owned_glyph = (selected is not None and
+                           tuple(selected[0].column_value_ids) in glyph_pools)
+            if source or resident or owned_glyph:
+                raise SSALoweringIncompleteError(((self.function_name,
+                    SSALoweringShortfall("ssa-sequence", "resident-glyph-key",
+                        f"value {sid}",
+                        "Resident glyph keys require content-aware keyed lookup, "
+                        "deduplication and owned key copying; scalar key kernels "
+                        "cannot consume a glyph span.")),))
+
     def _table_query_values(
         self, query_ids: int | tuple[int, ...], descriptor: Any = None,
     ) -> tuple[SSAValue, ...]:
-        values = tuple(
-            self.external_value(int(value_id))
-            for value_id in (
-                query_ids if isinstance(query_ids, tuple) else (query_ids,)
-            )
-        )
+        key_ids = query_ids if isinstance(query_ids, tuple) else (query_ids,)
+        self._refuse_resident_glyph_keys(key_ids)
+        values = tuple(self.external_value(int(value_id)) for value_id in key_ids)
         if descriptor is None:
             return values
         key_columns = tuple(map(int, descriptor.key_columns))
@@ -18683,6 +18726,8 @@ class _ControlSSABuilder(TiledObject):
         from .source_borrowed_record_spans import (
             borrowed_record_string_source, borrowed_record_string_view,
         )
+        if operation == "add":
+            self._refuse_resident_glyph_keys(mutation.argument_value_ids)
         borrowed_span = (
             borrowed_record_string_source(self._book(), self.lexical_read_scope,
                                           int(mutation.argument_value_ids[0]))
