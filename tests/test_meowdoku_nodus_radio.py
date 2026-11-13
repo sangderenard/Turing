@@ -22,6 +22,7 @@ class RadioTests(unittest.TestCase):
    cfg.write_text(json.dumps(config)); self.assertEqual(r.snapshot(cfg,dbp,now=101)['status'],'live')
    self.assertEqual(r.snapshot(cfg,dbp,now=103)['status'],'stale')
    config['peer']='127.0.0.1:11111';cfg.write_text(json.dumps(config));self.assertEqual(r.snapshot(cfg,dbp,now=101)['status'],'waiting')
+   live=r.snapshot(cfg,dbp,now=101,station={'peer':'127.0.0.1:23999','title':'Next song'});self.assertEqual(live['status'],'live');self.assertEqual(live['title'],'Next song')
    config['source']='system_output';cfg.write_text(json.dumps(config));self.assertEqual(r.snapshot(cfg,dbp,now=101)['status'],'unavailable')
    config['source']='file';config['owner_id']=8;cfg.write_text(json.dumps(config))
    with self.assertRaises(r.relay.RelayError):r.snapshot(cfg,dbp,now=101)
