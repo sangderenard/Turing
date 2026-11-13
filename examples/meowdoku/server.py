@@ -585,7 +585,7 @@ def make_handler(sessions: Sessions):
             self._principal_cache = None
             if self._origin_tier == "shader":                    # [LOGIN] a signed-in account lifts the shader lock; its caps still come from its role
                 account = self._account()
-                lift = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "admin": "edit"}
+                lift = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
                 if account is not None:
                     self._tier = lift.get(authz_mod.role_of(sessions.accounts_db, account["id"]), "shader")
 
@@ -842,6 +842,27 @@ def make_handler(sessions: Sessions):
             self._set_cookie = [c for c in self._set_cookie if not c.startswith(proxy_trust_mod.ROUTE_COOKIE + "=")]
             self._set_cookie.append(proxy_trust_mod.route_cookie(route))
 
+        def _kiosk(self) -> bool:
+            """[KIOSK] True for a kiosk account (authz.KIOSK_ROLES); speaktome_api.routes.index_route reads it too."""
+            return authz_mod.kiosk(self._principal())
+
+        def _kiosk_gate(self, path: str, method: str) -> bool:
+            """[KIOSK] True when the request was refused here: a kiosk role (authz.KIOSK_ROLES, the intern guest agent) is answered
+            only on the catalog endpoints declared kiosk (speaktome_api.catalog.kiosk_endpoint).  Every other method and path is
+            refused before any handler runs, including handlers that ask for no capability; without the catalog nothing is answered."""
+            if not self._kiosk():
+                return False
+            match = getattr(shared_catalog, "kiosk_endpoint", None)
+            if method in ("GET", "POST") and match is not None and match(method, path) is not None:
+                return False
+            self.close_connection = True
+            self._set_cookie = []
+            if method == "HEAD":
+                self.send_response(HTTPStatus.FORBIDDEN); self.send_header("Content-Length", "0"); self.end_headers()
+            else:
+                self._json({"error": "this account may use only the kiosk endpoints; see /api/index"}, HTTPStatus.FORBIDDEN)
+            return True
+
         def _route_gate(self, path: str) -> bool:
             """--require-cap: True when the request was refused here (403 + the cookie reset to the Stable server's route).  The route cookie alone never grants access."""
             cap = getattr(sessions, "require_cap", "")
@@ -870,7 +891,7 @@ def make_handler(sessions: Sessions):
         def _route_after_login(self, user_id: int) -> None:
             """On login: a dev_ui account with a stored preference gets that server's route (Development only when a dev route is configured); everyone else the Stable server's."""
             role = authz_mod.role_of(sessions.accounts_db, user_id)
-            lift = {"member": "play", "service": "play", "operator": "dev", "admin": "edit"}
+            lift = {"member": "play", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
             tier = lift.get(role, "shader") if self._origin_tier == "shader" else self._origin_tier
             principal = authz_mod.Principal(role, user_id, None, self._origin, tier)
             site = self._route_pref(user_id) if "dev_ui" in authz_mod.capabilities(principal, sessions.authz_policy.get()) else None
@@ -927,6 +948,7 @@ def make_handler(sessions: Sessions):
                         "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps),
                         "instance": sessions.instance or None,
                         "signed_in": self._principal().user_id is not None, "username": self._principal().username,
+                        "kiosk": self._kiosk(),
                         "origin_tier": self._origin_tier})
 
         # ---- [DIVIDER] /api/divider/jobs...: the source divider's intake and status (divider_intake.py; the page is web/divider.html).
@@ -2105,6 +2127,8 @@ def make_handler(sessions: Sessions):
 
         def do_HEAD(self):  # noqa: N802
             self._classify()
+            if self._kiosk_gate(self.path.split("?", 1)[0], "HEAD"):   # [KIOSK]
+                return
             if self._route_gate(self.path.split("?", 1)[0]):      # [ROUTE]
                 return
             if self._tier == "shader" or self.path.startswith("/api/") or self.path.startswith("/ws"):
@@ -2519,6 +2543,8 @@ def make_handler(sessions: Sessions):
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             self._classify()                                      # [ACCESS]
+            if self._kiosk_gate(path, "GET"):                     # [KIOSK]
+                return
             if self._route_gate(path):                            # [ROUTE]
                 return
             if path == "/api/route":                              # [ROUTE]
@@ -3031,6 +3057,9 @@ def make_handler(sessions: Sessions):
 
         def _do_post(self):
             path0 = self.path.split("?", 1)[0]
+            self._classify()                                      # [KIOSK] first: no POST route answers an intern unless declared kiosk
+            if self._kiosk_gate(path0, "POST"):
+                return
             if self._route_gate(path0):                           # [ROUTE]
                 return
             if path0 == "/api/radio/jukebox":

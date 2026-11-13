@@ -227,3 +227,37 @@ def test_lowerings_list_and_checkout_checkin_round_trip(server):
     assert _call(port, "/api/lowerings/checkin", "POST", me, good)[1] == {"ok": True}
     assert _call(port, "/api/lowerings/checkin", "POST", me, good)[0] == 409                # returned once only
     assert _call(port, f"/api/lowerings/blob/{sha}", headers=me)[0] == 403                  # the lease is closed
+
+
+def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
+    port = server.port
+    cookie = _signup(port, "kiosk_cat")
+    srv.authz_mod.grant_role(server.sessions.accounts_db, "kiosk_cat", "intern", "operator:test")
+    local = {"Host": "127.0.0.1", "Cookie": cookie}             # a LAN origin is the edit tier: it adds nothing to an intern
+    public = {**PUBLIC_XFF, "Cookie": cookie}
+    for headers in (local, public):
+        who = _call(port, "/api/whoami", headers=headers)[1]
+        assert who["role"] == "intern" and who["kiosk"] is True and who["capabilities"] == ["photo_read", "view_site"]
+        # writes, messaging, lifecycle and handlers that ask for no capability: refused before any handler runs
+        for method, path, body in (("POST", "/api/reports", {"request_id": "r1"}), ("POST", "/api/relay/send", {}),
+                                   ("GET", "/api/relay/addresses", None), ("GET", "/api/account/groups", None),
+                                   ("POST", "/api/account/groups", {"name": "g"}), ("POST", "/api/messages/send", {}),
+                                   ("POST", "/api/tickets", {}), ("POST", "/api/admin/lifecycle", {}), ("GET", "/api/log", None),
+                                   ("GET", "/api/paper/account", None), ("POST", "/api/account/signup", {"username": "x"}),
+                                   ("GET", "/", None)):
+            status, out, _, _ = _call(port, path, method, headers, body)
+            assert status == 403 and "kiosk" in out["error"], (method, path, status, out)
+        assert _call(port, "/", "HEAD", headers)[0] == 403
+    if getattr(srv.shared_catalog, "kiosk_endpoint", None) is None:
+        pytest.skip("the loaded SpeakToMe catalog declares no kiosk entries (set SPEAKTOME_REPO to a checkout that does)")
+    assert _call(port, "/api/account/me", headers=public)[0] == 200
+    index = _call(port, "/api/index", headers=public)[1]
+    kiosk = {e["name"] for e in srv.shared_catalog.ENDPOINTS if e["kiosk"]}
+    assert index["kiosk"] is True and {e["name"] for e in index["endpoints"] if e["allowed"]} == kiosk
+    member_index = _call(port, "/api/index", headers={**PUBLIC_XFF, "Cookie": _signup(port, "plain_cat")})[1]
+    assert member_index["kiosk"] is False and "messages_send" in {e["name"] for e in member_index["endpoints"] if e["allowed"]}
+    # a kiosk path still meets its handler's own gate: the system map needs dev_ui
+    status, out, _, _ = _call(port, "/site/system/", headers=public)
+    assert status == 403 and out == {"error": "this needs dev_ui"}
+    assert _call(port, "/api/account/logout", "POST", public, {})[0] == 200
+    assert _call(port, "/api/whoami", headers=public)[1]["role"] == "guest"
