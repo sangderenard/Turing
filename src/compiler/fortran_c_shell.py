@@ -15145,12 +15145,16 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
     def insert_in_conditional(block, owner_id, arm):
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
-                if str(arm) == "body":
-                    return replace(block, body=insert_ordered(block.body, item)), True
-                return replace(
-                    block,
-                    orelse=insert_ordered(block.orelse or SequenceBlock(()), item),
-                ), True
+                branch = block.body if str(arm) == "body" else (block.orelse or SequenceBlock(()))
+                # A branch can itself contain the comprehension that owns
+                # the query's operand. Stay in this arm, but descend into
+                # that exact loop before reading its current target value.
+                inserted = False
+                if len(binding_owners) == 1:
+                    branch, inserted = insert_into_loop(branch, binding_owners[0])
+                if not inserted:
+                    branch = insert_ordered(branch, item)
+                return replace(block, **{"body" if str(arm) == "body" else "orelse": branch}), True
             body, inserted = insert_in_conditional(block.body, owner_id, arm)
             if inserted:
                 return replace(block, body=body), True
@@ -15206,17 +15210,6 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
             return (replace(block, callee=callee), True) if inserted else (block, False)
         return block, False
 
-    memberships = _branch_compartments(graph)
-    guards = [
-        (int(owner), str(arm))
-        for owner, arm in memberships.get(int(node_id), ())
-        if str(arm) in {"body", "orelse"} and int(owner) in present
-    ]
-    if guards:
-        owner, arm = max(guards, key=lambda entry: node_position(entry[0]))
-        root, inserted = insert_in_conditional(root, owner, arm)
-        if inserted:
-            return root, True
     # ``ast.comprehension`` nodes do not carry source spans, so the fallback
     # span survey below cannot discover that a call consuming one of their
     # target bindings belongs inside that generator loop.  The reducer's
@@ -15230,7 +15223,8 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
         for parent, role in graph.G.nodes.get(int(node_id), {}).get(
             "parents", ()
         )
-        if str(role).startswith("arg:") and int(parent) in graph.G
+        if (str(role).startswith("arg:") or str(role) in {"lhs", "rhs"})
+        and int(parent) in graph.G
     }
     binding_owners = tuple(
         int(candidate_id)
@@ -15242,6 +15236,17 @@ def _insert_lexically(root, graph: Any, dispatch_subgraphs: Iterable[Any], item,
             ).values())
         )
     )
+    memberships = _branch_compartments(graph)
+    guards = [
+        (int(owner), str(arm))
+        for owner, arm in memberships.get(int(node_id), ())
+        if str(arm) in {"body", "orelse"} and int(owner) in present
+    ]
+    if guards:
+        owner, arm = max(guards, key=lambda entry: node_position(entry[0]))
+        root, inserted = insert_in_conditional(root, owner, arm)
+        if inserted:
+            return root, True
     if len(binding_owners) == 1:
         root, inserted = insert_into_loop(root, binding_owners[0])
         if inserted:
