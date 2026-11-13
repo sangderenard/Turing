@@ -29,7 +29,9 @@
         "--fabric-core-dir",
         "C:/dev/Powershell/srv/state/products/fabric-row",
         "--fabric-udp-port",
-        "48768"
+        "48768",
+        "--nodus-ui",
+        "nodus-messenger:47613"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -78,7 +80,9 @@
         "--fabric-core-dir",
         "C:/dev/Powershell/srv/state/products/fabric-row",
         "--fabric-udp-port",
-        "48771"
+        "48771",
+        "--nodus-ui",
+        "nodus-messenger:47613"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -133,6 +137,34 @@
         "NODUS_EXEC_ROWS": "C:/dev/Powershell/turing/examples/meowdoku/deploy/exec_rows.txt",
         "NODUS_EXEC_CORE_ROOTS": "C:/dev/Powershell",
         "NODUS_EXEC_WORK_ROOTS": "C:/dev/Powershell/srv/state/content/users"
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "nodus-ui-mirror",
+      "kind": "command",
+      "port": 47613,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-ui-mirror",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "C:/dev/Powershell/nodus/demo_canvas_tables.py",
+        "--mode", "server",
+        "--host", "127.0.0.1",
+        "--port", "47613",
+        "--attach-console", "127.0.0.1:47612",
+        "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-messenger.console.secret"
+      ],
+      "nodus": {
+        "path_prepend": [
+          "C:/dev/Powershell/srv/python/Lib/site-packages/torch/lib",
+          "C:/dev/Powershell/nodus/build-service/Release"
+        ]
+      },
+      "env": {
+        "CANVAS_TABLES_LIB": "C:/dev/Powershell/nodus/build-service/Release/canvas_tables.dll"
       },
       "python": "C:/dev/Powershell/srv/python/python.exe"
     },

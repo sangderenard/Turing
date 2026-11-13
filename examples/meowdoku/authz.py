@@ -1,4 +1,9 @@
-"""Meowdoku permissions: three roles (admin, member, guest) over the existing origin tiers.
+"""Meowdoku permissions: ranked human permission groups plus service/guest roles.
+
+Human authority is the highest direct permission group, with every lower group
+implied. account_roles supplies legacy direct grants and permission_groups adds
+dev/operator memberships. Owner-created account_content_groups only share
+content; they cannot change authority. Service is a separate machine role.
 
 ROLES.  ``guest`` is the absence of an account.  ``member`` is any account in ``accounts.db`` ``users`` without a row in
 ``account_roles``.  ``admin`` is an ``account_roles`` row; so is ``service`` (the supervisor's instance accounts: member caps +
@@ -88,9 +93,18 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
     _schema_version = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_schema_version)
 
+try:
+    from meowdoku import permission_groups as _permission_groups
+except ImportError:
+    import importlib.util as _permission_ilu
+    _permission_spec = _permission_ilu.spec_from_file_location(
+        "meowdoku_permission_groups", Path(__file__).with_name("permission_groups.py"))
+    _permission_groups = _permission_ilu.module_from_spec(_permission_spec)
+    _permission_spec.loader.exec_module(_permission_groups)
+
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git")
-ROLES = ("admin", "member", "service", "operator", "guest")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit")
+ROLES = ("admin", "member", "dev", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
 POLICY_FILE = "authz_policy.json"
@@ -101,13 +115,14 @@ DEFAULT_POLICY = {
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
         "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message",
-                                              "core_git")],
+                                              "core_git", "paper_train")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],
+        "dev": ["studio_write", "photo_submit", "share_live", "compile_submit", "message", "dev_ui"],
         # service: a supervisor-owned instance account (deploy/apache_supervisor.py).  Member caps plus library_manage, so the
         # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
-        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate", "compile_submit", "message"],
+        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate", "compile_submit", "message", "paper_train"],
         # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
         "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate", "compile_submit", "message",
                      "core_git"],      # core_git: Git in the core through core_git.py; no service account and no tier holds it
@@ -170,6 +185,7 @@ class Principal:
     username: str | None
     origin: str               # lan | ip | dns
     tier: str                 # the origin tier string as access.py gives it
+    groups: frozenset[str] = frozenset()
 
 
 # ---- policy -------------------------------------------------------------------------------------------------------------
@@ -218,11 +234,22 @@ class Policy:
 
 def capabilities(principal: Principal, policy: dict) -> frozenset:
     caps = set(policy["tier_caps"].get(principal.tier, ()))
-    caps |= set(policy["role_caps"].get(principal.role, ()))
+    if principal.role in _permission_groups.RANKS:
+        for group in _permission_groups.ORDER:
+            if _permission_groups.RANKS[group] <= _permission_groups.RANKS[principal.role]:
+                caps |= set(policy["role_caps"].get(group, ()))
+    else:
+        caps |= set(policy["role_caps"].get(principal.role, ()))
     if principal.origin != "lan":
         caps.discard("lifecycle_admin")
     if principal.role != "admin":
         caps.discard("account_manage")
+    if principal.role not in ("admin", "service"):
+        caps.discard("paper_train")
+    if "nodus" not in principal.groups or principal.user_id is None:
+        caps.discard("nodus_edit")
+    else:
+        caps.add("nodus_edit")
     # Unstable source attempts require an explicit account-role grant, never an origin tier.
     if (principal.user_id is None or principal.role == "guest"
             or "compile_unstable" not in policy["role_caps"].get(principal.role, ())):
@@ -241,11 +268,12 @@ def _connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     try:
-        _schema_version.declare(conn, "authz", 2)       # first: a newer database is refused before this module writes anything
+        _schema_version.declare(conn, "authz", 3)       # first: a newer database is refused before this module writes anything
     except _schema_version.SchemaVersionError:
         conn.close()
         raise
     conn.executescript(_DDL)
+    _permission_groups.prepare(conn)
     sql = (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'account_roles'").fetchone() or [""])[0] or ""
     if "'operator'" not in sql:     # a table created before the service/operator roles: rebuild it with the wider CHECK (rows kept)
         conn.executescript("BEGIN; ALTER TABLE account_roles RENAME TO account_roles_old;" + _DDL +
@@ -288,10 +316,10 @@ def role_of(db_path, user_id) -> str:
         return "guest"
     conn = _connect(db_path)
     try:
-        row = conn.execute("SELECT role FROM account_roles WHERE user_id = ?", (user_id,)).fetchone()
+        rank = _permission_groups.authority(conn, user_id)
     finally:
         conn.close()
-    return row[0] if row else "member"
+    return "service" if rank["service"] else rank["highest"]
 
 
 def _user_id(conn, username: str) -> int:
@@ -344,7 +372,14 @@ def revoke_admin(db_path, username: str, granted_by: str) -> int:
 def principal_from(account, origin: str, tier: str, db_path) -> Principal:
     if account is None:
         return Principal("guest", None, None, origin, tier)
-    return Principal(role_of(db_path, account["id"]), account["id"], account["username"], origin, tier)
+    db = _connect(db_path)
+    try:
+        rank = _permission_groups.authority(db, account["id"])
+    finally:
+        db.close()
+    role = "service" if rank["service"] else rank["highest"]
+    groups = frozenset(rank["groups"])
+    return Principal(role, account["id"], account["username"], origin, tier, groups)
 
 
 def grant_role(db_path, username: str, role: str, granted_by: str) -> int:

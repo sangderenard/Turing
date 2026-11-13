@@ -1,7 +1,66 @@
-// /nodus.html: READ-ONLY view of the graph of a running Nodus canvas host (/api/nodus/*).  Structure only; no canvas is drawn and nothing here
-// can change one.  Everything is set with textContent / createElement; no innerHTML.
+// /nodus.html: Living Data graph picture and read-only UI feeds from Nodus.
 const $ = (id) => document.getElementById(id);
-const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, tools: [], activity: null, abstract: null, busy: false };
+const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, busy: false };
+let feedQuads = [];
+
+function makeFrameQuad(canvas, status) {
+  const gl = canvas.getContext("webgl2", { alpha: false, antialias: false });
+  if (!gl) { status.textContent = "WebGL 2 is unavailable for this console."; return null; }
+  const shader = (kind, source) => {
+    const object = gl.createShader(kind);
+    gl.shaderSource(object, source); gl.compileShader(object);
+    if (!gl.getShaderParameter(object, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(object));
+    return object;
+  };
+  const program = gl.createProgram();
+  gl.attachShader(program, shader(gl.VERTEX_SHADER, `#version 300 es
+    out vec2 uv;
+    void main() {
+      vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID & 2) - 1);
+      uv = vec2((p.x + 1.0) * 0.5, 1.0 - (p.y + 1.0) * 0.5);
+      gl_Position = vec4(p, 0.0, 1.0);
+    }`));
+  gl.attachShader(program, shader(gl.FRAGMENT_SHADER, `#version 300 es
+    precision mediump float;
+    in vec2 uv; uniform sampler2D frame; out vec4 color;
+    void main() { color = texture(frame, uv); }`));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.useProgram(program);
+  gl.uniform1i(gl.getUniformLocation(program, "frame"), 0);
+  const quad = { url: "", busy: false, etag: null, abort: null, stopped: false,
+    stop() { this.stopped = true; this.abort?.abort(); },
+    setUrl(url) { this.abort?.abort(); this.url = url; this.etag = null; },
+    async update() {
+      if (this.stopped || this.busy || !this.url) return;
+      this.busy = true;
+      const abort = new AbortController(); this.abort = abort;
+      try {
+        const headers = this.etag ? { "If-None-Match": this.etag } : {};
+        const response = await fetch(this.url, { credentials: "same-origin", cache: "no-store", headers, signal: abort.signal });
+        if (response.status === 304) return;
+        if (!response.ok) throw new Error(`Frame unavailable (${response.status})`);
+        const bitmap = await createImageBitmap(await response.blob());
+        if (this.stopped || abort.signal.aborted) { bitmap.close(); return; }
+        canvas.width = bitmap.width; canvas.height = bitmap.height;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        bitmap.close();
+        this.etag = response.headers.get("ETag"); status.textContent = "Live Nodus frame";
+      } catch (error) { if (!abort.signal.aborted) status.textContent = error.message; }
+      finally { this.busy = false; if (this.abort === abort) this.abort = null; }
+    },
+  };
+  return quad;
+}
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -99,6 +158,62 @@ function drawGeneric() {
     nodes.reduce((n, x) => n + (x.dependencies || []).length, 0) + " dependencies";
 }
 
+function drawMap() {
+  const map = state.map;
+  $("maproot").textContent = map ? `${map.name} [${map.identity}]` : "Map unavailable.";
+  const nodes = $("mapregions");
+  const wall = $("console-wall");
+  for (const quad of feedQuads) quad.stop();
+  nodes.replaceChildren(); wall.replaceChildren(); feedQuads = [];
+  if (!map) return;
+  const feeds = (map.tracks || []).filter((t) => t.relationship === "feeds");
+  for (const region of map.regions || []) {
+    if (region.kind === "console" || region.kind === "console-wall") continue;
+    const card = el("div", region.name, "map-node");
+    card.title = region.identity;
+    const outgoing = feeds.filter((t) => t.source === region.identity).length;
+    if (outgoing) card.append(el("small", ` → ${outgoing} feed${outgoing === 1 ? "" : "s"}`, "mut"));
+    nodes.append(card);
+  }
+  const consoles = (map.regions || []).filter((r) => r.kind === "console" && r.view?.full);
+  if (!consoles.length) { wall.append(el("p", "No Nodus UI feed is configured for this graph.", "mut")); return; }
+  for (const consoleNode of consoles) {
+    const card = el("article", null, "console-device card");
+    card.dataset.identity = consoleNode.identity;
+    card.append(el("strong", consoleNode.name));
+    const canvas = el("canvas"); canvas.width = 800; canvas.height = 600;
+    canvas.setAttribute("role", "img"); canvas.setAttribute("aria-label", consoleNode.name + " UI feed");
+    card.append(canvas);
+    const status = el("small", "Connecting to Nodus UI feed…", "mut"); card.append(status);
+    const quad = makeFrameQuad(canvas, status);
+    if (quad) { quad.setUrl(consoleNode.view.full); feedQuads.push(quad); quad.update(); }
+    const full = el("a", "Open full view"); full.href = consoleNode.view.full; full.target = "_blank"; full.rel = "noopener";
+    card.append(full);
+    const form = el("form");
+    const fields = {};
+    for (const [key, value] of Object.entries({ x: 0, y: 0, width: 320, height: 240 })) {
+      const label = el("label", key + " ");
+      const input = el("input"); input.type = "number"; input.min = key === "width" || key === "height" ? "1" : "0";
+      input.value = String(value); input.required = true;
+      label.append(input); form.append(label); fields[key] = input;
+    }
+    const select = el("button", "Show region"); select.type = "submit"; form.append(select);
+    const reset = el("button", "Show whole UI"); reset.type = "button";
+    reset.addEventListener("click", () => { if (quad) { quad.setUrl(consoleNode.view.full); quad.update(); } });
+    form.append(reset);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const values = Object.fromEntries(Object.entries(fields).map(([key, input]) => [key, Number(input.value)]));
+      if (Object.values(values).some((value) => !Number.isInteger(value)) || values.width < 1 || values.height < 1) return;
+      if (quad) {
+        quad.setUrl(consoleNode.view.region.replace(/\{(x|y|width|height)\}/g, (_, key) => String(values[key])));
+        quad.update();
+      }
+    });
+    card.append(form); wall.append(card);
+  }
+}
+
 function explain(res, what) {
   if (res.status === 501) return what + ": not supported by this host";
   if (res.status === 503) return (res.body && res.body.error) || "the console is unreachable";
@@ -116,13 +231,15 @@ async function refresh() {
     $("digest").textContent = digestLine(d.body);
     const key = state.instance + "@" + d.body.revision;
     if (key !== state.graphKey) {
-      const [g, t, a] = await Promise.all([get(q("/api/nodus/graph")), get(q("/api/nodus/tools")), get(q("/api/nodus/abstract"))]);
+      const [g, t, a, m] = await Promise.all([get(q("/api/nodus/graph")), get(q("/api/nodus/tools")), get(q("/api/nodus/abstract")), get(q("/api/nodus/map"))]);
       if (g.status === 200) { state.graph = g.body; state.graphKey = key; }
       else setStatus(explain(g, "graph"), true);
       if (t.status === 200) { state.tools = t.body.tools || []; if (t.body.complete === false) setStatus("Tool list is incomplete: " + show(t.body.missing), true); }
       if (a.status === 200) state.abstract = a.body;
+      if (m.status === 200) state.map = m.body.map;
       drawTools();
       drawGeneric();
+      drawMap();
     }
     const bucket = d.body.tick;
     if (bucket !== state.tick || !state.activity) {
@@ -146,7 +263,8 @@ async function loadInstances() {
     o.value = i.name;
     select.append(o);
   }
-  const ready = list.find((i) => i.console) || list[0];
+  const requested = new URLSearchParams(location.search).get("instance");
+  const ready = list.find((i) => i.name === requested) || list.find((i) => i.console) || list[0];
   if (!ready) { setStatus("No nodus instance is recorded.", false); return; }
   select.value = ready.name;
   state.instance = ready.name;
@@ -154,7 +272,8 @@ async function loadInstances() {
 }
 
 function resetFor(name) {
-  Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, tools: [], activity: null, abstract: null });
+  Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null });
+  drawMap();
 }
 
 async function whoamiHasMessage() {
@@ -221,6 +340,10 @@ function drawWalk(cursor) {
   walk.id = cursor.session_id;
   walk.revision = cursor.revision;
   $("walkhere").textContent = cursor.text;
+  if (cursor.at?.kind === "console") {
+    const consoleCard = [...$("console-wall").children].find((card) => card.dataset.identity === cursor.at.identity);
+    consoleCard?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
   const names = walkNames();
   (cursor.exits || []).forEach((item, i) => {
     const b = el("button", exitLabel(i + 1, item, names));
@@ -277,6 +400,7 @@ async function copyJson() {
 }
 
 async function main() {
+  if (new URLSearchParams(location.search).get("picture") === "1") document.body.classList.add("picture-mode");
   $("instance").addEventListener("change", () => { resetFor($("instance").value); refresh(); });
   $("filter").addEventListener("input", drawTools);
   $("copy").addEventListener("click", copyJson);
@@ -285,6 +409,7 @@ async function main() {
   await setupWalk();
   await loadInstances();
   setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 2000);
+  setInterval(() => { if (document.visibilityState === "visible") for (const quad of feedQuads) quad.update(); }, 500);
 }
 
 if (typeof document !== "undefined" && document.getElementById("instance")) main();

@@ -57,6 +57,42 @@ function renderer(canvas) {
 }
 
 const fmt = (number) => Number(number).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+function drawQualification(payload) {
+  const root = $("qualification-runs"); root.replaceChildren();
+  for (const run of payload.runs || []) {
+    const card = document.createElement("article"); card.className = "qualification-run";
+    const title = document.createElement("h3"); title.textContent = `${run.market} · ${run.status}`;
+    const meta = document.createElement("div"); meta.className = "metrics";
+    const last = (run.progress || []).at(-1);
+    const fields = [`${run.model} · ${run.worker}`, `phase ${run.phase}`,
+                    `${run.completed_epochs}/${run.planned_epochs} epochs`];
+    if (last?.loss != null) fields.push(`loss ${Number(last.loss).toFixed(5)}`);
+    if (last?.validation_mean != null) fields.push(`validation mean ${(Number(last.validation_mean) * 100).toFixed(2)}% of order cap`);
+    if (run.result?.holdout_mean_return_on_order_cap != null)
+      fields.push(`holdout mean ${(Number(run.result.holdout_mean_return_on_order_cap) * 100).toFixed(2)}% of order cap`);
+    for (const value of fields) { const item = document.createElement("span"); item.textContent = value; meta.append(item); }
+    const bar = document.createElement("progress"); bar.max = Math.max(1, run.planned_epochs);
+    bar.value = Math.min(bar.max, run.completed_epochs);
+    const checks = document.createElement("ol"); checks.className = "checks";
+    for (const check of (run.progress || []).filter((item) => item.phase === "validation").slice(-8)) {
+      const line = document.createElement("li");
+      line.textContent = `seed ${check.seed}, epoch ${check.epoch}: validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
+      checks.append(line);
+    }
+    card.append(title, meta, bar, checks); root.append(card);
+  }
+  $("qualification-state").textContent = root.childElementCount
+    ? `${root.childElementCount} recent run(s). Updated ${new Date(payload.asof * 1000).toLocaleTimeString()}.`
+    : "No qualification run has started on this shared arena.";
+}
+
+async function updateQualification() {
+  drawQualification(await api("/api/paper/qualification/live"));
+}
+setInterval(() => { if (!document.hidden) updateQualification().catch((error) => { $("qualification-state").textContent = error.message; }); }, 2000);
+updateQualification().catch((error) => { $("qualification-state").textContent = error.message; });
+
 const historyView = renderer($("history"));
 const bookView = renderer($("book"));
 let lastHistory = null, lastBook = null;
@@ -195,3 +231,106 @@ setInterval(() => { if (!document.hidden) now().catch((error) => { $("status").t
 setInterval(() => { if (!document.hidden) history().catch((error) => { $("status").textContent = error.message; }); }, 300000);
 update();
 credentialState().catch((error) => { $("key-state").textContent = error.message; });
+
+const dmTemplates = {
+  "look:account": () => ({}), "look:bots": () => ({}), "look:presence": () => ({}),
+  "look:strategies": () => ({}),
+  "look:orders": () => ({}), "look:mock_orders": () => ({}),
+  "look:mock_ledger": () => ({ strategy_id: "" }),
+  "look:scoreboard": () => ({}), "look:map": () => ({}), "look:picture": () => ({}),
+  "look:qualification": () => ({}),
+  "look:proposals": () => ({ stock: "AAPL", offset: 0, limit: 100 }),
+  "examine:node": () => ({ radius: 1 }),
+  "make:strategy": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Strategy", risk: "cautious", policy: "momentum", outcomes: ["fixed_horizon", "closed_trade", "fill_quality"] }),
+  "make:bot": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Market bot", kind: "python", source: { ref: "divider:YOUR_JOB_ID" } }),
+  "make:order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
+  "make:mock_order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
+  "use:reconcile": () => ({ id: "" }),
+  "use:nodus_ui": () => ({ instance: "nodus-messenger", action: { op: "viewport", expected_revision: 0, width: 800, height: 600 } }),
+};
+$("dm-command").addEventListener("change", async () => {
+  const command = $("dm-command").value;
+  const template = dmTemplates[command]();
+  if (command === "use:nodus_ui") {
+    try {
+      const response = await fetch(`/api/nodus/digest?instance=${encodeURIComponent(template.instance)}`, { credentials: "same-origin", cache: "no-store" });
+      if (response.ok) template.action.expected_revision = (await response.json()).revision;
+    } catch (_) { /* The action response reports unavailable hosts. */ }
+  }
+  if ($("dm-command").value === command) $("dm-input").value = JSON.stringify(template, null, 2);
+});
+$("dm-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("dm-form").querySelector("button");
+  button.disabled = true;
+  try {
+    const input = JSON.parse($("dm-input").value);
+    if (input === null || Array.isArray(input) || typeof input !== "object") throw new Error("Input must be a JSON object.");
+    const [verb, target] = $("dm-command").value.split(":");
+    const response = await fetch("/api/paper/dm", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ verb, target, input }),
+    });
+    const result = await response.json();
+    $("dm-output").textContent = JSON.stringify(result, null, 2);
+    if (!response.ok) $("dm-output").textContent = `Command failed (${response.status})\n` + $("dm-output").textContent;
+    const picture = $("dm-picture");
+    picture.hidden = !(response.ok && verb === "look" && target === "picture" && result.view);
+    if (!picture.hidden) {
+      const view = new URL(result.view, location.href);
+      view.searchParams.set("picture", "1");
+      picture.src = view.href;
+      $("dm-output").textContent = "Living Data map picture";
+    } else picture.removeAttribute("src");
+  } catch (error) { $("dm-picture").hidden = true; $("dm-picture").removeAttribute("src"); $("dm-output").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+let latestPresence = null;
+let presenceCards = [];
+function drawPresence() {
+  const root = $("bot-presence"); root.replaceChildren();
+  presenceCards = [];
+  const bots = latestPresence?.bots || [];
+  for (const bot of bots) {
+    const age = Math.max(0, Date.now() / 1000 - bot.last_seen);
+    if (age >= (latestPresence?.fade_seconds || 300)) continue;
+    const card = document.createElement("div"); card.className = "bot-unit";
+    card.style.opacity = String(Math.max(.12, 1 - age / (latestPresence.fade_seconds || 300)));
+    const avatar = document.createElement("span"); avatar.className = "bot-avatar";
+    const head = document.createElement("span"); head.className = "bot-head";
+    const body = document.createElement("span"); body.className = "bot-body";
+    avatar.append(head, body);
+    const copy = document.createElement("span"); copy.className = "bot-copy";
+    const name = document.createElement("strong"); name.textContent = bot.name;
+    const kind = document.createElement("small"); kind.textContent = bot.kind.replaceAll("_", " ");
+    const source = document.createElement("small");
+    const channel = bot.activity?.channel === "mcp_reported" ? "MCP (reported)" : bot.activity?.channel || "REST";
+    source.textContent = `${channel} · ${bot.activity?.interaction || "active"}`;
+    copy.append(name, kind, source); card.append(avatar, copy); root.append(card);
+    presenceCards.push({ card, seen: bot.last_seen });
+  }
+  $("bot-presence-state").textContent = root.childElementCount ? `${root.childElementCount} bots active in the last five minutes.` : "No registered bots active in the last five minutes.";
+}
+function fadePresence() {
+  const seconds = latestPresence?.fade_seconds || 300;
+  for (const item of presenceCards) {
+    const age = Math.max(0, Date.now() / 1000 - item.seen);
+    item.card.style.opacity = age >= seconds ? "0" : String(Math.max(.12, 1 - age / seconds));
+  }
+}
+async function updatePresence() {
+  let offset = 0, combined = [], latest = null;
+  for (let page = 0; page < 20; page++) {
+    latest = await api(`/api/paper/presence?offset=${offset}`);
+    combined.push(...(latest.bots || []));
+    if (latest.next_offset === null || latest.next_offset === undefined) break;
+    offset = latest.next_offset;
+  }
+  latestPresence = { ...latest, bots: combined };
+  drawPresence();
+}
+setInterval(fadePresence, 1000);
+setInterval(() => { if (!document.hidden) updatePresence().catch((error) => { $("bot-presence-state").textContent = error.message; }); }, 15000);
+updatePresence().catch((error) => { $("bot-presence-state").textContent = error.message; });

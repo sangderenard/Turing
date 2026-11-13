@@ -1,4 +1,4 @@
-"""Read-only web view of a running Nodus canvas host (server.py [NODUS], web/nodus.html).
+"""Web view and authorized actions for a running Nodus canvas host.
 
 The host (nodus/tools/run_canvas.py, run by deploy/apache_supervisor.py as an instance of kind "nodus") keeps a READ-ONLY console on
 loopback: ``HELLO nodus-console/1 <token>`` -> ``OK console <name> read-only``; then the verbs DIGEST, GRAPH, TOOLS and ACTIVITY, each answered
@@ -6,7 +6,8 @@ loopback: ``HELLO nodus-console/1 <token>`` -> ``OK console <name> read-only``; 
 
 Where the console is found: the supervisor's own records.  ``service_instances`` (accounts.db) gives state and ``console_port``; the per-run
 token file is ``apache_supervisor.console_secret_path(paths, name)`` (imported, not re-derived).  The token is read, used for one HELLO and
-dropped: it is never logged, returned, or placed in an exception message.  Nothing here writes to a canvas; there is no action verb.
+dropped: it is never logged, returned, or placed in an exception message. Authorized canvas UI actions use console protocol 2.
+An optional loopback Nodus UI server mirrors the same host for full or region PNG views.
 
 ``as_generic_graph`` is a SECOND PRODUCER of the generic identity graph (a list of nodes, each with ``identity``, ``kind``, ``name`` and
 ``dependencies: [{"relationship", "target"}]``), the same shape the AbstractUI world model and its other producers emit (the class-mode and
@@ -16,12 +17,14 @@ nothing about pixels or layout.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.util
 import json
 import socket
 import sqlite3
 import threading
 import time
+from urllib.parse import quote, urlencode
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -46,13 +49,43 @@ class NotSupported(NodusError):
         super().__init__(f"not supported by this host ({what})", 501)
 
 
+def ui_frame(port: int, region: dict | None = None) -> bytes:
+    """Proxy the existing Nodus UI server's frame from loopback, with a size bound."""
+    path = "/frame" + ("?" + urlencode(region) if region else "")
+    conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=5)
+    try:
+        conn.request("GET", path)
+        reply = conn.getresponse()
+        body = reply.read(16 * 1024 * 1024 + 1)
+        if reply.status == 400:
+            raise NodusError("invalid UI region", 400)
+        if reply.status != 200:
+            raise NodusError("the Nodus UI feed is unavailable", 503)
+        if len(body) > 16 * 1024 * 1024 or not body.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise NodusError("the Nodus UI feed returned an invalid frame", 502)
+        return body
+    except (OSError, http.client.HTTPException):
+        raise NodusError("the Nodus UI feed is unavailable", 503) from None
+    finally:
+        conn.close()
+
+
+def ui_feeds(instance: str, enabled: bool) -> list[dict]:
+    if not enabled:
+        return []
+    base = "/api/nodus/frame?instance=" + quote(instance, safe="")
+    return [{"id": "canvas", "name": "Canvas UI", "full": base,
+             "region": base + "&x={x}&y={y}&width={width}&height={height}"}]
+
+
 # ---- console client -------------------------------------------------------------------------------------------------------------
 class ConsoleClient:
     """One connection to a host console.  ``with ConsoleClient(host, port, token, timeout) as c: c.json_verb("DIGEST")``."""
 
-    def __init__(self, host: str, port: int, token: str, timeout: float = TIMEOUT):
+    def __init__(self, host: str, port: int, token: str, timeout: float = TIMEOUT, *, actions: bool = False):
         self._host, self._port, self._timeout = host, int(port), float(timeout)
         self._token = str(token)
+        self._actions = actions
         self._sock = None
         self._file = None
         self.name = None
@@ -72,7 +105,8 @@ class ConsoleClient:
             self._sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
             self._sock.settimeout(self._timeout)
             self._file = self._sock.makefile("rb")
-            self._sock.sendall(f"HELLO {PROTOCOL} {self._token}\n".encode("utf-8"))
+            protocol = "nodus-console/2" if self._actions else PROTOCOL
+            self._sock.sendall(f"HELLO {protocol} {self._token}\n".encode("utf-8"))
             line = self._line()
         except (OSError, EOFError):
             self.close()
@@ -83,6 +117,34 @@ class ConsoleClient:
         parts = line.split(" ", 3)
         self.name = parts[2] if len(parts) > 2 else None
         self._token = ""
+
+    def action(self, body: dict) -> dict:
+        if not self._actions:
+            raise NodusError("this console connection is read-only", 403)
+        payload = json.dumps(body, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(payload) > 4096:
+            raise NodusError("canvas action is too large", 400)
+        try:
+            self._sock.sendall(b"ACTION %d\n" % len(payload) + payload)
+            line = self._line()
+            if line.startswith("REFUSED"):
+                if line == "REFUSED action outcome uncertain":
+                    raise NodusError("canvas action outcome uncertain; inspect the graph before retrying", 503)
+                raise NotSupported("canvas actions")
+            parts = line.split(" ")
+            if len(parts) != 3 or parts[:2] != ["JSON", "ACTION"]:
+                raise NodusError("the console sent an unexpected action reply", 502)
+            size = int(parts[2])
+            if not 0 <= size <= 4096:
+                raise NodusError("the console action reply is too large", 502)
+            result = json.loads(self._file.read(size))
+            if not isinstance(result, dict):
+                raise ValueError("action reply must be an object")
+            return result
+        except (OSError, EOFError):
+            raise NodusError("the console is unreachable", 503) from None
+        except (ValueError, UnicodeError):
+            raise NodusError("the console sent an unexpected action reply", 502) from None
 
     def close(self) -> None:
         for item in (self._file, self._sock):
@@ -207,6 +269,11 @@ class Cache:
                     del self._items[k]
         return value
 
+    def invalidate_instance(self, name: str) -> None:
+        with self._lock:
+            for key in [key for key in self._items if len(key) > 1 and key[1] == name]:
+                del self._items[key]
+
 
 CACHE = Cache()
 
@@ -250,6 +317,23 @@ def activity(db, paths, name=None, *, cache=CACHE, timeout=TIMEOUT) -> dict:
     return _result(inst, payload)
 
 
+def ui_action(db, paths, name, body: dict, *, cache=CACHE, timeout=TIMEOUT) -> dict:
+    try:
+        size = len(json.dumps(body, allow_nan=False).encode("utf-8")) if isinstance(body, dict) else 0
+    except (TypeError, ValueError):
+        size = 0
+    if not size or size > 4096:
+        raise NodusError("canvas action must be a bounded object", 400)
+    where = locate(db, paths, name)
+    with ConsoleClient(where["host"], where["port"], _read_token(where["token_path"]),
+                       timeout, actions=True) as client:
+        result = client.action(body)
+    if "error" in result:
+        raise NodusError(result["error"], 409 if result["error"] == "canvas revision changed" else 400)
+    cache.invalidate_instance(where["name"])
+    return _result(where["name"], result)
+
+
 # ---- the generic identity graph ---------------------------------------------------------------------------------------------------
 _SCALAR = (str, int, float, bool)
 
@@ -263,7 +347,7 @@ def _idx(item, position):
     return value if isinstance(value, int) and not isinstance(value, bool) else position
 
 
-def as_generic_graph(graph_json, instance) -> list:
+def as_generic_graph(graph_json, instance, ui_feeds=()) -> list:
     """The GRAPH reply as a list of identity-graph nodes (second producer of the generic graph; see the module docstring).
 
     Kinds: canvas, module, row, contact, edge, contract-port.  Identities are ``nodus:<instance>/<canvas>`` plus ``/m<i>``, ``/m<i>/r<j>``,
@@ -289,6 +373,13 @@ def as_generic_graph(graph_json, instance) -> list:
 
     def contained(target):
         return [{"relationship": "contained-by", "target": target}]
+
+    if ui_feeds:
+        wall = f"{root}/console-wall"
+        add(wall, "console-wall", "Inner console wall", contained(root))
+        for feed in ui_feeds:
+            add(f"{wall}/{feed['id']}", "console", feed["name"], contained(wall),
+                {"full": feed["full"], "region": feed["region"]})
 
     contact_id = {}
     module_by_stable = {}       # graph-definition v1 names a connector by the module's persistent id ...
@@ -364,7 +455,7 @@ def as_generic_graph(graph_json, instance) -> list:
     return nodes
 
 
-def as_living_map(graph_json, instance) -> dict:
+def as_living_map(graph_json, instance, ui_feeds=()) -> dict:
     """The GRAPH reply as the EXISTING ``abstract-ui-div-map-v0`` object the Living Data endpoints accept (/api/living-data/{query,sessions}).
 
     Same form the Karate Club test builds for an arbitrary graph (tests/test_living_data_cursor.py karate_map): the canvas is the map's own
@@ -377,7 +468,7 @@ def as_living_map(graph_json, instance) -> dict:
     ``contained-by`` (module/row/port -> its parent, as in the generic graph; the reverse is how a walker goes down), ``feeds``,
     and ``bound-on`` (contract port -> each module at an end of the edge it is bound to).
     """
-    nodes = as_generic_graph(graph_json, instance)
+    nodes = as_generic_graph(graph_json, instance, ui_feeds)
     by_id = {n["identity"]: n for n in nodes}
     root = next(n["identity"] for n in nodes if n["kind"] == "canvas")
 
@@ -395,13 +486,16 @@ def as_living_map(graph_json, instance) -> dict:
         tracks.append({"source": source, "target": target, "relationship": relationship})
 
     for n in nodes:
-        if n["kind"] not in ("module", "row", "contract-port"):
+        if n["kind"] not in ("module", "row", "contract-port", "console-wall", "console"):
             continue
         name = n["name"]
         if n["kind"] == "row":
             index = n["identity"].rsplit("/r", 1)[1]
             name = f"row {index}: {name}" if name != f"row {index}" else name
-        regions.append({"identity": n["identity"], "kind": n["kind"], "name": name, "buildings": []})
+        region = {"identity": n["identity"], "kind": n["kind"], "name": name, "buildings": []}
+        if n["kind"] == "console":
+            region["view"] = n.get("attributes", {})
+        regions.append(region)
         track(n["identity"], parent(n["identity"]), "contained-by")
     for n in nodes:
         if n["kind"] == "edge":
