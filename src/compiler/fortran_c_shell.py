@@ -14659,6 +14659,24 @@ def _loop_control_block_position(
     return max(candidates)
 
 
+def _unrolled_line(attributes: Mapping[str, Any], line: Any) -> Any:
+    """``line`` placed in the iteration slot an unrolled copy declares.
+
+    ``evaporate_unrolled_loops`` stamps each copy with its iteration slots
+    ``(k, trip count, loop first line, loop last line)``, innermost first.
+    Iteration ``k`` of an ``N``-trip loop occupies the k-th of N equal parts
+    of the loop's line span, in order, so a copy's authored line maps to
+    ``first + (k * span + (line - first)) / N`` -- inside the loop, after its
+    header, before the next iteration and before the code after the loop.
+    An authored node (no slots) keeps its line.
+    """
+
+    for k, count, first, last in tuple(attributes.get("unrolled_iteration_slots") or ()):
+        span = max(1, int(last) - int(first) + 1)
+        line = int(first) + (int(k) * span + (line - int(first))) / max(1, int(count))
+    return line
+
+
 def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
     """Source position of a graph node, or of the control record it left.
 
@@ -14686,7 +14704,10 @@ def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int
         statement = graph_obj.nodes[int(conditional_id)].get("expr_obj")
         if getattr(statement, "end_lineno", None) is not None:
             return (
-                int(statement.end_lineno),
+                _unrolled_line(
+                    graph_obj.nodes[int(conditional_id)].get("attributes") or {},
+                    int(statement.end_lineno),
+                ),
                 int(getattr(statement, "end_col_offset", 0) or 0),
                 int(node_id),
             )
@@ -14708,7 +14729,9 @@ def _authored_node_position(graph_obj: Any, node_id: int) -> tuple[int, int, int
                 int(node_id),
             )
     return (
-        int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
+        _unrolled_line(attributes, int(
+            getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)
+        )),
         int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
         int(node_id),
     )
@@ -14743,7 +14766,9 @@ def _conditional_block_position(
     if end_line is None:
         return position
     return (
-        int(end_line),
+        _unrolled_line(
+            (data or {}).get("attributes") or {}, int(end_line),
+        ),
         int(getattr(test, "end_col_offset", 0) or 0),
         node_id,
     )
@@ -14951,7 +14976,10 @@ def _member_completion_position(
             and getattr(display, "end_lineno", None) is not None
         ):
             position = max(position, (
-                int(display.end_lineno),
+                _unrolled_line(
+                    graph_obj.nodes[int(parent)].get("attributes") or {},
+                    int(display.end_lineno),
+                ),
                 int(getattr(display, "end_col_offset", 0) or 0),
                 int(node_id),
             ))
@@ -14971,7 +14999,9 @@ def _member_completion_position(
     if end_line is None:
         return position
     return max(position, (
-        int(end_line),
+        _unrolled_line(
+            graph_obj.nodes[value_id].get("attributes") or {}, int(end_line),
+        ),
         int(getattr(value_expression, "end_col_offset", 0) or 0),
         int(node_id),
     ))

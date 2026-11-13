@@ -13708,10 +13708,22 @@ def _ordinary_conditional_control_programs(
                         int(node_id), ()
                     ):
                         continue
+                    # Program: corpus c65 unrolled (``for x in range(6): if
+                    # x * 2 > n``).  Wrong record: the regions were carved
+                    # (and their member rows posted) under planning scope 1;
+                    # a later fold of the iterations' copied constants
+                    # changed the graph, the classifier began scope 2, and
+                    # this read joined scope 2 with scope-1 regions by node
+                    # id -- finding no member.  Rule: a region's members are
+                    # read under the scope that region was carved in, which
+                    # the region's own graph records.
+                    region_scope = subgraphs[region_index].G.graph.get(
+                        'planning_scope'
+                    )
                     member = (
                         book.latest_ref(DEPLOYMENT_REGION_MEMBER, (
-                            planning_scope, int(region_index), int(node_id),
-                        )) if planning_scope is not None else None
+                            region_scope, int(region_index), int(node_id),
+                        )) if region_scope is not None else None
                     )
                     _points, activity = activity_binding(
                         graph, int(node_id), book=book,
@@ -14226,7 +14238,42 @@ def _ordinary_conditional_control_programs(
             ),
         ))
         anchor_region = None
-        if not owned_predicate_regions and not arm_regions:
+        unrolled_control = (
+            (graph.G.nodes.get(int(control_id), {}).get("attributes") or {})
+            .get("unrolled_from") is not None
+        )
+        if not owned_predicate_regions and not arm_regions and unrolled_control:
+            # Program: corpus c156 ``for x in xs: if x <= n < x + 4 <= 12``
+            # unrolled; the fold makes each iteration's inner ``and`` arm the
+            # constant link, so the control owns no region and is anchored.
+            # Wrong record: the anchor compared authored source lines, which
+            # every iteration's copy shares, so iterations 1 and 2 were
+            # anchored at iteration 0's region (a CondBr read a value defined
+            # in a later block).  Rule: a loop-body copy is anchored in the
+            # unrolled activity schedule's order -- the first retained region
+            # whose earliest member is scheduled after the control completes.
+            from .control_activity import ActivitySchedule
+
+            schedule = ActivitySchedule(graph)
+
+            def scheduled(node_id, phase):
+                try:
+                    return schedule.position(int(node_id), phase)
+                except ValueError:
+                    return None
+
+            control_end = scheduled(control_id, 'exit')
+            for region_index in retained_regions if control_end is not None else ():
+                positions = [
+                    position
+                    for node_id in subgraphs[region_index].G.graph.get("deployment_nodes", ())
+                    for position in (scheduled(node_id, 'enter'),)
+                    if position is not None
+                ]
+                if positions and min(positions) > control_end:
+                    anchor_region = region_index
+                    break
+        elif not owned_predicate_regions and not arm_regions:
             control_end = (
                 int(getattr(expression, "end_lineno", expression.lineno)),
                 int(getattr(expression, "end_col_offset", expression.col_offset)),
@@ -14404,6 +14451,7 @@ def _nest_region_less_conditionals(
 
     remaining = {index: program for index, program in enumerate(programs)}
     expressions = dict(enumerate(expression for _id, expression in program_expressions))
+    memberships = _branch_compartments(graph)
     # Innermost children first, so a grandchild joins its parent before that
     # parent joins its own.
     region_less = sorted(
@@ -14422,10 +14470,33 @@ def _nest_region_less_conditionals(
             continue
         child_expression = expressions[child_index]
         candidates = []
+        child_control = int(program_expressions[child_index][0])
+        # Program: corpus c156 ``for x in xs: if x <= n < x + 4 <= 12``
+        # unrolled.  Wrong record: a region-less inner ``and`` was given to
+        # the parent whose AST contains an equal-signature node, and every
+        # iteration's outer ``and`` does, so iterations 1 and 2's inner
+        # conditionals joined iteration 0's (a CondBr read a value defined in
+        # a later block).  Rule: a loop-body copy joins the control its exact
+        # branch membership names (the deepest owner, the one guarded by the
+        # most others); authored controls keep the AST containment.
+        child_is_copy = (
+            (graph.G.nodes.get(child_control, {}).get("attributes") or {})
+            .get("unrolled_from") is not None
+        )
+        child_guards = dict(memberships.get(child_control, ()))
         for parent_index, parent in remaining.items():
             if parent_index == child_index:
                 continue
             parent_expression = expressions[parent_index]
+            if child_is_copy:
+                parent_control = int(program_expressions[parent_index][0])
+                arm = child_guards.get(parent_control)
+                if arm is not None:
+                    candidates.append((
+                        -len(memberships.get(parent_control, ())),
+                        parent_index, str(arm),
+                    ))
+                continue
             arm = owning_arm(parent_expression, child_expression)
             if arm is not None:
                 start, end = span(parent_expression)
@@ -14754,6 +14825,55 @@ def _source_control_nesting_hints(
             )
         return fields
 
+    # Program: corpus c69 unrolled (``for x in range(6): if x > 0 and x < n
+    # and x * 2 > n: total += x``).  Wrong record: an iteration's copy of a
+    # control has a deep-copied AST of its own, so AST identity cannot relate
+    # it, and the signature fallback below matched iteration 0's inner ``and``
+    # inside iteration 2's ``if`` (equal positions): overlay refused "nested
+    # control regions are absent from parent body".  Rule: a loop-body copy
+    # (minted by the loop-body clone transform) is related through the
+    # unrolled activity graph -- nested exactly when the parent's occurrence
+    # is one of its activity owners, the closest being the last owner.
+    from .concordance_declarations import (
+        CANONICAL_VALUE as _CANONICAL, SOURCE_ACTIVITY_NODE as _ACTIVITY_NODE,
+    )
+    from .control_activity import _binding_from_identity, activity_scope
+    from .identity_concordance import current_identity_book as _nesting_book
+
+    nesting_book = _nesting_book()
+    nesting_read_scope = graph.G.graph.get("lexical_read_scope")
+    clone_transform = nesting_book.registry.transforms.get("loop_body_clone")
+
+    def control_activity(index):
+        node = source_node_ids.get(int(index))
+        if node is None or nesting_read_scope is None:
+            return None
+        identity = nesting_book.latest_ref(
+            _CANONICAL, (nesting_read_scope, int(node)),
+        )
+        if identity is None:
+            return None
+        try:
+            scope = activity_scope(graph, book=nesting_book)
+        except ValueError:
+            return None
+        points, _cell = _binding_from_identity(
+            identity, scope, nesting_book, node=int(node),
+        )
+        if points is None:
+            return None
+        _kind, owners = nesting_book.page(_ACTIVITY_NODE).cell(
+            points[0].row, points[0].column,
+        )
+        mint = nesting_book.mint_of(identity)
+        return (
+            points[0].row[1],
+            tuple(owner for owner, _arm in owners),
+            mint is not None and mint[0] == clone_transform,
+        )
+
+    activities = {index: control_activity(index) for index in expressions}
+
     # Select the closest authored container for every control.  AST object
     # identity is the compiler's exact ingestion correlation; node count and
     # source span merely rank multiple real ancestors to find the direct one.
@@ -14761,6 +14881,20 @@ def _source_control_nesting_hints(
         candidates = []
         for parent_index, parent_expression in expressions.items():
             if parent_index == child_index:
+                continue
+            child_activity = activities.get(child_index)
+            parent_activity = activities.get(parent_index)
+            if (
+                child_activity is not None and parent_activity is not None
+                and (child_activity[2] or parent_activity[2])
+            ):
+                owners = child_activity[1]
+                if parent_activity[0] in owners:
+                    distance = len(owners) - max(
+                        position for position, owner in enumerate(owners)
+                        if owner == parent_activity[0]
+                    )
+                    candidates.append((distance, 0, parent_index))
                 continue
             # The metadata copier's `if all(new is old for ...)` evaluates
             # its comprehension BEFORE entering the conditional. Walking the
@@ -14805,6 +14939,15 @@ def _source_control_nesting_hints(
             # overlay silently lost their bodies. Exact AST identity remains
             # authoritative; a signature fallback requires a located node.
             located_child = getattr(child_expression, 'lineno', None) is not None
+            # A loop-body copy is related by exact AST identity only (its
+            # iteration's copies share one deep copy); an equal signature is
+            # every iteration's copy of the same source (corpus c156).
+            if any(
+                (graph.G.nodes.get(source_node_ids.get(index), {}).get("attributes") or {})
+                .get("unrolled_from") is not None
+                for index in (child_index, parent_index)
+            ):
+                located_child = False
             if not any(
                 id(member) == id(child_expression)
                 or located_child and _ast_source_signature(member) == child_signature
@@ -15351,6 +15494,13 @@ def _control_partition_keys(
             tuple(branch_frontiers_by_node.get(int(node_id), ())),
             tuple(condition_owners_by_node.get(int(node_id), ())),
             process_frontiers[int(node_id)],
+            # An unrolled iteration of a loop with an authored If is its own
+            # control unit (loop_composer ``unrolled_control_iteration``).
+            tuple(
+                (graph.G.nodes[int(node_id)].get("attributes") or {}).get(
+                    "unrolled_control_iteration"
+                ) or ()
+            ),
         )
         for node_id in node_ids
     }
@@ -30874,9 +31024,34 @@ def _remove_dead_metadata_nodes(
                 # until that projection itself becomes a literal or retires.
                 shape_dependencies.update(int(cell.row[1]) for cell in fact[:3]
                                           if isinstance(cell, Ref))
+    # Program: corpus c271 unrolled (``t = [i, n] if ... else [7, 8]`` as
+    # statements in a range loop).  The structural fold left the constant
+    # display ``[7, 8]`` with no element edges; each iteration's copy names its
+    # own copied members only in its SOURCE_AGGREGATE_LAYOUT record.  Wrong
+    # record: this pruner saw those members unconsumed and removed them, and
+    # the list birth found no producer ("List 55 lacks one exact element
+    # producer").  Rule: a resident aggregate's layout record consumes its
+    # members, as a source-dimension record consumes its receiver.
+    from .concordance_declarations import (
+        SOURCE_AGGREGATE_LAYOUT as _LAYOUT, SourceAggregateLayout as _Layout,
+    )
+
+    layout_scope = graph.G.graph.get("source_aggregate_layout_scope")
+    layout_dependencies: set[int] = set()
+    if layout_scope is not None:
+        layout_page = book.page(_LAYOUT)
+        for aggregate_id in tuple(graph.G):
+            layout = layout_page.latest((layout_scope, int(aggregate_id)))
+            if isinstance(layout, _Layout):
+                layout_dependencies.update(
+                    int(member.value_id) for member in layout.members
+                )
 
     def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
-        if int(node_id) in effect_ids or int(node_id) in shape_dependencies:
+        if (
+            int(node_id) in effect_ids or int(node_id) in shape_dependencies
+            or int(node_id) in layout_dependencies
+        ):
             return False
         # Program: ``self.trace(i)`` with ``trace`` a stored callable field
         # (SSAReferenceEvaluator._execute).  Wrong record: the spelling reads
@@ -34930,11 +35105,23 @@ def _fold_callsite_structural_values(
                         f"({selected_slot_values!r})"
                     )
             control_signature = _ast_source_signature(expression)
-            retained_control_id = next((
+            # Program: ``for f in (True, False, n > 2): if f: r += 1``
+            # unrolled.  Wrong record: every iteration's If copy has an equal
+            # AST signature, so iteration 1's If (graph 20) was paired with
+            # iteration 0's record (16): the decision for iteration 1 was
+            # posted under iteration 0's key and iteration 1 had none.  Rule:
+            # a control that has its own retained record IS that record; the
+            # signature correlation applies only to a control the records
+            # name under another id.
+            control_records = _source_control_records(graph.G)
+            retained_control_id = int(control_id) if (
+                isinstance(
+                    (control_records.get(int(control_id)) or {}).get("expression"),
+                    ast.If,
+                )
+            ) else next((
                 int(source_id)
-                for source_id, record in _source_control_records(
-                    graph.G
-                ).items()
+                for source_id, record in control_records.items()
                 if isinstance(record.get("expression"), ast.If)
                 and _ast_source_signature(record["expression"])
                 == control_signature
@@ -34974,23 +35161,37 @@ def _fold_callsite_structural_values(
                     replace_alias(
                         int(placeholder_id), int(selected_candidates[0])
                     )
+            # Program: ``for f in (False, True): if f: r += 1`` unrolled.
+            # Wrong record: each iteration's copy deep-copies its own AST, so
+            # the AST-id test cannot relate a copy to its If's arm, and the
+            # signature fallback rejected EVERY iteration's ``r += 1`` with
+            # iteration 0's False arm (n for n + 1).  Rule: a loop-body copy
+            # is rejected by its exact branch membership alone -- the unrolled
+            # activity graph owns it per iteration; the AST criteria remain
+            # for authored nodes.
             rejected_nodes = {
                 int(node_id)
                 for node_id, data in graph.G.nodes(data=True)
-                if id(data.get("expr_obj")) in rejected_ast_ids
-                # ``replace`` keeps the reducer-owned authored AST identity
-                # when it rewrites a rejected Return/Tuple into a structural
-                # Constant.  Its live ``expr_obj`` is then None, so checking
-                # only that display record leaves the rejected transport
-                # node behind with the source site's span and may let the
-                # later control pass publish it as a loop value.
-                or id(data.get("authored_expr_obj")) in rejected_ast_ids
-                or isinstance(data.get("expr_obj"), ast.AST)
-                and _ast_source_signature(data["expr_obj"])
-                in rejected_signatures
-                or isinstance(data.get("authored_expr_obj"), ast.AST)
-                and _ast_source_signature(data["authored_expr_obj"])
-                in rejected_signatures
+                if (
+                    (data.get("attributes") or {}).get("unrolled_from") is None
+                    and (
+                        id(data.get("expr_obj")) in rejected_ast_ids
+                        # ``replace`` keeps the reducer-owned authored AST
+                        # identity when it rewrites a rejected Return/Tuple
+                        # into a structural Constant.  Its live ``expr_obj``
+                        # is then None, so checking only that display record
+                        # leaves the rejected transport node behind with the
+                        # source site's span and may let the later control
+                        # pass publish it as a loop value.
+                        or id(data.get("authored_expr_obj")) in rejected_ast_ids
+                        or isinstance(data.get("expr_obj"), ast.AST)
+                        and _ast_source_signature(data["expr_obj"])
+                        in rejected_signatures
+                        or isinstance(data.get("authored_expr_obj"), ast.AST)
+                        and _ast_source_signature(data["authored_expr_obj"])
+                        in rejected_signatures
+                    )
+                )
                 or (int(retained_control_id), str(rejected_role)) in (
                     branch_memberships.get(int(node_id), frozenset())
                 )
@@ -41705,6 +41906,31 @@ def _plan_with_current_iterable(graph: Any, plan: Any) -> Any:
     return replace(plan, loop=replace(plan.loop, iterable_node=current))
 
 
+def _plan_with_current_carried(graph: Any, plan: Any) -> Any:
+    """The plan, each carried initial that an evaporated loop's version
+    replaced read as that loop's settled final copy.
+
+    Program: corpus c382 ``for f in (True, False, n > 2): if f: r += 1``
+    (unrolled) then ``for h in t: ... r += h * 10`` (retained).  Wrong
+    record: the retained plan, discovered before evaporation, still carried
+    ``r`` from the first loop's removed merge (36); its SSA value had no
+    producer accounting (audit: "value 36: dtype=int64 accounting_keys=[]").
+    Rule: a carried initial the evaporator retired is its final copy
+    (``evaporated_carried_finals``, the view of its ``name_binding`` alias).
+    """
+
+    finals = dict(graph.G.graph.get("evaporated_carried_finals") or {})
+    if not finals:
+        return plan
+    carried = tuple(
+        (name, int(finals.get(int(initial), int(initial))), updated)
+        for name, initial, updated in plan.loop.carried_bindings
+    )
+    if carried == tuple(plan.loop.carried_bindings):
+        return plan
+    return replace(plan, loop=replace(plan.loop, carried_bindings=carried))
+
+
 def strategize_shell_deployment(
     graph: Any,
     *,
@@ -42107,6 +42333,18 @@ def strategize_shell_deployment(
             "fold-callsite-structural-values-after-unroll",
             lambda: _fold_callsite_structural_values(graph),
         )
+    elif evaporated_loop_plans:
+        # Program: corpus c175 ``for i in range(6): if i not in (1, 4) and n >
+        # i: t += i``, unrolled.  Each iteration's literal makes some of its
+        # Ifs constant.  Wrong record: with no planner specialization this
+        # fold was skipped here, so it first ran after the regions were
+        # carved and removed a rejected arm's copy (``t += i`` at i = 1) that
+        # a carved region still listed (KeyError 43).  Rule: the structural
+        # fixed point an unroll makes decidable runs before regions are cut.
+        selection_phase(
+            "fold-callsite-structural-values-after-unroll",
+            lambda: _fold_callsite_structural_values(graph),
+        )
     evaporated_loop_ids = {
         int(plan.loop.node_id) for plan in evaporated_loop_plans
     }
@@ -42150,7 +42388,8 @@ def strategize_shell_deployment(
     # the removed node, so lowering raised KeyError.  Rule: a retained loop
     # plan names the iterable its node holds now.
     retained_loop_plans = tuple(
-        _plan_with_current_iterable(graph, plan) for plan in retained_loop_plans
+        _plan_with_current_carried(graph, _plan_with_current_iterable(graph, plan))
+        for plan in retained_loop_plans
     )
     semantic_loop_plans = selection_phase(
         "materialize-loop-semantic-ir",

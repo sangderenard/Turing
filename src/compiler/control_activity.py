@@ -432,6 +432,20 @@ def _ingested_kinds_from_identity(identity, book):
         elif cell.page == CANONICAL_VALUE:
             pending.extend(source for source, _stage in book.edges_into(cell)
                            if source.page in {CANONICAL_VALUE, INGESTION_VALUE})
+            # Program: corpus c65 (``for x in range(6): if x * 2 > n: ...``)
+            # unrolled.  An iteration's copy of a body node is minted NOVEL
+            # by the loop-body clone transform from the cell it copies, so
+            # it has no derived edge to an ingestion row and the copied If
+            # had no kind ("retained source control 17 disagrees with
+            # activity kind").  Rule: a loop-body clone IS a copy of its
+            # operand; its ingested kind is that operand's.  Other mints (a
+            # loop-made constant, minted from the loop) are not copies.
+            mint = book.mint_of(cell)
+            if mint is not None and mint[0] == book.registry.transforms.get(
+                'loop_body_clone'
+            ):
+                pending.extend(operand for operand in mint[1]
+                               if operand.page in {CANONICAL_VALUE, INGESTION_VALUE})
     return kinds
 
 

@@ -1169,14 +1169,336 @@ def loop_requires_iterative_control(graph: Any, plan: LoopPlan) -> bool:
     boundary; its retained realization must consult the same predicate or an
     UNROLL plan with no emitted iterations erases the loop's carried value.
     """
+    # An authored ``If`` whose node is resident in the body of a ``for`` loop
+    # whose ingested activity can be unrolled is cloned per iteration with
+    # its own conditional identity and its own activity occurrence
+    # (``evaporate_unrolled_loops``, ``_unroll_loop_activity``).  One with no
+    # resident node (folded out of the graph, as ``last([1.5])``'s isinstance
+    # branch) has nothing to clone, and keeps its iterative owner; so does
+    # every If of a loop whose activity layout is not admitted.
+    resident_ifs = {
+        id(expression)
+        for node_id in plan.loop.body_nodes
+        if int(node_id) in graph.G
+        for expression in (graph.G.nodes[int(node_id)].get("expr_obj"),)
+        if isinstance(expression, ast.If)
+    } if _loop_activity_layout(graph, int(plan.loop.node_id)) is not None else set()
     return bool(_source_loop_control_work(graph, plan.loop) or plan.loop.return_controls) or any(
         isinstance(member_expression, ast.If)
+        and id(member_expression) not in resident_ifs
         for loop_expression in (
             graph.G.nodes.get(int(plan.loop.node_id), {}).get("expr_obj"),
         )
         if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While))
         for statement in loop_expression.body
         for member_expression in ast.walk(statement)
+    )
+
+
+def _loop_activity_layout(graph: Any, loop_id: int) -> tuple | None:
+    """``(scope, loop occurrence, body rows)`` when a ``for`` loop's ingested
+    activity can be unrolled per iteration; ``None`` otherwise.
+
+    The ingested layout (``source_control_ingestion.visit``) is ``enter ->
+    iter -> select -> body_enter -> target, body -> body_exit``, with
+    ``body_exit -> select`` the declared ``repeat`` backedge, ``body_exit ->
+    exit`` the ``iteration_extent`` and ``select -> orelse/exit`` the
+    ``exhausted`` edges.  The body is every activity point guarded by
+    ``(loop, 'body')``.  Only that layout is admitted: an edge entering or
+    leaving the body any other way, or a terminal ``return`` in the body,
+    keeps the loop's iterative control.
+    """
+
+    from .concordance_declarations import (
+        SOURCE_ACTIVITY_EDGE as _EDGE, SOURCE_ACTIVITY_NODE as _NODE,
+        SOURCE_TERMINAL_RETURN as _RETURN,
+    )
+    from .control_activity import activity_scope, binding
+    from .identity_concordance import current_identity_book
+
+    if int(loop_id) not in graph.G or not isinstance(
+        graph.G.nodes[int(loop_id)].get("expr_obj"), ast.For,
+    ):
+        return None
+    book = current_identity_book()
+    try:
+        scope = activity_scope(graph, book=book)
+        points, _cell = binding(graph, int(loop_id), book=book)
+    except ValueError:
+        return None
+    if points is None:
+        return None
+    node_page = book.page(_NODE)
+    enter = points[0]
+    if node_page.cell(enter.row, enter.column)[0] != "For":
+        return None
+    occurrence = enter.row[1]
+    body = frozenset(
+        row for row in node_page.scope_rows(scope)
+        if (occurrence, "body") in tuple(node_page.latest(row)[1])
+    )
+    if not body:
+        return None
+    for _scope, before, after, relation in book.page(_EDGE).scope_rows(scope):
+        leaves, enters = before.row in body, after.row in body
+        if leaves == enters:
+            continue
+        if enters and not (
+            before.row == (scope, occurrence, "select")
+            and after.row == (scope, occurrence, "body_enter")
+            and relation == "body"
+        ):
+            return None
+        if leaves and not (
+            before.row == (scope, occurrence, "body_exit")
+            and (after.row, relation) in {
+                ((scope, occurrence, "select"), "repeat"),
+                ((scope, occurrence, "exit"), "iteration_extent"),
+            }
+        ):
+            return None
+    return_page = book.page(_RETURN)
+    for row in return_page.scope_rows(scope):
+        if (occurrence, "body") in tuple(return_page.latest(row)[2]):
+            return None
+    return scope, occurrence, body
+
+
+def _unroll_loop_activity(
+    graph: Any,
+    loop_id: int,
+    layout: tuple,
+    iteration_mappings: tuple[dict[int, int], ...],
+) -> Any:
+    """Give an evaporated ``for`` loop's copy its own unrolled activity graph.
+
+    Program: ``for x in range(6): if x * 2 > n: total += x`` (corpus c65),
+    and the AbstractTensor YoungMan's ``for map_name in map_names:
+    loaded_map = self._load_map(...); if loaded_map is not None: maps[...] =
+    loaded_map``.  Wrong record: evaporation cloned the body's values per
+    iteration but bound every clone to the authored body's activity points,
+    so the activity graph still held ONE occurrence of the body under a
+    ``repeat`` backedge for a loop that no longer exists, and conditional
+    ownership (``control_activity.memberships``) could name only one If for
+    all iterations.  Rule: the copy's read scope gets a new activity scope,
+    every row of it DERIVED from the row it continues -- points and edges
+    outside the body as they were; body points once per iteration, on a
+    ``SOURCE_SPAN`` occurrence ``<path>@<loop path>[k]`` derived from the
+    authored span and the loop's, guarded by that iteration's owners (the
+    loop's own ``body`` guard is gone); the backedge replaced by ``body_exit
+    k -> body_enter k+1`` and the last iteration flowing on to the loop's
+    ``exhausted`` successors; each clone bound to its iteration's points.
+    The read scope's ``source_activity_scope`` row is revised to the new
+    scope, so every later reader follows the book to the current graph.
+    """
+
+    from .concordance_declarations import (
+        LOOP_COMPOSER, SOURCE_ACTIVITY_ARM_RELATION, SOURCE_ACTIVITY_BINDING,
+        SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_CHILD, SOURCE_ACTIVITY_EDGE,
+        SOURCE_ACTIVITY_NODE, SOURCE_ACTIVITY_POLICY, SOURCE_ACTIVITY_SCOPE,
+        SOURCE_SPAN, SOURCE_TERMINAL_RETURN,
+    )
+    from .control_activity import binding
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    book = current_identity_book()
+    scope, occurrence, body = layout
+    count = len(iteration_mappings)
+    read_scope = tuple(graph.G.graph["lexical_read_scope"])
+    scope_cell = book.latest_ref(SOURCE_ACTIVITY_SCOPE, (read_scope,))
+    unrolled = book.mint_scope(f"{scope!r}|unrolled", LOOP_COMPOSER)
+    node_page = book.page(SOURCE_ACTIVITY_NODE)
+    span_page = book.page(SOURCE_SPAN)
+    body_occurrences = frozenset(row[1] for row in body)
+    loop_path = str(occurrence.row[2])
+
+    def unique(cells):
+        return tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+
+    spans: dict = {}
+
+    def iteration_span(authored, index):
+        key = (authored, index)
+        if key not in spans:
+            module, qualname, path = authored.row
+            spans[key] = book.post(
+                SOURCE_SPAN, (module, qualname, f"{path}@{loop_path}[{index}]"),
+                span_page.cell(authored.row, authored.column),
+                stage=LOOP_COMPOSER,
+                provenance=Derived(unique((authored, occurrence))),
+                mode=Mode.CONCORD,
+            )
+        return spans[key]
+
+    points: dict = {}
+
+    def point(old_row, index):
+        key = (old_row, index)
+        if key in points:
+            return points[key]
+        old = book.latest_ref(SOURCE_ACTIVITY_NODE, old_row)
+        kind, owners = node_page.cell(old.row, old.column)
+        _old_scope, authored, phase = old_row
+        if index is None:
+            current, current_owners = authored, tuple(owners)
+        else:
+            current = iteration_span(authored, index)
+            current_owners = tuple(
+                (
+                    iteration_span(owner, index)
+                    if owner in body_occurrences else owner,
+                    arm,
+                )
+                for owner, arm in owners
+                if (owner, arm) != (occurrence, "body")
+            )
+        points[key] = book.post(
+            SOURCE_ACTIVITY_NODE, (unrolled, current, phase),
+            (kind, current_owners), stage=LOOP_COMPOSER,
+            provenance=Derived(unique((
+                old, current, *(owner for owner, _arm in current_owners),
+            ))),
+            mode=Mode.CONCORD,
+        )
+        return points[key]
+
+    def copies(old_row):
+        return (
+            tuple((index,) for index in range(count))
+            if old_row in body else ((None,),)
+        )
+
+    for old_row in tuple(node_page.scope_rows(scope)):
+        for (index,) in copies(old_row):
+            point(old_row, index)
+
+    edge_page = book.page(SOURCE_ACTIVITY_EDGE)
+    exhausted = tuple(
+        after.row
+        for _scope, before, after, relation in edge_page.scope_rows(scope)
+        if before.row == (scope, occurrence, "select") and relation == "exhausted"
+    )
+
+    def edge(old, before, after, relation):
+        book.post(
+            SOURCE_ACTIVITY_EDGE, (unrolled, before, after, relation), True,
+            stage=LOOP_COMPOSER,
+            provenance=Derived(unique((old, before, after))),
+            mode=Mode.CONCORD,
+        )
+
+    for row in tuple(edge_page.scope_rows(scope)):
+        _scope, before, after, relation = row
+        old = book.latest_ref(SOURCE_ACTIVITY_EDGE, row)
+        leaves, enters = before.row in body, after.row in body
+        if not leaves and not enters:
+            edge(old, point(before.row, None), point(after.row, None), relation)
+        elif leaves and enters:
+            for index in range(count):
+                edge(old, point(before.row, index), point(after.row, index), relation)
+        elif enters:
+            if count:
+                edge(old, point(before.row, None), point(after.row, 0), relation)
+        elif relation == "repeat":
+            for index in range(count - 1):
+                edge(old, point(before.row, index),
+                     point((scope, occurrence, "body_enter"), index + 1), "flow")
+            if count:
+                for successor in exhausted:
+                    edge(old, point(before.row, count - 1),
+                         point(successor, None), "flow")
+        else:
+            for index in range(count):
+                edge(old, point(before.row, index), point(after.row, None), relation)
+
+    def carry(page, row, new_row, value, *cells):
+        old = book.latest_ref(page, row)
+        book.post(
+            page, new_row, value, stage=LOOP_COMPOSER,
+            provenance=Derived(unique((
+                old, *(source for source, _stage in book.edges_into(old)),
+                *cells,
+            ))),
+            mode=Mode.CONCORD,
+        )
+
+    for row in tuple(book.page(SOURCE_ACTIVITY_CHILD).scope_rows(scope)):
+        _scope, owner, ordinal = row
+        first, last = book.page(SOURCE_ACTIVITY_CHILD).latest(row)
+        for (index,) in copies(owner.row):
+            new_owner = point(owner.row, index)
+            new_first = point(first.row, index if first.row in body else None)
+            new_last = point(last.row, index if last.row in body else None)
+            carry(SOURCE_ACTIVITY_CHILD, row, (unrolled, new_owner, ordinal),
+                  (new_first, new_last), new_owner, new_first, new_last)
+    for row in tuple(book.page(SOURCE_ACTIVITY_CALL).scope_rows(scope)):
+        _scope, authored = row
+        value = book.page(SOURCE_ACTIVITY_CALL).latest(row)
+        if authored in body_occurrences:
+            for index in range(count):
+                current = iteration_span(authored, index)
+                carry(SOURCE_ACTIVITY_CALL, row, (unrolled, current), value, current)
+        else:
+            carry(SOURCE_ACTIVITY_CALL, row, (unrolled, authored), value, authored)
+    for row in tuple(book.page(SOURCE_ACTIVITY_ARM_RELATION).scope_rows(scope)):
+        _scope, owner, before_arm, after_arm = row
+        value = book.page(SOURCE_ACTIVITY_ARM_RELATION).latest(row)
+        owners = (
+            tuple(iteration_span(owner, index) for index in range(count))
+            if owner in body_occurrences else (owner,)
+        )
+        for current in owners:
+            carry(SOURCE_ACTIVITY_ARM_RELATION, row,
+                  (unrolled, current, before_arm, after_arm), value, current)
+    for row in tuple(book.page(SOURCE_TERMINAL_RETURN).scope_rows(scope)):
+        _scope, authored = row
+        enter, leave, owners = book.page(SOURCE_TERMINAL_RETURN).latest(row)
+        carry(SOURCE_TERMINAL_RETURN, row, (unrolled, authored),
+              (point(enter.row, None), point(leave.row, None), owners),
+              authored, point(enter.row, None), point(leave.row, None))
+    policy = book.page(SOURCE_ACTIVITY_POLICY).latest((scope,))
+    if policy is not None:
+        carry(SOURCE_ACTIVITY_POLICY, (scope,), (unrolled,), policy)
+
+    # Every incumbent process binding outside the body keeps its points in
+    # the new graph; an authored body node is replaced by its clones.
+    binding_page = book.page(SOURCE_ACTIVITY_BINDING)
+    for row in tuple(binding_page.scope_rows(scope)):
+        first, last = binding_page.latest(row)
+        if first.row in body or last.row in body:
+            continue
+        new_first, new_last = point(first.row, None), point(last.row, None)
+        carry(SOURCE_ACTIVITY_BINDING, row, (unrolled, row[1]),
+              (new_first, new_last), row[1], new_first, new_last)
+    for index, mapping in enumerate(iteration_mappings):
+        for source_id, clone_id in mapping.items():
+            if (
+                int(clone_id) not in graph.G
+                or (graph.G.nodes[int(clone_id)].get("attributes") or {}).get(
+                    "unrolled_from"
+                ) != int(source_id)
+            ):
+                continue
+            source_points, source_binding = binding(graph, int(source_id), book=book)
+            if source_points is None:
+                continue
+            first, last = source_points
+            new_first = point(first.row, index if first.row in body else None)
+            new_last = point(last.row, index if last.row in body else None)
+            clone_cell = node_identity_cell(graph, int(clone_id), book=book)
+            book.post(
+                SOURCE_ACTIVITY_BINDING, (unrolled, clone_cell),
+                (new_first, new_last), stage=LOOP_COMPOSER,
+                provenance=Derived(unique((
+                    source_binding, clone_cell, new_first, new_last,
+                ))),
+                mode=Mode.CONCORD,
+            )
+    return book.post(
+        SOURCE_ACTIVITY_SCOPE, (read_scope,), unrolled, stage=LOOP_COMPOSER,
+        provenance=Derived(unique((scope_cell, occurrence))),
+        mode=Mode.REVISE,
     )
 
 
@@ -1233,10 +1555,19 @@ def evaporate_unrolled_loops(
     ) + 1
     handled_loop_ids: set[int] = set()
     effect_live_call_clones: set[int] = set()
+    #: True while the loop being evaporated has its activity graph unrolled.
+    clone_activity_owned = [False]
+    #: The deep-copy memo of the iteration being cloned (see ``add_clone``).
+    iteration_memo: list[dict] = [{}]
 
     def add_clone(source_id: int, parents: tuple[tuple[int, str], ...]) -> int:
         clone_id = next_process_value_id(graph)
-        cloned = copy.deepcopy(dict(graph.G.nodes[int(source_id)]))
+        # One deep-copy memo per iteration: a copied node's ``expr_obj`` is
+        # the very object inside its copied parent's AST, as in the authored
+        # graph, so AST identity stays exact within an iteration and distinct
+        # across iterations (corpus c156: a chained comparison's inner ``and``
+        # copies were otherwise related to every iteration's outer ``and``).
+        cloned = copy.deepcopy(dict(graph.G.nodes[int(source_id)]), iteration_memo[0])
         cloned["parents"] = []
         cloned["children"] = []
         cloned["value_id"] = clone_id
@@ -1286,10 +1617,43 @@ def evaporate_unrolled_loops(
                             node_identity_cell(graph, int(source_id)))),
                         mode=Mode.CONCORD,
                     )
+            # Program: corpus c239 ``v = maybe(row + i, flag - i); if v is not
+            # None: s += v`` in a range loop.  Wrong record: an iteration's
+            # copy of the ``None`` had no class row (the authored one is
+            # NoneType), so the planner refused it as an unclassed host
+            # scalar.  Rule: a copy's value class is its source's, DERIVED
+            # from the source's class cell and the copy's identity.
+            from .concordance_declarations import SOURCE_VALUE_CLASS
+            from ..common.tensors.topological_reducer import (
+                _concord_source_value_class, _resolved_source_value_class,
+                _source_numeric_scope,
+            )
+
+            class_identity, class_limbs = _resolved_source_value_class(
+                graph, int(source_id),
+            )
+            if class_identity is not None:
+                class_scope = _source_numeric_scope(graph)
+                class_cell = activity_book.latest_ref(
+                    SOURCE_VALUE_CLASS, (class_scope, int(source_id)),
+                )
+                _concord_source_value_class(
+                    class_scope, int(clone_id), str(class_identity),
+                    precision_limbs=int(class_limbs),
+                    source="loop body clone",
+                    provenance=Derived(tuple(
+                        cell for cell in (class_cell, clone_cell)
+                        if cell is not None
+                    )),
+                )
             points, activity_cell = binding(
                 graph, int(source_id), book=activity_book,
             )
-            if points is not None:
+            # A loop whose activity graph is unrolled binds each clone to its
+            # own iteration's points (``_unroll_loop_activity``); binding it
+            # here to the authored body points would leave a record that
+            # still says every iteration is the one source occurrence.
+            if points is not None and not clone_activity_owned[0]:
                 scope = activity_scope(graph, book=activity_book)
                 source_cell = node_identity_cell(
                     graph, int(source_id), book=activity_book,
@@ -1367,9 +1731,39 @@ def evaporate_unrolled_loops(
         layout = book.page(SOURCE_AGGREGATE_LAYOUT).latest(row)
         if not isinstance(layout, SourceAggregateLayout):
             return
-        if layout.conditional_cell is not None or layout.arm_layout_cells:
-            return  # a conditional layout's arms are not cloned here
         source_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, row)
+        # Program: corpus c274 unrolled (``w = {i, n}`` else ``w = {7, 8}``
+        # in a range loop).  Wrong record: a conditional layout (a merge of
+        # two arm displays) was not cloned, so each iteration's copy of the
+        # merge kept its source's ``source_aggregate_layout_row`` and read the
+        # authored body's members; its set keys had no class.  Rule: the
+        # copy's conditional layout is the source's with its control cell and
+        # arm layouts carried through this iteration's mapping, as members are.
+        conditional_cell = layout.conditional_cell
+        arm_layout_cells = tuple(layout.arm_layout_cells)
+        if conditional_cell is not None or arm_layout_cells:
+            def carried_identity(cell):
+                if (
+                    cell is None or not isinstance(cell.row, tuple)
+                    or len(cell.row) != 2 or not isinstance(cell.row[1], int)
+                ):
+                    return cell
+                copied = mapping.get(int(cell.row[1]))
+                if copied is None or int(copied) not in graph.G:
+                    return cell
+                return node_identity_cell(graph, int(copied))
+
+            def carried_arm(cell):
+                if cell is None or not isinstance(cell.row, tuple) or len(cell.row) != 2:
+                    return cell
+                copied = mapping.get(int(cell.row[1]))
+                if copied is None:
+                    return cell
+                carried = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, (scope, int(copied)))
+                return cell if carried is None else carried
+
+            conditional_cell = carried_identity(conditional_cell)
+            arm_layout_cells = tuple(carried_arm(cell) for cell in arm_layout_cells)
         members = []
         for member in layout.members:
             value_id = int(mapping.get(int(member.value_id), member.value_id))
@@ -1388,12 +1782,17 @@ def evaporate_unrolled_loops(
         target_row = (scope, int(clone_id))
         book.post(
             SOURCE_AGGREGATE_LAYOUT, target_row,
-            SourceAggregateLayout(str(layout.aggregate_kind), tuple(members)),
+            SourceAggregateLayout(
+                str(layout.aggregate_kind), tuple(members),
+                conditional_cell=conditional_cell,
+                arm_layout_cells=arm_layout_cells,
+            ),
             stage=LOOP_COMPOSER,
-            provenance=Derived(tuple(dict.fromkeys((
+            provenance=Derived(tuple(dict.fromkeys(cell for cell in (
                 source_cell, node_identity_cell(graph, int(clone_id)),
                 *(member.value_cell for member in members),
-            )))),
+                conditional_cell, *arm_layout_cells,
+            ) if cell is not None))),
             mode=Mode.CONCORD,
         )
         attributes = dict(graph.G.nodes[int(clone_id)].get("attributes") or {})
@@ -1678,6 +2077,74 @@ def evaporate_unrolled_loops(
             for member in selected_plans
             for binding in member.loop.carried_bindings
         ))
+        # Program: corpus c670 ``d = {1: n, 2: 5}; for i in range(3): if i
+        # == n: d[2] = i`` then ``d[2] * 10 + d[1]`` (and the YoungMan's
+        # ``maps[map_name] = loaded_map`` under ``if loaded_map is not None``).
+        # Wrong record: the merge of ``d`` after the body's ``if`` (Phi 15:
+        # test, body = the keyed store, orelse = the dict's birth) is no loop
+        # body node and no carried binding -- an in-place store rebinds no
+        # name -- so evaporation cloned the store per iteration, left Phi 15
+        # with its test's loop operand gone, and the reads after the loop read
+        # it ("process node 7 lacks an ingested evaluation point").  Rule: a
+        # merge owned by a body ``If`` is body work, and one whose arms reach
+        # exactly one value from outside the body (through other such merges)
+        # is that binding's carried version: in Python the ``d`` an iteration
+        # starts with is the one the previous iteration ended with.  Its
+        # carried binding is posted like a discovered one.
+        body_conditionals = {
+            int(node_id) for node_id in body_ids
+            if int(node_id) in graph.G
+            and isinstance(graph.G.nodes[int(node_id)].get("expr_obj"), ast.If)
+        }
+        conditional_merges = {
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if int(node_id) not in body_ids
+            and (data.get("attributes") or {}).get("source_conditional_id")
+            is not None
+            and int((data.get("attributes") or {})["source_conditional_id"])
+            in body_conditionals
+        }
+        if conditional_merges:
+            carried_updates = {int(updated) for _n, _i, updated in carried_bindings}
+
+            def outside_arms(merge_id: int, seen: frozenset = frozenset()) -> set:
+                found: set = set()
+                for parent, role in graph.G.nodes[merge_id].get("parents") or ():
+                    if str(role) not in {"body", "orelse"}:
+                        continue
+                    parent = int(parent)
+                    if parent in conditional_merges and parent not in seen:
+                        found |= outside_arms(parent, seen | {merge_id})
+                    elif parent not in body_ids and parent not in conditional_merges:
+                        found.add(parent)
+                return found
+
+            consumed_by_merge = {
+                int(parent)
+                for merge_id in conditional_merges
+                for parent, role in graph.G.nodes[merge_id].get("parents") or ()
+                if str(role) in {"body", "orelse"}
+                and int(parent) in conditional_merges
+            }
+            added: list[tuple[str, int, int]] = []
+            for merge_id in sorted(conditional_merges - consumed_by_merge):
+                name = (graph.G.nodes[merge_id].get("attributes") or {}).get(
+                    "binding_name"
+                )
+                outside = outside_arms(merge_id)
+                if name is None or merge_id in carried_updates or len(outside) != 1:
+                    continue
+                initial = next(iter(outside))
+                if any(int(other_initial) == initial
+                       for _n, other_initial, _u in carried_bindings):
+                    continue
+                _post_loop_carried_binding(
+                    graph, int(loop.node_id), merge_id, initial, (str(name),),
+                )
+                added.append((str(name), initial, merge_id))
+            body_ids = frozenset((*body_ids, *conditional_merges))
+            carried_bindings = (*carried_bindings, *added)
+            required_outputs.update(merge_id for _n, _i, merge_id in added)
         state_effects = tuple(dict.fromkeys(
             effect
             for member in selected_plans
@@ -1694,13 +2161,41 @@ def evaporate_unrolled_loops(
             for node_id in nx.descendants(graph.G, target_id)
         }
         iteration_dependent.discard(int(loop.node_id))
+        # Program: corpus c271 ``for i in range(3): if i == n % 3: t = [i, n]
+        # else: t = [7, 8]``.  Wrong record: the structural fold left the
+        # constant display ``[7, 8]`` with no element edges -- its members
+        # are named by its SOURCE_AGGREGATE_LAYOUT record alone -- so this
+        # walk over graph edges never needed (or cloned) the constants, they
+        # were removed with the body, and each iteration's copy of the
+        # display named deleted members ("List 53 lacks one exact element
+        # producer").  Rule: a layout record's members are its display's
+        # operands; the walk reads them as it reads edges.
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT as _LAYOUT, SourceAggregateLayout as _Layout,
+        )
+        from .identity_concordance import current_identity_book as _layout_book
+
+        layout_scope = graph.G.graph.get("source_aggregate_layout_scope")
+        layout_page = _layout_book().page(_LAYOUT)
+
+        def layout_operands(value_id):
+            if layout_scope is None:
+                return ()
+            layout = layout_page.latest((layout_scope, int(value_id)))
+            if not isinstance(layout, _Layout):
+                return ()
+            return tuple(int(member.value_id) for member in layout.members)
+
         needed = set(required_outputs)
         pending = list(required_outputs)
         while pending:
             value_id = pending.pop()
             if value_id not in graph.G:
                 continue
-            for parent, _role in graph.G.nodes[value_id].get("parents") or ():
+            for parent in (
+                *(int(parent) for parent, _role in graph.G.nodes[value_id].get("parents") or ()),
+                *layout_operands(value_id),
+            ):
                 parent = int(parent)
                 if (
                     parent in body_ids or parent in iteration_dependent
@@ -1773,7 +2268,17 @@ def evaporate_unrolled_loops(
         last_mapping: dict[int, int] = {}
         iteration_lane_nodes: list[tuple[int, ...]] = []
 
+        # A single ``for`` loop whose ingested activity has the admitted
+        # layout gets its own unrolled activity graph; its clones are bound
+        # there (``_unroll_loop_activity``), not to the authored body points.
+        activity_layout = (
+            _loop_activity_layout(graph, int(loop.node_id))
+            if group is None else None
+        )
+        clone_activity_owned[0] = activity_layout is not None
+        iteration_mappings: list[dict[int, int]] = []
         for iteration_index, iteration in enumerate(iteration_values):
+            iteration_memo[0] = {}
             mapping = dict(carried_values)
             if iteration_assignments is not None:
                 mapping.update(
@@ -1845,6 +2350,113 @@ def evaporate_unrolled_loops(
             # canonical relabel carries layouts into canonical ids.
             for source_id in body_order:
                 post_cloned_layout(int(source_id), mapping)
+            # Program: ``for x in range(6): if x * 2 > n: total += x``
+            # (corpus c65; scratch c86), and the AbstractTensor YoungMan's
+            # ``for map_name in map_names: loaded_map = self._load_map(...);
+            # if loaded_map is not None: maps[map_name] = loaded_map``.
+            # Wrong record: an authored ``If`` node is a sink (no value reads
+            # it), so it was never in ``body_order`` and never cloned, and
+            # every iteration's cloned merge kept ``source_conditional_id``
+            # = the ONE source If: the planner built one conditional from
+            # iteration 0's test and iteration 5's arm.  That is why such a
+            # loop was refused evaporation.  Rule: a clone's conditional
+            # owner is its iteration's clone of that If (its operand edges
+            # carried through this iteration's mapping, as any body node's).
+            for source_id in body_order:
+                clone_attributes = graph.G.nodes[
+                    int(mapping[int(source_id)])
+                ].get("attributes") or {}
+                conditional = clone_attributes.get("source_conditional_id")
+                if (
+                    conditional is None
+                    or int(conditional) not in body_ids
+                    or int(conditional) not in graph.G
+                ):
+                    continue
+                if int(conditional) not in mapping:
+                    mapping[int(conditional)] = add_clone(
+                        int(conditional),
+                        tuple(
+                            (
+                                int(mapping.get(int(parent), int(parent))),
+                                str(role),
+                            )
+                            for role, _ordinal, parent in _operand_positions(
+                                graph.G.nodes[int(conditional)].get("parents")
+                                or ()
+                            )
+                        ),
+                    )
+                clone_attributes["source_conditional_id"] = int(
+                    mapping[int(conditional)]
+                )
+            # Program: corpus c274 unrolled (``w = {i, n}`` / ``w = {7, 8}``
+            # in a range loop's ``if``).  Wrong record: a clone deep-copies its
+            # source's attributes, so a copied display or merge still named the
+            # authored body's leaves (``aggregate_leaf_value_ids`` (17, 18),
+            # removed with the body) and its merge's ``initial_value_id``; the
+            # planner read no member class and each iteration's set held
+            # 'unknown' keys.  Rule: an attribute view naming body values names
+            # this iteration's copies, through the same mapping as the edges.
+            # Program: corpus c156 ``for x in xs: if x <= n < x + 4 <= 12``
+            # unrolled.  Wrong record: every iteration's copy kept its source's
+            # authored coordinates, and lexical placement orders by (line,
+            # column, node id), so iterations 1 and 2's inner ``and`` were
+            # placed inside iteration 0's (a CondBr read a value defined in a
+            # later block).  Rule: a copy declares its iteration slot -- (k,
+            # trip count, loop first line, loop last line), innermost first --
+            # and the position readers map its line into that slot
+            # (``fortran_c_shell._unrolled_line``): iterations keep their
+            # order inside the loop's span.
+            loop_expression = graph.G.nodes[int(loop.node_id)].get("expr_obj")
+            slot = (
+                (
+                    int(iteration_index), len(iteration_values),
+                    int(loop_expression.lineno),
+                    int(getattr(loop_expression, "end_lineno", None)
+                        or loop_expression.lineno),
+                )
+                if getattr(loop_expression, "lineno", None) is not None
+                else None
+            )
+            for source_id, clone_id in tuple(mapping.items()):
+                if (
+                    int(clone_id) not in graph.G
+                    or (graph.G.nodes[int(clone_id)].get("attributes") or {}).get(
+                        "unrolled_from"
+                    ) != int(source_id)
+                ):
+                    continue
+                clone_attributes = graph.G.nodes[int(clone_id)].get("attributes") or {}
+                if slot is not None:
+                    clone_attributes["unrolled_iteration_slots"] = (
+                        *tuple(clone_attributes.get("unrolled_iteration_slots") or ()),
+                        slot,
+                    )
+                    # Program: corpus c156 unrolled.  Wrong record: the region
+                    # carver fused the three iterations' ``x <= n`` into one
+                    # region; a region is placed where its last member
+                    # completes, so iteration 0's conditional read a value its
+                    # region produced only at iteration 2's slot.  Rule: in a
+                    # loop whose body holds an authored If, an iteration is a
+                    # control unit -- its copies are partitioned apart
+                    # (``_control_partition_keys``).
+                    if body_conditionals:
+                        clone_attributes["unrolled_control_iteration"] = (
+                            *tuple(clone_attributes.get("unrolled_control_iteration") or ()),
+                            (int(loop.node_id), int(iteration_index)),
+                        )
+                leaves = clone_attributes.get("aggregate_leaf_value_ids")
+                if isinstance(leaves, (tuple, list)):
+                    clone_attributes["aggregate_leaf_value_ids"] = tuple(
+                        int(mapping.get(int(leaf), int(leaf))) for leaf in leaves
+                    )
+                initial = clone_attributes.get("initial_value_id")
+                if initial is not None:
+                    clone_attributes["initial_value_id"] = int(
+                        mapping.get(int(initial), int(initial))
+                    )
+            iteration_mappings.append(dict(mapping))
             for _name, initial, updated in carried_bindings:
                 if int(updated) in mapping:
                     carried_values[int(initial)] = int(mapping[int(updated)])
@@ -1899,6 +2511,28 @@ def evaporate_unrolled_loops(
                 if int(value_id) in graph.G
             )))
 
+        if activity_layout is not None:
+            _unroll_loop_activity(
+                graph, int(loop.node_id), activity_layout,
+                tuple(iteration_mappings),
+            )
+            # The retained control-record snapshot still named the authored
+            # body's If, whose activity the unrolled graph no longer holds
+            # ("retained source control 8 lacks activity binding", corpus
+            # c65).  Each iteration's If is the control now: snapshot the
+            # clones, and the authored body's records leave with their nodes,
+            # as an unrolled append effect leaves the mutation snapshot.
+            from .glsl_deployment_strategy import _retain_source_control_records
+
+            _retain_source_control_records(graph.G)
+            graph.G.graph["source_control_records"] = {
+                int(node_id): record
+                for node_id, record in (
+                    graph.G.graph.get("source_control_records") or {}
+                ).items()
+                if int(node_id) not in body_ids
+            }
+        clone_activity_owned[0] = False
         for _name, _initial, updated in carried_bindings:
             # ``last_mapping`` only gets assigned inside the per-iteration
             # loop above (line ~765). A loop whose traced iterable is empty
@@ -2272,6 +2906,17 @@ def evaporate_unrolled_loops(
                 if effect.loop_result_id is not None:
                     live.add(int(effect.loop_result_id))
                 live.update(map(int, effect.argument_value_ids))
+        # Program: ``for f in (True, False, n > 2): if f: r += 1`` unrolled
+        # (corpus c382).  Wrong record: an ``If`` node is a sink -- it owns
+        # its arms by control, not by value -- so this ancestry pruning
+        # deleted every iteration's If; the structural fold then decided the
+        # constant iterations from retained records alone and the return read
+        # iteration 1's version (1 for 2).  Rule: an If node is live, as a
+        # retained loop is: control ownership, not dataflow, keeps it.
+        live.update(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.If)
+        )
         # Loop plans are snapshots taken before evaporation rewrites the
         # graph.  A sibling/nested rewrite can legitimately remove IDs still
         # named by a retained plan; only live graph nodes may seed ancestry.
@@ -2369,6 +3014,19 @@ def evaporate_unrolled_loops(
             if any(int(value_id) in graph.G for value_id in value_ids)
         }
         graph.G.graph["evaporated_loop_plans"] = tuple(evaporated)
+        # The settled final copy of every evaporated carried version, the
+        # graph view of the ``name_binding`` aliases posted above: a retained
+        # loop planned before this evaporation may carry such a version as
+        # its initial value (corpus c382, ``r`` from an unrolled loop into a
+        # retained one), and reads it here (``_plan_with_current_carried``).
+        graph.G.graph["evaporated_carried_finals"] = {
+            **dict(graph.G.graph.get("evaporated_carried_finals") or {}),
+            **{
+                int(value_id): settled_final(int(value_id))
+                for value_id in carried_finals
+                if settled_final(int(value_id)) in graph.G
+            },
+        }
         live_deployment_regions = []
         for region in deployment_regions:
             live_lanes = []

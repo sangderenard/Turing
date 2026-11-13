@@ -3375,6 +3375,46 @@ class CorrelationTable:
                 found.append(Finding("activity-node-source", str(row[0]), None,
                                      "activity node lacks its exact ingested source/owner identity"))
             graphs.setdefault(row[0], nx.DiGraph()).add_node(cell)
+        # An evaporated ``for`` loop's copy reads an unrolled activity graph
+        # (loop_composer._unroll_loop_activity): the read scope's
+        # source_activity_scope row is revised at LOOP_COMPOSER to a new scope
+        # whose every point continues ONE point of the scope it replaces --
+        # same kind and phase, at the same occurrence or at an iteration span
+        # SOURCE_SPAN derived from that occurrence.
+        from .concordance_declarations import LOOP_COMPOSER as _LOOP_COMPOSER
+        unrolled_scopes = {
+            value(cell)
+            for scope_row in book.page(SOURCE_ACTIVITY_SCOPE).rows()
+            for cell in (book.latest_ref(SOURCE_ACTIVITY_SCOPE, scope_row),)
+            if cell is not None
+            and any(stage == _LOOP_COMPOSER for _source, stage in book.edges_into(cell))
+        }
+        for scope in unrolled_scopes:
+            for row in book.page(SOURCE_ACTIVITY_NODE).scope_rows(scope):
+                cell = book.latest_ref(SOURCE_ACTIVITY_NODE, row)
+                kind, _owners = value(cell)
+                continued = tuple(
+                    source for source, _stage in book.edges_into(cell)
+                    if source.page == SOURCE_ACTIVITY_NODE and source.row[0] != scope
+                )
+                occurrence = row[1]
+                valid = len(continued) == 1 and (
+                    value(continued[0])[0] == kind
+                    and continued[0].row[2] == row[2]
+                    and (
+                        continued[0].row[1] == occurrence
+                        or continued[0].row[1] in {
+                            source for source, _stage in book.edges_into(occurrence)
+                            if source.page == SOURCE_SPAN
+                        }
+                    )
+                )
+                if not valid:
+                    found.append(Finding(
+                        "unrolled-activity-node", str(scope), None,
+                        "unrolled activity point does not continue exactly one "
+                        "point of the graph it replaces",
+                    ))
         for row in book.page(SOURCE_ACTIVITY_EDGE).rows():
             scope, before, after, relation = row
             cell = book.latest_ref(SOURCE_ACTIVITY_EDGE, row)
