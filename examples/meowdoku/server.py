@@ -975,7 +975,7 @@ def make_handler(sessions: Sessions):
                         "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps),
                         "instance": sessions.instance or None,
                         "signed_in": self._principal().user_id is not None, "username": self._principal().username,
-                        "kiosk": self._kiosk(),
+                        "kiosk": self._kiosk(), "guest": self._guest_gated(),
                         "origin_tier": self._origin_tier})
 
         # ---- [DIVIDER] /api/divider/jobs...: the source divider's intake and status (divider_intake.py; the page is web/divider.html).

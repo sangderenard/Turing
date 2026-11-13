@@ -271,6 +271,7 @@ def test_a_guest_keeps_pages_game_and_machine_routes_and_nothing_else(server):
     if getattr(srv.shared_catalog, "guest_endpoint", None) is None:
         pytest.skip("the loaded SpeakToMe catalog declares no guest entries (set SPEAKTOME_REPO to a checkout that does)")
     local = {"Host": "127.0.0.1"}                                 # an anonymous LAN visitor: once the edit tier, now a guest
+    assert _call(port, "/api/whoami", headers=local)[1]["guest"] is True        # the foyer: speaktome_mcp reads it as a visitor
     status, page, _, ctype = _call(port, "/shader.html", headers=local)
     assert status == 200 and b"SHADER-PAGE" in page                # pages are answered by the static handler
     for path in ("/api/whoami", "/api/route", "/api/state", "/api/catalog"):

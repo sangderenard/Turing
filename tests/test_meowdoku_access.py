@@ -189,7 +189,7 @@ def test_whoami_reports_the_tier_and_nothing_else(tiered):
         status, who = _get(port, "/api/whoami", {"X-Secret": "abc"})
         assert status == 200 and who["tier"] == tier and who["origin"] == "lan"
         assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities", "instance", "signed_in", "username", "origin_tier",
-                            "kiosk"}
+                            "kiosk", "guest"}
         assert who["edit"] is False and who["dev"] is False and who["shader"] == (tier == "shader")      # a guest, on any tier
         if tier != "shader":                                                                     # an account on shader is lifted to play
             who = _get(port, "/api/whoami", member)[1]
