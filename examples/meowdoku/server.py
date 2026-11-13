@@ -388,8 +388,8 @@ class Sessions:
         self.spectral_root = Path(spectral_override).resolve() if spectral_override else ROOT.parent / "spectral-analyzer"
         if spectral_override and not self.spectral_root.is_dir():
             raise ValueError("SPECTRAL_ANALYZER_ROOT must name an existing checkout")
-        from meowdoku.wave_arena_site import WaveArenaSite
-        self.wave_arena_site = WaveArenaSite(self.spectral_root)
+        from meowdoku.wave_arena_service import WaveArenaService
+        self.wave_arena = WaveArenaService(self.spectral_root)
         self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, self.spectral_root,
                                                         users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
@@ -633,14 +633,12 @@ def make_handler(sessions: Sessions):
                 return
             if method == "POST" and self.headers.get("Sec-Fetch-Site") == "cross-site":
                 return self._json({"error": "same-origin request required"}, HTTPStatus.FORBIDDEN)
-            account = self._account()
-            if account is None:
-                return self._json({"error": "sign in to use the wave arena"}, HTTPStatus.UNAUTHORIZED)
+            self._table()
             body = self._body_json() if method == "POST" else None
             if method == "POST" and body is None:
                 return
             try:
-                return self._json(sessions.wave_arena_site.request(account["id"], body))
+                return self._json(sessions.wave_arena.command(self._token, body))
             except (ValueError, TypeError) as error:
                 return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             except RuntimeError as error:
