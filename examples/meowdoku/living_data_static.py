@@ -68,6 +68,108 @@ def _optics(value):
     return result
 
 
+def _scene_snapshot(value, world):
+    """Admit the complete native draw data, not a marble/OBJ substitution.
+
+    This is an owner-host declaration. It is never executable and is not a
+    ray job: native celestial shading has no physical emitter/medium receipt.
+    Keep the original stream/tables; RGB-to-material selection is part of the
+    native vertex shader and must not silently become a different material map.
+    """
+    if not isinstance(value, dict):
+        raise CursorError('realized scene snapshot required')
+    if len(json.dumps(value, allow_nan=False).encode()) > 3 * 1024 * 1024:
+        raise CursorError('scene snapshot exceeds 3 MiB admission limit', 413)
+    if (value.get('schema') != 'living-data-realized-mesh.v1' or
+            value.get('coordinate_space') != 'world' or value.get('up_axis') != 'Y' or
+            value.get('stride') != 9 or value.get('world_identity') != world['root'] or
+            value.get('source_sha256') != world['source'] or
+            value.get('renderer_identity') != world['renderer']):
+        raise CursorError('scene source or coordinate contract mismatch', 409)
+    if value.get('physics_started') is not False or value.get('simulation_advanced') is not False:
+        raise CursorError('static scene cannot contain advancing simulation')
+    vertices = value.get('vertices')
+    if (not isinstance(vertices, list) or not vertices or len(vertices) % 27 or
+            len(vertices) > 200000 * 27 or any(type(x) not in (int, float) or
+            not math.isfinite(x) for x in vertices)):
+        raise CursorError('finite interleaved native triangles required')
+    colors = value.get('material_colors')
+    if (not isinstance(colors, list) or not 1 <= len(colors) <= 16 or
+            any(not isinstance(c, list) or len(c) != 3 or any(type(x) not in (int, float)
+            or not math.isfinite(x) for x in c) for c in colors)):
+        raise CursorError('native material palette required')
+    tables = value.get('materials')
+    if not isinstance(tables, dict):
+        raise CursorError('native material tables required')
+    for name, stride in [('pbr', 16), ('phong', 8), ('enamel', 8), ('texstack', 16), ('thermal_k', 0)]:
+        data = tables.get(name)
+        size = len(colors) * stride if stride else 1
+        if (not isinstance(data, list) or len(data) != size or any(type(x) not in (int, float)
+                or not math.isfinite(x) for x in data)):
+            raise CursorError('invalid native material table: ' + name)
+    registry = value.get('world')
+    objects = registry.get('objects') if isinstance(registry, dict) else None
+    if not isinstance(objects, list) or not objects:
+        raise CursorError('native object registry required')
+    if _digest(registry) != world['world_registry_digest']:
+        raise CursorError('scene registry differs from registered world', 409)
+    owners = {}
+    for obj in objects:
+        if not isinstance(obj, dict) or not isinstance(obj.get('identity'), str):
+            raise CursorError('invalid native object identity')
+        identity = obj['identity']
+        if identity in owners or identity not in world['graph'].nodes or obj != world['graph'].nodes[identity]:
+            raise CursorError('scene object differs from registered world', 409)
+        owners[identity] = obj
+    spans, overlays, parts = (value.get(key) for key in ('identity_spans', 'overlays', 'semantic_part_spans'))
+    if any(not isinstance(x, list) for x in (spans, overlays, parts)):
+        raise CursorError('native ownership spans required')
+    def span_range(span):
+        if not isinstance(span, dict):
+            raise CursorError('invalid native span')
+        first, count = span.get('firstVertex'), span.get('vertexCount')
+        if (type(first) is not int or type(count) is not int or first < 0 or count < 0 or
+                first % 3 or count % 3 or first + count > len(vertices) // 9):
+            raise CursorError('invalid native triangle span')
+        return first, count
+    owned = {}
+    for span in spans:
+        span_range(span)
+        identity = span.get('identity')
+        if not isinstance(identity, str) or identity not in owners or identity in owned:
+            raise CursorError('missing or duplicate span owner')
+        owned[identity] = span
+    kinds = set()
+    for span in overlays:
+        span_range(span)
+        kind = span.get('kind')
+        if not isinstance(kind, str) or kind not in ('navigation-routes', 'portal-tubes', 'portal-splats') or kind in kinds:
+            raise CursorError('invalid overlay provenance')
+        kinds.add(kind)
+    covered = 0
+    for first, count in sorted(span_range(s) for s in spans + overlays):
+        if count:
+            if first != covered:
+                raise CursorError('scene ownership has gaps or overlap')
+            covered += count
+    if covered != len(vertices) // 9:
+        raise CursorError('scene ownership omits triangles')
+    for part in parts:
+        first, count = span_range(part)
+        parent_id = part.get('objectIdentity')
+        parent = owned.get(parent_id) if isinstance(parent_id, str) else None
+        if (parent is None or not isinstance(part.get('identity'), str) or not part['identity'] or
+                first < parent['firstVertex'] or first + count > parent['firstVertex'] + parent['vertexCount']):
+            raise CursorError('invalid semantic part ownership')
+    # The digest binds every supplied field, including material data and raw
+    # coordinates. No normalizing, re-extruding, centering or shell substitution.
+    return {'snapshot': deepcopy(value), 'scene_sha256': _digest(value),
+            'ray_available': False, 'ray_unavailable_reasons': [
+                'Native celestial shader has no physical light-source contract',
+                'Native scene has no certified volume/boundary ownership contract',
+                'PhotoJobs admits saved Studio subjects, not general world scenes']}
+
+
 class StaticWorlds:
     def __init__(self, clock=time.monotonic):
         self.clock = clock
@@ -92,7 +194,9 @@ class StaticWorlds:
                 'source_sha256': world['source'], 'renderer_identity': world['renderer'],
                 'map_sha256': world['map_digest'],
                 'authority': 'registered browser-host snapshot; not server-attested live physics',
-                'capabilities': ['inspect', 'render-phong'], 'simulation': False}
+                'capabilities': ['inspect', 'render-phong', 'export-scene'], 'simulation': False,
+                'scene_sha256': world.get('scene', {}).get('scene_sha256'),
+                'ray_available': False}
 
     def register(self, owner, body):
         _fields(body, {'map', 'source_sha256', 'renderer_identity', 'request_id'})
@@ -129,7 +233,8 @@ class StaticWorlds:
             world = {'id': secrets.token_hex(16), 'owner': owner, 'token': secrets.token_urlsafe(32),
                      'graph': graph, 'layout': layout, 'root': root, 'source': source,
                      'renderer': renderer, 'map_digest': _digest(body['map']), 'commands': {}, 'touched': self.clock(),
-                     'request_id': request_id, 'digest': digest}
+                     'request_id': request_id, 'digest': digest,
+                     'world_registry_digest': _digest(body['map'].get('world', {}))}
             self.worlds[world['id']] = world
             return dict(self._public(world), host_token=world['token'])
 
@@ -149,8 +254,8 @@ class StaticWorlds:
                        'edge_offset', 'position', 'facing', 'width', 'height', 'optics'})
         request_id = _rid(body.get('request_id')); digest = _digest(body)
         operation = body.get('operation')
-        if operation not in ('inspect', 'render-phong'):
-            raise CursorError('supported DM commands: inspect, render-phong')
+        if operation not in ('inspect', 'render-phong', 'export-scene'):
+            raise CursorError('supported DM commands: inspect, render-phong, export-scene')
         with self.lock:
             world = self._owned(owner, identity)
             old = world['commands'].get(request_id)
@@ -162,7 +267,12 @@ class StaticWorlds:
                 raise CursorError('command receipt capacity reached; close and reattach world', 429)
             entry = {'id': request_id, 'digest': digest, 'operation': operation,
                      'state': 'complete', 'deadline': self.clock() + RENDER_TIMEOUT}
-            if operation == 'inspect':
+            if operation == 'export-scene':
+                _fields(body, {'request_id', 'operation'})
+                if 'scene' not in world:
+                    raise CursorError('host has not admitted its realized scene snapshot', 409)
+                entry['result'] = world['scene']
+            elif operation == 'inspect':
                 _fields(body, {'request_id', 'operation', 'at', 'layer', 'radius', 'limit', 'offset', 'edge_offset'})
                 layer = body.get('layer', 'world')
                 if layer not in ('world', 'layout'):
@@ -203,12 +313,21 @@ class StaticWorlds:
             return self._receipt(world, entry)
 
     def host(self, owner, identity, body):
-        _fields(body, {'host_token', 'action', 'request_id', 'result'})
+        _fields(body, {'host_token', 'action', 'request_id', 'result', 'scene'})
         with self.lock:
             world = self._owned(owner, identity)
             token = body.get('host_token')
             if not isinstance(token, str) or not token.isascii() or not hmac.compare_digest(token, world['token']):
                 raise CursorError('invalid static host token', 403)
+            if body.get('action') == 'scene':
+                _fields(body, {'host_token', 'action', 'scene'})
+                admitted = _scene_snapshot(body.get('scene'), world)
+                previous = world.get('scene')
+                if previous and previous['scene_sha256'] != admitted['scene_sha256']:
+                    raise CursorError('scene changed; close and register a new world', 409)
+                world['scene'] = admitted
+                world['touched'] = self.clock()
+                return {**self._public(world), **{k: v for k, v in admitted.items() if k != 'snapshot'}}
             if body.get('action') == 'poll':
                 _fields(body, {'host_token', 'action'})
                 for entry in world['commands'].values():
@@ -219,7 +338,7 @@ class StaticWorlds:
                                 'source_sha256': world['source'], 'renderer_identity': world['renderer']}
                 return {'request_id': None}
             if body.get('action') != 'complete':
-                raise CursorError('host action must be poll or complete')
+                raise CursorError('host action must be scene, poll or complete')
             request_id = _rid(body.get('request_id')); entry = world['commands'].get(request_id)
             if not entry or entry['operation'] != 'render-phong':
                 raise CursorError('render command not found', 404)
