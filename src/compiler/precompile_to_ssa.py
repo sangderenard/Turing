@@ -6173,6 +6173,39 @@ class _ControlSSABuilder(TiledObject):
             int(region_index)
         ) and int(region_index) not in self.region_writing_indices
 
+    def _sequence_mutation_call_sources(self, mutation) -> tuple[Ref, ...]:
+        """Retain an exact source effect at its native helper invocation.
+
+        A shared helper's registration names only its first control owner.
+        Each call status instead records its own current mutation, when the
+        authored control fact proves it. Source-less lowering stays unchanged;
+        no owned-output reader can infer missing evidence from attributes.
+        """
+        from .concordance_declarations import CONTROL_BLOCK
+
+        control = self._control_cells[-1] if self._control_cells else None
+        if control is None or control.page != CONTROL_BLOCK:
+            return ()
+        book = self._book()
+        if book.latest_ref(CONTROL_BLOCK, control.row) != control:
+            return ()
+        target = self._canonical_cell(mutation.sequence_value_id)
+        effect = self._canonical_cell(mutation.effect_node_id)
+        arguments = tuple(self._canonical_cell(value)
+                          for value in mutation.argument_value_ids)
+        if any(cell is None or cell.page != CANONICAL_VALUE
+               for cell in (target, effect, *arguments)):
+            return ()
+        expected = (target, str(mutation.operator), arguments, effect,
+                    mutation.policy, str(mutation.argument_kind),
+                    mutation.object_contract_cell)
+        fact = book.page(control.page).cell(control.row, control.column)
+        if tuple(getattr(fact, 'sequence_mutations', ())).count(expected) != 1:
+            return ()
+        if not {target, effect, *arguments} <= {p for p, _ in book.edges_into(control)}:
+            return ()
+        return effect, control
+
     def _register_sequence_lowering(self, lowering) -> None:
         """Install helpers through ``register_sequence_lowering``, caused by
         the innermost control cell (else this lowering's root)."""
@@ -19469,9 +19502,9 @@ class _ControlSSABuilder(TiledObject):
         # cell the descriptor names, never a positional stand-in.
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
-            operands=(*call_arguments, *((mutation.snapshot_cell,)
-                                         if mutation.snapshot_cell is not None
-                                         else ())),
+            operands=(*call_arguments, *self._sequence_mutation_call_sources(mutation),
+                      *((mutation.snapshot_cell,)
+                        if mutation.snapshot_cell is not None else ())),
         )
         self.emit(
             Handler.Call,
