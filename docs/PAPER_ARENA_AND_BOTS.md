@@ -60,6 +60,26 @@ increase on reconciliation. Trainer processes can register as bots and use
 the same strategy/order APIs; no autonomous tensor trainer is started by this
 feature.
 
+## Modular strategy experiments
+
+Each strategy stores a policy module and a nonempty selection of outcome
+modules. The initial policies are `manual`, `momentum`, `mean_reversion`,
+`tensor`, and `external`. The first two are explicit dry-run baselines;
+`tensor` and `external` report that they need trained weights or an external
+runner. `/api/paper/proposals` evaluates a page of strategies against one
+cached history snapshot and places no orders. This keeps signal comparison
+separate from broker execution.
+
+The independent outcome modules are `fixed_horizon`, `closed_trade`, and
+`fill_quality`. They require the relevant future mark, close fill, or execution
+reference before producing a label. `TensorOutcomeNet` uses the existing
+`AbstractTensor` autograd to fit all three heads in one batch, with an observed
+mask so an immature or unselected outcome contributes no loss. No one reward
+rule is fixed for every strategy. A future trainer must persist reference
+marks, mature labels from Alpaca paper fill events, and checkpoints before its
+network can issue proposals. The current tensor policy deliberately returns
+`ready=false`.
+
 ## Interfaces
 
 The SpeakToMe REST catalog declares all paper routes and generates signed-in

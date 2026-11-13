@@ -98,6 +98,7 @@ from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS
 from meowdoku import paper_arena as paper_arena_mod
 from meowdoku import paper_broker as paper_broker_mod
 from meowdoku import paper_mock as paper_mock_mod
+from meowdoku import paper_policies as paper_policies_mod
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
@@ -1334,6 +1335,7 @@ def make_handler(sessions: Sessions):
                             ("look", "mock_orders"): ("/api/paper/mock/orders", "GET"),
                             ("look", "mock_ledger"): ("/api/paper/mock/ledger", "GET"),
                             ("look", "scoreboard"): ("/api/paper/scoreboard", "GET"),
+                            ("look", "proposals"): ("/api/paper/proposals", "GET"),
                             ("look", "map"): ("/api/paper/map", "GET"),
                             ("examine", "node"): ("/api/paper/map/query", "GET"),
                             ("make", "strategy"): ("/api/paper/strategies", "POST"),
@@ -1352,6 +1354,10 @@ def make_handler(sessions: Sessions):
                 elif command == ("look", "mock_ledger"):
                     if set(body) != {"strategy_id"} or not isinstance(body["strategy_id"], str):
                         return self._json({"error": "mock ledger requires strategy_id"}, HTTPStatus.BAD_REQUEST)
+                    dm_query = body
+                elif command == ("look", "proposals"):
+                    if set(body) - {"stock", "offset", "limit"}:
+                        return self._json({"error": "proposals accept stock, offset and limit"}, HTTPStatus.BAD_REQUEST)
                     dm_query = body
                 elif command == ("use", "reconcile"):
                     if set(body) != {"id"} or not isinstance(body["id"], str):
@@ -1479,6 +1485,18 @@ def make_handler(sessions: Sessions):
                 if path == "/api/paper/scoreboard" and method == "GET":
                     prices = market_data_mod.latest_prices(sessions.state.secrets_dir, credential_owner)
                     return self._json(paper_arena_mod.scoreboard(db, account["id"], prices))
+                if path == "/api/paper/proposals" and method == "GET":
+                    from urllib.parse import parse_qs
+                    args = dm_query if dm_query is not None else {key: value[0] for key, value in
+                        parse_qs(self.path.partition("?")[2]).items()}
+                    try:
+                        stock = args.get("stock", "AAPL")
+                        offset, limit = int(args.get("offset", 0)), int(args.get("limit", 100))
+                    except (ValueError, TypeError):
+                        raise paper_arena_mod.ArenaError("invalid proposal page")
+                    history = market_data_mod.history(sessions.state.secrets_dir, credential_owner, stock)
+                    return self._json(paper_policies_mod.proposals(
+                        paper_arena_mod.strategies(db, account["id"]), history, offset=offset, limit=limit))
                 if path == "/api/paper/mock/orders" and method == "POST":
                     prices = market_data_mod.latest_prices(sessions.state.secrets_dir, credential_owner)
                     if not isinstance(body, dict) or not isinstance(body.get("symbol"), str):

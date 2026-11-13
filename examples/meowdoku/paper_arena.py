@@ -21,6 +21,8 @@ RISK = {
     "standard": (Decimal("25"), Decimal("250")),
     "explore": (Decimal("100"), Decimal("1000")),
 }
+POLICIES = ("manual", "momentum", "mean_reversion", "tensor", "external")
+OUTCOMES = ("fixed_horizon", "closed_trade", "fill_quality")
 SYMBOLS = frozenset((*market_data.ETFS, *market_data.WILDCARDS, market_data.CRYPTO))
 RID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SID = re.compile(r"^[0-9a-f]{32}$")
@@ -36,7 +38,7 @@ def connect(path) -> sqlite3.Connection:
     db = sqlite3.connect(str(path), timeout=10, isolation_level=None)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
-    schema_version.declare(db, "paper_arena", 2)
+    schema_version.declare(db, "paper_arena", 3)
     db.execute("CREATE TABLE IF NOT EXISTS paper_bots ("
                "id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, "
                "source TEXT NOT NULL, request_id TEXT NOT NULL, created REAL NOT NULL, last_seen REAL, "
@@ -48,6 +50,8 @@ def connect(path) -> sqlite3.Connection:
     db.execute("CREATE INDEX IF NOT EXISTS paper_activity_recent ON paper_activity(created DESC)")
     db.execute("CREATE TABLE IF NOT EXISTS paper_bot_strategies ("
                "strategy_id TEXT PRIMARY KEY, bot_id TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS paper_strategy_modules ("
+               "strategy_id TEXT PRIMARY KEY, policy TEXT NOT NULL, outcomes TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS paper_shared_account ("
                "singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner_id INTEGER NOT NULL, "
                "set_by INTEGER NOT NULL, updated REAL NOT NULL)")
@@ -225,23 +229,32 @@ def _strategy(db, owner: int, strategy_id: str):
 
 
 def strategies(db, owner: int) -> list[dict]:
-    rows = db.execute("SELECT s.*, b.bot_id FROM paper_strategies s "
+    rows = db.execute("SELECT s.*, b.bot_id, m.policy, m.outcomes FROM paper_strategies s "
                       "LEFT JOIN paper_bot_strategies b ON b.strategy_id=s.id "
+                      "LEFT JOIN paper_strategy_modules m ON m.strategy_id=s.id "
                       "WHERE s.owner_id=? ORDER BY s.created", (owner,))
     return [{"id": r["id"], "name": r["name"], "risk": r["risk"], "created": r["created"],
-             "bot_id": r["bot_id"], "max_order_usd": str(RISK[r["risk"]][0]),
+             "bot_id": r["bot_id"], "policy": r["policy"] or "manual",
+             "outcomes": json.loads(r["outcomes"]) if r["outcomes"] else list(OUTCOMES),
+             "max_order_usd": str(RISK[r["risk"]][0]),
              "gross_buy_budget_usd": str(RISK[r["risk"]][1])} for r in rows]
 
 
 def create_strategy(db, owner: int, body: dict) -> dict:
-    if not isinstance(body, dict) or not {"request_id", "name", "risk"} <= set(body) or set(body) - {"request_id", "name", "risk", "bot_id"}:
-        raise ArenaError("provide request_id, name, risk and optional bot_id")
+    if not isinstance(body, dict) or not {"request_id", "name", "risk"} <= set(body) or set(body) - {"request_id", "name", "risk", "bot_id", "policy", "outcomes"}:
+        raise ArenaError("provide request_id, name, risk and optional bot_id, policy and outcomes")
     request_id = _request_id(body["request_id"])
     name, risk = body["name"], body["risk"]
     if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80 or name != name.strip():
         raise ArenaError("strategy name must be 1-80 characters")
     if risk not in RISK:
         raise ArenaError("risk must be cautious, standard or explore")
+    policy = body.get("policy", "manual")
+    outcomes = body.get("outcomes", list(OUTCOMES))
+    if (not isinstance(policy, str) or policy not in POLICIES or not isinstance(outcomes, list)
+            or not outcomes or not all(isinstance(x, str) and x in OUTCOMES for x in outcomes)
+            or len(outcomes) != len(set(outcomes))):
+        raise ArenaError("invalid policy or outcomes")
     bot_id = body.get("bot_id")
     if bot_id is not None and db.execute("SELECT 1 FROM paper_bots WHERE id=? AND owner_id=?", (bot_id, owner)).fetchone() is None:
         raise ArenaError("bot not found", 404)
@@ -261,6 +274,8 @@ def create_strategy(db, owner: int, body: dict) -> dict:
             created = time.time()
             db.execute("INSERT INTO paper_strategies VALUES (?,?,?,?,?,?,?)",
                        (identity, owner, name, risk, request_id, digest, created))
+            db.execute("INSERT INTO paper_strategy_modules VALUES(?,?,?)",
+                       (identity, policy, json.dumps(outcomes)))
             if bot_id is not None:
                 db.execute("INSERT INTO paper_bot_strategies VALUES(?,?)", (identity, bot_id))
             result = {"id": identity, "name": name, "risk": risk, "created": created, "replayed": False}

@@ -63,8 +63,15 @@ def test_admin_shared_paper_account_and_dev_own_account(server, monkeypatch):
         "client_order_id": payload["client_order_id"]})
     bot_headers = {**dev_headers, "X-Meowdoku-Bot": bot_id}
     created = helpers._call(port, "/api/paper/strategies", "POST", bot_headers,
-                            {"request_id": "model1", "name": "Model 1", "risk": "cautious", "bot_id": bot_id})
+                            {"request_id": "model1", "name": "Model 1", "risk": "cautious", "bot_id": bot_id,
+                             "policy": "momentum", "outcomes": ["fixed_horizon", "fill_quality"]})
     assert created[0] == 201
+    monkeypatch.setattr(market_data, "history", lambda directory, account, stock: {
+        "bars": {"SPY": [{"c": 100 + i} for i in range(9)],
+                 "BTC/USD": [{"c": 50000 + i * 100} for i in range(9)]}})
+    proposals = helpers._call(port, "/api/paper/proposals?stock=AAPL", headers=dev_headers)
+    assert proposals[0] == 200 and proposals[1]["strategies"][0]["policy"] == "momentum"
+    assert proposals[1]["execution"].startswith("dry-run")
     command = {"request_id": "decision1", "strategy_id": created[1]["id"],
                "symbol": "BTC/USD", "side": "buy", "amount": "5"}
     assert helpers._call(port, "/api/paper/orders", "POST", bot_headers, command)[0] == 201
