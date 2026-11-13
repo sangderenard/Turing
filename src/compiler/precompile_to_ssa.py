@@ -17757,7 +17757,10 @@ class _ControlSSABuilder(TiledObject):
             length_address = storage[len(destination.column_value_ids)]
             self.emit(
                 Handler.Store,
-                [self.constant_value(0), length_address],
+                [self.constant_value(
+                    0, length_address,
+                    *self._sequence_mutation_call_sources(mutation),
+                ), length_address],
                 attributes={
                     "binding": "ssa_sequence_clear",
                     "sequence_id": int(destination.sequence_id),
