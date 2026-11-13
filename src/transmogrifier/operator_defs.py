@@ -144,7 +144,7 @@ operator_signatures = {
         'min_outputs': 1, 'max_outputs': 1,
         'concurrency': None, 'allows_inplace': False,
     } for name, count in {
-        'ExceptionNone': 0, 'ExceptionTake': 0,
+        'ExceptionNone': 0, 'ExceptionTake': 0, 'ExceptionPending': 0,
         'ExceptionActive': 1, 'ExceptionMatch': 1, 'ExceptionRaise': 1,
         'ExceptionIndexType': 1, 'ExceptionLength': 1,
     }.items()},
