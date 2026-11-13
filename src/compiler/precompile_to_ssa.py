@@ -11969,7 +11969,16 @@ class _ControlSSABuilder(TiledObject):
         ))
         if len(alternatives) <= 1 or "builtins.NoneType" not in alternatives:
             return None
-        # Only a fixed-width value union carries its tag beside the payload.
+        # An authored optional span parameter already publishes an exact
+        # tag companion. Consume it, not the span payload, for its None test.
+        # Do not fabricate a pending companion for aggregate call results:
+        # their presence may instead belong to the aggregate's own layout.
+        tag = self.native_value_type_tags.get(subject_id)
+        if tag is not None and "native_type_tag_pending_for_value_id" not in (
+            tag.accounting or {}
+        ):
+            return subject_id
+        # Only a fixed-width value union may require a pending tag companion.
         # Program: bootstrap unit 35 (``found = self._resolved(...)``, an
         # Optional[tuple]).  Wrong record: its ``is None`` minted a pending
         # tag that nothing publishes; an optional aggregate's presence is a
