@@ -19041,14 +19041,29 @@ class _ControlSSABuilder(TiledObject):
             self.ensure_plan_callsite_result(
                 source_id, location=f"{location}.source"
             )
+            # The source keeps its declared policy. list(set) reads a keyed
+            # source into a duplicate-preserving destination, not vice versa.
+            source_schema = self.resolved_sequence_schemas.get(source_id)
             source = self._sequence_descriptor(
                 source_id,
-                policy=mutation.policy if operation == "replace" else "duplicates",
+                policy=(
+                    source_schema.policy if source_schema is not None else
+                    mutation.policy if operation == "replace" else "duplicates"
+                ),
                 writable=False,
                 location=location,
             )
             if source is None:
                 return
+            if mutation.argument_kind == "set_snapshot":
+                # list(set) is fresh storage, not a keyed-table alias. Reset
+                # on each execution, then use the existing source iterator
+                # and destination insertion policy (including live rows).
+                self._lower_sequence_mutation_body(
+                    replace(mutation, operator="clear", argument_value_ids=(),
+                            argument_kind="value"), path=path,
+                )
+                operation = "extend"
             _dtype_cells = self._cells(
                 mutation.snapshot_cell,
                 self._sequence_contract_cell(
