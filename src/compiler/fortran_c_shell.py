@@ -34148,6 +34148,8 @@ def _class_surface_ssa_program(
             )
         ):
             export_symbols.append(symbol)
+            from .source_owned_record_projection import publish_public_source_entry
+            publish_public_source_entry(module_ir.functions[symbol])
         report(
             f"function {shell_index}/{len(planned_shells)} {function_name}: "
             f"local lowering complete; module_functions={len(module_ir.functions)} "

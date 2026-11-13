@@ -1596,6 +1596,22 @@ SOURCE_SEQUENCE_CAPACITY_BOUND = declare_page(
 
 
 @dataclass(frozen=True)
+class PublicSourceEntry:
+    """An authored pursuit root selected at the actual public export boundary."""
+
+    lowered_source_cell: Ref
+    function_address_cell: Ref
+    source_definition_cell: Ref
+    activation_cell: Ref
+    root_demand_cell: Ref
+
+
+PUBLIC_SOURCE_ENTRY = declare_page(
+    "public_source_entry", (RowField("function", K.NAME),), PublicSourceEntry,
+)
+
+
+@dataclass(frozen=True)
 class SourceOwnedSequenceReturn:
     """An authored bytes concat returned from its exact source slot."""
 
