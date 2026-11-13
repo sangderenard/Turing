@@ -6409,6 +6409,17 @@ def _authored_annotation_field_receipt(
         if isinstance(annotation.value, ast.Attribute)
         else ""
     )
+    # compile_nodes.output_node_keys: Optional[List[str]] already declares
+    # builtins.list in the semantic annotation reader.  Derive its physical
+    # container from that SAME identity: a separate spelling whitelist lost
+    # the List/Tuple receipts and left an otherwise exact union arm unbacked.
+    # Protocols retain their existing layouts; they declare no concrete class.
+    declared_types = _authored_annotation_python_types(annotation)
+    if len(declared_types) == 1 and declared_types[0] in {
+        "builtins.dict", "builtins.list", "builtins.tuple",
+        "builtins.set", "builtins.frozenset",
+    }:
+        container = declared_types[0].removeprefix("builtins.")
     if container == "Literal":
         members = (
             tuple(annotation.slice.elts)
@@ -6594,6 +6605,12 @@ def _authored_annotation_field_receipt(
             if isinstance(element.value, ast.Attribute)
             else ""
         )
+        nested_types = _authored_annotation_python_types(element)
+        if len(nested_types) == 1 and nested_types[0] in {
+            "builtins.list", "builtins.tuple", "builtins.set",
+            "builtins.frozenset",
+        }:
+            nested_container = nested_types[0].removeprefix("builtins.")
         if nested_container in {
             "list", "tuple", "Sequence", "Iterable",
             "set", "Set", "frozenset", "FrozenSet",
