@@ -407,9 +407,11 @@ async function main() {
   }
 
   let route = {};
-  if (caps.has("dev_ui")) { try { route = await getJson("/api/route"); } catch (e) { route = {}; } }
+  const pageRouteControl = who.signed_in && (caps.has("dev_ui") || location.pathname === "/" ||
+    location.pathname === "/index.html");
+  if (pageRouteControl) { try { route = await getJson("/api/route"); } catch (e) { route = {}; } }
   const onDev = !!(route.dev_route && route.route === route.dev_route);
-  const serverName = caps.has("dev_ui") ? (onDev ? "development" : "stable") : "";
+  const serverName = pageRouteControl ? (onDev ? "development" : "stable") : "";
   const chip = el("button", { class: "chip", "aria-haspopup": "true", "aria-expanded": "false",
     text: who.username + (serverName ? " · " + serverName : "") });
   const menu = el("div", { class: "menu", role: "menu", hidden: "" });
@@ -442,6 +444,7 @@ async function main() {
   } }));
   for (const item of [
     link("Home", "/"),
+    link("Games", "/games.html", !onDev || caps.has("dev_ui")),
     link("Profile and servers", "/profile.html"),
     link("Keys", "/keys.html", caps.has("message")),
     link("My files", "/files.html", caps.has("message")),
@@ -455,7 +458,7 @@ async function main() {
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
     link("Account and password", "/login.html"),
   ]) if (item) menu.append(item);
-  if (caps.has("dev_ui")) {
+  if (pageRouteControl) {
     menu.append(el("div", { class: "sep" }), el("div", { class: "head", text: "Server: " + (who.instance || serverName) }),
       serverButton("Stable server", "stable", !onDev, false),
       serverButton("Development server", "dev", onDev, route.dev_available === false));

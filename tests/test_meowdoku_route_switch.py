@@ -2,6 +2,8 @@
 ephemeral ports with different --instance/--route and temp roots.  Outside visitors are simulated as a trusted-proxy peer."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import json
 import sqlite3
@@ -17,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import authz  # noqa: E402
+from meowdoku import authored_pages as pages  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
 
 OUTSIDE = {"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https", "Host": "cats.example.org"}
@@ -97,10 +100,14 @@ def pair(tmp_path):
         h.server_close()
 
 
-def test_member_cannot_switch_operator_can_and_cookie_is_set(pair):
+def test_member_can_select_dev_preview_but_not_arbitrary_route(pair):
     s = pair.stable
     mem, _ = _login(s, "memcat")
     assert _call(s.port, "/api/route", "POST", {"Cookie": mem}, {"route": "b"})[0] == 403
+    assert _call(s.port, "/api/route", "POST", {"Cookie": mem}, {"site": "dev"})[0] == 403
+    status, cookies, body = _call(s.port, "/api/route", "POST",
+                                  {"Cookie": mem, "Origin": "https://cats.example.org"}, {"site": "dev"})
+    assert status == 200 and _route_cookies(cookies) == [ROUTE + "=b"] and body["site"] == "dev"
     op, _ = _login(s, "opcat")
     status, cookies, body = _call(s.port, "/api/route", "POST", {"Cookie": op}, {"route": "b"})
     assert status == 200 and _route_cookies(cookies) == [ROUTE + "=b"] and body["route"] == "b"
@@ -125,6 +132,8 @@ def test_dev_instance_refuses_member_resets_cookie_allows_open_paths_and_operato
     mem, _ = _login(d, "memcat", {"Cookie": ROUTE + "=b"})
     status, cookies, body = _call(d.port, "/api/mathlab/jobs", headers={"Cookie": mem + "; " + ROUTE + "=b"})
     assert status == 403 and body == {"error": "this instance needs dev_ui"} and _route_cookies(cookies) == [ROUTE + "=a"]
+    assert _call(d.port, "/", headers={"Cookie": mem})[0] == 200
+    assert _call(d.port, "/api/pages", headers={"Cookie": mem})[0] == 200
     assert _call(d.port, "/", headers={"Cookie": ROUTE + "=b"})[0] == 403          # the route cookie alone grants nothing
     for path in ("/login.html", "/login.js", "/api/whoami", "/api/account/me", "/api/route"):
         assert _call(d.port, path, headers={"Cookie": mem})[0] == 200, path
@@ -133,15 +142,67 @@ def test_dev_instance_refuses_member_resets_cookie_allows_open_paths_and_operato
     assert _call(d.port, "/", headers={"Cookie": op})[0] == 200
 
 
+def test_page_author_dev_preview_and_stable_release_share_account_authority(pair, tmp_path):
+    stable, dev = pair.stable, pair.dev
+    # Production gives both instances one Accounts database; their web/content
+    # roots remain distinct. Apply that deployment binding to this pair.
+    dev.sessions.accounts_db = stable.sessions.accounts_db
+    dev.sessions.accounts = stable.sessions.accounts
+    dev.sessions.authz_policy = stable.sessions.authz_policy
+    member, _ = _login(stable, "memcat")
+    headers = {"Cookie": member, "Origin": "https://cats.example.org"}
+    payload = {"title": "Cat page", "description": "One author", "content_type": "text/html",
+               "content_base64": base64.b64encode(b"<h1>Cat</h1>").decode(), "confirmed_public_copy": True}
+    status, _, made = _call(stable.port, "/api/pages", "POST", headers, payload)
+    assert status == 201 and made["stage"] == "dev"
+    page = made["id"]
+    assert _call(stable.port, "/api/pages")[2]["pages"] == []
+    assert _call(stable.port, f"/p/{page}/")[0] == 404
+    assert _call(dev.port, f"/p/{page}/", headers={"Cookie": member})[0] == 200
+    assert _call(dev.port, f"/p/{page}/")[0] == 403
+    operator, _ = _login(stable, "opcat")
+    assert _call(dev.port, f"/p/{page}/", headers={"Cookie": operator})[0] == 404
+    assert _call(stable.port, f"/api/pages/{page}/stage", "POST", headers, {"stage": "release"})[0] == 200
+    assert _call(stable.port, f"/p/{page}/")[0] == 200
+    assert _call(stable.port, "/api/pages?author=memcat")[2]["pages"][0]["id"] == page
+    assert _call(stable.port, f"/api/pages/{page}/stage", "POST", headers, {"stage": "dev"})[0] == 200
+    assert _call(stable.port, f"/p/{page}/")[0] == 404
+    root = tmp_path / "workspaces"
+    bundle = root / "ws1" / "site" / "programs" / "memcat-cat" / "versions" / "v1"
+    bundle.mkdir(parents=True)
+    compiled = b"<h1>Compiled cat</h1>"
+    (bundle / "index.html").write_bytes(compiled)
+    url = "/site/programs/memcat-cat/versions/v1/index.html"
+    (bundle / "bundle.json").write_text(json.dumps({"schema": "turing-program-bundle-v1",
+        "page": {"path": "index.html", "url": url}, "program": {"title": "Compiled cat"},
+        "artifacts": [{"path": "index.html", "bytes": len(compiled), "sha256": hashlib.sha256(compiled).hexdigest()}]}),
+        encoding="utf-8")
+    db = pages.connect(stable.sessions.accounts_db)
+    try:
+        db.execute("CREATE TABLE workspace_volumes(volume_id TEXT PRIMARY KEY,root TEXT NOT NULL)")
+        db.execute("CREATE TABLE workspace_leases(workspace_id TEXT PRIMARY KEY,volume_id TEXT,owner_id INTEGER,state TEXT,measured_bytes INTEGER)")
+        db.execute("INSERT INTO workspace_volumes VALUES('v',?)", (str(root),))
+        db.execute("INSERT INTO workspace_leases VALUES('ws1','v',?,'active',?)",
+                   (_uid(stable, "memcat"), len(compiled) + (bundle / "bundle.json").stat().st_size))
+        db.commit()
+        compiled_page = pages.register_bundle(db, _uid(stable, "memcat"), "ws1", bundle)["id"]
+    finally:
+        db.close()
+    assert _call(dev.port, url, headers={"Cookie": member})[0] == 200
+    assert _call(stable.port, url)[0] == 404
+    assert _call(stable.port, f"/api/pages/{compiled_page}/stage", "POST", headers, {"stage": "release"})[0] == 200
+    assert _call(stable.port, url)[0] == 200
+
+
 def test_login_sets_route_by_capability_and_preference(pair):
     s = pair.stable
     op, cookies = _login(s, "opcat")
     assert _route_cookies(cookies) == [ROUTE + "=a"]                                 # no stored preference yet
     _call(s.port, "/api/route", "POST", {"Cookie": op}, {"site": "dev"})
     assert _route_cookies(_login(s, "opcat")[1]) == [ROUTE + "=b"]
-    assert _route_cookies(_login(s, "memcat", {"Cookie": ROUTE + "=b"})[1]) == [ROUTE + "=a"]   # member: stable route, clears a stale b
-    authz.set_site_pref(s.sessions.accounts_db, _uid(s, "memcat"), "dev")               # never honoured without dev_ui
-    assert _route_cookies(_login(s, "memcat")[1]) == [ROUTE + "=a"]
+    assert _route_cookies(_login(s, "memcat", {"Cookie": ROUTE + "=b"})[1]) == [ROUTE + "=a"]
+    authz.set_site_pref(s.sessions.accounts_db, _uid(s, "memcat"), "dev")
+    assert _route_cookies(_login(s, "memcat")[1]) == [ROUTE + "=b"]
 
 
 def test_logout_resets_route_to_stable(pair):

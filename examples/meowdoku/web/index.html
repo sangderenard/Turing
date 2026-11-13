@@ -2,356 +2,48 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Meowdoku</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pages · Meowdoku</title>
 <style>
-  /* The shared background: --scene-bg is set by app.js from the Rayleigh sky model for the viewer's local
-     time (the same colour the WebGL clear and the shaders' empty colour use); html[data-night="1"] is its
-     night mode.  The dark palette below is tinted by it; the fallbacks are the old fixed colours. */
-  :root { color-scheme: dark; --scene-bg: #16161a;
-          --panel: color-mix(in srgb, var(--scene-bg) 14%, #14141a); --ctl: #26262c; --ctl-hover: #30303a;
-          --line: #3a3a42; --fg: #e8e8ea; --fg-strong: #f0f0f3; }
-  :root[data-night="1"] { --panel: color-mix(in srgb, var(--scene-bg) 55%, #04060c); --ctl: #151b2e; --ctl-hover: #212b48;
-          --line: #55648c; --fg: #f4f6ff; --fg-strong: #ffffff; }
-  /* MOBILE: the page never zooms (the scene owns pinch and pan): no double-tap zoom anywhere, no gestures leaving the canvas, and no
-     iOS focus-zoom on text fields (it zooms any field under 16px) */
-  html, body { touch-action: manipulation; overscroll-behavior: none; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
-  @media (pointer: coarse) { input, select, textarea { font-size: 16px; } }
-  #unzoom { position: fixed; z-index: 99; left: 50%; top: 10px; transform: translateX(-50%); display: none; padding: 8px 14px;
-            border-radius: 18px; border: 1px solid var(--line); background: var(--ctl); color: var(--fg-strong); font: 600 15px system-ui; }
-  html, body { margin: 0; height: 100%; background: var(--scene-bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
-  #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
-         background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
-         /* a wrapping bar must not eat the viewport: past a third of the screen it scrolls, so the
-            canvas below it (var(--vh100, 100vh) - --bar-h) always keeps at least two thirds */
-         max-height: calc(var(--vh100, 100vh) * 0.34); overflow-y: auto; box-sizing: border-box; }
-  #bar select, #bar button, #bar input[type=text] { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; font: inherit; }
-  #bar button:hover { background: var(--ctl-hover); }
-  #bar label { display: inline-flex; gap: 6px; align-items: center; }
-  #bar input[type=range] { width: 90px; }
-  #bar .tool.active { background: #3b5a8a; border-color: #6a9be0; }
-  #bar .tool, #hint { align-items: center; }
-  /* The status / instruction line never takes layout space (a long one used to wrap the bar and shift the canvas): it
-     floats over the bottom of the scene, see-through and click-through.  (On the fountain the page also draws it into
-     the scene, on the plate under the grains.) */
-  #status { position: fixed; left: 12px; right: 12px; bottom: 10px; z-index: 2; pointer-events: none; margin: 0;
-            opacity: 0.55; font-size: 12px; line-height: 1.35; max-height: 4.2em; overflow: hidden;
-            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7); }
-  #gamectl { display: contents; }
-  #gamectl .gctl-file { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
-  #gamectl button:disabled { opacity: .4; }
-  #gamectl .gctl-group { position: relative; display: inline-block; }
-  #gamectl .gctl-group > summary { cursor: pointer; background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; list-style: none; }
-  #gamectl .gctl-body { position: absolute; z-index: 30; top: 100%; left: 0; width: min(24rem, 92vw); max-height: 70vh; overflow: auto; display: grid; gap: 4px; padding: 8px; background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; }
-  #gamectl .gctl-body label { display: grid; grid-template-columns: 9rem 1fr 3rem; align-items: center; gap: 6px; }
-  #gamectl .gctl-body select { grid-column: 2 / 4; }
-  #gamectl .gctl-val { font-variant-numeric: tabular-nums; opacity: .7; }
-  #gamectl .saved-particle-note:not(:empty) { color: #ffbd80; font-size: 12px; max-width: 18rem; }
-  #gamectl button.on { outline: 2px solid currentColor; }
-  #scene-settings { position: relative; }
-  #scene-settings > summary { cursor: pointer; background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; }
-  #scene-settings-body { position: absolute; z-index: 35; top: 100%; left: 0; width: min(32rem, 92vw); max-height: 65vh; overflow: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px; background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; }
-  body.play-link #scene-settings, body.play-link #marble-designer, body.play-link #marble-studio-link, body.play-link #studio-link, body.play-link #log-link,
-  body.play-link #share-view-button, body.play-link #share-live-button,
-  body.play-link #tickets-link, body.play-link #report-ticket, body.play-link #settings-reset, body.play-link #compact-capture,
-  body.play-link #bar > label:has(#game), body.play-link #bar > label:has(#arcade), body.play-link #bar > label:has(#plate), body.play-link #bar > label:has(#projection) { display: none !important; }
-  body.play-link[data-game="fountain"] #gamectl > .gctl-group,
-  body.play-link[data-game="fountain3d"] #gamectl > .gctl-group,
-  body.play-link[data-game="marble_madness"] #gamectl > .gctl-group,
-  body.play-link[data-game="fountain"] #gamectl > [data-ctl]:not([data-play-control]),
-  body.play-link[data-game="fountain3d"] #gamectl > [data-ctl]:not([data-play-control]),
-  body.play-link[data-game="marble_madness"] #gamectl > [data-ctl]:not([data-play-control]) { display: none !important; }
-  body.play-link[data-game="fountain"] #status, body.play-link[data-game="fountain3d"] #status,
-  body.play-link[data-game="marble_madness"] #status { display: none !important; }
-  /* The canvas starts below the control bar (which wraps to several lines on a
-     phone) so the bar never covers the board; --bar-h is kept live below. */
-  canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw);
-           height: calc(var(--vh100, 100vh) - var(--bar-h, 0px)); touch-action: none; }
-  #marble-pad { box-sizing: border-box; max-width: min(96vw, 320px); max-height: calc(var(--vh100, 100vh) - var(--bar-h, 0px) - 20px);
-                overflow: auto; flex-wrap: wrap; justify-content: center; border: 2px solid #f3cc7b;
-                background: rgba(12, 19, 31, .96) !important; box-shadow: 0 6px 28px #000b; }
-  #marble-pad input[type=range] { accent-color: #f3cc7b; height: 24px; }
-  #marble-pad label { white-space: nowrap; }
-  #marble-sticks { display:flex; gap:12px; justify-content:center; width:100%; }
-  .marble-stick-wrap { display:grid; justify-items:center; gap:4px; font-size:12px; }
-  .marble-stick { position:relative; width:104px; height:104px; border-radius:50%; border:2px solid #9eb8d1; background:#19283b; touch-action:none; cursor:grab; }
-  .marble-stick:focus-visible { outline:3px solid #f3cc7b; outline-offset:3px; }
-  .marble-stick::before, .marble-stick::after { content:""; position:absolute; background:#6885a3; pointer-events:none; }
-  .marble-stick::before { width:1px; height:80%; left:50%; top:10%; }
-  .marble-stick::after { height:1px; width:80%; top:50%; left:10%; }
-  .marble-stick .nub { position:absolute; left:50%; top:50%; width:30px; height:30px; margin:-15px; border-radius:50%; background:#f3cc7b; box-shadow:0 2px 8px #0008; pointer-events:none; }
-  .marble-stick-wrap output { max-width:120px; min-height:2.4em; text-align:center; color:#c5d7e9; }
-  /* Wordle's entry is drawn in the scene (the entry bar); this input is only its keyboard: visually hidden, off-screen, still focusable
-     (16px font so a phone does not zoom on focus) */
-  #word { position: fixed; left: 0; top: 0; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; display: none; }
-  #word input { font: 16px/1 monospace; width: 1px; height: 1px; border: 0; padding: 0; margin: 0; text-transform: uppercase; }
-  body[data-game="wordle"] #status { text-align: center; }
-  #help { display: none; }   /* instructions remain in HTML source, outside the visible layout */
-  /* Scoped under #bar so they outrank "#bar label { display: inline-flex }". */
-  .meowdoku-only, .wordle-only, .lichess-only, #bar .meowdoku-only, #bar .lichess-only { display: none; }
-  body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
-  /* A light, readable frame around the lit Meowdoku board. Other games keep
-     their own dark controls and atmosphere. */
-  body[data-game="meowdoku"] { color-scheme: light; background: #e3f0ef; color: #183047; }
-  body[data-game="meowdoku"] #bar { background: rgba(247,251,248,.96); border-bottom: 2px solid #9bcac7;
-                                    box-shadow: 0 3px 14px rgba(25,67,73,.12); }
-  body[data-game="meowdoku"] #bar select, body[data-game="meowdoku"] #bar button,
-  body[data-game="meowdoku"] #bar input[type=text], body[data-game="meowdoku"] #gamectl .gctl-file {
-    background: #fff; color: #183047; border: 1px solid #668e97; font-weight: 600; }
-  body[data-game="meowdoku"] #bar button:hover { background: #e5f5ef; }
-  body[data-game="meowdoku"] #bar .tool.active { background: #186d73; color: #fff; border-color: #104e56; }
-  body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #b14a78; outline-offset: 2px; }
-  body[data-game="meowdoku"] #status { opacity: 1; font-weight: 650; }
-  body[data-game="meowdoku"] #splash { color: #183047; background: rgba(255,255,255,.95); border-color: #668e97; }
-  body[data-game="meowdoku"] #splash.win #splash-title { color: #11635b; }
-  body[data-game="meowdoku"] #splash.loss #splash-title { color: #a33f57; }
-  body[data-game="meowdoku"].immersive #hud { opacity: 1; color: #183047; text-shadow: 0 1px 2px #fff; }
-  body[data-game="meowdoku"].immersive #fs-exit { background: rgba(255,255,255,.92); color: #183047; border-color: #668e97; }
-  body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
-  .arena-only, #bar .arena-only { display: none; }
-  .pilot-only, #bar .pilot-only { display: none; }
-  /* The learning panel: shown while demo learning is on. */
-  #learn-panel { position: fixed; right: 12px; top: 64px; z-index: 3; display: none; pointer-events: none;
-                 padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--line);
-                 font: 12px/1.35 ui-monospace, Consolas, monospace; color: var(--fg); transition: box-shadow .3s; }
-  #learn-panel.show { display: block; }
-  #learn-panel.flash { box-shadow: 0 0 0 2px #7cf7a6, 0 0 22px #7cf7a6; }
-  #learn-badge { font-weight: 700; letter-spacing: .08em; color: #7cf7a6; margin-bottom: 4px; }
-  #learn-badge .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #7cf7a6;
-                      animation: learnpulse 1.1s ease-in-out infinite; }
-  #learn-panel.training #learn-badge { color: #ffd76a; } #learn-panel.training #learn-badge .dot { background: #ffd76a; animation-duration: .45s; }
-  @keyframes learnpulse { 0%, 100% { opacity: .25; transform: scale(.8); } 50% { opacity: 1; transform: scale(1.15); } }
-  #learn-text { margin-top: 4px; max-width: 220px; opacity: .85; }
-  .depth-only, #bar .depth-only { display: none; }
-  body[data-game="bullet_hell"] #bar .depth-only { display: inline-flex; }
-  .cockpit-game, #bar .cockpit-game { display: none; }
-  body[data-game="bullet_hell"] #bar .cockpit-game, body[data-game="space_invaders"] #bar .cockpit-game { display: inline-flex; }
-  body[data-game="space_invaders"] #bar .pilot-only, body[data-game="bullet_hell"] #bar .pilot-only { display: inline-flex; }
-  .chessmove-only, #bar .chessmove-only, #position { display: none; }
-  body[data-game="chess"] #bar .chessmove-only, body[data-game="chess_vs_net"] #bar .chessmove-only { display: inline-flex; }
-  body[data-game="chess"] #position, body[data-game="chess_vs_net"] #position,
-  body[data-game="chess_arena"] #position, body[data-game="lichess"] #position { display: block; }
-  /* The position as text: readable without the 3D board. */
-  #position { position: fixed; left: 12px; bottom: 12px; z-index: 3; margin: 0; padding: 8px 10px; max-width: 46ch;
-              font: 13px/1.35 ui-monospace, Consolas, monospace; white-space: pre-wrap; background: color-mix(in srgb, var(--panel) 82%, transparent);
-              border: 1px solid var(--line); border-radius: 8px; color: var(--fg); }
-  body[data-game="chess_arena"] #bar .arena-only { display: inline-flex; }
-  body[data-game="wordle"] #word { display: block; }
-  #player { width: 9em; }
-  /* The result splash: centred over the board, never takes a tap. */
-  #splash { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0.9); z-index: 4; display: none;
-            text-align: center; pointer-events: none; padding: 18px 28px; border-radius: 14px;
-            background: color-mix(in srgb, var(--panel) 78%, transparent); border: 1px solid var(--line); opacity: 0; transition: opacity .25s, transform .25s; }
-  #splash.show { display: block; opacity: 1; transform: translate(-50%, -50%) scale(1); }
-  #splash-title { font-size: 34px; font-weight: 700; letter-spacing: 0.02em; }
-  #splash.win #splash-title { color: #ffd76a; } #splash.loss #splash-title { color: #ff8a7a; }
-  #splash-detail { margin-top: 6px; opacity: 0.8; font-size: 14px; }
-  /* Fullscreen: the canvas takes the whole screen; a status line and an exit
-     button float over it. */
-  #hud, #fs-exit { display: none; position: fixed; z-index: 3; }
-  body.immersive #bar, body.immersive #scores { display: none; }
-  body.immersive canvas { top: 0; height: var(--vh100, 100vh); }
-  body.immersive #hud { display: block; left: 10px; top: 8px; right: 64px; font-size: 13px; opacity: 0.8; pointer-events: none;
-                        text-shadow: 0 1px 2px #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  body.immersive #fs-exit { display: block; right: 10px; top: 6px; background: color-mix(in srgb, var(--ctl) 75%, transparent); color: #e8e8ea;
-                            border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; }
-  #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(var(--vw100, 100vw) - 20px));
-            max-height: calc(var(--vh100, 100vh) * 0.7); overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
-  #scores.open { display: block; }
-  #shop { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(var(--vw100, 100vw) - 20px));
-          max-height: calc(var(--vh100, 100vh) * 0.7); overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
-  #shop.open { display: block; }
-  #shop h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
-  #shop .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 4px 0; }
-  #shop .muted { opacity: 0.6; font-size: 12px; }
-  body.immersive #shop { display: none; }
-  #scores h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
-  #scores table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  #scores td { padding: 2px 4px; } #scores td.n { text-align: right; font-variant-numeric: tabular-nums; }
-  #scores tr.me { color: #ffd76a; }
-  #scores .muted { opacity: 0.6; font-size: 12px; }
-  /* NIGHT MODE for the light Meowdoku frame: the same rules as its day look, on the dark palette. */
-  :root[data-night="1"] body[data-game="meowdoku"] { color-scheme: dark; background: var(--scene-bg); color: var(--fg); }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar { background: color-mix(in srgb, var(--panel) 94%, transparent);
-                                    border-bottom: 2px solid var(--line); box-shadow: 0 3px 14px rgba(0,0,0,.4); }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar select, :root[data-night="1"] body[data-game="meowdoku"] #bar button,
-  :root[data-night="1"] body[data-game="meowdoku"] #bar input[type=text], :root[data-night="1"] body[data-game="meowdoku"] #gamectl .gctl-file {
-    background: var(--ctl); color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar button:hover { background: var(--ctl-hover); }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar .tool.active { background: #2f7f86; color: #fff; border-color: #7fd0d6; }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #ffd76a; outline-offset: 2px; }
-  :root[data-night="1"] body[data-game="meowdoku"] #splash { color: var(--fg); background: color-mix(in srgb, var(--panel) 92%, transparent); border-color: var(--line); }
-  :root[data-night="1"] body[data-game="meowdoku"] #splash.win #splash-title { color: #ffd76a; }
-  :root[data-night="1"] body[data-game="meowdoku"] #splash.loss #splash-title { color: #ff8a7a; }
-  :root[data-night="1"] body[data-game="meowdoku"].immersive #hud { color: var(--fg); text-shadow: 0 1px 2px #000; }
-  :root[data-night="1"] body[data-game="meowdoku"].immersive #fs-exit { background: color-mix(in srgb, var(--ctl) 85%, transparent); color: var(--fg); border-color: var(--line); }
-  /* night: dim helper text is raised for contrast */
-  :root[data-night="1"] #status { opacity: 1; }
-  :root[data-night="1"] #scores .muted, :root[data-night="1"] #shop .muted { opacity: .85; }
+  :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
+  body { margin: 0; background: #121822; color: #edf2fb; }
+  main { max-width: 56rem; margin: auto; padding: 2rem 1rem 5rem; }
+  a { color: #a9cfff; }
+  .row { display: flex; gap: .7rem; align-items: center; flex-wrap: wrap; }
+  .card { border: 1px solid #34455c; border-radius: 12px; padding: 1rem; margin: 1rem 0; background: #1a2534; }
+  .card h2 { margin: .1rem 0 .4rem; }
+  .muted { color: #becbe0; }
+  button, input, select, textarea { font: inherit; color: inherit; background: #101a29; border: 1px solid #506582; border-radius: 6px; padding: .45rem; }
+  button { cursor: pointer; }
+  input[type=text], textarea { box-sizing: border-box; width: 100%; }
+  textarea { min-height: 5rem; }
+  form { display: grid; gap: .8rem; }
+  [hidden] { display: none !important; }
 </style>
 </head>
-<body data-game="meowdoku">
-<div id="bar">
-  <label>Game <select id="game"></select></label>
-  <label class="meowdoku-only">Level <select id="level"></select></label>
-  <label class="meowdoku-only">Board <select id="board"></select></label>
-  <button id="new">New</button>
-  <a id="marble-studio-link" href="marble_studio.html?v=lod-20261107" target="_blank" rel="noopener" style="color:var(--fg);background:var(--ctl);border:1px solid var(--line);border-radius:6px;padding:4px 10px;text-decoration:none" title="Design a close-up layered glass cat's-eye marble">Marble studio</a>
-  <a id="studio-link" href="studio.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="the loading studio: record, view and pick loading animations">Studio</a>  <a id="log-link" href="log.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="the server log, drawn as glyphs">Log</a>
-  <button id="report-ticket" type="button" title="Send the current game state and recent browser log to the server">Report issue</button>
-  <a id="tickets-link" href="issues.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="Review your account’s issue tickets">Tickets</a>
-
-  <button id="undo">Undo (U)</button>
-  <button id="reset">Reset (R)</button>
-  <button id="settings-reset" type="button" title="Clear saved site settings and reload with defaults; keep player identity and diagnostic log">Reset settings</button>
-  <label class="chessmove-only" for="move-input">Move</label>
-  <input id="move-input" class="chessmove-only" type="text" placeholder="e2e4" autocomplete="off" spellcheck="false" size="7" aria-label="Chess move in UCI, like e2e4">
-  <button id="move-submit" class="chessmove-only">Submit move</button>
-  <span id="move-result" class="chessmove-only" role="status" aria-live="polite"></span>
-  <button id="rise" class="depth-only" title="Climb (hold; E or PageUp)">Rise</button>
-  <button id="dive" class="depth-only" title="Dive (hold; Q or PageDown)">Dive</button>
-  <button id="bomb" class="depth-only" title="Alternate fire: drop a bomb (B or X); press again to burst a hanging parachute bomb">Bomb</button>
-  <button id="bomb-style" class="depth-only" title="Bomb style (C)">Style: dumb bomb</button>
-  <button id="camera-mode" class="cockpit-game" title="First person out of the rocket's nose, or the board view (N)">Camera: board (N)</button>
-  <button id="demo-learn" class="pilot-only" title="Let the demo player train on its own better runs (each finished demo game that beats its running average)">Start demo learning</button>
-  <span id="learn-status" class="pilot-only" role="status" aria-live="polite"></span>
-  <button id="arena-save" class="arena-only" title="Write the network's weights to disk now">Save network</button>
-  <button id="arena-stop" class="arena-only" title="Stop self-play training (saves first)">Stop training</button>
-  <button id="lichess-stop" class="lichess-only">Stop Lichess after game</button>
-  <button id="lichess-resume" class="lichess-only">Resume Lichess</button>
-  <span class="meowdoku-only" style="gap:4px" role="group" aria-label="Tool">
-    <button id="tool-cat" class="tool" title="Tap places a cat">Cats</button>
-    <button id="tool-mouse" class="tool active" title="Tap marks an X: a note that no cat goes here">X marks</button>
-  </span>
-  <label class="meowdoku-only">Palette <select id="palette"></select></label>
-  <details id="scene-settings"><summary>Scene</summary><div id="scene-settings-body">
-  <button id="light">Light: sun (L)</button>
-  <label title="The page's background and night mode follow the sun at your local time; auto, or force day or night">Sky <select id="sky-mode"><option value="auto">auto</option><option value="day">day</option><option value="night">night</option></select></label>
-  <label title="Where the sun is: the place sets the sun's path and its colour through the air (Rayleigh and Mie); a fixed clock is that place's local time">Place <select id="sky-place"><option value="here">here</option><option value="honolulu">Honolulu</option><option value="los_angeles">Los Angeles</option><option value="chicago">Chicago</option><option value="new_york">New York</option><option value="reykjavik">Reykjavik</option><option value="london">London</option><option value="cairo">Cairo</option><option value="mumbai">Mumbai</option><option value="beijing">Beijing</option><option value="tokyo">Tokyo</option><option value="sydney">Sydney</option><option value="ushuaia">Ushuaia</option></select></label>
-  <label title="Empty = live (the real time); a time = that time of day at the place, held">Clock <input id="sky-clock" type="time"></label>
-  <label title="Light the game with a visible bulb when the sun sets"><input id="auto-lamp" type="checkbox" checked> Auto lamp</label>
-  <label title="Color of the night bulb and the light it casts">Bulb <select id="lamp-color"><option value="warm">warm</option><option value="amber">amber</option><option value="neutral">neutral</option><option value="cool">cool</option></select></label>
-  <button id="sky-locate" title="Optional: use your location for the sun's place (otherwise a rough latitude from your timezone). Nothing asks until you press this.">Locate</button>
-  <button id="flat">Flat (V)</button>
-  <label title="Soft bodies: pieces shear, squash and twist as they move"><input id="wobble" type="checkbox"> Wobble</label>
-  <label title="Spring stiffness of the soft bodies; lower is also less damped, so soft pieces jiggle longer">Stiff <input id="wobble-k" type="range" min="0.5" max="16" step="0.25" value="8"></label>
-  <label id="wobble-gpu-label" style="display:none"><input id="wobble-gpu" type="checkbox"> WebGPU</label>
-  <label>Tilt <input id="tilt" type="range" min="15" max="90" value="84"></label>
-  <!-- [SPEED+ZOOM] shown for the real-time scrolling games that take the controls -->
-  <label id="speed-label" style="display:none" title="Game clock speed: how much play a second of your time runs (the law and its step are the same at any speed). Logarithmic, 0.05x to 2x; remembered per game.">Speed <input id="speed" type="range" min="0" max="1000" value="0"> <span id="speed-read"></span></label>
-  <label id="zoom-label" style="display:none" title="World zoom: below 1x packs more of the world into the same screen (pinch or the wheel also zoom). Limited by how much world the game supplies.">Zoom <input id="zoom" type="range" min="0" max="1000" value="0"> <span id="zoom-read"></span></label>
-  <label title="A gentle hyperbolic lens over a planet game: the centre bulges, the rim recedes">Curve <input id="curve" type="range" min="0" max="100" value="30"></label>
-  <label>Saturation <input id="saturation" type="range" min="0" max="200" value="200"></label>
-  <label>Round <input id="round" type="range" min="0" max="4" value="0"></label>
-  <label>Crease <input id="crease" type="range" min="0" max="90" value="0"></label>
-  </div></details>
-  <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
-  <button id="scores-toggle">Scores</button>
-  <button id="shop-toggle" title="Points you have earned, and what they buy">Shop</button>
-  <details id="marble-designer" style="position:relative"><summary>Marble designer</summary>
-    <div style="position:absolute;z-index:30;right:0;top:100%;min-width:220px;padding:10px;background:#202632;color:#fff;border:1px solid #768397;border-radius:8px;box-shadow:0 8px 22px #0008">
-      <label><input id="marble-preview" type="checkbox"> Show lit preview</label><br>
-      <label>Dyed eye <select id="marble-eye"><option value="blue">Blue</option><option value="green">Green</option><option value="amber">Amber</option></select></label><br>
-      <label>Width <input id="marble-width" type="range" min="8" max="42" value="28"></label><br>
-      <label>Curve <input id="marble-curve" type="range" min="-28" max="28" value="18"></label><br>
-      <label>Facets <select id="marble-facets"><option value="24">Fine</option><option value="40">Very fine</option><option value="12">Coarse</option></select></label><br>
-      <small>Dyed, triangulated inclusion inside a separate glass shell. Preview uses the scene lights and material database.</small>
-    </div>
-  </details>
-  <label title="The pinball ring of coloured lights around the board: off removes the bulbs and their light from the scene and brings the house light back up">Arcade lights <input id="arcade" type="checkbox"></label>
-  <label title="The slab and glass plate under the board; off removes them from the scene (a game may also leave them out)">Plate <input id="plate" type="checkbox"></label>
-  <label title="A glass screen above the field showing the wide-angle broadcast; tilt to see the real game beneath it">Projection glass <input id="projection" type="checkbox"></label>
-  <label title="After a win or a loss, show the result, then start again">Auto restart <input id="autorestart" type="checkbox" checked></label>
-  <span id="modes"></span>
-  <span id="gamectl"></span>
-  <span id="compact-capture" style="display:none;align-items:center;gap:5px"><button id="capture-candidate">Record compact animation</button><button id="submit-candidate" disabled>Stop and submit</button><button id="report-ticket-toy" type="button">Report issue</button><small id="capture-candidate-status" aria-live="polite"></small></span>
-  <span id="hotbars"></span>
-  <span id="wordle-opts"></span>
-  <label title="Two on-screen thumbsticks: left turns and throttles (double tap: bomb), right climbs and fires while held">Thumbpads <input id="pads" type="checkbox"></label>
-  <button id="fullscreen">Fullscreen (F)</button>
-  <span id="status">loading…</span>
-</div>
-<div id="scores"></div>
-<div id="shop"></div>
-<div id="hud"></div>
-<div id="learn-panel" aria-live="polite">
-  <div id="learn-badge"><span class="dot"></span> LEARNING</div>
-  <svg id="learn-chart" viewBox="0 0 220 64" width="220" height="64" role="img" aria-label="Recent demo runs and training loss"></svg>
-  <div id="learn-text"></div>
-</div>
-<pre id="position" aria-label="Chess position as text" aria-live="polite"></pre>
-<div id="splash"><div id="splash-title"></div><div id="splash-detail"></div></div>
-<button id="fs-exit" title="Leave fullscreen (F or Esc)">✕</button>
-<canvas id="gl"></canvas>
-<div id="marble-pad" style="display:none;position:fixed;right:14px;bottom:18px;z-index:25;gap:10px;align-items:center;background:#111a;padding:8px;border-radius:12px;color:white;touch-action:none">
-  <label><input id="marble-phone-tilt" type="checkbox"> Phone tilt</label>
-  <label title="Allow touch camera gestures to pitch the view; marble gravity is controlled separately"><input id="marble-camera-tilt" type="checkbox" checked> Camera tilt</label>
-  <label title="Keep the camera close to the simulated marble"><input id="marble-follow" type="checkbox" checked> Follow marble</label>
-  <label title="Rotate the course with its tilt"><input id="marble-watch-case" type="checkbox"> Watch case move</label>
-  <label title="Use the existing glowing glass backdrop behind the course"><input id="marble-backlit" type="checkbox"> Backlit plate</label>
-  <label title="A lamp mounted above the course and aimed at the marble"><input id="marble-spot" type="checkbox" checked> Follow spot</label>
-  <label>Marble light <select id="marble-light-mode"><option value="lit">Lit</option><option value="glow">Glow only</option><option value="both">Lit + glow</option></select></label>
-  <label>Glow color <input id="marble-glow-color" type="color" value="#8bcaff"></label>
-  <label>Glow strength <input id="marble-glow-strength" type="range" min="0" max="8" step="0.1" value="2"></label>
-  <div id="marble-sticks"><div class="marble-stick-wrap">Tilt X/Y<div class="marble-stick" id="marble-tilt-stick" role="group" tabindex="0" aria-label="Tilt course in two axes; hold and drag"><span class="nub"></span></div><output id="marble-tilt-readout">neutral</output></div><div class="marble-stick-wrap">Nudge direction/strength<div class="marble-stick" id="marble-nudge-stick" role="group" tabindex="0" aria-label="Drag to choose nudge direction and strength, then release"><span class="nub"></span></div><output id="marble-nudge-readout">ready</output></div></div>
-</div>
-<div id="word">
-  <input id="entry" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="word" tabindex="-1">
-</div>
-<div id="help" hidden aria-hidden="true">meowdoku: pick Cats or X marks, then tap; swipe paints X marks, double-tap is always a cat; tap the cat, mouse or bulb under the board to use a power-up · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack · space_invaders: arrows or A/D move, space fires; on a phone hold a finger where the rocket should go · bullet_hell: arrows or WASD fly, space fires; on a phone hold a finger below the ship · tilequest: arrows or WASD walk, space swings the sword; villagers commute, towers shoot monsters · boardwalk: turn race round a forking track; on your turn left/right picks the fork, up runs, down rests, space rolls and goes · worldwalk: you are a wizard on foot, not a rocket: tap the globe to walk there along the cheapest path (roads are fastest, water a slow swim), or A/D turn and W/S walk (let go and you stop; any key cancels the walk), space swings the sword; the bar's tap menu turns a tap into a house, wall, tower or market placed beside a road, Build here places one near you; settlers commute along the roads, builders found lights, towers shoot raiders · purrline: match three; tap a tile then a neighbour (or drag it) to swap; 4 in a row makes a pounce (row + column), an L or T a hairball (3x3), 5 a catnip (swap it with any tile to clear that kind); cascades multiply the score · delve: a map of rooms; A/D or arrows run, Space (or W/Up) jumps (hold for height), W/S climb ladders, walk off the edge of a room through a door or down a ladder shaft to the next one, M shows the map; the double-jump orb opens the high ledges · worldwalk: A/D turn, W/S throttle (as bullet_hell), space swings the sword; settlers commute along the roads, builders found lights, towers shoot raiders</div>
-<script>
-  // Keep the canvas below the control bar as the bar wraps or unwraps.
-  (() => { const bar = document.getElementById("bar");
-    const fit = () => document.documentElement.style.setProperty("--bar-h", bar.offsetHeight + "px");
-    // border-box, so the clamp (max-height) is seen; and again after a window resize has settled
-    new ResizeObserver(fit).observe(bar, { box: "border-box" }); fit();
-    addEventListener("resize", () => { fit(); requestAnimationFrame(fit); }); })();
-</script>
-<script>
-  // CLIENT ERRORS to the server log (a phone has no console to read): uncaught errors and rejections, at most 20 per page load
-  (() => {
-    let sent = 0;
-    const send = (kind, msg, where, stack) => {
-      if (sent++ >= 20) return;
-      const body = JSON.stringify({ kind, msg: String(msg || ""), where: String(where || ""), stack: String(stack || "").slice(0, 1500), ua: navigator.userAgent });
-      try { navigator.sendBeacon ? navigator.sendBeacon("/api/clientlog", new Blob([body], { type: "application/json" }))
-                                 : fetch("/api/clientlog", { method: "POST", body, keepalive: true }); } catch (_) { /* never let reporting throw */ }
-    };
-    addEventListener("error", (e) => send("error", e.message, `${e.filename}:${e.lineno}:${e.colno}`, e.error && e.error.stack), true);
-    addEventListener("unhandledrejection", (e) => { const r = e.reason || {}; send("rejection", r.message || r, "", r.stack); });
-  })();
-</script>
-<button id="unzoom" type="button">Reset zoom</button>
-<script>
-  // THE PAGE DOES NOT ZOOM.  The viewport meta stops it on Android; iOS Safari ignores user-scalable for pinch, so its gesture
-  // events and any multi-finger touchmove outside the canvas are cancelled here (the canvas handles its own pinch: touch-action
-  // none).  If the page is zoomed anyway (an older browser, an accessibility zoom), a "Reset zoom" pill appears: tapping it
-  // re-applies the viewport meta, which snaps the page back to scale 1 in Safari and Chrome.
-  (() => {
-    const stop = (e) => { e.preventDefault(); };
-    for (const type of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(type, stop, { passive: false });
-    document.addEventListener("touchmove", (e) => { if (e.touches.length > 1 || (e.scale !== undefined && e.scale !== 1)) e.preventDefault(); }, { passive: false });
-    const meta = document.getElementById("viewport-meta"), pill = document.getElementById("unzoom"), base = meta.content;
-    const vv = window.visualViewport;
-    const check = () => { pill.style.display = vv && vv.scale > 1.02 ? "block" : "none"; };
-    pill.addEventListener("click", () => {
-      meta.content = base + ", minimum-scale=1";
-      requestAnimationFrame(() => { meta.content = base; window.scrollTo(0, 0); setTimeout(check, 300); });
-    });
-    if (vv) { vv.addEventListener("resize", check); vv.addEventListener("scroll", check); }
-    check();
-  })();
-</script>
-<dialog id="ticket-dialog" style="background:#141923;color:#e4eaf4;border:1px solid #56647a;border-radius:10px;max-width:min(90vw,520px);box-shadow:0 15px 60px #0009">
-  <form id="ticket-form"><h2>Report issue</h2><p>The current game state, particle sample, and recent browser log will be attached to your account’s issue ticket, visible to you and site administrators. Sign in before submitting.</p>
-    <textarea id="ticket-note" rows="4" maxlength="3000" placeholder="What happened?" style="box-sizing:border-box;width:100%;background:#0c0e13;color:inherit;border:1px solid #56647a;border-radius:6px;padding:8px;font:inherit"></textarea>
-    <p id="ticket-result" role="status"></p><button id="ticket-send" type="submit">Send ticket</button> <button id="ticket-cancel" type="button">Close</button></form>
-</dialog>
-<script type="module" src="loading_panel.js"></script>   <!-- [LOADING] first: its fetch wrapper counts the page's downloads -->
-<script type="module" src="lifecycle.js"></script>
-<script type="module" src="local_log.js"></script>
-<script type="module" src="settings_reset.js"></script>
-<script type="module" src="app.js"></script>
+<body>
+<main>
+  <h1>Pages</h1>
+  <p class="muted">Pages people have chosen to publish. Open an author to see their pages.</p>
+  <nav class="row" aria-label="Pages"><a href="/">Feed</a><a id="games-link" href="/games.html" hidden>Games</a><a id="files-link" href="/files.html" hidden>My files</a></nav>
+  <p id="notice" role="status"></p>
+  <section id="author-heading" hidden><h2 id="author-title"></h2><p><a href="/">All authors</a></p></section>
+  <section id="feed" aria-label="Published pages"></section>
+  <section id="publish" class="card" hidden>
+    <h2>Publish a page</h2>
+    <p class="muted">Choose a UTF-8 HTML or text file. A private encrypted file must first be decrypted on your device. Publishing sends a separate readable copy. New pages begin in dev.</p>
+    <form id="publish-form">
+      <label>Title <input id="page-title" type="text" maxlength="120" required></label>
+      <label>Description <textarea id="page-description" maxlength="500"></textarea></label>
+      <label>Page file <input id="page-file" type="file" accept=".html,.htm,.txt,text/html,text/plain" required></label>
+      <label><input id="public-copy" type="checkbox" required> I understand this creates a readable copy for publication.</label>
+      <button type="submit">Create dev page</button>
+    </form>
+    <h3>My pages</h3>
+    <div id="mine"></div>
+  </section>
+</main>
+<script type="module" src="/pages.js"></script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>
 </body>
 </html>
