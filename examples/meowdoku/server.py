@@ -90,6 +90,9 @@ from meowdoku import account_content
 from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
+from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
+from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
+from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
@@ -1131,6 +1134,152 @@ def make_handler(sessions: Sessions):
                                               accounts_db=sessions.accounts_db)
         # ---- end [MESSAGES]
 
+        def _user_files_route(self, path: str, method: str) -> None:
+            import base64
+            import binascii
+            import sqlite3
+            self._set_cookie = []
+            if not self._require("message"):
+                return
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            owner_id = self._principal().user_id
+            if owner_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            db = None
+            try:
+                db = user_files_mod.connect(sessions.accounts_db)
+                if method == "GET" and path == "/api/user-files":
+                    return self._json({"files": user_files_mod.list_owned(db, owner_id)})
+                if method == "GET" and path.startswith("/api/user-files/"):
+                    item, data = user_files_mod.readable(db, sessions.state.users_dir, owner_id,
+                                                         path[len("/api/user-files/"):])
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", "attachment; filename=encrypted-file.bin")
+                    self.send_header("X-Meowdoku-File-Meta", base64.urlsafe_b64encode(item["envelope"].encode()).decode().rstrip("="))
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "private, no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if method == "POST" and path == "/api/user-files":
+                    origin = self.headers.get("Origin")
+                    expected = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                    if origin != expected or self.headers.get("X-Meowdoku-Upload") != "1":
+                        return self._json({"error": "same-origin upload required"}, HTTPStatus.FORBIDDEN)
+                    if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                        return self._json({"error": "one Content-Length is required"}, HTTPStatus.LENGTH_REQUIRED)
+                    if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "application/octet-stream":
+                        return self._json({"error": "binary upload required"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    length = int(self.headers["Content-Length"])
+                    if not 17 <= length <= user_files_mod.MAX_BLOB_BYTES:
+                        return self._json({"error": "encrypted file must be at most 8 MiB"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    meta_header = self.headers.get("X-Meowdoku-File-Meta", "")
+                    if len(meta_header) > 4000:
+                        return self._json({"error": "encrypted file metadata too large"}, HTTPStatus.BAD_REQUEST)
+                    envelope = json.loads(base64.urlsafe_b64decode(meta_header + "=" * (-len(meta_header) % 4)))
+                    return self._json(user_files_mod.put(db, sessions.state.users_dir, owner_id,
+                                                          envelope, self.rfile.read(length)), HTTPStatus.CREATED)
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except user_files_mod.FileError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (ValueError, UnicodeError, binascii.Error):
+                return self._json({"error": "invalid upload request"}, HTTPStatus.BAD_REQUEST)
+            except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "file storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _file_keys_route(self, path: str, method: str) -> None:
+            from urllib.parse import parse_qs
+            import sqlite3
+            self._set_cookie = []
+            if not self._require("message"):
+                return
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            me = self._principal().user_id
+            if me is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            db = None
+            try:
+                db = user_files_mod.connect(sessions.accounts_db)
+                if method == "GET" and path == "/api/file-keys/me":
+                    return self._json(user_files_mod.key_bundle(db, me))
+                if method == "GET" and path == "/api/file-keys/peer":
+                    username = (parse_qs(self.path.partition("?")[2]).get("username") or [""])[0]
+                    peer = user_files_mod.peer_key(db, me, username)
+                    return self._json({"username": peer["username"], "public_spki": peer["public_spki"],
+                                       "fingerprint": peer["fingerprint"]})
+                if method == "POST" and path == "/api/file-keys/me":
+                    if self.headers.get("Origin") != "https://" + self.headers.get("Host", "") or self.headers.get("X-Meowdoku-Key") != "1":
+                        return self._json({"error": "same-origin key setup required"}, HTTPStatus.FORBIDDEN)
+                    if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                        return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    body = self._body_json(8192)
+                    if body is None:
+                        return
+                    return self._json(user_files_mod.register_key(db, me, body), HTTPStatus.CREATED)
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except user_files_mod.FileError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "file key storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _paper_credentials_route(self, method: str) -> None:
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            account_id = self._principal().user_id
+            if account_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            if method == "GET":
+                return self._json({"configured": alpaca_credentials_mod.configured(sessions.state.secrets_dir, account_id)})
+            origin = self.headers.get("Origin")
+            expected = "https://" + self.headers.get("Host", "")
+            if origin != expected or self.headers.get("X-Meowdoku-Secret") != "1":
+                return self._json({"error": "same-origin secret submission required"}, HTTPStatus.FORBIDDEN)
+            if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            body = self._body_json(2048)
+            if body is None:
+                return
+            if set(body) != {"key_id", "secret_key"}:
+                return self._json({"error": "provide paper key ID and secret"}, HTTPStatus.BAD_REQUEST)
+            try:
+                alpaca_credentials_mod.save_paper(sessions.state.secrets_dir, account_id,
+                                                   body["key_id"], body["secret_key"])
+                market_data_mod.invalidate(account_id)
+                return self._json({"configured": True})
+            except alpaca_credentials_mod.CredentialError as error:
+                return self._json({"error": str(error)}, error.status)
+            except OSError:
+                return self._json({"error": "credential storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+
+        def _markets_route(self, path: str) -> None:
+            from urllib.parse import parse_qs
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            account_id = self._principal().user_id
+            if account_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            stock = (parse_qs(self.path.partition("?")[2]).get("stock") or ["AAPL"])[0]
+            try:
+                action = market_data_mod.history if path.endswith("/history") else market_data_mod.now
+                return self._json(action(sessions.state.secrets_dir, account_id, stock))
+            except market_data_mod.MarketError as error:
+                return self._json({"error": str(error)}, error.status)
+            except alpaca_credentials_mod.CredentialError as error:
+                return self._json({"error": str(error)}, error.status)
+
         # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
         # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
         def _profile_route(self, path: str, method: str) -> None:
@@ -2076,6 +2225,14 @@ def make_handler(sessions: Sessions):
                 return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]
                 return self._messages_route(path, "GET")
+            if path == "/api/user-files" or path.startswith("/api/user-files/"):
+                return self._user_files_route(path, "GET")
+            if path in ("/api/file-keys/me", "/api/file-keys/peer"):
+                return self._file_keys_route(path, "GET")
+            if path == "/api/user-secrets/alpaca-paper":
+                return self._paper_credentials_route("GET")
+            if path in ("/api/markets/history", "/api/markets/now"):
+                return self._markets_route(path)
             if path.startswith("/api/profile/"):                  # [PROFILE]
                 return self._profile_route(path, "GET")
             if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
@@ -2564,6 +2721,12 @@ def make_handler(sessions: Sessions):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
+            if path0 == "/api/user-files":
+                return self._user_files_route(path0, "POST")
+            if path0 == "/api/file-keys/me":
+                return self._file_keys_route(path0, "POST")
+            if path0 == "/api/user-secrets/alpaca-paper":
+                return self._paper_credentials_route("POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]
                 return self._nodus_post(path0)
             if path0.startswith("/api/profile/"):              # [PROFILE]

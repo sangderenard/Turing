@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My files · Meowdoku</title>
+<style>
+  :root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
+  body { margin: 0; background: #171b24; color: #f0f3fa; }
+  main { max-width: 48rem; margin: auto; padding: 2rem 1rem 5rem; }
+  a { color: #9fc7ff; }
+  .card { background: #242b38; border: 1px solid #435066; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  button, select, input { font: inherit; color: inherit; background: #1b2230; border: 1px solid #62718b; border-radius: 6px; padding: .4rem; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+  li { margin: .8rem 0; }
+  small { color: #bec8db; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="/">← Meowdoku</a></p>
+  <h1>My files</h1>
+  <p id="identity">Checking your account…</p>
+  <section class="card" id="file-key-box">
+    <h2>Encrypted files</h2>
+    <p>Set up your file key on <a href="/keys.html">Keys</a>, then unlock it here with your recovery passphrase. The passphrase stays in this page's memory.</p>
+    <form id="unlock-form" class="row"><input id="unlock-passphrase" type="password" autocomplete="off" placeholder="File recovery passphrase" aria-label="File recovery passphrase" required><button type="submit">Unlock files</button></form>
+  </section>
+  <section class="card" id="upload-box" hidden>
+    <h2>Upload a private file</h2>
+    <p>Files are encrypted in your browser before upload. Sharing makes a recipient-specific encrypted copy for an accepted contact. Maximum 8 MiB per file, 64 MiB and 128 files per account.</p>
+    <form id="upload-form" class="row">
+      <input id="chosen-file" type="file" required aria-label="Choose a file">
+      <button id="upload-button" type="submit">Upload</button>
+    </form>
+  </section>
+  <section class="card" id="files-box" hidden>
+    <h2>Stored files</h2>
+    <ul id="files"></ul>
+  </section>
+  <p id="status" role="status"></p>
+</main>
+<script type="module" src="/files.js"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body>
+</html>
