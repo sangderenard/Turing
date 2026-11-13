@@ -31041,6 +31041,13 @@ def _remove_dead_metadata_nodes(
     if layout_scope is not None:
         layout_page = book.page(_LAYOUT)
         for aggregate_id in tuple(graph.G):
+            # Only a live aggregate (one with a consumer) consumes its
+            # members: a folded arm's layout must not keep that arm's dead
+            # values (the real YoungMan's ``network_configured`` arm,
+            # ``self.network_geometry["edge_pairs"].clone()``, otherwise
+            # reached a region with no class).
+            if graph.G.out_degree(aggregate_id) == 0:
+                continue
             layout = layout_page.latest((layout_scope, int(aggregate_id)))
             if isinstance(layout, _Layout):
                 layout_dependencies.update(
@@ -35110,12 +35117,13 @@ def _fold_callsite_structural_values(
             # AST signature, so iteration 1's If (graph 20) was paired with
             # iteration 0's record (16): the decision for iteration 1 was
             # posted under iteration 0's key and iteration 1 had none.  Rule:
-            # a control that has its own retained record IS that record; the
-            # signature correlation applies only to a control the records
-            # name under another id.
+            # a loop-body copy that has its own retained record IS that
+            # record; the signature correlation remains for authored controls.
             control_records = _source_control_records(graph.G)
             retained_control_id = int(control_id) if (
-                isinstance(
+                (graph.G.nodes.get(int(control_id), {}).get("attributes") or {})
+                .get("unrolled_from") is not None
+                and isinstance(
                     (control_records.get(int(control_id)) or {}).get("expression"),
                     ast.If,
                 )
