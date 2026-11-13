@@ -10187,6 +10187,12 @@ class CorrelationTable:
                 cell = Ref(FORMAL_ACTUAL_OCCURRENCE, row, column)
                 causes = tuple(parent for parent, _stage in book.edges_into(cell))
                 previous = Ref(FORMAL_ACTUAL_OCCURRENCE, row, old_column)
+                if isinstance(current, Unresolved):
+                    from .source_formal_occurrence_pruning import occurrence_retirement_sources
+                    if occurrence_retirement_sources(book, cell, module.functions) is None:
+                        found.append(Finding("formal-actual-retirement-disagreement", str(caller), int(formal),
+                                             "positional occurrence retirement lacks exact pruning/replacement proof"))
+                    continue
                 transition_key = (scope, block, index, position)
                 transitions = tuple(parent for parent in causes
                     if parent.page == LOOP_RESULT_USE_REBINDING and parent.row == transition_key)
@@ -22883,6 +22889,8 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                 and str(row[2]) in functions
                 and row[6] == caller_scope(functions[str(row[2])])
             )
+            from .source_formal_occurrence_pruning import live_occurrence_rows
+            source_rows = live_occurrence_rows(book, source_rows, functions)
             source_facts = tuple(
                 incoming_page.latest(row) for row in source_rows
             )

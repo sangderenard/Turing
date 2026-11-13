@@ -4724,6 +4724,10 @@ def _prune_unused_callee_formals_once(
             PRUNED_CALLEE_FORMAL as _PRUNED_CALLEE_FORMAL,
         )
 
+        from .source_formal_occurrence_pruning import capture_pruned_occurrences, retire_pruned_occurrences
+        occurrence_captures = capture_pruned_occurrences(
+            functions, callee, keep_indices, current_identity_book())
+
         # A formal no instruction references (or a superseded placeholder):
         # DERIVED from its own ``ssa_value`` cell in the callee.
         removed_ids = {
@@ -4815,6 +4819,7 @@ def _prune_unused_callee_formals_once(
                     )
             _refresh_frame_aliased_result(call, callee)
         callee.args = [callee.args[index] for index in keep_indices]
+        retire_pruned_occurrences(functions, occurrence_captures, current_identity_book())
         integral = dict(metadata.get("source_region_integral") or {})
         if integral.get("capture_value_ids") is not None:
             integral["capture_value_ids"] = tuple(

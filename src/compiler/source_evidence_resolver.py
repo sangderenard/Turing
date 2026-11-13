@@ -216,6 +216,11 @@ def _bound_formal_span_layout(book, subject, fact, seen):
                     copied.add(source)
     rows = tuple(row for row in page.scope_rows(subject.row[0])
                  if len(row) == 7 and int(row[1]) == int(subject.row[1]))
+    from .source_formal_occurrence_pruning import live_occurrence_rows
+    try:
+        rows = live_occurrence_rows(book, rows)
+    except ValueError:
+        return None
     if not rows:
         return None
     proof = []
