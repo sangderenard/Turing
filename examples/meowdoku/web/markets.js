@@ -66,14 +66,20 @@ function drawQualification(payload) {
     const meta = document.createElement("div"); meta.className = "metrics";
     const last = (run.progress || []).at(-1);
     const fields = [`${run.model} · ${run.worker}`, `phase ${run.phase}`,
-                    `${run.completed_epochs}/${run.planned_epochs} epochs`];
+                    run.planned_epochs ? `${run.completed_epochs}/${run.planned_epochs} epochs`
+                                       : `${run.completed_epochs} epochs · continuous`];
     if (last?.loss != null) fields.push(`loss ${Number(last.loss).toFixed(5)}`);
     if (last?.validation_mean != null) fields.push(`validation mean ${(Number(last.validation_mean) * 100).toFixed(2)}% of order cap`);
     if (run.result?.holdout_mean_return_on_order_cap != null)
       fields.push(`holdout mean ${(Number(run.result.holdout_mean_return_on_order_cap) * 100).toFixed(2)}% of order cap`);
     for (const value of fields) { const item = document.createElement("span"); item.textContent = value; meta.append(item); }
-    const bar = document.createElement("progress"); bar.max = Math.max(1, run.planned_epochs);
-    bar.value = Math.min(bar.max, run.completed_epochs);
+    const bar = document.createElement("progress");
+    if (run.planned_epochs) {
+      bar.max = run.planned_epochs;
+      bar.value = Math.min(bar.max, run.completed_epochs);
+    } else {
+      bar.removeAttribute("value");
+    }
     const checks = document.createElement("ol"); checks.className = "checks";
     for (const check of (run.progress || []).filter((item) => item.phase === "validation").slice(-8)) {
       const line = document.createElement("li");

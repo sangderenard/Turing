@@ -31,7 +31,9 @@
         "--fabric-udp-port",
         "48768",
         "--nodus-ui",
-        "nodus-messenger:47614"
+        "nodus-messenger:47614",
+        "--nodus-ui",
+        "nodus-training:47617"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -82,7 +84,9 @@
         "--fabric-udp-port",
         "48771",
         "--nodus-ui",
-        "nodus-messenger:47614"
+        "nodus-messenger:47614",
+        "--nodus-ui",
+        "nodus-training:47617"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -165,6 +169,62 @@
       },
       "env": {
         "CANVAS_TABLES_LIB": "C:/dev/Powershell/nodus/build-service/Release/canvas_tables.dll"
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "nodus-training",
+      "kind": "nodus",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-training",
+      "args": [
+        "--history-file", "C:/dev/Powershell/srv/state/content/paper_training/history.json",
+        "--output", "C:/dev/Powershell/srv/state/products/paper-training",
+        "--turing-root", "C:/dev/Powershell/turing",
+        "--native-nodus-root", "C:/dev/Powershell/srv/state/products/nodus-training-runtime",
+        "--publish-db", "C:/dev/Powershell/srv/state/sql/paper_arena.sqlite",
+        "--worker", "nodus-training",
+        "--autosave-seconds", "60",
+        "--validation-epochs", "1000"
+      ],
+      "leases": [],
+      "nodus": {
+        "tool": "C:/dev/Powershell/nodus/tools/train_aapl_continuous.py",
+        "canvas": "C:/dev/Powershell/srv/state/content/paper_training/training.canvas",
+        "create_canvas": true,
+        "rate": 60,
+        "console_port": 47616,
+        "dll": "C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release/nodus_headless.dll",
+        "path_prepend": ["C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release"]
+      },
+      "env": {
+        "NODUS_TENSOR_CORE": "C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release/nodus_tensor_core.dll"
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "nodus-training-ui-mirror",
+      "kind": "command",
+      "port": 47617,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-training-ui-mirror",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "C:/dev/Powershell/nodus/demo_canvas_tables.py",
+        "--mode", "server",
+        "--host", "127.0.0.1",
+        "--port", "47617",
+        "--attach-console", "127.0.0.1:47616",
+        "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-training.console.secret",
+        "--attach-wait", "240"
+      ],
+      "nodus": {"path_prepend": ["C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release"]},
+      "env": {
+        "CANVAS_TABLES_LIB": "C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release/canvas_tables.dll"
       },
       "python": "C:/dev/Powershell/srv/python/python.exe"
     },
