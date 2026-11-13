@@ -41,6 +41,10 @@ def snapshot(config_path, accounts_db, *, now=None, station=None):
     # Publishing must be intentional and limited to a dedicated authored source.
     if config.get('enabled') is not True or config.get('source') != 'file':
         return empty
+    try:
+        audio = station is not None and config['jukebox']['native']['hls']['enabled'] is True
+    except (KeyError, TypeError):
+        audio = False
     address, owner, peer = config.get('address'), config.get('owner_id'), config.get('peer')
     # Trusted in-process native source metadata, never taken from HTTP inputs.
     if station is not None:
@@ -48,7 +52,7 @@ def snapshot(config_path, accounts_db, *, now=None, station=None):
         config['title'] = station['title']
     if type(address) is not int or type(owner) is not int or not isinstance(peer, str) or not peer:
         raise ValueError('invalid Radio station configuration')
-    state = {**empty, 'title': str(config.get('title', 'Nodus Radio'))[:160], 'status': 'waiting'}
+    state = {**empty, 'title': str(config.get('title', 'Nodus Radio'))[:160], 'status': 'waiting', 'audio': audio}
     # Read-only view of the existing bounded relay table. Validate the real
     # owner's open address, then inspect only its newest retained record.
     uri = accounts_db.resolve().as_uri() + '?mode=ro'
