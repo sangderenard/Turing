@@ -717,6 +717,8 @@ def make_handler(sessions: Sessions):
             # grants no other shader-tier capability or access to other APIs.
             if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/") or path in ("/api/account/authority", "/api/account/authority/grant"):
                 return False
+            if path == "/api/foyer" or path.startswith("/api/foyer/"):
+                return False                                   # [FOYER] the public front face; its route bounds itself
             if method == "GET" and path in ("/reports.html", "/reports.js"):
                 return False
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
@@ -1759,6 +1761,17 @@ def make_handler(sessions: Sessions):
                 self, path, method, service=sessions.living_data_static,
                 CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
 
+        def _foyer(self, path, method):
+            """[FOYER] the one shared demo world (speaktome_api.routes.foyer_route over living_data_static.StaticWorlds).  The
+            visitor is the caller's job identity: its account, or its browser session when it has none."""
+            from meowdoku.living_data_cursor import CursorError
+            from meowdoku.living_data_query import QueryError
+            route = getattr(shared_rest, "foyer_route", None)
+            if route is None:
+                return self._json({"error": "the foyer needs a newer SpeakToMe checkout"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return route(self, path, method, service=sessions.living_data_static, CursorError=CursorError,
+                         QueryError=QueryError, visitor=self._job_identity()[0][0])
+
         def _living_data_cursor(self, path, method):
             from meowdoku.living_data_cursor import CursorError
             from meowdoku.living_data_query import QueryError, MAX_BODY
@@ -2586,6 +2599,8 @@ def make_handler(sessions: Sessions):
                 return self._log_get()
             if path.startswith("/api/living-data/dm/"):
                 return self._living_data_dm(path, "GET")
+            if path == "/api/foyer" or path.startswith("/api/foyer/"):  # [FOYER]
+                return self._foyer(path, "GET")
             if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path, "GET")
             if path.startswith("/api/show/pictures/"):
@@ -3128,6 +3143,8 @@ def make_handler(sessions: Sessions):
                     return
             if path0.startswith("/api/living-data/dm/"):
                 return self._living_data_dm(path0, "POST")
+            if path0 == "/api/foyer" or path0.startswith("/api/foyer/"):  # [FOYER]
+                return self._foyer(path0, "POST")
             if path0 == "/api/living-data/sessions" or path0.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path0, "POST")
             if path0 == "/api/living-data/query":
