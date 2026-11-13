@@ -3112,6 +3112,21 @@ def _emit_repository_call_module(
                                   source_unsigned=_unsigned_value(value),
                                   target_unsigned=target_unsigned)
 
+        def scalar_pointer_receipt(value):
+            # Native pointer VALUE, not an aggregate/address alias. The
+            # physical ledger, not ptr spelling alone, owns this distinction.
+            if _value_llvm_type(value) != "ptr" or tuple(value.shape or ()):
+                return False
+            from .concordance_declarations import SSA_VALUE, SSAValueFact
+            from .ssa_record_return_state import function_scope_of
+            book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+            cell = (None if book is None else book.latest_ref(
+                SSA_VALUE, (function_scope_of(function), int(value.id))))
+            fact = (None if cell is None else book.page(SSA_VALUE).cell(cell.row, cell.column))
+            return (isinstance(fact, SSAValueFact) and fact.physical_dtype == "ptr"
+                    and fact.storage == "scalar" and fact.rank == 0
+                    and tuple(fact.shape or ()) == () and not fact.arena)
+
         scheduled_instructions = [
             (block_name, instruction)
             for block_name, block in function.blocks.items()
@@ -3610,6 +3625,19 @@ def _emit_repository_call_module(
                     payload = instruction.attributes.get("values")
                 if payload is None and "value" in instruction.attributes:
                     payload = instruction.attributes.get("value")
+                if _value_llvm_type(result) == "ptr" and not tuple(result.shape or ()):
+                    has_payload = any(key in instruction.attributes for key in ("constant", "values", "value"))
+                    if (not scalar_pointer_receipt(result) or not has_payload
+                            or not (type(payload) is int and payload == 0)):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            "native pointer constant requires an explicit null and scalar physical receipt",
+                        ))
+                        continue
+                    target = pointer(result)
+                    body.append(f"  store ptr null, ptr {target}, align {_align('ptr')}")
+                    register_cache.clear()
+                    continue
                 if payload is Ellipsis:
                     # ``...`` selects the full extent of a rank the program
                     # ABI declared; it is resolved into the normalized axes
@@ -4401,24 +4429,7 @@ def _emit_repository_call_module(
                             f"{stored_type} element of %t{int(address_argument.id)}; "
                             "explicit conversion required"))
                         continue
-                    # A native pointer VALUE is distinct from an aggregate
-                    # address alias. Require the exact scalar physical receipt;
-                    # raw ptr spelling and shape alone historically mean both.
-                    scalar_pointer_snapshot = False
-                    if loaded_type == "ptr" and not tuple(result.shape or ()):
-                        from .concordance_declarations import SSA_VALUE, SSAValueFact
-                        from .ssa_record_return_state import function_scope_of
-                        physical_book = (getattr(module, "metadata", {}) or {}).get("identity_book")
-                        cell = (None if physical_book is None else physical_book.latest_ref(
-                            SSA_VALUE, (function_scope_of(function), result_id)))
-                        fact = (None if cell is None else physical_book.page(SSA_VALUE).cell(
-                            cell.row, cell.column))
-                        scalar_pointer_snapshot = (
-                            isinstance(fact, SSAValueFact)
-                            and fact.physical_dtype == "ptr"
-                            and fact.storage == "scalar" and fact.rank == 0
-                            and tuple(fact.shape or ()) == () and not fact.arena
-                        )
+                    scalar_pointer_snapshot = scalar_pointer_receipt(result)
                     if (loaded_type in {"double", "float", *_INTEGER_LLVM_TYPES}
                             or scalar_pointer_snapshot
                             or int(address_argument.id) in owned_heap_addresses
