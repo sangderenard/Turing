@@ -26,7 +26,7 @@ def test_reject_unsupported_glyph_key_contracts():
                     replace(d, child_table_pool=replace(d.child_table_pool, status_value_id=47)),
                     replace(d, live_flags_value_id=40),
                     replace(d, column_shapes=((), (2,))),
-                    replace(d, heap_owner_value_id=41, capacity_policy=SSASequenceCapacityPolicy.DYNAMIC),
+                    replace(d, capacity_policy=SSASequenceCapacityPolicy.DYNAMIC),
                     replace(d, child_table_pool=replace(d.child_table_pool, key_columns=(0,))),
                     replace(d, child_table_pool=replace(d.child_table_pool, shape_value_id=42,rank_value_id=43,shape_stride_value_id=44))):
         with pytest.raises(ValueError):
@@ -50,12 +50,11 @@ def test_reject_unsupported_glyph_key_contracts():
             lower_table_lookup(d, query_sequence=changed)
     with pytest.raises(ValueError, match='handle column is outside'):
         replace(d, child_table_pool=replace(d.child_table_pool, handle_column=99))
-    # The phase refuses owned scalar-hash carriers rather than treating their
-    # row handles as content hashes. Global hash policy is unchanged here.
+    # A content-key child handle is not a scalar hash key, even when owned.
+    # Unrelated scalar keys retain the existing hash carrier contract.
     carrier = replace(d, heap_owner_value_id=41, capacity_policy=SSASequenceCapacityPolicy.DYNAMIC)
-    assert hash_index_carrier(carrier) == 0
-    with pytest.raises(ValueError):
-        lower_table_lookup(carrier, query_sequence=q)
+    assert hash_index_carrier(carrier) is None
+    assert lower_table_lookup(carrier, query_sequence=q).complete
 
 
 @pytest.mark.parametrize('backend', ['c','llvm'])
