@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 7;
+const VERSION = 8;
 
 function allowed() {
   const here = import.meta.url;
@@ -421,6 +421,11 @@ async function main() {
   }
 
   menu.append(el("div", { class: "head", text: "Signed in as " + who.username + " (" + (who.role || "member") + ")" }));
+  if (caps.has("message")) menu.append(el("button", { role: "menuitem", type: "button", text: "Messages", onclick: () => {
+    setOpen(false);
+    if (window.MeowdokuMessenger) window.MeowdokuMessenger.open();
+    else location.assign("/login.html?messages=1");
+  } }));
   for (const item of [
     link("Home", "/"),
     link("Profile and servers", "/profile.html"),
