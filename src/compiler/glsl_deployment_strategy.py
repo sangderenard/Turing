@@ -3290,6 +3290,20 @@ def _planned_scalar_dtypes_from_graph(
     # A list of lists holds one element class per row: ``row_element`` is
     # the class every row of a collection-of-collections shares.
     row_element: dict[int, str] = {}
+    # A sequence of fixed-width tuples holds one class per tuple position:
+    # ``row_columns`` is that per-position dtype tuple (``pairs.append((a,
+    # b))``, ``[(k, k + 1) for k in ...]``, a display of tuple rows).
+    row_columns: dict[int, tuple] = {}
+
+    def tuple_row_dtypes(node_id):
+        """The member dtypes of a tuple display ``node_id``, or None."""
+
+        node_attributes = G.nodes.get(int(node_id), {}).get("attributes") or {}
+        leaves = tuple(node_attributes.get("aggregate_leaf_value_ids") or ())
+        if node_attributes.get("aggregate_kind") != "tuple" or len(leaves) < 2:
+            return None
+        dtypes = tuple(scalar.get(int(leaf)) for leaf in leaves)
+        return None if any(dtype is None for dtype in dtypes) else dtypes
 
     def join(dtypes):
         known = {dtype for dtype in dtypes if dtype is not None}
@@ -3928,6 +3942,31 @@ def _planned_scalar_dtypes_from_graph(
                 # int rows through float64.  Rule: the i-th name of a tuple
                 # target over ``zip(a, b, ...)`` is an element of the i-th
                 # argument.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and iterable
+                    and len(row_columns.get(iterable[0], ()))
+                    == len(loop_expression.target.elts)
+                ):
+                    # ``for a, b in pairs`` over tuple rows: the i-th name is
+                    # the rows' i-th column.
+                    for item, held in zip(
+                        loop_expression.target.elts, row_columns[iterable[0]],
+                    ):
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
                 zipped = G.nodes.get(iterable[0], {}) if iterable else {}
                 if (
                     isinstance(loop_expression, ast.For)
@@ -4150,6 +4189,30 @@ def _planned_scalar_dtypes_from_graph(
                     isinstance(expression.target, ast.Tuple)
                     and all(isinstance(item, ast.Name)
                             for item in expression.target.elts)
+                    and iterable
+                    and len(row_columns.get(iterable[0], ()))
+                    == len(expression.target.elts)
+                ):
+                    # ``for v1, v2 in active_edges`` over tuple rows: the
+                    # i-th name is the rows' i-th column.
+                    for item, held in zip(
+                        expression.target.elts, row_columns[iterable[0]],
+                    ):
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
+                if (
+                    isinstance(expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in expression.target.elts)
                     and identity in {"builtins.zip", "builtins.enumerate"}
                 ):
                     arguments = sorted(
@@ -4195,6 +4258,9 @@ def _planned_scalar_dtypes_from_graph(
                 if carried in row_element:
                     # A carried list of lists keeps its row class.
                     settle(row_element, node_id, row_element[carried])
+                if carried in row_columns:
+                    # A carried list of tuple rows keeps its columns.
+                    settle(row_columns, node_id, row_columns[carried])
                 settle(element, node_id, element.get(carried))
                 settle(scalar, node_id, scalar.get(carried))
                 continue
@@ -4365,6 +4431,43 @@ def _planned_scalar_dtypes_from_graph(
                                 observed_writers[node_id] = None
                         continue
                 writers = [scalar.get(member) for member in members]
+                # Program: YoungMan ``_build_triangle_map``:
+                # ``active_edges = []``, ``active_edges.append((v1, v2))``
+                # with ``v1 = int(v1)``, then ``[(vertex_offsets[v1] +
+                # vertex_offsets[v2]) / 2 for v1, v2 in active_edges]``.
+                # Wrong record: a tuple writer has no scalar class, so the
+                # list's rows had none and each unpacked target had "no
+                # settled dtype".  Rule: a list/set whose every writer --
+                # display member, ``append``/``add``/``insert`` argument,
+                # comprehension ``elt`` -- is a tuple display of one width
+                # with known member dtypes holds rows of those columns,
+                # joined per position.
+                if attributes.get("aggregate_kind") != "dict" and not isinstance(
+                    expression, ast.Dict,
+                ):
+                    row_writer_nodes = list(members)
+                    for record in records.values():
+                        if int(record.get("sequence_value_id", -1)) == int(
+                            data.get("value_id", node_id)
+                        ) and str(record.get("operator")) in {
+                            "append", "add", "insert",
+                        }:
+                            arguments = tuple(record.get("argument_value_ids") or ())
+                            if arguments:
+                                row_writer_nodes.append(int(arguments[-1]))
+                    if isinstance(expression, (ast.ListComp, ast.SetComp)):
+                        row_writer_nodes.extend(parents(data, "elt"))
+                    row_dtypes = [tuple_row_dtypes(writer) for writer in row_writer_nodes]
+                    if (
+                        row_dtypes
+                        and all(row is not None for row in row_dtypes)
+                        and len({len(row) for row in row_dtypes}) == 1
+                    ):
+                        columns = tuple(
+                            join(list(position)) for position in zip(*row_dtypes)
+                        )
+                        if all(column is not None for column in columns):
+                            settle(row_columns, node_id, columns)
                 # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
                 # (corpus c127, c129).  ``sorted`` returns a new list of its
                 # argument's rows; nobody read that, so every row of ``ys``
