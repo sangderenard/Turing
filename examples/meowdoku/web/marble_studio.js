@@ -1952,6 +1952,7 @@ async function boot() {
       const layers=studioLighting.backdrops.getState();
       layers[0]=tallMountedFabricLayer(layers[0]);
       studioLighting.backdrops.setState(layers);
+      studioLighting.surfaces.advancedBackdropChanged();
       $('backdrop-material').value='fabric_muslin_white';
       $('backdrop-layers').value='1';
       studioLighting.invalidateRenderState();
