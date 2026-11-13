@@ -11969,7 +11969,16 @@ class _ControlSSABuilder(TiledObject):
         ))
         if len(alternatives) <= 1 or "builtins.NoneType" not in alternatives:
             return None
-        # Only a fixed-width value union carries its tag beside the payload.
+        # An authored optional span parameter already publishes an exact
+        # tag companion. Consume it, not the span payload, for its None test.
+        # Do not fabricate a pending companion for aggregate call results:
+        # their presence may instead belong to the aggregate's own layout.
+        tag = self.native_value_type_tags.get(subject_id)
+        if tag is not None and "native_type_tag_pending_for_value_id" not in (
+            tag.accounting or {}
+        ):
+            return subject_id
+        # Only a fixed-width value union may require a pending tag companion.
         # Program: bootstrap unit 35 (``found = self._resolved(...)``, an
         # Optional[tuple]).  Wrong record: its ``is None`` minted a pending
         # tag that nothing publishes; an optional aggregate's presence is a
@@ -19041,14 +19050,29 @@ class _ControlSSABuilder(TiledObject):
             self.ensure_plan_callsite_result(
                 source_id, location=f"{location}.source"
             )
+            # The source keeps its declared policy. list(set) reads a keyed
+            # source into a duplicate-preserving destination, not vice versa.
+            source_schema = self.resolved_sequence_schemas.get(source_id)
             source = self._sequence_descriptor(
                 source_id,
-                policy=mutation.policy if operation == "replace" else "duplicates",
+                policy=(
+                    source_schema.policy if source_schema is not None else
+                    mutation.policy if operation == "replace" else "duplicates"
+                ),
                 writable=False,
                 location=location,
             )
             if source is None:
                 return
+            if mutation.argument_kind == "set_snapshot":
+                # list(set) is fresh storage, not a keyed-table alias. Reset
+                # on each execution, then use the existing source iterator
+                # and destination insertion policy (including live rows).
+                self._lower_sequence_mutation_body(
+                    replace(mutation, operator="clear", argument_value_ids=(),
+                            argument_kind="value"), path=path,
+                )
+                operation = "extend"
             _dtype_cells = self._cells(
                 mutation.snapshot_cell,
                 self._sequence_contract_cell(

@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 6;
+const VERSION = 7;
 
 function allowed() {
   const here = import.meta.url;
@@ -64,6 +64,8 @@ const CSS = `
 .binding { display: grid; gap: 3px; padding: 7px; margin: 4px 0; border: 1px solid #454556; border-radius: 4px; overflow-wrap: anywhere; }
 .binding span { font-size: 11px; color: #b6b6ca; }
 .binding.active { border-color: #ffd166; background: #80551e; }
+.radio-bands { display: flex; gap: 4px; align-items: center; min-height: 30px; }
+.radio-bands meter { flex: 1; min-width: 0; width: 40px; height: 24px; }
 [hidden] { display: none !important; }
 .note { padding: 4px 10px; color: #ffb3a8; font-size: 12px; }
 `;
@@ -154,6 +156,169 @@ function mountControlSuite(wrap, host, spec) {
   };
 }
 
+// Nodus owns capture/FFT; Python reads its existing UDP relay inbox.
+// This widget shows NRAD bands, not a browser FFT or an invented audio stream.
+function mountRadio(wrap, host, canControl = false) {
+  const chip = el("button", {class: "chip", type: "button", text: "Nodus Radio", "aria-expanded": "false"});
+  const panel = el("section", {class: "suite", hidden: "", "aria-label": "Nodus Radio"});
+  const close = el("button", {class: "chip", type: "button", text: "Close radio"});
+  const title = el("strong", {text: "Nodus Radio"});
+  const status = el("p", {role: "status", text: "Waiting for Nodus"});
+  const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
+  panel.append(close, title, status, bands,
+    el("p", {text: "Live spectrum from Nodus. This feed carries levels, not playable audio."}));
+  const queueStatus = el("p", {role: "status", text: "Jukebox: checking configuration"});
+  const songs = el("select", {"aria-label": "Song to request"});
+  const request = el("button", {class: "chip", type: "button", text: "Request song"});
+  const queue = el("div", {"aria-label": "Radio request lists"});
+  const charts = el("div", {"aria-label": "Radio billboard"});
+  const rating = el("select", {"aria-label": "Rate the playing song"});
+  rating.append(el("option", {value: "", text: "No rating"}));
+  for (let n = 0; n <= 5; n++) rating.append(el("option", {value: String(n), text: String(n)}));
+  const vote = el("button", {class: "chip", type: "button", text: "Vote 0–5"});
+  const adminButtons = [];
+  let jukeboxBusy = false, currentPlay = null;
+  request.disabled = vote.disabled = true;
+  panel.append(queueStatus, songs, request, rating, vote, queue, charts);
+  function showJukebox(data) {
+    const catalogue = data.catalogue || [];
+    const names = new Map(catalogue.map(s => [s.id, s.title]));
+    const selected = songs.value;
+    songs.replaceChildren(...catalogue.map(s => el("option", {value: s.id, text: s.title})));
+    if (names.has(selected)) songs.value = selected;
+    currentPlay = data.current?.id || null;
+    queueStatus.textContent = data.error || data.runner?.error || (data.paused ? "Jukebox paused" : "Jukebox running") +
+      (data.current ? ": " + (names.get(data.current.song_id) || data.current.song_id) : ": no song playing");
+    request.disabled = jukeboxBusy || !catalogue.length;
+    vote.disabled = jukeboxBusy || !currentPlay;
+    for (const button of adminButtons) button.disabled = jukeboxBusy || !!data.error;
+    queue.replaceChildren();
+    for (const row of (data.requests || [])) {
+      const line = el("div", {text: (row.mine ? "Your request: " : "Request: ") + (names.get(row.song_id) || row.song_id)});
+      if (row.mine || canControl) {
+        const remove = el("button", {type: "button", text: "Remove"});
+        remove.disabled = jukeboxBusy;
+        remove.addEventListener("click", () => commandJukebox({action: "remove", request_id: row.id}));
+        line.append(remove);
+      }
+      queue.append(line);
+    }
+    charts.replaceChildren(el("strong", {text: "Billboard · average rating, then vote count"}));
+    for (const row of (data.charts || [])) charts.append(el("p", {text:
+      (names.get(row.song_id) || row.song_id) + " · " + Number(row.average).toFixed(2) + "/5 · " + row.votes + " votes"}));
+  }
+  async function commandJukebox(body) {
+    if (jukeboxBusy) return;
+    jukeboxBusy = true; request.disabled = vote.disabled = true;
+    for (const button of adminButtons) button.disabled = true;
+    const epoch = generation;
+    try {
+      const response = await fetch("/api/radio/jukebox", {method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-Meowdoku-Radio": "1"}, body: JSON.stringify(body)});
+      const data = await response.json();
+      jukeboxBusy = false;
+      if (epoch === generation && !panel.hidden) showJukebox(data);
+    } catch (error) {jukeboxBusy = false; if (epoch === generation && !panel.hidden) showJukebox({error: "Request failed; refresh status before retrying"});}
+  }
+  request.addEventListener("click", () => commandJukebox({action: "request", song_id: songs.value}));
+  vote.addEventListener("click", () => {
+    if (rating.value !== "" && currentPlay) commandJukebox({action: "rate", play_id: currentPlay, rating: Number(rating.value)});
+  });
+  if (canControl) for (const [action, label] of [["resume", "Start / resume jukebox"], ["pause", "Pause after this song"], ["skip", "Skip current song"]]) {
+    const button = el("button", {class: "chip", type: "button", text: label});
+    button.disabled = true; button.addEventListener("click", () => commandJukebox({action}));
+    adminButtons.push(button); panel.append(button);
+  }
+  let paTimer = null, paBusy = false;
+  const paStatus = el("p", {role: "status", text: "Server speakers: checking configuration"});
+  const play = el("button", {class: "chip", type: "button", text: "Play on server speakers"});
+  const stop = el("button", {class: "chip", type: "button", text: "Stop my server playback"});
+  play.disabled = stop.disabled = true;
+  function showPA(data) {
+    paStatus.textContent = "Server speakers: " + (data.error || data.status || "unavailable");
+    play.disabled = paBusy || !data.configured || !["stopped", "failed"].includes(data.status);
+    stop.disabled = paBusy || !data.can_stop;
+  }
+  async function pollPA(epoch) {
+    try {
+      const data = await getJson("/api/radio/jukebox");
+      if (epoch !== generation || panel.hidden) return;
+      if (!jukeboxBusy) showJukebox(data);
+    } catch (error) {
+      if (epoch !== generation || panel.hidden) return;
+      showJukebox({error: "Jukebox unavailable"});
+    }
+    if (canControl) try {
+      const data = await getJson("/api/radio/playback");
+      if (epoch !== generation || panel.hidden) return;
+      showPA(data);
+    } catch (error) {
+      if (epoch !== generation || panel.hidden) return;
+      showPA({error: "unavailable"});
+    }
+    if (epoch === generation && !panel.hidden) paTimer = setTimeout(() => pollPA(epoch), 1000);
+  }
+  async function commandPA(action) {
+    if (paBusy) return;
+    paBusy = true; play.disabled = stop.disabled = true;
+    try {
+      const response = await fetch("/api/radio/playback", {method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-Meowdoku-Radio": "1"}, body: JSON.stringify({action})});
+      const data = await response.json();
+      paBusy = false;
+      showPA(data);
+    } catch (error) {paBusy = false; showPA({error: "request failed; check status before retrying"});}
+  }
+  if (canControl) {
+    panel.append(el("p", {text: "Admin PA control: plays on the server's selected speakers, not this browser. Continues until Stop or the source ends."}), paStatus, play, stop);
+    play.addEventListener("click", () => commandPA("start"));
+    stop.addEventListener("click", () => commandPA("stop"));
+  }
+  let generation = 0, timer = null;
+  const dismiss = () => setOpen(false);
+  async function poll(epoch) {
+    try {
+      const data = await getJson("/api/radio");
+      if (epoch !== generation || panel.hidden) return;
+      window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: data}));
+      title.textContent = data.title || "Nodus Radio";
+      status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
+        : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
+        : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
+      bands.replaceChildren();
+      for (const [index, value] of (data.bands || []).slice(0, 128).entries()) {
+        const level = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+        const meter = el("meter", {min: "0", max: "1", value: String(data.status === "live" ? level : 0),
+          "aria-label": "Band " + (index + 1), title: "Band " + (index + 1) + ": " + level.toFixed(3)});
+        bands.append(meter);
+      }
+    } catch (error) {
+      if (epoch !== generation || panel.hidden) return;
+      window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
+      status.textContent = "Radio unavailable";
+      bands.replaceChildren();
+    }
+    if (epoch === generation && !panel.hidden) timer = setTimeout(() => poll(epoch), 100);
+  }
+  function setOpen(open) {
+    if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
+    dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
+    generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
+    if (!open) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
+    panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
+    if (open) {poll(generation); pollPA(generation);}
+  }
+  chip.addEventListener("click", () => setOpen(panel.hidden));
+  close.addEventListener("click", () => {setOpen(false); chip.focus();});
+  panel.addEventListener("keydown", event => {
+    if (event.key === "Escape") {event.stopPropagation(); setOpen(false); chip.focus();}
+  });
+  document.addEventListener("pointerdown", event => {if (!event.composedPath().includes(host)) setOpen(false);});
+  window.addEventListener("pagehide", () => setOpen(false));
+  document.addEventListener("visibilitychange", () => {if (document.hidden) setOpen(false);});
+  wrap.append(chip, panel);
+}
+
 async function main() {
   if (!allowed()) { console.info("[site-nav] not loaded: this page's script tag lacks data-site-nav=\"allow\""); return; }
 
@@ -198,6 +363,8 @@ async function main() {
     reserveSpace();
     return;
   }
+
+  if (caps.has("view_site")) mountRadio(actions, host, caps.has("account_manage"));
 
   if (!new URLSearchParams(location.search).has("viewer")) {
     // Tickets is a small menu: the account's issue tickets, and (dev_ui) the change reviews an admin approves.

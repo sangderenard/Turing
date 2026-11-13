@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reports</title></head><body>
+<h1>Reports</h1><p>Public reports are signed off and readable by anyone on the Internet. Personal reports are unfinished/private. Administrators can explicitly include every report.</p>
+<p><a href="/login.html">Sign in</a></p>
+<label>Show <select id="scope"><option value="public">Public, signed off</option><option value="mine">My reports</option><option value="shared">My group spaces</option><option value="all" hidden>All system reports, including private (admin)</option></select></label>
+<button id="refresh" type="button">Refresh</button><button id="next" type="button" disabled>Next page</button>
+<p id="status" role="status" aria-live="polite"></p><ul id="list"></ul>
+<section id="detail" hidden><h2 id="title"></h2><p id="access"></p><pre id="body"></pre>
+<h3>Prompt history</h3><pre id="prompts"></pre><h3>Next steps</h3><ul id="steps"></ul>
+<form id="sharing" hidden><h3>Sharing</h3><label>Access <select id="visibility"><option value="personal">Personal / private</option><option value="group">Group space</option><option value="public">Public / signed off</option></select></label>
+<label id="group-label" hidden>Group <select id="group"></select></label>
+<label id="signoff-label" hidden><input type="checkbox" id="signoff">I approve publishing the complete report, its prompt history and next steps to anyone on the Internet.</label>
+<button id="save" type="submit">Save sharing</button><button id="cancel" type="button">Cancel changes</button></form></section>
+<script src="/reports.js" defer></script></body></html>
