@@ -30,6 +30,10 @@ def test_admin_shared_paper_account_and_dev_own_account(server, monkeypatch):
     admin_headers = {**helpers.PUBLIC_XFF, "Cookie": admin_cookie}
     dev_headers = {**helpers.PUBLIC_XFF, "Cookie": dev_cookie}
     assert helpers._call(port, "/api/paper/shared-account", "POST", admin_headers,
+                         {"username": "paper_holder"})[0] == 403
+    assert helpers._call(port, "/api/account/admin/grant", "POST", admin_headers,
+                         {"username": "paper_holder"})[0] == 200
+    assert helpers._call(port, "/api/paper/shared-account", "POST", admin_headers,
                          {"username": "paper_holder"})[0] == 200
     assert helpers._call(port, "/api/account/authority/grant", "POST", admin_headers,
                          {"username": "paper_dev", "group": "dev", "enabled": True})[0] == 200

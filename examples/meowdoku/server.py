@@ -1433,6 +1433,9 @@ def make_handler(sessions: Sessions):
                         if row is None:
                             raise paper_arena_mod.ArenaError("account not found", 404)
                         target = row[0]
+                        target_authority = permission_groups_mod.authority(authority_db, target)
+                        if target_authority["highest"] != "admin" and not target_authority["service"]:
+                            raise paper_arena_mod.ArenaError("shared paper key holder must be an admin or service account", 403)
                         if not alpaca_credentials_mod.configured(sessions.state.secrets_dir, target):
                             raise paper_arena_mod.ArenaError("paper credentials unavailable for that account", 409)
                     finally:
