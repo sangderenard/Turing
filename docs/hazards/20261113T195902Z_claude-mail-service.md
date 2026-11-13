@@ -13,9 +13,15 @@ Measured on this machine (system Python 3.11.7):
 - tests/test_meowdoku_apache_supervisor.py -k "federation_from or shipped_instances or disabled_instance": 3 passed
   (shipped instance list now includes `mail`, which ships disabled).
 
+Later the same day (service interpreter C:/dev/Powershell/srv/python 3.11.18, aiosmtpd 1.4.6 installed there):
+tests/test_meowdoku_mail.py 11 passed, 1 skipped; STARTTLS through mail_service.start_receiver negotiated TLSv1.3 on
+loopback and stored the message with tls=1. Set-ServiceFirewall.ps1, non-elevated: reports the missing rule, exits 0.
+
 Hazards:
-- The `mail` instance ships `"enabled": false`. instances.json also gives nodus-messenger `--acquire mail:4:36000`
-  and `--cron mail:7204:<state>/jobs/mail`; until Enable-MailTable.ps1 has added the port and installed the table,
-  the canvas host logs that the mail cron tool did not attach (not fatal) and meowdoku-a queues sends for the sweep.
-- Not measured: aiosmtpd's Controller arguments (server_hostname, ident, tls_context, require_starttls,
-  data_size_limit) against aiosmtpd 1.4.6 itself, and a real provider.
+- The `mail` instance is ENABLED. At the first restart after this lands, the supervisor starts it: the receiver binds
+  0.0.0.0:47625 as srv/python/python.exe. Its firewall rule comes from Set-ServiceFirewall.ps1, which Start-Apache.ps1
+  runs; a non-elevated bring-up only reports the missing rule. instances.json also gives nodus-messenger
+  `--acquire mail:4:36000` and `--cron mail:7204:<state>/jobs/mail`; until Enable-MailTable.ps1 has added port 47619
+  and installed the table, the canvas host logs that the mail cron tool did not attach (not fatal; not observed live)
+  and sends wait for the sweep.
+- Not measured: an elevated firewall run, a real provider, the live stop window.

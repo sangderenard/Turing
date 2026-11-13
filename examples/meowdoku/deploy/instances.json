@@ -239,13 +239,15 @@
     {
       "name": "mail",
       "kind": "command",
-      "enabled": false,
       "port": null,
       "route": "",
       "bind": "0.0.0.0",
       "account": "svc-mail",
       "federation_from": "nodus-messenger",
       "mail_prefix": "mail",
+      "firewall": [
+        {"protocol": "TCP", "port": 47625, "program": "C:/dev/Powershell/srv/python/python.exe"}
+      ],
       "leases": [],
       "args": [
         "C:/dev/Powershell/srv/python/python.exe",
