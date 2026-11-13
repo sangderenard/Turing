@@ -13,9 +13,11 @@ class SequenceSelection:
     arms: tuple['SequenceSelection', ...] = ()
 
 
-def sequence_selection(module, function_name, sequence_id):
+def sequence_selection(module, function_name, sequence_id, *, include_child_pool=False):
     """Return a concorded selection tree, with unclassified terminal descriptors.
 
+    Child storage is opt-in and direct-leaf only. Existing primitive callers
+    still refuse a pool, so they cannot project away its payload storage.
     A leaf is NOT a claim of local ownership. Its lifetime admission is a
     separate obligation, including when an owner cell happens to be present.
     """
@@ -29,9 +31,17 @@ def sequence_selection(module, function_name, sequence_id):
     book = table.book
 
     def members(d):
+        pool = d.child_table_pool
+        # The existing local dynamic pool's storage vector puts arena roles
+        # first, then extent cells, and keeps the shared owner last. Outer
+        # status retains its incumbent selection position, not helper arity.
+        child = (() if pool is None else (
+            *pool.column_value_ids, pool.length_value_id,
+            *((pool.status_value_id,) if pool.status_value_id is not None else ()),
+            pool.capacity_value_id, pool.row_stride_value_id))
         return (*d.column_value_ids, d.length_address_id, d.capacity_value_id,
                 *((d.status_address_id,) if d.status_address_id is not None else ()),
-                d.heap_owner_value_id)
+                *child, d.heap_owner_value_id)
 
     def layout(d):
         return (len(d.column_value_ids), tuple(d.column_dtypes), tuple(d.column_shapes),
@@ -54,10 +64,18 @@ def sequence_selection(module, function_name, sequence_id):
                    if p.page == CANONICAL_VALUE]
         if len(sources) != 1 or int(sources[0].row[-1]) != sid:
             return None
-        if (descriptor.heap_owner_value_id is None or descriptor.child_table_pool is not None
+        pool = descriptor.child_table_pool
+        if (descriptor.heap_owner_value_id is None
+                or (pool is not None and not include_child_pool)
                 or descriptor.live_flags_value_id is not None or descriptor.key_columns):
             return None
+        if pool is not None and (pool.key_columns or pool.live_flags_value_id is not None
+                or any(value is not None for value in (
+                    pool.shape_value_id, pool.rank_value_id, pool.shape_stride_value_id))):
+            return None
         ids = tuple(map(int, members(descriptor)))
+        if pool is not None and len(set(ids)) != len(ids):
+            return None
         producers = {}
         for label, block in function.blocks.items():
             for op in block.instrs:
@@ -69,6 +87,12 @@ def sequence_selection(module, function_name, sequence_id):
         phis = [p for p in selected if p is not None and p[2].op == 'Phi']
         if not phis:
             return SequenceSelection(sid, cell, ids)
+        # A direct source-built glyph list can expose its complete structural
+        # vector. No child-Phi producer is admitted here yet: an address-Phi
+        # extent is not a terminal scalar extent receipt, and all child roles
+        # must eventually be proved against the same selected predecessor.
+        if pool is not None:
+            return None
         if len(phis) != len(ids) or len({p[0] for p in phis}) != 1:
             return None
         label, block, _ = phis[0]
@@ -113,22 +137,26 @@ class LocalSelectionLifetimes:
     selection: SequenceSelection
     terminal_cells: tuple[Ref, ...]
     original_owner_ids: tuple[int, ...]
+    child_storage_cells: tuple[Ref, ...] = ()
 
 
-def local_selection_lifetimes(module, function_name, sequence_id):
+def local_selection_lifetimes(module, function_name, sequence_id, *, include_child_pool=False):
     """Prove selected terminals are local-owned, without granting an escape.
 
+    Opted-in direct child leaves carry separate complete child-storage proof
+    refs; these do not grant a public escape or reinterpret glyph tokens.
     The owner IDs identify original owner cells, not a new allocation for
     the selector. A caller exporting multiple fields must additionally
     refuse intersecting owner sets until shared exports have their own ABI.
     """
     from .concordance_declarations import SequenceLifetimeKind
     from .source_sequence_lifetime import validated_sequence_lifetime
-    tree = sequence_selection(module, function_name, sequence_id)
+    tree = sequence_selection(module, function_name, sequence_id,
+                              include_child_pool=include_child_pool)
     if tree is None:
         return None
     table = module.sequence_tables[str(function_name)]
-    cells, owners = [], []
+    cells, owners, child_cells = [], [], []
     pending = [tree]
     while pending:
         node = pending.pop()
@@ -153,8 +181,15 @@ def local_selection_lifetimes(module, function_name, sequence_id):
             owner = int(fact.owner_cell.row[-1])
             if owner != node.member_ids[-1]:
                 return None
+            if table.sequences[node.sequence_id].child_table_pool is not None:
+                from .source_sequence_child_lifetime import validated_sequence_child_storage
+                child_proof = validated_sequence_child_storage(module, function_name, node.sequence_id)
+                if child_proof is None:
+                    return None
+                child_cells.extend(child_proof)
         except (ValueError, KeyError, AttributeError, TypeError):
             return None
         cells.append(terminal_cell)
         owners.append(owner)
-    return LocalSelectionLifetimes(tree, tuple(cells), tuple(dict.fromkeys(owners)))
+    return LocalSelectionLifetimes(tree, tuple(cells), tuple(dict.fromkeys(owners)),
+                                   tuple(dict.fromkeys(child_cells)))
