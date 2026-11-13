@@ -88,6 +88,20 @@ globalThis.livingDataStaticHost = Object.freeze({
       throw Error('Static realized mesh changed after attachment; reload a new host');}
     return result;
   },
+  async admitScene({world_id,host_token}) {
+    // Explicit owner action; use the existing authenticated same-origin service.
+    if(!/^[a-f0-9]{32}$/.test(world_id)||typeof host_token!=='string'||!host_token)
+      throw Error('Registered world identity and private host token required');
+    await livingDataStaticReady;
+    const scene=this.meshSnapshot();
+    const response=await fetch('/api/living-data/dm/worlds/'+world_id+'/host',{
+      method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'scene',host_token,scene})});
+    const result=await response.json();
+    if(!response.ok)throw Error(result.error||'Scene admission failed');
+    livingDataStaticCheckPinned();
+    return result;
+  },
   async render(request={}) {
     await livingDataStaticReady;
     if(stateLoopRuntime.worker) throw Error('Static host refuses a physics worker');

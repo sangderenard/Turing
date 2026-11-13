@@ -3,7 +3,7 @@
 Implemented locally, not deployed. This slice exposes the registered Living
 Data map as analytic data and requests images from its existing Pluck Phong
 renderer. It does not start a game engine or simulation. The current commands
-are `inspect` and `render-phong`, not arbitrary DM edits or tensor writes.
+are `inspect`, `render-phong` and `export-scene`, not arbitrary DM edits or tensor writes.
 
 ## Authentication and ownership
 
@@ -199,3 +199,47 @@ Open only the printed loopback test URL within 180 seconds. Fixture state is tem
 no production account, service, or render queue is touched. Preserve the sibling
 spectral-analyzer checkout layout: missing native Pluck source is correctly refused,
 not silently replaced by a fallback shader.
+
+
+## Exact general-scene admission (2026-11-13)
+
+After registering the actual host snapshot, the owner can call
+`await livingDataStaticHost.admitScene({world_id, host_token})`. This posts the
+existing `meshSnapshot()` to the same-origin authenticated host route with
+`action: "scene"`. It never submits an exposure or executes uploaded code.
+The existing account session and private host token are both required.
+
+The service validates the registered world/source/renderer identity, complete
+object registry, contiguous triangle ownership, semantic-part ranges, palette
+and material table layouts. The complete original interleaved vertex stream,
+normals, colors, all material tables, ownership and geometry metadata are
+retained unchanged, bound to `scene_sha256`. Admission is immutable for the
+attachment: changing the scene requires closing and registering again.
+Maximum scene JSON is 3 MiB within the existing 4 MiB host request limit; larger
+scenes fail explicitly, never truncate. Close/expiry discards it. This is still
+a host declaration, not independent server attestation or persistent storage.
+
+Retrieve it using the existing commands endpoint:
+
+```json
+{"request_id":"scene-1","operation":"export-scene"}
+```
+
+The completed result includes `snapshot`, `scene_sha256`, `ray_available:false`
+and explicit `ray_unavailable_reasons`. Export before admission returns 409.
+No fake marble, shell material replacement, guessed physical emitters, or
+placeholder image is used. The native shader's palette-nearest material
+selection remains represented by the raw colors and tables, not recoded as
+claimed original material IDs. The existing Phong path remains available.
+
+Ray photographs still require a real physical light-source contract (native
+celestial shader lighting is not one), certified volume/boundary ownership,
+and a general-world admission to PhotoJobs rather than its saved-subject-only
+contract. Merely transporting this snapshot does not satisfy those requirements.
+
+Local production-code verification admitted the existing realized Storybook
+scene (33 objects, 7,164 vertices, 1,299,206 JSON bytes) through StaticWorlds and
+retrieved exactly equal source data. Scene digest:
+`da56eed18f9f391993b567556bf791a3c467f501e8629ee47cadab2b30ab57e7`.
+Python/JavaScript syntax and diff checks passed. No live HTTP deployment,
+ray exposure, service restart or publication was performed for this change.
