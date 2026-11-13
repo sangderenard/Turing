@@ -568,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("browse.html", "browse.js"):                                                            # [LISTING] the /browse page (server.py /browse/*, listing.py)
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("issues.html", "issues.js", "reviews.html", "reviews.js"):                               # [REVIEWS] change reviews (branch_review.py /api/reviews)
+    for name in ("issues.html", "issues.js", "reviews.html", "reviews.js", "reports.html", "reports.js"):   # [REVIEWS] change reviews; [REPORTS] the report reader
         shutil.copyfile(HERE / "web" / name, out / name)
     # Studio imports these authored modules transitively. A partial publication
     # leaves the whole ES module graph (including loading_panel.js) unstarted.

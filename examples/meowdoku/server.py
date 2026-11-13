@@ -85,6 +85,8 @@ from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS]
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
 from meowdoku.rest_api import reports as shared_reports
+from meowdoku.rest_api import groups as shared_groups
+from meowdoku import account_content
 from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
@@ -370,7 +372,13 @@ class Sessions:
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(self.state.content_dir)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(self.state.marble_objects_dir)
-        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer",
+        # Same explicit source-root convention as glyph_start; isolated dev
+        # instances must not accidentally import the shared production checkout.
+        spectral_override = os.environ.get("SPECTRAL_ANALYZER_ROOT")
+        self.spectral_root = Path(spectral_override).resolve() if spectral_override else ROOT.parent / "spectral-analyzer"
+        if spectral_override and not self.spectral_root.is_dir():
+            raise ValueError("SPECTRAL_ANALYZER_ROOT must name an existing checkout")
+        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, self.spectral_root,
                                                         users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
@@ -394,12 +402,16 @@ class Sessions:
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
         self.accounts = accounts_mod.Accounts(self.state.accounts_db)   # [ACCOUNTS] real password login
         self.accounts_db = self.state.accounts_db
+        self.radio_lock = threading.Lock()
+        self.radio_control = None
+        self.radio_jukebox = None
+        self.radio_jukebox_runner = None
         self.mathlab_lock = threading.Lock()
         self.mathlab_worker = None                                      # [MATHLAB] set by main() unless --no-mathlab
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
         self.instance = ""                                                      # [INSTANCE] --instance NAME (account_instances binding)
         self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
-        self.obj_assets = obj_assets_mod.Store(self.state.obj_assets_dir, self.accounts, ROOT.parent / "spectral-analyzer")
+        self.obj_assets = obj_assets_mod.Store(self.state.obj_assets_dir, self.accounts, self.spectral_root)
         self.marble_objects.obj_assets = self.obj_assets
 
     # ---- [FEDERATE begin] what this instance promises a federating peer (see _contract_socket)
@@ -689,6 +701,12 @@ def make_handler(sessions: Sessions):
 
         def _shader_request(self, path: str, method: str) -> bool:
             """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
+            # Content routes enforce session/group/public policy themselves. This
+            # grants no other shader-tier capability or access to other APIs.
+            if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/"):
+                return False
+            if method == "GET" and path in ("/reports.html", "/reports.js"):
+                return False
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
                 return False                                   # [LOGIN] served by do_POST's login/logout branches
             if method == "POST" and path == "/api/account/signup":
@@ -997,12 +1015,52 @@ def make_handler(sessions: Sessions):
             return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
         # ---- end [DIVIDER]
 
+        def _groups_route(self, path: str, method: str) -> None:
+            return shared_groups.route(self, path, method,
+                service_type=account_content.Groups, accounts=sessions.accounts,
+                account_cookie=ACCOUNT_COOKIE, AccessError=account_content.AccessError,
+                SchemaVersionError=account_content.schema_version.SchemaVersionError)
+
         def _reports_route(self, path: str, method: str) -> None:
             return shared_reports.route(self, path, method,
                 service_type=experience_reports_mod.Service, accounts=sessions.accounts,
                 account_cookie=ACCOUNT_COOKIE, ReportError=experience_reports_mod.ReportError,
                 SchemaVersionError=experience_reports_mod.schema_version.SchemaVersionError,
                 max_body=experience_reports_mod.MAX_BODY)
+
+        # ---- [RADIO] construction is inert; only explicit POST starts native work.
+        def _radio_jukebox_services(self):
+            # Caller holds sessions.radio_lock, shared by both entry points.
+            from meowdoku.nodus_radio_jukebox import Jukebox
+            from meowdoku.nodus_radio_jukebox_runner import Runner
+            if sessions.radio_jukebox is None:
+                sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
+                sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs)
+            return sessions.radio_jukebox, sessions.radio_jukebox_runner
+
+        def _radio_playback(self, method):
+            from meowdoku.nodus_radio_control import Manager, http_route
+            with sessions.radio_lock:
+                if sessions.radio_control is None:
+                    sessions.radio_control = Manager(sessions.state.radio_json, sessions.jobs)
+                    # Station mode is selected by operator config, not request data.
+                    # Binding this tap does not start the runner, source, or speakers.
+                    try:
+                        config = json.loads(sessions.state.radio_json.read_text(encoding="utf-8"))
+                        native = config.get("jukebox", {}).get("native")
+                    except (OSError, ValueError, AttributeError):
+                        native = None
+                    if isinstance(native, dict):
+                        _, runner = self._radio_jukebox_services()
+                        sessions.radio_control.source_provider = runner
+                manager = sessions.radio_control
+            return http_route(self, method, manager)
+
+        def _radio_jukebox(self, method):
+            from meowdoku.nodus_radio_jukebox import http_route
+            with sessions.radio_lock:
+                store, runner = self._radio_jukebox_services()
+            return http_route(self, method, store, runner)
 
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
         def _issues_route(self, path: str, method: str) -> None:
@@ -1558,7 +1616,7 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
-            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports")) and self.close_connection:
+            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports", "/api/account/groups")) and self.close_connection:
                 self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
@@ -1974,6 +2032,8 @@ def make_handler(sessions: Sessions):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
                 return self._issues_route(path, "GET")
+            if path == "/api/account/groups" or path.startswith("/api/account/groups/"):
+                return self._groups_route(path, "GET")
             if path == "/api/reports" or path.startswith("/api/reports/"):
                 return self._reports_route(path, "GET")
             if path == "/api/tickets":
@@ -1987,6 +2047,19 @@ def make_handler(sessions: Sessions):
                     return self._json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id else {"tickets": sessions.tickets.list()})
                 except (ValueError, FileNotFoundError):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
+            if path == "/api/radio/jukebox":
+                return self._radio_jukebox("GET")
+            if path == "/api/radio/playback":
+                return self._radio_playback("GET")
+            if path == "/api/radio":
+                if not self._require("view_site"):
+                    return
+                from meowdoku import nodus_radio
+                try:
+                    return self._json(nodus_radio.snapshot(sessions.state.radio_json, sessions.accounts_db,
+                        station=sessions.radio_jukebox_runner.station() if sessions.radio_jukebox_runner else None))
+                except (OSError, ValueError, nodus_radio.sqlite3.Error, nodus_radio.relay.RelayError):
+                    return self._json({"status": "unavailable", "title": "Nodus Radio", "bands": [], "audio": False}, 503)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
             if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
@@ -2430,6 +2503,10 @@ def make_handler(sessions: Sessions):
             path0 = self.path.split("?", 1)[0]
             if self._route_gate(path0):                           # [ROUTE]
                 return
+            if path0 == "/api/radio/jukebox":
+                return self._radio_jukebox("POST")
+            if path0 == "/api/radio/playback":
+                return self._radio_playback("POST")
             if path0 == "/api/route":                             # [ROUTE]
                 return self._route_post()
             if path0 == "/api/studio/fabric":
@@ -2481,6 +2558,8 @@ def make_handler(sessions: Sessions):
                 return self._instance_control("POST", cancel=True)
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
+            if path0 == "/api/account/groups" or path0.startswith("/api/account/groups/"):
+                return self._groups_route(path0, "POST")
             if path0 == "/api/reports" or path0.startswith("/api/reports/"):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
@@ -2610,7 +2689,10 @@ def make_handler(sessions: Sessions):
                     return
                 try:
                     from meowdoku.trigger_grid_service import command
-                    return self._json(command(account["id"], body, sessions.marble_photos.spectral_root))
+                    from meowdoku.nodus_radio import snapshot
+                    return self._json(command(account["id"], body, sessions.marble_photos.spectral_root,
+                        radio_snapshot=lambda: snapshot(sessions.state.radio_json, sessions.accounts_db,
+                            station=sessions.radio_jukebox_runner.station() if sessions.radio_jukebox_runner else None)))
                 except (ValueError, TypeError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             if path0 == "/api/marble_photo/calibration_qr":
@@ -3340,6 +3422,10 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lc.stopping = True
+        if sessions.radio_jukebox_runner is not None:
+            sessions.radio_jukebox_runner.close()
+        if sessions.radio_control is not None:
+            sessions.radio_control.close()
         if sessions.mathlab_worker is not None:
             sessions.mathlab_worker.stop()
         if site_compiler is not None:

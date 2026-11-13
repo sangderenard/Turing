@@ -8806,6 +8806,16 @@ def _normalize_lexical_values(
         )
 
     def annotation_aggregate_kind(annotation: ast.AST | None) -> str | None:
+        if isinstance(annotation, ast.Name):
+            # Read the imported annotation's actual origin, not its spelling:
+            # ``typing.List[Node]`` and ``List as Nodes`` carry the same list
+            # element contract as ``list[Node]``. A user class named List
+            # is not that alias and must not acquire a fabricated list ABI.
+            from typing import get_origin
+
+            origin = get_origin((static_bindings or {}).get(annotation.id))
+            if origin in (list, set, frozenset, dict, tuple):
+                return origin.__name__
         if isinstance(annotation, ast.Name) and annotation.id in {
             "list", "set", "frozenset", "dict", "tuple", "bytes",
             "bytearray",

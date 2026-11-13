@@ -1,6 +1,6 @@
 // Receive actual forward deposits and traced throughput, never invented lights.
 import {inverseAffine} from './marble_studio_subject_renderer.js';
-import {receiveSceneResponses,SCENE_RESPONSE_SCHEMA} from './marble_scene_responses.js';
+import {receiveSceneResponses,isSceneResponseSchema,validateSceneResponseManifest} from './marble_scene_responses.js';
 import {RESPONSE_INFORMATION} from './marble_response_lineage.js';
 import {responseApplicationTexture,currentResponseQuery} from './marble_response_application.js';
 
@@ -9,14 +9,15 @@ const sha256=async bytes=>Array.from(new Uint8Array(await crypto.subtle.digest('
 export const MAX_FIELD_BYTES=256*256*256*12;
 export const MAX_SCENE_RESPONSE_BYTES=64*1024*1024;
 export function validateSceneResponseReceipt(value,digest,revision) {
-  if(!value||value.schema!==SCENE_RESPONSE_SCHEMA||!DIGEST.test(digest)||value.digest!==digest||
+  if(!value||!isSceneResponseSchema(value.schema)||!DIGEST.test(digest)||value.digest!==digest||
       value.live_revision!==revision||!Number.isSafeInteger(value.sequence)||value.sequence<1||
       !/^light-scene-response-[0-9a-f]{32}\.bin$/.test(value.name)||
       !Number.isSafeInteger(value.byte_length)||value.byte_length<0||value.byte_length>MAX_SCENE_RESPONSE_BYTES||
       !DIGEST.test(value.sha256)||value.application_ready!==false||
-      value.metadata?.schema!==SCENE_RESPONSE_SCHEMA||value.metadata.payload_bytes!==value.byte_length||
+      value.metadata?.schema!==value.schema||value.metadata.payload_bytes!==value.byte_length||
       value.metadata.payload_sha256!==value.sha256)
     throw Error('Invalid or stale scene-response receipt.');
+  if(value.schema!== 'studio-scene-responses-v1')validateSceneResponseManifest(value.metadata);
   return structuredClone(value);
 }
 // Dense subject bundles can exceed 85 MiB over the public connection. Newer
@@ -428,7 +429,7 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
       const decoded=await receiveSceneResponses(next.metadata,bytes,{sceneRevision:next.metadata.scene_revision,
         information:s.information,maxPayloadBytes:MAX_SCENE_RESPONSE_BYTES});
       if(!current(s))return;
-      // This is unreachable for the currently published unready v1 schema.
+      // This is unreachable for the currently published unready v1/v2 schemas.
       // A producer readiness declaration is necessary, never inferred from
       // positive RGB, retained sample counts, or a successful texture upload.
       let nextTexture=null,nextCount=0;

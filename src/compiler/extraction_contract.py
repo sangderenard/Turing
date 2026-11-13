@@ -835,6 +835,86 @@ def binding_names_function(
     )
 
 
+def record_row_columns(
+    records: Mapping[str, Mapping[str, Any]],
+    record_name: str,
+    *,
+    prefix: str = "",
+    active: tuple[str, ...] = (),
+) -> tuple[Mapping[str, Any], ...]:
+    """Lower one declared row record to logical shaped SoA columns."""
+
+    if record_name in active:
+        raise ExtractionContractError(
+            "program_abi table row_record cycle: "
+            + " -> ".join((*active, record_name))
+        )
+    columns: list[Mapping[str, Any]] = []
+    record = records[record_name]
+    for field_name, row_field in dict(record.get("fields") or {}).items():
+        name = f"{prefix}{field_name}"
+        if bool(row_field.get("optional")):
+            columns.append({"name": f"{name}.__present", "dtype": "bool"})
+        if row_field.get("storage", "scalar") in {"scalar", "reference"}:
+            column = {
+                "name": name,
+                "dtype": str(row_field.get("dtype") or "opaque_ref"),
+                # Column descriptors normalize rank explicitly.  The
+                # table-field parser does the same for an authored
+                # column without a shape, so the derived row-record
+                # view must retain the scalar's exact rank as well.
+                # Otherwise ``receipt()`` cannot be consumed again:
+                # parsing adds rank 0 and the strict row-record join
+                # then sees two spellings of the same schema.
+                "rank": int(row_field.get("rank", 0)),
+            }
+            if row_field.get("token_vocabulary") is not None:
+                column["token_vocabulary"] = row_field.get("token_vocabulary")
+            columns.append(column)
+            continue
+        if row_field.get("storage", "scalar") == "span":
+            column = {
+                "name": name,
+                "dtype": str(row_field.get("dtype")),
+                "rank": int(row_field.get("rank", 0)),
+            }
+            if row_field.get("shape") is not None:
+                column["shape"] = tuple(map(int, row_field.get("shape")))
+            columns.append(column)
+            continue
+        if row_field.get("storage", "scalar") == "record":
+            columns.extend(record_row_columns(
+                records, str(row_field.get("record")),
+                prefix=f"{name}.",
+                active=(*active, record_name),
+            ))
+            continue
+        if row_field.get("storage", "scalar") == "table":
+            # A child table in a record row is represented by the
+            # row's exact int64 handle.  Its columns, lengths and
+            # stride remain in the incumbent child-table pool named
+            # by the field's row_record; they are not flattened into
+            # the parent row or replaced by an opaque object.
+            columns.append({
+                "name": name,
+                "dtype": "int64",
+                "rank": 0,
+            })
+            continue
+        raise ExtractionContractError(
+            "program_abi table row record "
+            f"{record_name}.{field_name} uses unsupported "
+            f"{row_field.get('storage', 'scalar')!r} storage"
+        )
+    names = tuple(str(column["name"]) for column in columns)
+    if len(names) != len(set(names)):
+        raise ExtractionContractError(
+            f"program_abi table row record {record_name} has duplicate "
+            "flattened column names"
+        )
+    return tuple(columns)
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramABIContract:
     """Typed host/native boundary independent of Python object identity."""
@@ -907,84 +987,6 @@ class ProgramABIContract:
                         f"unknown record {field.row_record!r}"
                     )
 
-        def row_columns(
-            record_name: str,
-            *,
-            prefix: str = "",
-            active: tuple[str, ...] = (),
-        ) -> tuple[Mapping[str, Any], ...]:
-            """Lower one declared row record to logical shaped SoA columns."""
-
-            if record_name in active:
-                raise ExtractionContractError(
-                    "program_abi table row_record cycle: "
-                    + " -> ".join((*active, record_name))
-                )
-            columns: list[Mapping[str, Any]] = []
-            record = records[record_name]
-            for field_name, row_field in record.fields.items():
-                name = f"{prefix}{field_name}"
-                if row_field.optional:
-                    columns.append({"name": f"{name}.__present", "dtype": "bool"})
-                if row_field.storage in {"scalar", "reference"}:
-                    column = {
-                        "name": name,
-                        "dtype": str(row_field.dtype or "opaque_ref"),
-                        # Column descriptors normalize rank explicitly.  The
-                        # table-field parser does the same for an authored
-                        # column without a shape, so the derived row-record
-                        # view must retain the scalar's exact rank as well.
-                        # Otherwise ``receipt()`` cannot be consumed again:
-                        # parsing adds rank 0 and the strict row-record join
-                        # then sees two spellings of the same schema.
-                        "rank": int(row_field.rank),
-                    }
-                    if row_field.token_vocabulary is not None:
-                        column["token_vocabulary"] = row_field.token_vocabulary
-                    columns.append(column)
-                    continue
-                if row_field.storage == "span":
-                    column = {
-                        "name": name,
-                        "dtype": str(row_field.dtype),
-                        "rank": int(row_field.rank),
-                    }
-                    if row_field.shape is not None:
-                        column["shape"] = tuple(map(int, row_field.shape))
-                    columns.append(column)
-                    continue
-                if row_field.storage == "record":
-                    columns.extend(row_columns(
-                        str(row_field.record),
-                        prefix=f"{name}.",
-                        active=(*active, record_name),
-                    ))
-                    continue
-                if row_field.storage == "table":
-                    # A child table in a record row is represented by the
-                    # row's exact int64 handle.  Its columns, lengths and
-                    # stride remain in the incumbent child-table pool named
-                    # by the field's row_record; they are not flattened into
-                    # the parent row or replaced by an opaque object.
-                    columns.append({
-                        "name": name,
-                        "dtype": "int64",
-                        "rank": 0,
-                    })
-                    continue
-                raise ExtractionContractError(
-                    "program_abi table row record "
-                    f"{record_name}.{field_name} uses unsupported "
-                    f"{row_field.storage!r} storage"
-                )
-            names = tuple(str(column["name"]) for column in columns)
-            if len(names) != len(set(names)):
-                raise ExtractionContractError(
-                    f"program_abi table row record {record_name} has duplicate "
-                    "flattened column names"
-                )
-            return tuple(columns)
-
         # Resolve the schema edge once, at contract construction.  Every
         # downstream consumer then sees the same row identity and the same
         # physical column order; none needs a private reconstruction cache.
@@ -995,7 +997,10 @@ class ProgramABIContract:
                 if abi_field.row_record is None:
                     fields[field_name] = abi_field
                     continue
-                derived_columns = row_columns(str(abi_field.row_record))
+                derived_columns = record_row_columns(
+                    {name: value.receipt() for name, value in records.items()},
+                    str(abi_field.row_record),
+                )
                 if (
                     abi_field.table_columns is not None
                     and tuple(abi_field.table_columns) != derived_columns

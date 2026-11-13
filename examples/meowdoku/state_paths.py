@@ -109,6 +109,10 @@ class StatePaths:
         return self.secrets_dir / f"admin_token{suffix}.txt"
 
     # ---- run
+    @property
+    def radio_json(self) -> Path:
+        return self.run_dir / "nodus_radio.json"
+
     def sessions_dir(self, port=None) -> Path:
         return self.run_dir / f"sessions{'' if port in (None, DEFAULT_PORT) else f'_{port}'}"
 
