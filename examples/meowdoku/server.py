@@ -3261,6 +3261,14 @@ def main(argv: list[str] | None = None) -> int:
     sessions.jobs = service_jobs.Registry(sessions.accounts_db, sessions.instance)
     sessions.marble_photos.registry = sessions.jobs
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
+    # A supervised instance restart keeps the supervisor's loaded spec. The
+    # deployed product is discoverable from this instance's own state root,
+    # so installing the native row does not require a whole-stack restart.
+    fabric_dir = state.products_dir / "fabric-row"
+    if not args.fabric_row_host and (fabric_dir / "spring_network_nodus_host.exe").is_file():
+        args.fabric_row_host = str(fabric_dir / "spring_network_nodus_host.exe")
+        args.fabric_row_plugin = str(fabric_dir / "spring_network_nodus_row.dll")
+        args.fabric_core_dir = str(fabric_dir)
     if args.fabric_row_host and args.fabric_row_plugin and args.fabric_core_dir:
         from meowdoku.fabric_motion import FabricMotion
         sessions.fabric_motion = FabricMotion(Path(args.fabric_row_host), Path(args.fabric_row_plugin),
