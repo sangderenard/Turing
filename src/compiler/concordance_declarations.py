@@ -2290,6 +2290,33 @@ SSA_CONSTANT_HOIST = declare_page("ssa_constant_hoist", (
     RowField("to_block", K.NAME),
     RowField("from_geometry", K.PAGE_REF),
 ), tuple)                              # exact geometry/value inputs; CONCORD
+
+
+@dataclass(frozen=True)
+class SequenceHelperHeapOperation:
+    """Existing heap ABI as declared at source-linked helper registration.
+
+    This records producer semantics, not bounds, nonaliasing, or permission
+    to export an allocation. Those remain separate reader obligations.
+    """
+    control_cell: Ref
+    block_cell: Ref
+    operation: str
+    argument_cells: tuple[Ref, ...]
+    result_cell: Ref | None
+    allocation_kind: str | None
+    element_dtype: str | None
+    zero_initialize: bool | None
+    callee: str | None
+    native_heap_abi: str | None
+    # Exact carrier, owner, element layout at the allocating/copying factory.
+    carrier_layouts: tuple[tuple[Ref, Ref, str], ...]
+
+
+SEQUENCE_HELPER_HEAP_OPERATION = declare_page("sequence_helper_heap_operation", (
+    RowField("scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("block", K.NAME), RowField("instruction", K.INDEX),
+), SequenceHelperHeapOperation)        # DERIVED(source control/block/SSA); CONCORD
 #: ``Unsourced`` reasons of ``_post_loop_result_reconciliation``: a pass that
 #: states something different about the same unchanged cells (the IR was
 #: rewritten between two runs by a pass whose cell is not in hand), and a

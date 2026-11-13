@@ -10659,6 +10659,13 @@ class CorrelationTable:
                 continue
             if type(literal) is not int:
                 continue
+            # Native sequence helper literals retain the exact declared width
+            # chosen by the existing scalar-width producer, not Python's int
+            # default. Source/block/value/width causes and the live Const must
+            # all agree; an arbitrary dtype or historical width is not enough.
+            from .source_sequence_helper_heap import registered_helper_integer_materialization
+            if registered_helper_integer_materialization(module, row, materialization_cell):
+                continue
             try:
                 expected_dtype = python_int_literal_dtype(literal)
             except (TypeError, OverflowError):

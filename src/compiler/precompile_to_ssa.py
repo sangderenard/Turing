@@ -2250,6 +2250,8 @@ def register_sequence_lowering(
         function.metadata = remap_metadata(
             dict(function.metadata or {}), replacements,
         )
+        from .source_sequence_helper_heap import post_sequence_helper_semantics
+        post_sequence_helper_semantics(book, function, owner, stage)
         registered[function.name] = function
         for block in function.blocks.values():
             for instruction in block.instrs:

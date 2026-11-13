@@ -213,7 +213,10 @@ class _Builder:
 
     def const(self, block: BasicBlock, literal: int, *, dtype: str = "int") -> SSAValue:
         result = self.fresh(dtype)
-        self.emit(block, "Const", [], result, attributes={"value": int(literal)})
+        # Preserve the declared boolean domain for its exact two values.
+        # In particular, do not rewrite native ``int`` (int32) to Python int64.
+        payload = bool(literal) if dtype == "bool" and type(literal) in (bool, int) and literal in (0, 1) else int(literal)
+        self.emit(block, "Const", [], result, attributes={"value": payload})
         return result
 
     def branch(self, block: BasicBlock, target: BasicBlock) -> None:
