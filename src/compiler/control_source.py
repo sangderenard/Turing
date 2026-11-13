@@ -1777,6 +1777,10 @@ def post_control_program(
             for source, target, induction, projection
             in program.projected_iterable_bindings
         ),
+        iterable_bindings=tuple(
+            (cell_or_id(source), cell_or_id(target), str(induction))
+            for source, target, induction in program.iterable_bindings
+        ),
     )
     incumbent_program = latest_fact(CONTROL_PROGRAM, program_row)
     if incumbent_program != program_fact:
@@ -1798,7 +1802,10 @@ def post_control_program(
                 *(item for item in program_fact.regions if isinstance(item, Ref)),
                 *(
                     item
-                    for binding in program_fact.projected_iterable_bindings
+                    for binding in (
+                        *program_fact.projected_iterable_bindings,
+                        *program_fact.iterable_bindings,
+                    )
                     for item in binding[:2]
                     if isinstance(item, Ref)
                 ),

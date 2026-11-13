@@ -3282,6 +3282,9 @@ class ControlProgramFact:
     # Kept last so older serialized facts and positional seed construction
     # retain their field order.
     projected_iterable_bindings: tuple = ()
+    # Ordinary iterable targets need the same exact identity receipt as
+    # projected rows; this records the existing control relation, not ownership.
+    iterable_bindings: tuple = ()
 
 
 #: ``CONTROL_PROGRAM.program`` for the shell's one program.
