@@ -3554,6 +3554,17 @@ class _ControlSSABuilder(TiledObject):
             if int(sequence_id) in self.sequence_child_table_layouts
             and int(self.sequence_child_table_layouts[int(sequence_id)][0]) > 0
         }
+        from .source_borrowed_record_spans import (
+            borrowed_record_string_layouts_from_book, exact_string_classes,
+        )
+        glyph_list_layouts = borrowed_record_string_layouts_from_book(
+            self._book(), self.lexical_read_scope, sequence_declarations,
+        )
+        selected_string_rows = {
+            int(target_id) for iterable_id, target_id, _induction in program.iterable_bindings
+            if int(iterable_id) in glyph_list_layouts
+            and exact_string_classes(self._book(), self._canonical_cell(int(target_id)))
+        }
         heterogeneous_columns: set[tuple[int, int]] = set()
         for sequence_id, policy, column_count, writable in sequence_declarations:
             # A row of a list of lists is selected by its row load, which
@@ -3576,7 +3587,7 @@ class _ControlSSABuilder(TiledObject):
                 ),
                 stage=self._stage(),
             )
-            if int(sequence_id) in handle_merge_ids:
+            if int(sequence_id) in handle_merge_ids or int(sequence_id) in selected_string_rows:
                 continue
             authored_column_dtypes = tuple(
                 (sequence_column_dtypes or {}).get(int(sequence_id), ())
@@ -3847,7 +3858,7 @@ class _ControlSSABuilder(TiledObject):
         for sequence_id, policy, column_count in sequence_initializations:
             if int(sequence_id) in (consumer_row_loads or {}):
                 continue
-            if int(sequence_id) in selected_mapping_rows:
+            if int(sequence_id) in selected_mapping_rows or int(sequence_id) in selected_string_rows:
                 continue
             literal_table_rows = None
             descriptor_policy = (
@@ -11960,6 +11971,11 @@ class _ControlSSABuilder(TiledObject):
             self.lower_control_expression(operand)
             for operand in expression.operands
         ]
+        resident_comparison = self._resident_string_control_comparison(
+            expression, operand_values, result_override=result_override,
+        )
+        if resident_comparison is not None:
+            return resident_comparison
         if expression.op in {"float", "int", "bool"}:
             return operand_values[0]
         if expression.op == "item":
@@ -12037,6 +12053,78 @@ class _ControlSSABuilder(TiledObject):
                 int(expression.value_id), result,
                 BindingKind.CONTROL_EXPRESSION, *operand_values,
             )
+        return result
+
+    def _resident_string_control_comparison(self, expression, operand_values, *, result_override=None):
+        """Use the incumbent full-content helper for actual resident strings.
+
+        Source class alone does not turn a vocabulary token into a span.
+        Conversely an actual glyph span must never fall through to scalar Eq.
+        """
+        if expression.op not in {"eq", "ne"} or len(expression.operands) != 2:
+            return None
+        ids = tuple(operand.value_id for operand in expression.operands)
+        if any(value is None for value in ids):
+            return None
+        from .source_borrowed_record_spans import (
+            exact_string_classes, borrowed_record_string_layouts_from_book,
+        )
+        classes = tuple(exact_string_classes(self._book(), self._canonical_cell(int(sid))) for sid in ids)
+        descriptors = tuple(self.sequence_descriptors.get(int(sid)) for sid in ids)
+        # A selected glyph row is still a span when its class receipt is
+        # missing or contradicted. Never let that failure become scalar Eq.
+        glyph_lists = borrowed_record_string_layouts_from_book(
+            self._book(), self.lexical_read_scope,
+            ((sid, "duplicates", len(d.column_value_ids), d.writable)
+             for sid, d in self.sequence_descriptors.items() if not d.key_columns),
+        )
+        glyph_pools = {tuple(self.sequence_descriptors[sid].child_table_pool.column_value_ids)
+                       for sid in glyph_lists
+                       if self.sequence_descriptors[sid].child_table_pool is not None}
+        selected_glyph = any(
+            int(sid) in self.child_table_selections
+            and tuple(self.child_table_selections[int(sid)][0].column_value_ids) in glyph_pools
+            for sid in ids
+        )
+        if not selected_glyph and not any(cls and descriptor is not None for cls, descriptor in zip(classes, descriptors)):
+            return None
+        if not all(classes) or any(descriptor is None for descriptor in descriptors):
+            raise ValueError("resident string comparison requires exact string classes and both glyph descriptors")
+        left, right = descriptors
+        if (any(d.writable or d.status_address_id is not None or d.key_columns
+                or d.live_flags_value_id is not None or d.child_table_pool is not None
+                or any(d.column_shapes) for d in descriptors)
+                or left.column_dtypes != ("int64",) or right.column_dtypes != ("int64",)
+                or len(left.column_value_ids) != 1 or len(right.column_value_ids) != 1
+                or any(int(actual.id) != int(descriptor.column_value_ids[0])
+                       for actual, descriptor in zip(operand_values, descriptors))):
+            raise ValueError("resident string comparison has incompatible or unbound glyph storage")
+        from .ir_sequence_tables import lower_sequence_equal
+        lowering = lower_sequence_equal(left, right,
+            function_name=self._sequence_helper_name(int(left.sequence_id), "equal", int(right.sequence_id)),
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek())
+        if not lowering.complete:
+            raise ValueError("resident string equality helper did not lower completely")
+        arguments = tuple(self.ssa_value_objects[int(formal.id)] for formal in lowering.entry.args)
+        self._register_sequence_lowering(lowering)
+        comparison = (result_override if expression.op == "eq" and result_override is not None else
+                      self.fresh_value(dtype="bool", transform=REGION_CALL_RESULT,
+                          operands=(*arguments, *(cell for group in classes for cell in group),
+                                    *(self._sequence_contract_cell(int(sid)) for sid in ids),
+                                    *self._sequence_helper_call_sources(lowering.entry))))
+        self.emit(Handler.Call, list(arguments), comparison, attributes={
+            "callee": lowering.entry.name, "source_linked": True,
+            "ssa_sequence_operation": "equal", "source_value_id": expression.value_id,
+            "left_sequence_id": int(left.sequence_id), "right_sequence_id": int(right.sequence_id),
+        })
+        result = comparison
+        if expression.op == "ne":
+            result = result_override or self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(comparison,))
+            self.emit(Handler.LNot, [comparison], result,
+                      attributes={"binding": "control_expression", "source_value_id": expression.value_id})
+        if expression.value_id is not None:
+            self._bind(int(expression.value_id), result, BindingKind.CONTROL_EXPRESSION,
+                       *operand_values, *(cell for group in classes for cell in group))
         return result
 
     def _union_none_identity_subject(self, expression) -> int | None:
@@ -13039,8 +13127,14 @@ class _ControlSSABuilder(TiledObject):
             causes = (handle_arena, self._sequence_contract_cell(int(iterable_id)), declaration)
             members = []
             for name, element_dtype, rank in (("column", dtype, 1), ("lengths", "int64", 1), ("row_stride", "int64", 0), ("capacity", "int64", 0)):
+                from .source_borrowed_record_spans import publish_borrowed_record_span_role
+                role_cell = publish_borrowed_record_span_role(
+                    self, target_id, name, projection, handle_arena,
+                    self._sequence_contract_cell(int(iterable_id)),
+                )
                 value = self.fresh_value(dtype=element_dtype, transform=DESCRIPTOR_CELL,
-                    operands=causes, physical={"physical_dtype": element_dtype,
+                    operands=(*causes, *((role_cell,) if role_cell is not None else ())),
+                    physical={"physical_dtype": element_dtype,
                         "storage": "span" if rank else "scalar", "rank": rank,
                         "arena": bool(rank), "device": None})
                 fact = self._book().page(SSA_VALUE).latest((self._scope(), int(value.id)))
@@ -13542,11 +13636,12 @@ class _ControlSSABuilder(TiledObject):
         # _storage_values in ir_sequence_tables.py) -- both sides of that
         # shared value must declare the same width or the Fortran call
         # fails with a real ABI type mismatch, not a cosmetic one.
-        def storage_cell(dtype: str, shape: tuple = ()) -> SSAValue:
+        def storage_cell(dtype: str, shape: tuple = (), *, scalar: bool = False) -> SSAValue:
             return self.fresh_value(
                 dtype=dtype, shape=shape, transform=DESCRIPTOR_CELL,
                 operands=descriptor_operands,
-                physical=_declared_physical_dtype(dtype),
+                physical={**_declared_physical_dtype(dtype),
+                          **({"storage": "scalar", "rank": 0} if scalar else {})},
             )
 
         length_address = storage_cell("int64", (1,))
@@ -13594,8 +13689,9 @@ class _ControlSSABuilder(TiledObject):
                 storage_cell(dtype) for dtype in child_column_dtypes
             )
             child_lengths = storage_cell("int64")
-            child_capacity = storage_cell("int64")
-            child_stride = storage_cell("int64")
+            # These descriptor roles are native scalar counts, not arenas.
+            child_capacity = storage_cell("int64", scalar=True)
+            child_stride = storage_cell("int64", scalar=True)
             child_shapes = (
                 storage_cell("int32") if nested_tensor else None
             )
@@ -17426,6 +17522,33 @@ class _ControlSSABuilder(TiledObject):
         if destination is None:
             return
 
+        from .source_borrowed_record_spans import (
+            borrowed_record_string_layouts_from_book, borrowed_record_string_source,
+        )
+        glyph_layouts = borrowed_record_string_layouts_from_book(
+            self._book(), self.lexical_read_scope,
+            ((sid, "duplicates", len(descriptor.column_value_ids), descriptor.writable)
+             for sid, descriptor in self.sequence_descriptors.items()
+             if not descriptor.key_columns),
+        )
+        # A descriptor alias must not turn a glyph child handle into an
+        # ordinary scalar payload. This census only restricts writes; copy
+        # permission still requires the full borrowed-view proof below.
+        glyph_destination = any(
+            set(self.sequence_descriptors[sid].column_value_ids).intersection(destination.column_value_ids)
+            for sid in glyph_layouts
+        )
+        if glyph_destination and operation != "clear" and not (
+            operation == "append" and len(mutation.argument_value_ids) == 1
+            and borrowed_record_string_source(self._book(), self.lexical_read_scope,
+                                              int(mutation.argument_value_ids[0])) is not None
+        ):
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "borrowed-string-child-copy", location,
+                "glyph child-pool mutation requires an exact borrowed string view",
+            ))
+            return
+
         if operation == "sorted":
             if not mutation.argument_value_ids:
                 self.shortfalls.append(SSALoweringShortfall(
@@ -18556,10 +18679,54 @@ class _ControlSSABuilder(TiledObject):
         deferred_record_slots: tuple[tuple[int, int, str, int], ...] = ()
         indexed_record_row_source: tuple[int, int, str] | None = None
         native_type_tag_sequence_receipt: tuple = ()
+        borrowed_span_sources: tuple = ()
+        from .source_borrowed_record_spans import (
+            borrowed_record_string_source, borrowed_record_string_view,
+        )
+        borrowed_span = (
+            borrowed_record_string_source(self._book(), self.lexical_read_scope,
+                                          int(mutation.argument_value_ids[0]))
+            if operation == "append" and len(mutation.argument_value_ids) == 1
+            else None
+        )
         if operation == "append" and str(mutation.argument_kind) == "child_row":
             self._emit_child_row_birth(mutation, destination, location=location)
             return
-        if operation in {"append", "add"}:
+        if borrowed_span is not None:
+            from .source_sequence_lifetime import _validate as validate_lifetime
+            from .concordance_declarations import SEQUENCE_STORAGE_LIFETIME, SequenceLifetimeKind
+            from .ir_sequence_tables import lower_record_sequence_append_with_child_copy
+            source_id = int(mutation.argument_value_ids[0])
+            borrowed_span_sources = borrowed_record_string_view(self, source_id)
+            local_cell = self._book().latest_ref(SEQUENCE_STORAGE_LIFETIME,
+                                                (self._scope(), int(destination.sequence_id)))
+            local = None if local_cell is None else validate_lifetime(self._book(), local_cell)
+            if (borrowed_span_sources is None or destination.child_table_pool is None
+                    or local is None or local.kind is not SequenceLifetimeKind.LOCAL_NEW
+                    or local.owner_cell is None
+                    or local.owner_cell.row[-1] != destination.heap_owner_value_id):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "borrowed-string-child-copy", location,
+                    "runtime string span append requires exact borrowed field provenance "
+                    "and an independent local child-pool destination",
+                ))
+                return
+            source = self.sequence_descriptors[source_id]
+            lowering = lower_record_sequence_append_with_child_copy(
+                destination, source,
+                function_name=self._sequence_helper_name(int(destination.sequence_id),
+                                                        "append_child_copy", source_id),
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            )
+            if not lowering.complete:
+                self.shortfalls.extend(SSALoweringShortfall(
+                    "ssa-sequence", item.code.value, location, item.reason)
+                    for item in lowering.shortfalls)
+                return
+            call_arguments = tuple(self.ssa_value_objects[int(formal.id)]
+                                   for formal in lowering.entry.args)
+            borrowed_span_sources = (*borrowed_span_sources, local_cell)
+        elif operation in {"append", "add"}:
             expected_columns = len(destination.column_value_ids)
             record_slots = self.sequence_row_record_slots.get(
                 int(destination.sequence_id), ()
@@ -19561,7 +19728,7 @@ class _ControlSSABuilder(TiledObject):
         # cell the descriptor names, never a positional stand-in.
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
-            operands=(*call_arguments, *self._sequence_mutation_call_sources(mutation),
+            operands=(*call_arguments, *borrowed_span_sources, *self._sequence_mutation_call_sources(mutation),
                       *self._sequence_helper_call_sources(lowering.entry),
                       *((mutation.snapshot_cell,)
                         if mutation.snapshot_cell is not None else ())),
@@ -19573,7 +19740,7 @@ class _ControlSSABuilder(TiledObject):
             attributes={
                 "callee": callee,
                 "source_linked": True,
-                "ssa_sequence_operation": operation,
+                "ssa_sequence_operation": "append_child_copy" if borrowed_span_sources else operation,
                 "sequence_id": int(destination.sequence_id),
                 "source_effect_node_id": int(mutation.effect_node_id),
                 **({"source_sequence_snapshot_cell": mutation.snapshot_cell}
@@ -22038,10 +22205,49 @@ class _ControlSSABuilder(TiledObject):
                     attributes={"induction": loop.induction},
                 )
                 continue
+            from .source_borrowed_record_spans import (
+                borrowed_record_string_layouts_from_book, exact_string_classes,
+            )
+            string_classes = exact_string_classes(self._book(), self._canonical_cell(int(target_id)))
+            glyph_rows = borrowed_record_string_layouts_from_book(
+                self._book(), self.lexical_read_scope,
+                ((int(iterable_id), "duplicates", len(outer_descriptor.column_value_ids), outer_descriptor.writable),)
+                if outer_descriptor is not None and not outer_descriptor.key_columns else (),
+            )
+            if int(iterable_id) in glyph_rows and not string_classes:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "string-row-class", "owned string row iteration",
+                    "glyph row target requires its exact string class declaration",
+                ))
+                continue
+            string_view = bool(string_classes and int(iterable_id) in glyph_rows
+                               and outer_descriptor.child_table_pool is not None)
+            read_phase_sources = ()
+            if string_view:
+                from .source_owned_child_read_phase import owned_child_read_phase_sources
+                read_phase_sources = owned_child_read_phase_sources(
+                    self._book(), self.lexical_read_scope, int(iterable_id),
+                    loop_cell, int(target_id),
+                )
+                if not read_phase_sources:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "ssa-sequence", "string-row-read-phase", "owned string row iteration",
+                        "selected glyph views require a closed build-then-read phase without mutation or escape",
+                    ))
+                    continue
+            # The integer row handle is not the authored string value. Give
+            # it its own scalar identity, then bind the string to its actual
+            # selected glyph span, so equality never compares handles.
+            handle_target = (self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(self.external_value(iterable_id), induction,
+                          self._canonical_cell(int(target_id)), *string_classes, *read_phase_sources),
+                physical={"physical_dtype": "int64", "storage": "scalar", "rank": 0},
+            ).id if string_view else target_id)
             handle_value = self.indexed_load(
                 self.external_value(iterable_id),
                 induction,
-                target_id,
+                handle_target,
                 attributes={
                     "binding": "iterable",
                     "induction": loop.induction,
@@ -22056,9 +22262,21 @@ class _ControlSSABuilder(TiledObject):
             if outer_pool is not None and outer_pool.key_columns == () and (
                 len(outer.column_value_ids) == 1
             ):
+                if string_view:
+                    # The backing pool remains mutable/owned. Its string
+                    # value is a readonly slice, not a mutation-status port.
+                    outer_pool = replace(outer_pool, writable=False, status_value_id=None)
                 self.child_table_selections[int(target_id)] = (
                     outer_pool, handle_value,
                 )
+                if string_view:
+                    view = self._sequence_descriptor(int(target_id), policy="duplicates",
+                                                     writable=False, location="owned string row view")
+                    if view is None:
+                        raise ValueError("owned string row has no selected glyph descriptor")
+                    self._bind(int(target_id), self.ssa_value_objects[view.column_value_ids[0]],
+                               BindingKind.SEQUENCE_RESULT, handle_value,
+                               self._canonical_cell(int(target_id)), *string_classes, *read_phase_sources)
         for iterable_id, target_id, induction_name, projection in (
             self.program.projected_iterable_bindings
         ):
@@ -25332,6 +25550,7 @@ class _ControlSSABuilder(TiledObject):
         def register_sequence(table, descriptor):
             # A descriptor stands on the cells of the values it names.
             from .concordance_declarations import SOURCE_PRIVATE_DYNAMIC_SEQUENCE
+            from .ir_sequence_tables import _child_pool_identity_ids
             private_dynamic = (
                 None if self.lexical_read_scope is None else
                 self._book().latest_ref(
@@ -25360,6 +25579,7 @@ class _ControlSSABuilder(TiledObject):
                         descriptor.status_address_id,
                         descriptor.live_flags_value_id,
                         descriptor.heap_owner_value_id,
+                        *_child_pool_identity_ids(descriptor.child_table_pool),
                     )
                     if value_id is not None
                 ),

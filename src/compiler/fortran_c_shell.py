@@ -19836,9 +19836,10 @@ def _sequence_child_table_layout_contracts(
         )
         return matches[0] if len(matches) == 1 else None
 
+    from .source_borrowed_record_spans import borrowed_record_string_layouts
     result: dict[
         int, tuple[int, tuple[str, ...], tuple[int, ...], bool]
-    ] = {}
+    ] = borrowed_record_string_layouts(graph_obj, sequence_declarations)
     declarations = {int(sid): int(width) for sid, _policy, width, _writable in sequence_declarations}
     field_kinds = dict(graph_obj.graph.get("class_field_value_aggregate_kinds") or {})
     field_contracts = dict(graph_obj.graph.get("class_field_mapping_contracts") or {})
@@ -32826,6 +32827,14 @@ def _class_surface_ssa_program(
                 .get("aggregate_kind") == "list"
             ),
         }
+        from .source_borrowed_record_spans import borrowed_record_string_layouts
+        borrowed_string_child_layouts = borrowed_record_string_layouts(
+            graph_obj, sequence_declarations,
+        )
+        # A bound on input rows does not bound their runtime glyph widths.
+        # Only these proven fresh local list destinations acquire owned
+        # dynamic child storage; incoming spans retain their borrowed ABI.
+        dynamic_sequence_ids.update(borrowed_string_child_layouts)
         dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
         from types import SimpleNamespace as _GraphView
         from .glsl_deployment_strategy import (
@@ -33115,6 +33124,7 @@ def _class_surface_ssa_program(
                         )
                     },
                     **nested_descriptor_sequence_dtypes,
+                    **{int(sid): ("int64",) for sid in borrowed_string_child_layouts},
                 },
                 sequence_record_identities=(
                     _sequence_record_identity_contracts(

@@ -860,3 +860,14 @@ lower_ast_source_to_ssa entry and its ExtractionContract. The first bounded
 loop compiled through that path; full traversal remains incomplete and must
 not be activated as if repaired. Reading the existing AST route and required
 public entry before implementing would have prevented this departure.
+
+## 2026-11-13 - changing collected tests during a frozen comparison
+
+While another agent was running a paired source-proof comparison, I added two
+native consumer cases to a test file that the pair also collected. The runs
+therefore collected different case sets and could not serve as a paired
+comparison. Both added cases stopped at source audit, before native execution.
+The concrete cost was an extra source-only rerun to restore comparable evidence.
+I disclosed the mismatch and held subsequent edits until the coordinated window
+was released. A test freeze includes test collection files, not only production
+source; I should have written the cases separately until the pair completed.

@@ -9060,8 +9060,12 @@ def emit_ssa_module_to_c(
                             )
                 pointer_cell = None
                 if element_count is None:
-                    from .source_sequence_pointer_cells import sequence_pointer_cell
+                    from .source_sequence_pointer_cells import (
+                        sequence_pointer_cell, sequence_child_pointer_cell,
+                    )
                     pointer_cell = sequence_pointer_cell(module, function_name, value_id)
+                    if pointer_cell is None:
+                        pointer_cell = sequence_child_pointer_cell(module, function_name, value_id)
                     if pointer_cell is not None:
                         # The dynamic payload keeps its unknown extent. Only
                         # its exact descriptor's native pointer CELL is sized.

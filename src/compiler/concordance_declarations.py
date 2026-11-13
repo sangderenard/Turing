@@ -5666,3 +5666,18 @@ class SequenceStorageLifetime:
 SEQUENCE_STORAGE_LIFETIME = declare_page("sequence_storage_lifetime", (
     RowField("function_scope", K.SCOPE), RowField("sequence_value_id", K.VALUE_ID),
 ), SequenceStorageLifetime)
+
+
+@dataclass(frozen=True)
+class BorrowedRecordSpanRole:
+    """Birth role of one direct-input record field pool member."""
+    control_cell: Ref
+    parent_cell: Ref
+    projection: tuple
+
+
+BORROWED_RECORD_SPAN_ROLE = declare_page("borrowed_record_span_role", (
+    RowField("function_scope", K.SCOPE),
+    RowField("field_source", K.PAGE_REF),
+    RowField("role", K.LABEL),
+), BorrowedRecordSpanRole)

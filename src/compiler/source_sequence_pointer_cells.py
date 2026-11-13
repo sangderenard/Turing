@@ -61,3 +61,39 @@ def sequence_pointer_cell(module, function_name, value_id):
         return None
     return SequencePointerCell(value_id, tuple(dict.fromkeys((
         declared,contract,*source,column,data,owner,length,capacity))))
+
+
+def sequence_child_pointer_cell(module, function_name, value_id):
+    """Prove a local child arena's pointer slot, never its payload extent.
+
+    Complete child roles, physical layouts and shared LOCAL_NEW owner must
+    already validate. Scalar capacity/stride, borrowed views and arbitrary
+    pointers are not eligible for this private wrapper storage rule.
+    """
+    from .source_sequence_child_lifetime import validated_sequence_child_storage
+    name, value_id = str(function_name), int(value_id)
+    function = module.functions.get(name)
+    table = getattr(module, 'sequence_tables', {}).get(name)
+    if function is None or table is None:
+        return None
+    formals = [v for v in function.args if int(v.id) == value_id]
+    if (len(formals) != 1 or str(formals[0].dtype) != 'ptr'
+            or tuple(formals[0].shape or ()) or formals[0].device is not None):
+        return None
+    candidates = []
+    for sid, descriptor in table.sequences.items():
+        pool = descriptor.child_table_pool
+        if pool is None:
+            continue
+        arenas = (*pool.column_value_ids, pool.length_value_id, pool.status_value_id)
+        if value_id in arenas:
+            candidates.append((sid, arenas))
+    if len(candidates) != 1:
+        return None
+    sid, arenas = candidates[0]
+    if arenas.count(value_id) != 1:
+        return None
+    proof = validated_sequence_child_storage(module, name, sid)
+    if proof is None:
+        return None
+    return SequencePointerCell(value_id, proof)
