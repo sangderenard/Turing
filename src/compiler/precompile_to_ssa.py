@@ -20508,13 +20508,24 @@ class _ControlSSABuilder(TiledObject):
                 (true_exit.name, false_exit.name),
                 binding="conditional_native_type_tag",
             )
+            # A nested conditional may publish a planning alias onto its
+            # initial resident (97 -> 104 in compile_nodes). The outer
+            # source arm still names 97, while its emitted Phi operand is
+            # 104. Select the existing descriptor through that same durable
+            # alias proof, not a new descriptor for the source spelling.
+            true_sequence_id = self._conditional_sequence_descriptor_id(
+                int(_true_id), true_value,
+            )
+            false_sequence_id = self._conditional_sequence_descriptor_id(
+                int(_false_id), false_value,
+            )
             if (
-                int(_true_id) in self.sequence_descriptors
-                and int(_false_id) in self.sequence_descriptors
+                true_sequence_id is not None
+                and false_sequence_id is not None
                 and int(result_id) in conditional.sequence_handle_results
             ):
                 self._lower_sequence_handle_merge(
-                    int(_true_id), int(_false_id), merged,
+                    true_sequence_id, false_sequence_id, merged,
                     incoming_blocks=(true_exit.name, false_exit.name),
                     predicate=predicate,
                 )
@@ -20752,6 +20763,23 @@ class _ControlSSABuilder(TiledObject):
         if status is not None:
             roles[("status",)] = status
         return roles
+
+    def _conditional_sequence_descriptor_id(
+        self, source_id: int, value: SSAValue,
+    ) -> int | None:
+        """Resolve a source arm only when its emitted arena proves the same resident.
+
+        Planning aliases carry storage identity; mutable lowering bindings
+        and matching dtypes do not. A missing descriptor or a different Phi
+        operand cannot authorize borrowing another sequence's length/owner.
+        """
+        resident = self._concorded_resident(int(source_id))
+        descriptor = self.sequence_descriptors.get(resident)
+        if descriptor is None or not descriptor.column_value_ids:
+            return None
+        if int(value.id) != int(descriptor.column_value_ids[0]):
+            return None
+        return resident
 
     def _lower_sequence_handle_merge(
         self, true_id: int, false_id: int, merged: SSAValue, *,
