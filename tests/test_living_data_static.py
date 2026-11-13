@@ -37,7 +37,7 @@ def test_http_static_inspection_render_transport_and_ownership(server):
     h = _cookie(server, 'staticdm', 'operator')
     other = _cookie(server, 'staticother', 'operator')
     assert _call(server.port, BASE, 'POST', OUTSIDE, registration())[0] == 403
-    assert _call(server.port, BASE, 'POST', {}, registration())[0] == 401
+    assert _call(server.port, BASE, 'POST', {}, registration())[0] == 403          # a guest never holds dev_ui (owner, 2026-11-13)
     status, _, world = _call(server.port, BASE, 'POST', h, registration())
     assert status == 201
     url = BASE + '/' + world['world_id']
