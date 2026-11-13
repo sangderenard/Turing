@@ -31,7 +31,7 @@
         "--fabric-udp-port",
         "48768",
         "--nodus-ui",
-        "nodus-messenger:47613"
+        "nodus-messenger:47614"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -82,7 +82,7 @@
         "--fabric-udp-port",
         "48771",
         "--nodus-ui",
-        "nodus-messenger:47613"
+        "nodus-messenger:47614"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -143,7 +143,7 @@
     {
       "name": "nodus-ui-mirror",
       "kind": "command",
-      "port": 47613,
+      "port": 47614,
       "route": "",
       "bind": "127.0.0.1",
       "account": "svc-nodus-ui-mirror",
@@ -153,7 +153,7 @@
         "C:/dev/Powershell/nodus/demo_canvas_tables.py",
         "--mode", "server",
         "--host", "127.0.0.1",
-        "--port", "47613",
+        "--port", "47614",
         "--attach-console", "127.0.0.1:47612",
         "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-messenger.console.secret"
       ],
