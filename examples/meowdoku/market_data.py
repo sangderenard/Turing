@@ -22,6 +22,7 @@ CRYPTO = "BTC/USD"
 HISTORY_SECONDS = 300
 NOW_SECONDS = 15
 MAX_RESPONSE = 2 * 1024 * 1024
+MAX_HISTORY_PAGES = 24
 _lock = threading.Lock()
 _cache: dict[tuple, tuple[float, dict]] = {}
 _key_locks: dict[tuple, threading.Lock] = {}
@@ -69,6 +70,27 @@ def _fetch(path: str, params: dict, keys: tuple[str, str]) -> tuple[dict, dict]:
         raise MarketError("Alpaca market data is unavailable") from None
 
 
+def _history_pages(path: str, params: dict, keys: tuple[str, str]) -> tuple[dict, dict]:
+    """Collect Alpaca's symbol-first pages without silently dropping later symbols."""
+    bars: dict[str, list] = {}
+    seen: set[str] = set()
+    page_token = None
+    quota = {}
+    for _ in range(MAX_HISTORY_PAGES):
+        page, quota = _fetch(path, {**params, **({"page_token": page_token} if page_token else {})}, keys)
+        for symbol, series in (page.get("bars") or {}).items():
+            if not isinstance(series, list):
+                raise MarketError("Alpaca historical bars response was invalid")
+            bars.setdefault(symbol, []).extend(series)
+        page_token = page.get("next_page_token")
+        if not page_token:
+            return {"bars": bars}, quota
+        if not isinstance(page_token, str) or page_token in seen:
+            raise MarketError("Alpaca historical pagination was invalid")
+        seen.add(page_token)
+    raise MarketError("Alpaca historical bars exceeded the page limit")
+
+
 def _cached(account_id: int, kind: str, stock: str, seconds: int, load) -> dict:
     key = (account_id, kind, stock)
     with _lock:
@@ -95,10 +117,10 @@ def history(secrets_dir, account_id: int, stock: str = "AAPL") -> dict:
                   "end": end.isoformat().replace("+00:00", "Z"),
                   "timeframe": "1Hour", "limit": "10000"}
         stock_end = end - timedelta(minutes=20)
-        equities, equity_quota = _fetch("/v2/stocks/bars", {**window,
+        equities, equity_quota = _history_pages("/v2/stocks/bars", {**window,
             "end": stock_end.isoformat().replace("+00:00", "Z"),
             "symbols": ",".join((*ETFS, stock)), "feed": "iex"}, keys)
-        crypto, crypto_quota = _fetch("/v1beta3/crypto/us/bars", {**window, "symbols": CRYPTO}, keys)
+        crypto, crypto_quota = _history_pages("/v1beta3/crypto/us/bars", {**window, "symbols": CRYPTO}, keys)
         return {"asof": end.isoformat(), "stock": stock, "etf_feed": "iex",
                 "bars": {**{symbol: (equities.get("bars") or {}).get(symbol, []) for symbol in (*ETFS, stock)},
                          CRYPTO: (crypto.get("bars") or {}).get(CRYPTO, [])},

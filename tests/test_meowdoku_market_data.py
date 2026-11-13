@@ -56,6 +56,27 @@ class MarketDataTest(unittest.TestCase):
         self.assertEqual(result["book_note"], "book unavailable")
         self.assertIn("BTC/USD", result["bars"])
 
+    def test_history_collects_later_symbol_and_crypto_pages(self):
+        calls = []
+
+        def fetch(path, params, keys):
+            calls.append((path, params.get("page_token")))
+            if "stocks" in path:
+                if not params.get("page_token"):
+                    return {"bars": {"AAPL": [{"c": 1}]}, "next_page_token": "next-stock"}, {}
+                return {"bars": {"SPY": [{"c": 2}], "QQQ": [{"c": 3}]}}, {}
+            if not params.get("page_token"):
+                return {"bars": {"BTC/USD": [{"c": 4}]}, "next_page_token": "next-crypto"}, {}
+            return {"bars": {"BTC/USD": [{"c": 5}]}}, {}
+
+        with patch.object(market_data, "_fetch", side_effect=fetch):
+            result = market_data.history(self.secrets, 1)
+        self.assertEqual([bar["c"] for bar in result["bars"]["BTC/USD"]], [4, 5])
+        self.assertEqual(result["bars"]["SPY"][0]["c"], 2)
+        self.assertEqual(result["bars"]["QQQ"][0]["c"], 3)
+        self.assertEqual(calls, [("/v2/stocks/bars", None), ("/v2/stocks/bars", "next-stock"),
+                                 ("/v1beta3/crypto/us/bars", None), ("/v1beta3/crypto/us/bars", "next-crypto")])
+
 
 if __name__ == "__main__":
     unittest.main()
