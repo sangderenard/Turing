@@ -26,6 +26,16 @@ def test_reject_shaped_or_sparse_source():
         with pytest.raises(ValueError,match='dense scalar leaf'):
             lower_record_sequence_append_with_child_copy(d,changed)
 
+def test_dynamic_destination_requires_dense_unshaped_child_pool():
+    from dataclasses import replace
+    d,s=descriptors()
+    for pool in (replace(d.child_table_pool,shape_value_id=40,rank_value_id=41,shape_stride_value_id=42),
+                 replace(d.child_table_pool,live_flags_value_id=43),
+                 replace(d.child_table_pool,key_columns=(0,))):
+        result=lower_record_sequence_append_with_child_copy(replace(d,child_table_pool=pool),s)
+        assert not result.complete
+        assert result.shortfalls[0].code.value=='dynamic-growth-unavailable'
+
 @pytest.mark.parametrize('backend',['c','llvm'])
 def test_runtime_glyph_copy(backend,tmp_path):
     from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm,compile_artifact,prepare_artifact_execution
