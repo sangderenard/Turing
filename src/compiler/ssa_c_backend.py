@@ -8947,6 +8947,7 @@ def emit_ssa_module_to_c(
     buffer_dtypes: list[str] = []
     entry_lines: list[str] = []
     root_allocations: list[tuple[str, str, int]] = []
+    root_allocation_proofs: dict[str, tuple] = {}
     # The wrapper's units are posted under the root function's row.
     wrapper = recorders.get(function_name) or emission_recorder(
         emission, root, Backend.C_MODULE, stage=EMISSION_C,
@@ -9042,6 +9043,15 @@ def emit_ssa_module_to_c(
                                 int(element_count or 0),
                                 len(record_entry.fields),
                             )
+                pointer_cell = None
+                if element_count is None:
+                    from .source_sequence_pointer_cells import sequence_pointer_cell
+                    pointer_cell = sequence_pointer_cell(module, function_name, value_id)
+                    if pointer_cell is not None:
+                        # The dynamic payload keeps its unknown extent. Only
+                        # its exact descriptor's native pointer CELL is sized.
+                        element_count = pointer_cell.element_count
+                        held = c_lane_storage_for_llvm_type("ptr")
                 if element_count is None:
                     # Lane D, item D1. Wrong record: a private root arena
                     # with no storage requirement (or a dynamic or ranked
@@ -9064,6 +9074,8 @@ def emit_ssa_module_to_c(
                     ))
                     element_count = 1
                 owned = activation_array(held, element_count)
+                if pointer_cell is not None:
+                    root_allocation_proofs[owned] = pointer_cell.proof_cells
                 owned_storage_names[value_id] = owned
                 copied_from = (
                     rendered_root_value(int(split_source))
@@ -9432,8 +9444,12 @@ def emit_ssa_module_to_c(
     wrapper_header_unit = wrapper.unit(
         UnitKind.FUNCTION_HEADER, wrapper_header, spelling=name,
     )
-    for line in entry_lines[:wrapper_prefix]:
-        wrapper.unit(UnitKind.DECLARATION, line)
+    for index, line in enumerate(entry_lines[:wrapper_prefix]):
+        allocation_index = (index if index < len(root_allocations)
+                            else (index - len(root_allocations)) // 2)
+        allocation_name = root_allocations[allocation_index][1]
+        wrapper.unit(UnitKind.DECLARATION, line,
+                     extra_cells=root_allocation_proofs.get(allocation_name, ()))
     wrapper.unit(
         UnitKind.RETURN, "\n".join((*entry_lines[len(entry_lines) - wrapper_tail:], "}")),
     )
