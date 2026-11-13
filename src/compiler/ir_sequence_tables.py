@@ -4267,15 +4267,111 @@ def lower_sequence_equal(
     return SSASequenceLowering((function,))
 
 
+def _validate_glyph_key_query(descriptor, query):
+    """First phase: fixed, dense, single glyph-key lookup, not insertion.
+
+    As with the incumbent raw table ABI, callers provide valid initialized
+    handle/length/capacity buffers. Source dispatch must prove the exact
+    glyph layout/lifetime; this low-level constructor does not infer classes.
+    """
+    pool = descriptor.child_table_pool
+    if len(descriptor.column_dtypes) != len(descriptor.column_value_ids):
+        raise ValueError("glyph-key lookup requires explicit outer column layouts")
+    if pool is not None:
+        # Read-only data aliasing is allowed only with the exact same role and
+        # physical declaration. Never overwrite a conflicting member by ID.
+        roles = {}
+        def admit(value_id, role, dtype, shape=()):
+            declaration = (role, str(dtype), tuple(shape))
+            incumbent = roles.get(int(value_id))
+            if incumbent is not None and incumbent != declaration:
+                raise ValueError("glyph-key storage identity has conflicting roles")
+            roles[int(value_id)] = declaration
+        for index, (value_id, dtype) in enumerate(zip(descriptor.column_value_ids, descriptor.column_dtypes)):
+            admit(value_id, ("outer_column", index), dtype)
+        admit(descriptor.length_address_id, "outer_length", "int64", (1,))
+        admit(descriptor.capacity_value_id, "outer_capacity", "int64")
+        if descriptor.status_address_id is not None:
+            admit(descriptor.status_address_id, "outer_status", "int", (1,))
+        for value_id in pool.column_value_ids:
+            admit(value_id, "glyph_data", "int64")
+        admit(pool.length_value_id, "child_lengths", "int64")
+        admit(pool.capacity_value_id, "child_capacity", "int64")
+        admit(pool.row_stride_value_id, "child_stride", "int64")
+        if pool.status_value_id is not None:
+            admit(pool.status_value_id, "child_status", "int")
+        for value_id, dtype in zip(query.column_value_ids, query.column_dtypes):
+            admit(value_id, "glyph_data", dtype)
+        admit(query.length_address_id, "query_length", "int64", (1,))
+        admit(query.capacity_value_id, "query_capacity", "int64")
+    if (pool is None or tuple(descriptor.key_columns) != (pool.handle_column,)
+            or descriptor.column_dtypes[pool.handle_column] != "int64"
+            or descriptor.live_flags_value_id is not None or any(descriptor.column_shapes)
+            or descriptor.heap_owner_value_id is not None
+            or descriptor.capacity_policy is not SSASequenceCapacityPolicy.FIXED):
+        raise ValueError("glyph-key lookup first requires a fixed dense single-key child table")
+    if (tuple(pool.column_dtypes) != ("int64",) or len(pool.column_value_ids) != 1
+            or pool.key_columns or pool.live_flags_value_id is not None
+            or pool.status_value_id is not None
+            or any(getattr(pool, name) is not None for name in
+                   ("shape_value_id", "rank_value_id", "shape_stride_value_id"))):
+        raise ValueError("glyph-key lookup requires one dense scalar glyph child column")
+    if (query.column_dtypes != ("int64",) or len(query.column_value_ids) != 1
+            or query.key_columns or query.child_table_pool is not None
+            or query.live_flags_value_id is not None or query.heap_owner_value_id is not None
+            or query.status_address_id is not None
+            or query.capacity_policy is not SSASequenceCapacityPolicy.FIXED
+            or query.writable or any(query.column_shapes)):
+        raise ValueError("glyph-key lookup requires an exact borrowed leaf query descriptor")
+
+
+def _glyph_key_row_match(builder, descriptor, query, helper_name):
+    """Compose the existing complete equality helper, not a handle comparison."""
+    pool = descriptor.child_table_pool
+    selected_data = builder.fresh("ptr")
+    selected_length = builder.fresh("ptr")
+    selected = SSASequenceDescriptor(
+        selected_data.id, (selected_data.id,), selected_length.id,
+        pool.row_stride_value_id, column_dtypes=("int64",), writable=False)
+    equality = lower_sequence_equal(selected, query,
+        function_name=helper_name + "__glyph_equal")
+    equality_entry = equality.entry
+    def match(block, row):
+        handle_address = builder.fresh("ptr")
+        handle = builder.fresh("int64")
+        offset = builder.fresh("int64")
+        builder.emit(block, "GetElementPtr", [SSAValue(
+            descriptor.column_value_ids[pool.handle_column], dtype="int64"), row], handle_address)
+        builder.emit(block, "Load", [handle_address], handle)
+        builder.emit(block, "Mul", [handle, SSAValue(pool.row_stride_value_id, dtype="int64")], offset)
+        builder.emit(block, "GetElementPtr", [SSAValue(pool.column_value_ids[0], dtype="int64"), offset], selected_data)
+        builder.emit(block, "GetElementPtr", [SSAValue(pool.length_value_id, dtype="int64"), handle], selected_length)
+        actuals = {v.id: v for v in _storage_values(query)}
+        actuals.update({selected_data.id: selected_data, selected_length.id: selected_length,
+                       pool.row_stride_value_id: SSAValue(pool.row_stride_value_id, dtype="int64")})
+        result = builder.fresh("bool")
+        builder.emit(block, "Call", [actuals[v.id] for v in equality_entry.args], result,
+                     attributes={"callee": equality_entry.name, "source_linked": True,
+                                 "ssa_sequence_operation": "equal"})
+        return result
+    return match, equality.functions
+
+
 def lower_table_lookup(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
     default_parameter: bool = False,
+    query_sequence: SSASequenceDescriptor | None = None,
     required: bool = False,
     first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build key lookup and return every physical value column.
+
+    ``query_sequence`` opts into the existing full-content equality helper
+    for one fixed-pool glyph key. Without it, a child-handle key cannot be
+    mistaken for a scalar token. This read-only operation neither inserts nor
+    reallocates keys; callers retain the incumbent valid-buffer ABI contract.
 
     ``default_parameter`` appends one trailing argument of the value column's
     dtype and returns it from the absent branch -- the ``d.get(key, default)``
@@ -4294,7 +4390,20 @@ def lower_table_lookup(
         )
     if descriptor.status_address_id is None:
         raise ValueError("table lookup requires a caller-visible status cell")
+    if (query_sequence is None and descriptor.child_table_pool is not None
+            and descriptor.child_table_pool.handle_column in descriptor.key_columns):
+        raise ValueError("child-handle key lookup requires an explicit resident query descriptor")
+    if query_sequence is not None:
+        _validate_glyph_key_query(descriptor, query_sequence)
     storage = _storage_values(descriptor)
+    if query_sequence is not None:
+        pool = descriptor.child_table_pool
+        storage = tuple({v.id: v for v in (*storage,
+            SSAValue(pool.column_value_ids[0], dtype="int64", accounting={"sequence_arena": True}),
+            SSAValue(pool.length_value_id, dtype="int64", accounting={"sequence_arena": True}),
+            SSAValue(pool.capacity_value_id, dtype="int64"),
+            SSAValue(pool.row_stride_value_id, dtype="int64"),
+            *_storage_values(query_sequence))}.values())
     status_arena = SSAValue(descriptor.status_address_id, dtype="int", shape=(1,))
     builder = _Builder(_first_fresh_identity(
         descriptor, values=(*storage, status_arena), minimum=first_value_id
@@ -4305,7 +4414,7 @@ def lower_table_lookup(
     value_dtypes = tuple(
         descriptor.column_dtypes[column] for column in value_columns
     )
-    queries = tuple(builder.fresh(dtype) for dtype in key_dtypes)
+    queries = tuple(builder.fresh(dtype) for dtype in key_dtypes) if query_sequence is None else ()
     entry = builder.block("entry")
     header = builder.block("lookup_header")
     body = builder.block("lookup_body")
@@ -4323,10 +4432,16 @@ def lower_table_lookup(
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
-    key_match = _key_row_match(builder, descriptor, key_dtypes, queries)
+    dependencies = ()
+    if query_sequence is None:
+        key_match = _key_row_match(builder, descriptor, key_dtypes, queries)
+    else:
+        key_match, dependencies = _glyph_key_row_match(
+            builder, descriptor, query_sequence,
+            function_name or f"ssa_sequence_{descriptor.sequence_id}_lookup")
     found_rows: list[tuple[SSAValue, BasicBlock]] = []
     scan = entry
-    if hash_index_carrier(descriptor) is not None:
+    if query_sequence is None and hash_index_carrier(descriptor) is not None:
         capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
         indexed, scan = _hash_index_valid(
             builder, entry, descriptor, capacity, length, label="lookup",
@@ -4416,6 +4531,10 @@ def lower_table_lookup(
             "key_columns": descriptor.key_columns,
             "sequence_array_argument_ids": tuple((
                 *map(int, descriptor.column_value_ids),
+                *((int(descriptor.child_table_pool.column_value_ids[0]),
+                   int(descriptor.child_table_pool.length_value_id),
+                   int(query_sequence.column_value_ids[0]),
+                   int(query_sequence.length_address_id)) if query_sequence is not None else ()),
                 int(descriptor.length_address_id),
                 int(descriptor.status_address_id),
                 *((int(descriptor.live_flags_value_id),) if descriptor.live_flags_value_id is not None else ()),
@@ -4428,9 +4547,12 @@ def lower_table_lookup(
                 for index, result in enumerate(results)
             ),
             "required": bool(required),
+            **({"resident_key_query_sequence_id": int(query_sequence.sequence_id),
+                "resident_key_child_column": int(descriptor.child_table_pool.handle_column)}
+               if query_sequence is not None else {}),
         },
     )
-    return SSASequenceLowering((function,))
+    return SSASequenceLowering((function, *dependencies))
 
 
 def lower_glyph_token_copy(
