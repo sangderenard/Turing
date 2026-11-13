@@ -17,6 +17,7 @@ One AbstractTensor input per execution:
 - Configuration: float64 `[8, 256, 38]`. This resets the row's private state and emits its initial positions.
 - Tick: float64 scalar containing seconds. This advances one symplectic Euler step with implicit linear drag and emits new positions as float64 `[8, 256, 3]`.
 - Freeze/thaw: float64 `[2]` containing `[1, 1]` to freeze or `[1, 0]` to thaw. Both return the held positions. While frozen, scalar ticks return the same positions without advancing velocity or sending redundant frames. Thaw resumes the stored velocity; neither command resets the fabric.
+- Table contact: float64 `[6]` containing `[2, topY, minX, maxX, minZ, maxZ]`. This installs the stage tabletop bounds without resetting fabric state or publishing an unchanged frame. The compiled SymPy step projects the Y coordinate against `topY` when the node's X/Z position is within the bounds. This is tabletop support for the drape, not side-wall or cloth self-collision.
 
 The 38 configuration fields per node are:
 
@@ -38,6 +39,8 @@ The 38 configuration fields per node are:
 
 For a grid sheet, use the four neighbor slots for left/right/up/down. For a rope, use two slots for previous/next and mask the other two. All networks and nodes occupy the fixed batch; unoccupied nodes retain their state, and missing edges contribute zero force. An active fabric must have a nonzero integral identity no greater than `2^53-1`, unique among the active fabrics in this row. Other fields of column 37 are ignored. An unstable tick above the row's configured conservative spring limit is refused; the caller can deliver smaller ticks.
 
+`fabricRowConfiguration` accepts `attachments`, an array of distinct node IDs or `{node,anchor:[x,y,z]}` records. It writes the actual pinned mask and anchors to row fields 7 and 8–10. The default hanging wall uses nodes 72 and 80. The table drape uses nodes 0 and 8 at the back edge. Saved Studio backdrop layers can carry `fabricAttachmentPoints` as node IDs; the controls expose that list.
+
 ## UDP publication
 
 After each successful configure or tick, the row sends `NFAB` v1 UDP datagrams to `239.255.78.68:48768` by default. `NODUS_FABRIC_UDP_HOST` and `NODUS_FABRIC_UDP_PORT` can select a different multicast or unicast destination before row initialization. Multicast TTL is four. Network routing must permit multicast for receivers beyond the local segment.
@@ -46,7 +49,7 @@ Every datagram is little endian: `magic:u32`, `version:u16`, `header_bytes:u16` 
 
 ## Measured speed
 
-On the local Windows Nodus build, five 100-step runs of the 81-node sheet measured median row times of 59.1, 59.7, 61.7, 62.1 and 64.5 microseconds. This includes the fixed 8×256×3 batch kernel, AbstractTensor handoff, output publication and two UDP sends. Median UDP receive plus CSV writing was about 111 microseconds. These are local measurements, not a deadline guarantee or live-server result.
+The original sheet kernel measured median row times of 59.1–64.5 microseconds across five 100-step local Windows runs. With the compiled tabletop contact law enabled, five new 100-step runs measured 72.3, 68.4, 67.6, 94.8 and 64.2 microseconds median (0.064–0.095 ms); the fourth run was noisier. Times include the fixed 8×256×3 batch kernel, AbstractTensor handoff, output publication and two UDP sends. UDP receive plus CSV writing is separate, typically about 0.11–0.12 ms median. These are local measurements, not a deadline guarantee or live-server result.
 
 ## Local cloth demo
 
@@ -67,3 +70,11 @@ python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\stu
 ```
 
 `marble_backdrop_fabric.js` samples the two wall triangles from `backdropFaces` into 81 nodes and 128 triangles without changing their material ID. The same helper packs the fixed Nodus row configuration and accepts returned positions when the Studio scene is rebuilt. The live Studio server does not yet connect a canvas fabric row or subscribe to its UDP stream, so its fabric control currently changes the mesh and saved surface behavior, while the live motion/freeze path is proven by the local native demo. Ellipse, grid, artwork and curved sweep fabric are outside this first wall-mesh lane; cardstock retains those existing shapes.
+
+For the stage-table drape, the exporter starts the same wall-derived fabric mesh horizontally 0.8 Studio units above the actual table top. Its back edge sits 0.15 units behind the table, and the free edge extends forward to 0.15 units shy of the front. The exported contact command uses the table's own dimensions and `TABLE_TOP_Y` rather than guessed collision geometry. The two back corners are attached by node IDs 0 and 8.
+
+```powershell
+node tools/export_backdrop_fabric.mjs build/meowdoku/web/assets.json C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv table-drape
+& 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_nodus_row_demo.exe' 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_network_nodus_row.dll' 'C:\Users\alber\nodus-build\spring-row\table_drape_udp.csv' 'C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv' freeze 'C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv.contact.csv'
+python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\table_drape_udp.csv C:\Users\alber\nodus-build\spring-row\table_drape.gif --pins 0,8 --assets build/meowdoku/web/assets.json --material fabric_muslin_white --contact C:\Users\alber\nodus-build\spring-row\table_drape_mesh.csv.contact.csv
+```

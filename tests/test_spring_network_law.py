@@ -49,3 +49,20 @@ def test_batched_spring_step_native_llvm():
     assert np.isclose(output["position_next"][0], .8)
     assert output["position_next"][1] == 3 and output["velocity_next"][1] == 0
     assert output["position_next"][3] == 7 and output["velocity_next"][3] == 2
+
+
+def test_tabletop_unilateral_contact_from_authored_height():
+    from src.compiler.native_law_kernels import law_kernel
+
+    compilation, values = columns()
+    values["edge_0"][0] = values["edge_1"][0] = 0
+    values["position"][0] = -.95
+    values["velocity"][0] = -2
+    values["contact_enabled"][0] = 1
+    values["contact_height"][0] = -1
+    native = law_kernel(compilation, "spring_network_step", 24, "llvm")
+    output = native(values)
+    assert np.isclose(output["position_next"][0], -1)
+    assert np.isclose(output["velocity_next"][0], -.5)
+    values["contact_enabled"][0] = 0
+    assert output["position_next"][0] > native(values)["position_next"][0]

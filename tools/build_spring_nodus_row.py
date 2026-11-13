@@ -35,7 +35,7 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
     # The row template's buffers are positional.  Refuse any compiler ABI
     # drift instead of calling a changed kernel with stale pointer order.
     expected = (
-        "anchor", "drag", "dt", "edge_0", "edge_1", "edge_2", "edge_3",
+        "anchor", "contact_enabled", "contact_height", "drag", "dt", "edge_0", "edge_1", "edge_2", "edge_3",
         "external_acceleration", "inverse_mass", "neighbor_0", "neighbor_1",
         "neighbor_2", "neighbor_3", "occupied", "pinned", "position",
         "rest_0", "rest_1", "rest_2", "rest_3", "stiffness", "velocity",
@@ -43,7 +43,7 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
     if tuple(kernel.argument_names) != expected or set(kernel.argument_names) != set(INPUT_NAMES):
         raise RuntimeError("spring row argument order changed")
     ids = tuple(kernel.argument_ids) + (kernel.output_ids["position_next"], kernel.output_ids["velocity_next"])
-    if tuple(artifact.buffer_order) != ids or artifact.extent_order or len(ids) != 24:
+    if tuple(artifact.buffer_order) != ids or artifact.extent_order or len(ids) != 26:
         raise RuntimeError("spring row buffer ABI changed")
     if any(tuple(shape) != (BATCH,) for shape in artifact.buffer_shapes):
         raise RuntimeError("spring row batch shape changed")

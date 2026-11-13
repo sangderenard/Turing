@@ -15,7 +15,8 @@ from .symbolic_equation_compiler import compile_symbolic_program
 
 
 INPUT_NAMES = (
-    "position", "velocity", "neighbor_0", "neighbor_1", "neighbor_2", "neighbor_3",
+    "position", "velocity", "contact_enabled", "contact_height",
+    "neighbor_0", "neighbor_1", "neighbor_2", "neighbor_3",
     "rest_0", "rest_1", "rest_2", "rest_3", "edge_0", "edge_1", "edge_2", "edge_3",
     "stiffness", "inverse_mass", "drag", "external_acceleration", "dt",
     "occupied", "pinned", "anchor",
@@ -38,8 +39,12 @@ def spring_network_equations():
     acceleration = s["external_acceleration"] + s["inverse_mass"] * s["stiffness"] * force
     velocity_free = (s["velocity"] + s["dt"] * acceleration) / (1 + s["dt"] * s["drag"])
     free = s["occupied"] * (1 - s["pinned"])
-    velocity_next = free * velocity_free + (1 - s["occupied"]) * s["velocity"]
-    position_next = (free * (s["position"] + s["dt"] * velocity_free)
+    candidate_position=s["position"]+s["dt"]*velocity_free
+    penetration=s["contact_enabled"]*sp.Max(s["contact_height"]-candidate_position,0)
+    accepted_position=candidate_position+penetration
+    accepted_velocity=velocity_free+penetration/s["dt"]
+    velocity_next = free * accepted_velocity + (1 - s["occupied"]) * s["velocity"]
+    position_next = (free * accepted_position
                      + s["occupied"] * s["pinned"] * s["anchor"]
                      + (1 - s["occupied"]) * s["position"])
     equations = (

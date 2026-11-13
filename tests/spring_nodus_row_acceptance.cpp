@@ -94,8 +94,15 @@ int main(int argc,char** argv){
   };
   okay=okay&&receive(1,1.0f,0)&&receive(2,1.0f,1)&&
     receive(3,1.0f,0)&&receive(4,.8f,0);
+  uint64_t table_shape[1]={6};
+  uint64_t table=nodus_tensor_create(NODUS_DTYPE_F64,1,table_shape);
+  double bounds[6]={2,.75,0,2,-1,1};
+  okay=okay&&table&&nodus_tensor_write(table,0,bounds,sizeof(bounds))==sizeof(bounds);
+  okay=okay&&invoke(tool,table,output)&&std::abs(output[4]-.8)<1e-12;
+  okay=okay&&invoke(tool,dt,output)&&std::abs(output[4]-.75)<1e-12;
+  okay=okay&&receive(5,.75f,0);
   tool->shutdown();destroy(tool);FreeLibrary(module);
-  nodus_tensor_destroy(config);nodus_tensor_destroy(dt);nodus_tensor_destroy(control);
+  nodus_tensor_destroy(config);nodus_tensor_destroy(dt);nodus_tensor_destroy(control);nodus_tensor_destroy(table);
   closesocket(receiver);WSACleanup();
   std::cout<<(okay?"spring row + UDP: PASS":"spring row + UDP: FAIL")<<"\n";
   return okay?0:1;

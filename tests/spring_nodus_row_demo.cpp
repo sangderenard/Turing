@@ -37,8 +37,8 @@ static bool invoke(ITool* tool,uint64_t input){
 }
 
 int main(int argc,char** argv){
-  if(argc<3||argc>5||(argc==5&&std::string(argv[4])!="freeze"))return 2;
-  const bool studio_source=argc>=4,freeze_demo=argc==5;
+  if(argc<3||argc>6||(argc>=5&&std::string(argv[4])!="freeze"&&std::string(argv[4])!="run"))return 2;
+  const bool studio_source=argc>=4,freeze_demo=argc>=5&&std::string(argv[4])=="freeze",table_contact=argc==6;
   _putenv_s("NODUS_FABRIC_UDP_HOST","127.0.0.1");
   _putenv_s("NODUS_FABRIC_UDP_PORT","48770");
   WSADATA wsa{};if(WSAStartup(MAKEWORD(2,2),&wsa))return 2;
@@ -58,17 +58,24 @@ int main(int argc,char** argv){
   auto field=[&](int node,int column)->double&{return data[node*Fields+column];};
   auto node_at=[](int x,int y){return y*Width+x;};
   std::array<std::array<double,3>,Width*Height> source{};
+  std::array<int,Width*Height> source_pins{};
   if(studio_source){
     std::ifstream input(argv[3]);std::string line;
-    if(!input||!std::getline(input,line)||line!="x,y,z")return 2;
-    for(auto& point:source){
+    if(!input||!std::getline(input,line)||
+       (line!="x,y,z"&&line!="x,y,z,pinned"))return 2;
+    const bool pins_in_source=line=="x,y,z,pinned";
+    for(int node=0;node<Width*Height;node++){
+      auto& point=source[node];
       if(!std::getline(input,line))return 2;
       for(char& c:line)if(c==',')c=' ';
       std::istringstream values(line);
       if(!(values>>point[0]>>point[1]>>point[2])||!std::isfinite(point[0])||
          !std::isfinite(point[1])||!std::isfinite(point[2]))return 2;
+      if(pins_in_source&&( !(values>>source_pins[node]) ||
+         (source_pins[node]!=0&&source_pins[node]!=1)))return 2;
     }
     if(std::getline(input,line))return 2;
+    if(!pins_in_source){source_pins[72]=1;source_pins[80]=1;}
   }else for(int y=0;y<Height;y++)for(int x=0;x<Width;x++)
     source[node_at(x,y)]={0.18*x,-0.18*y,0.08*std::sin(0.7*x)*std::sin(0.5*y)};
   field(0,37)=20261112;
@@ -76,7 +83,7 @@ int main(int argc,char** argv){
     const int node=node_at(x,y);
     for(int axis=0;axis<3;axis++)field(node,axis)=source[node][axis];
     field(node,6)=1;field(node,7)=(y==0&&(x==0||x==Width-1))?1:0;
-    if(studio_source)field(node,7)=(y==Height-1&&(x==0||x==Width-1))?1:0;
+    if(studio_source)field(node,7)=source_pins[node];
     field(node,8)=field(node,0);field(node,9)=field(node,1);field(node,10)=field(node,2);
     field(node,11)=1;field(node,12)=600;field(node,13)=0.35;field(node,15)=-9.8;
     const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};
@@ -98,17 +105,29 @@ int main(int argc,char** argv){
   uint64_t control=nodus_tensor_create(NODUS_DTYPE_F64,1,control_shape);
   double command[2]={1,1};
   if(!control||nodus_tensor_write(control,0,command,sizeof(command))!=sizeof(command))return 2;
+  uint64_t contact_handle=0;
+  if(table_contact){
+    std::ifstream input(argv[5]);std::string line;
+    if(!input||!std::getline(input,line)||line!="topY,minX,maxX,minZ,maxZ"||
+       !std::getline(input,line))return 2;
+    for(char& c:line)if(c==',')c=' ';
+    std::istringstream values(line);double bounds[6]={2};
+    if(!(values>>bounds[1]>>bounds[2]>>bounds[3]>>bounds[4]>>bounds[5]))return 2;
+    uint64_t contact_shape[1]={6};contact_handle=nodus_tensor_create(NODUS_DTYPE_F64,1,contact_shape);
+    if(!contact_handle||nodus_tensor_write(contact_handle,0,bounds,sizeof(bounds))!=sizeof(bounds))return 2;
+  }
   std::ofstream csv(argv[2]);if(!csv)return 2;
   csv<<"frame,node,x,y,z,frozen\n";
   bool okay=true;
   std::vector<double> step_us,receive_us;
   for(int frame=0;frame<=100&&okay;frame++){
     const auto start=std::chrono::steady_clock::now();
+    if(frame==1&&table_contact)okay=invoke(tool,contact_handle);
     const bool hold=freeze_demo&&frame>=30&&frame<=50;
     const bool thaw=freeze_demo&&frame==51;
     if(hold||thaw){command[1]=hold?1:0;
-      okay=nodus_tensor_write(control,0,command,sizeof(command))==sizeof(command)&&invoke(tool,control);
-    }else okay=invoke(tool,frame?dt:config);
+      okay=okay&&nodus_tensor_write(control,0,command,sizeof(command))==sizeof(command)&&invoke(tool,control);
+    }else okay=okay&&invoke(tool,frame?dt:config);
     const auto stepped=std::chrono::steady_clock::now();
     int got_nodes=0;
     for(int chunk=0;chunk<2&&okay;chunk++){
@@ -148,6 +167,7 @@ int main(int argc,char** argv){
   report("udp_receive_and_csv",receive_us);
   tool->shutdown();destroy(tool);FreeLibrary(module);
   nodus_tensor_destroy(config);nodus_tensor_destroy(dt);nodus_tensor_destroy(control);
+  if(contact_handle)nodus_tensor_destroy(contact_handle);
   closesocket(receiver);WSACleanup();
   std::cout<<(okay?"cloth UDP demo: 101 complete frames, 81 nodes each":"cloth UDP demo failed")<<'\n';
   return okay?0:1;

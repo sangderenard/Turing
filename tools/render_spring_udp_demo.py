@@ -11,7 +11,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 def render(source: Path, target: Path, pins: tuple[int,int] = (0,8),
-           material: tuple[str, tuple[float,float,float]] | None = None) -> None:
+           material: tuple[str, tuple[float,float,float]] | None = None,
+           table: tuple[float,float,float,float,float] | None = None) -> None:
     frames: dict[int, dict[int, tuple[float, float, float]]] = {}
     frozen_frames: set[int] = set()
     with source.open(newline="", encoding="utf-8") as stream:
@@ -22,8 +23,12 @@ def render(source: Path, target: Path, pins: tuple[int,int] = (0,8),
                 frozen_frames.add(frame)
     if len(frames) != 101 or any(len(nodes) != 81 for nodes in frames.values()):
         raise ValueError("expected 101 complete UDP frames with 81 nodes each")
-    projected = [(x + .30*z, -y + .18*z) for nodes in frames.values()
+    depth_y=.42 if table else .18
+    projected = [(x + .30*z, -y + depth_y*z) for nodes in frames.values()
                  for x, y, z in nodes.values()]
+    if table:
+        top,min_x,max_x,min_z,max_z=table
+        projected.extend((x+.30*z,-top+depth_y*z) for x in (min_x,max_x) for z in (min_z,max_z))
     low_x=min(point[0] for point in projected);high_x=max(point[0] for point in projected)
     low_y=min(point[1] for point in projected);high_y=max(point[1] for point in projected)
     scale=min(610/max(high_x-low_x,1e-6),390/max(high_y-low_y,1e-6))
@@ -37,7 +42,16 @@ def render(source: Path, target: Path, pins: tuple[int,int] = (0,8),
 
         def project(node: int) -> tuple[int, int]:
             x, y, z = positions[node]
-            return (round(left+(x+.30*z-low_x)*scale),round(88+(-y+.18*z-low_y)*scale))
+            return project_xyz(x,y,z)
+
+        def project_xyz(x:float,y:float,z:float) -> tuple[int,int]:
+            return (round(left+(x+.30*z-low_x)*scale),round(88+(-y+depth_y*z-low_y)*scale))
+
+        if table:
+            top,min_x,max_x,min_z,max_z=table
+            slab=[project_xyz(x,top,z) for x,z in ((min_x,min_z),(max_x,min_z),
+                                                    (max_x,max_z),(min_x,max_z))]
+            draw.polygon(slab,fill='#263640',outline='#6b8490',width=3)
 
         if material:
             _,albedo=material
@@ -59,6 +73,13 @@ def render(source: Path, target: Path, pins: tuple[int,int] = (0,8),
         for node in pins:
             px, py = project(node)
             draw.ellipse((px - 6, py - 6, px + 6, py + 6), fill="#ffc56c")
+        if table:
+            top,min_x,max_x,min_z,max_z=table
+            for x in (min_x+.22,max_x-.22):
+                a=project_xyz(x,top,max_z-.15);b=project_xyz(x,top-1.25,max_z-.15)
+                draw.line((a,b),fill='#526674',width=7)
+            front=[project_xyz(x,top,max_z) for x in (min_x,max_x)]
+            draw.line(front,fill='#9aabb1',width=4)
         draw.text((24, 20), "Nodus cloth / native SymPy -> AbstractTensor -> LLVM", font=font, fill="#e7faff")
         draw.text((24, 42), f"fabric 20261112  |  UDP frame {frame + 1:03d}  |  t = {frame * .01:.2f} s", font=font, fill="#8ab3c5")
         if frame in frozen_frames:
@@ -77,6 +98,7 @@ def main() -> None:
     parser.add_argument("--pins", default="0,8", help="two pinned node IDs, e.g. 72,80 for a Studio wall")
     parser.add_argument('--assets',type=Path,help='Studio exported assets.json for material color')
     parser.add_argument('--material',help='name of a material in --assets')
+    parser.add_argument('--contact',type=Path,help='Studio table contact CSV for drawing the actual tabletop')
     args = parser.parse_args()
     pins=tuple(int(value) for value in args.pins.split(','))
     if len(pins)!=2 or any(node<0 or node>=81 for node in pins):
@@ -89,7 +111,14 @@ def main() -> None:
         index=assets['material_index'][args.material]
         table=assets['materials']['pbr'];stride=table['floats_per_record']
         material=(args.material,tuple(float(v) for v in table['data'][index*stride:index*stride+3]))
-    render(args.source, args.target, pins, material)
+    table=None
+    if args.contact:
+        with args.contact.open(newline='',encoding='utf-8') as stream:
+            rows=list(csv.reader(stream))
+        if len(rows)!=2 or rows[0]!=['topY','minX','maxX','minZ','maxZ']:
+            parser.error('--contact needs the exported Studio table contact CSV')
+        table=tuple(float(value) for value in rows[1])
+    render(args.source, args.target, pins, material, table)
     print(args.target)
 
 

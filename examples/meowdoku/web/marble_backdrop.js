@@ -2,7 +2,7 @@
 // Preview and photo use these same faces; the saved marble mesh is untouched.
 import {validateStudioGrid,studioGridCells,createStudioGridControls,validateStudioArtwork,studioArtworkFaces} from './marble_studio_grid.js';
 import {TABLE_TOP_Y} from './marble_studio_table.js';
-import {fabricWallMesh} from './marble_backdrop_fabric.js';
+import {fabricWallMesh,fabricTableDrapePose,fabricMeshAtPositions} from './marble_backdrop_fabric.js';
 export const MAX_BACKDROP_LAYERS = 6;
 export const MAX_BACKDROP_SIZE = 64;
 export const BACKDROP_CIRCLE_SEGMENTS = 96;
@@ -28,6 +28,12 @@ export function validateBackdropLayers(value, materialNames) {
       throw new RangeError("Unknown backdrop shape");
     if(layer.surfaceBehavior!==undefined&&!['cardstock','fabric'].includes(layer.surfaceBehavior))
       throw new RangeError('Unknown backdrop surface behavior');
+    if(layer.fabricPose!==undefined&&!['wall','table'].includes(layer.fabricPose))
+      throw new RangeError('Unknown backdrop fabric pose');
+    if(layer.fabricAttachmentPoints!==undefined&&(!Array.isArray(layer.fabricAttachmentPoints)||
+       layer.fabricAttachmentPoints.length>81||new Set(layer.fabricAttachmentPoints).size!==layer.fabricAttachmentPoints.length||
+       !layer.fabricAttachmentPoints.every(node=>Number.isInteger(node)&&node>=0&&node<81)))
+      throw new RangeError('Fabric attachment points must be distinct node IDs from 0 to 80');
     if(layer.fabricFrozen!==undefined&&typeof layer.fabricFrozen!=='boolean')
       throw new RangeError('Invalid backdrop fabric freeze state');
     if(layer.surfaceBehavior==='fabric'&&(layer.shape==='ellipse'||layer.grid||layer.artwork))
@@ -49,6 +55,8 @@ export function validateBackdropLayers(value, materialNames) {
     return {material: layer.material, width: layer.width, height: layer.height,
       ...(layer.shape === undefined ? {} : {shape: layer.shape}),
       ...(layer.surfaceBehavior===undefined?{}:{surfaceBehavior:layer.surfaceBehavior}),
+      ...(layer.fabricPose===undefined?{}:{fabricPose:layer.fabricPose}),
+      ...(layer.fabricAttachmentPoints===undefined?{}:{fabricAttachmentPoints:[...layer.fabricAttachmentPoints]}),
       ...(layer.fabricFrozen===undefined?{}:{fabricFrozen:layer.fabricFrozen}),
       ...(layer.centerY === undefined ? {} : {centerY: layer.centerY}),
       ...Object.fromEntries(["heightOffGround", "stageDistance", "pitch", "curveRadius",
@@ -162,8 +170,10 @@ export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, flo
         [[-w,cy-h,z],[w,cy+h,z],[-w,cy+h,z],mat,[n,n,n]]);
       if(layer.surfaceBehavior==='fabric'){
         transformWalls();
-        faces.splice(wallFirst,2,...fabricWallMesh(faces.slice(wallFirst),
-          {positions:fabricPositions?.[i]}).faces);
+        const wall=fabricWallMesh(faces.slice(wallFirst));
+        const posed=layer.fabricPose==='table'?fabricTableDrapePose(wall,table):wall;
+        faces.splice(wallFirst,2,...(fabricPositions?.[i]
+          ?fabricMeshAtPositions(posed,fabricPositions[i]):posed).faces);
       }
     }
     pendingParts.push({id:`layer-${i}-wall`,bodyId:`backdrop-layer-${i}`,
@@ -227,6 +237,28 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       layers[index].surfaceBehavior=behavior.value;onChange();
     });
     behaviorLabel.append(behavior);panel.append(behaviorLabel);
+    const poseLabel=doc.createElement('label'),pose=doc.createElement('select');
+    poseLabel.textContent='Fabric start pose';pose.id=`backdrop-layer-${index}-fabricPose`;
+    for(const [value,name] of [['wall','Hang at back wall'],['table','Extend forward over stage table']]){
+      const option=doc.createElement('option');option.value=value;option.textContent=name;pose.append(option);
+    }
+    pose.addEventListener('change',()=>{
+      layers[index].fabricPose=pose.value;
+      if(layers[index].fabricAttachmentPoints===undefined)
+        attachments.value=pose.value==='table'?'0,8':'72,80';
+      onChange();
+    });poseLabel.append(pose);panel.append(poseLabel);
+    const attachmentLabel=doc.createElement('label'),attachments=doc.createElement('input');
+    attachmentLabel.textContent='Attachment points (node IDs 0–80)';
+    attachments.type='text';attachments.id=`backdrop-layer-${index}-fabricAttachmentPoints`;
+    attachments.value='72,80';
+    attachments.addEventListener('change',()=>{
+      const text=attachments.value.trim();
+      const points=text?text.split(/[\s,]+/).map(Number):[];
+      const candidate=layers.map((layer,i)=>i===index?{...layer,fabricAttachmentPoints:points}:layer);
+      try{layers=validateBackdropLayers(candidate,names);attachments.setCustomValidity?.('');onChange();}
+      catch(error){attachments.setCustomValidity?.(error.message);attachments.reportValidity?.();}
+    });attachmentLabel.append(attachments);panel.append(attachmentLabel);
     const freezeLabel=doc.createElement('label'),freeze=doc.createElement('input');
     freeze.type='checkbox';freeze.id=`backdrop-layer-${index}-fabricFrozen`;freeze.disabled=true;
     freezeLabel.append(freeze,' Freeze fabric state (requires Nodus stream connection)');panel.append(freezeLabel);
@@ -279,16 +311,18 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       layers=validateBackdropLayers(candidate,names);onChange();
     });
     container.append(panel);
-    return {panel, select, shape, behavior, freeze, sizes,switches,grid};
+    return {panel, select, shape, behavior, pose, attachments, freeze, sizes,switches,grid};
   });
   return {
     getState: () => validateBackdropLayers(layers,names),
     setState(value) {
       layers = validateBackdropLayers(value, names);
-      editors.forEach(({select, shape, behavior, freeze, sizes,switches,grid}, i) => {
+      editors.forEach(({select, shape, behavior, pose, attachments, freeze, sizes,switches,grid}, i) => {
         select.value = layers[i].material;
         shape.value = layers[i].shape ?? "rectangle";
         behavior.value=layers[i].surfaceBehavior??'cardstock';freeze.checked=layers[i].fabricFrozen??false;
+        pose.value=layers[i].fabricPose??'wall';
+        attachments.value=(layers[i].fabricAttachmentPoints??(pose.value==='table'?[0,8]:[72,80])).join(',');
         freeze.disabled=true;
         grid.setState(layers[i].grid);
         for (const [key, {input, output}] of Object.entries(sizes)) {

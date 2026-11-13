@@ -1,6 +1,7 @@
 // Generated from the SymPy spring law's LLVM artifact by build_spring_nodus_row.py.
 // Configuration: F64 [8,256,38]. Tick: F64 scalar seconds.
 // Control: F64 [2] = [1, frozen?1:0].
+// Table contact: F64 [6] = [2, topY, minX, maxX, minZ, maxZ].
 // Field 37 of node zero in each network is the stable fabric identity.
 // Output: F64 [8,256,3] positions. One row instance owns one batch of networks.
 #include "tool_api.h"
@@ -91,6 +92,10 @@ public:
     }
     else if(description.rank==1&&description.shape[0]==2&&ready_)
       okay=control(input.id,output.id);
+    else if(description.rank==1&&description.shape[0]==6&&ready_){
+      publish_frame=false;
+      okay=table_contact(input.id,output.id);
+    }
     if(!okay||!raw_stack_push_abstract_tensor(stack,output)){
       nodus_tensor_destroy(output.id);restore();return;
     }
@@ -141,19 +146,19 @@ private:
       for(int axis=0;axis<kAxes;axis++){
         const int lane=node*kAxes+axis;
         positions_[lane]=row[axis];velocities_[lane]=row[3+axis];
-        columns_[0][lane]=row[8+axis];columns_[1][lane]=row[13];
-        columns_[7][lane]=row[14+axis];columns_[8][lane]=row[11];
-        columns_[13][lane]=row[6];columns_[14][lane]=row[7];
-        columns_[20][lane]=row[12];
+        columns_[0][lane]=row[8+axis];columns_[3][lane]=row[13];
+        columns_[9][lane]=row[14+axis];columns_[10][lane]=row[11];
+        columns_[15][lane]=row[6];columns_[16][lane]=row[7];
+        columns_[22][lane]=row[12];
         for(int edge=0;edge<4;edge++){
-          columns_[3+edge][lane]=row[33+edge];
-          columns_[16+edge][lane]=row[21+edge*3+axis];
+          columns_[5+edge][lane]=row[33+edge];
+          columns_[18+edge][lane]=row[21+edge*3+axis];
         }
       }
     }
     if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
     fabric_ids_=fabric_ids;
-    frozen_=false;ready_=true;return true;
+    frozen_=false;tabletop_enabled_=false;ready_=true;return true;
   }
   bool advance(uint64_t input,uint64_t output){
     double dt=0;
@@ -161,22 +166,30 @@ private:
     if(frozen_)
       return nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))==
         kBatch*static_cast<int64_t>(sizeof(double));
-    std::fill(columns_[2].begin(),columns_[2].end(),dt);
-    std::copy(positions_.begin(),positions_.end(),columns_[15].begin());
-    std::copy(velocities_.begin(),velocities_.end(),columns_[21].begin());
+    std::fill(columns_[4].begin(),columns_[4].end(),dt);
+    std::fill(columns_[1].begin(),columns_[1].end(),0);
+    std::fill(columns_[2].begin(),columns_[2].end(),tabletop_y_);
+    std::copy(positions_.begin(),positions_.end(),columns_[17].begin());
+    std::copy(velocities_.begin(),velocities_.end(),columns_[23].begin());
+    if(tabletop_enabled_)for(int node=0;node<kNodeSlots;node++){
+      const int lane=node*kAxes;
+      if(positions_[lane]>=table_min_x_&&positions_[lane]<=table_max_x_&&
+         positions_[lane+2]>=table_min_z_&&positions_[lane+2]<=table_max_z_)
+        columns_[1][lane+1]=1;
+    }
     for(int node=0;node<kNodeSlots;node++)for(int edge=0;edge<4;edge++){
       const int other=neighbors_[node][edge];
       for(int axis=0;axis<kAxes;axis++)
-        columns_[9+edge][node*kAxes+axis]=columns_[3+edge][node*kAxes+axis]?positions_[other*kAxes+axis]:0;
+        columns_[11+edge][node*kAxes+axis]=columns_[5+edge][node*kAxes+axis]?positions_[other*kAxes+axis]:0;
     }
-    std::array<void*,24> buffers{};
-    for(int i=0;i<24;i++)buffers[i]=columns_[i].data();
+    std::array<void*,26> buffers{};
+    for(int i=0;i<26;i++)buffers[i]=columns_[i].data();
     if(reset_)reset_();entry_(buffers.data(),nullptr);
     if(take_&&take_()!=0)return false;
-    for(int i=0;i<kBatch;i++)if(!std::isfinite(columns_[22][i])||!std::isfinite(columns_[23][i]))return false;
-    if(nodus_tensor_write(output,0,columns_[22].data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
-    std::copy(columns_[22].begin(),columns_[22].end(),positions_.begin());
-    std::copy(columns_[23].begin(),columns_[23].end(),velocities_.begin());
+    for(int i=0;i<kBatch;i++)if(!std::isfinite(columns_[24][i])||!std::isfinite(columns_[25][i]))return false;
+    if(nodus_tensor_write(output,0,columns_[24].data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
+    std::copy(columns_[24].begin(),columns_[24].end(),positions_.begin());
+    std::copy(columns_[25].begin(),columns_[25].end(),velocities_.begin());
     return true;
   }
   bool control(uint64_t input,uint64_t output){
@@ -188,13 +201,24 @@ private:
     frozen_=command[1]==1;
     return true;
   }
+  bool table_contact(uint64_t input,uint64_t output){
+    double command[6]{};
+    if(nodus_tensor_read(input,0,command,sizeof(command))!=sizeof(command)||command[0]!=2||
+       !std::all_of(command+1,command+6,[](double x){return std::isfinite(x);})||
+       !(command[2]<command[3])||!(command[4]<command[5]))return false;
+    if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=
+       kBatch*static_cast<int64_t>(sizeof(double)))return false;
+    tabletop_y_=command[1];table_min_x_=command[2];table_max_x_=command[3];
+    table_min_z_=command[4];table_max_z_=command[5];tabletop_enabled_=true;
+    return true;
+  }
   void publish(){
     if(socket_==INVALID_SOCKET||!destination_bytes_||!ready_)return;
     // NFAB v1 little-endian: 32-byte header, then up to 48 (node id, xyz) pairs.
     // The sequence and chunk fields allow consumers to discard incomplete frames.
     ++frame_;
     for(int net=0;net<kNetworks;net++){
-      int active=0;for(int node=0;node<kNodes;node++)if(columns_[13][(net*kNodes+node)*kAxes])active++;
+      int active=0;for(int node=0;node<kNodes;node++)if(columns_[15][(net*kNodes+node)*kAxes])active++;
       if(!active)continue;
       const uint16_t chunks=static_cast<uint16_t>((active+47)/48);
       int emitted=0,chunk=0;
@@ -209,7 +233,7 @@ private:
         uint16_t count=0;int skip=emitted;
         for(int node=0;node<kNodes&&count<48;node++){
           const int lane=(net*kNodes+node)*kAxes;
-          if(!columns_[13][lane])continue;
+          if(!columns_[15][lane])continue;
           if(skip>0){--skip;continue;}
           const uint32_t id=static_cast<uint32_t>(node);
           const float vector[3]={static_cast<float>(positions_[lane]),static_cast<float>(positions_[lane+1]),static_cast<float>(positions_[lane+2])};
@@ -225,11 +249,13 @@ private:
   HMODULE module_=nullptr;
   Entry entry_=nullptr;void(*reset_)()=nullptr;uint32_t(*take_)()=nullptr;
   bool ready_=false,frozen_=false;double max_dt_=0;
-  std::array<std::vector<double>,24> columns_{};
+  std::array<std::vector<double>,26> columns_{};
   std::vector<double> positions_,velocities_;
   std::vector<std::array<int,4>> neighbors_;
   std::array<uint64_t,kNetworks> fabric_ids_{};uint64_t frame_=0;
   bool winsock_=false;SOCKET socket_=INVALID_SOCKET;
+  bool tabletop_enabled_=false;
+  double tabletop_y_=0,table_min_x_=0,table_max_x_=0,table_min_z_=0,table_max_z_=0;
   sockaddr_storage destination_{};int destination_bytes_=0;
 };
 }
