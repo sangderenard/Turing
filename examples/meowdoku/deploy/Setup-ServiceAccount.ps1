@@ -128,6 +128,11 @@ $tokens = @(Get-ChildItem -Path $SecretsBase -Filter 'admin_token*.txt' -ErrorAc
 if ($tokens.Count -eq 0) { Cmd "icacls $SecretsBase/admin_token.txt /grant ${Name}:(R)   (no admin_token*.txt present now)" }
 foreach ($f in $tokens) { Run 'icacls.exe' @($f.FullName, '/grant', "${Name}:(R)") }
 Run 'icacls.exe' @("$SecretsBase/tls/key.pem", '/grant', "${Name}:(R)")
+# [MAIL] the mail receiver's public certificate and key (Copy-PublicCertificate.ps1 copies them in): read only, granted on
+# the folder and inherited by its files, so the copy a renewal writes is readable too.
+$tlsPublic = "$SecretsBase/tls-public"
+if (Test-Path -LiteralPath $tlsPublic) { Run 'icacls.exe' @($tlsPublic, '/grant', "${Name}:(OI)R") }
+else { Cmd "icacls $tlsPublic /grant ${Name}:(OI)R   (no tls-public folder yet: run Copy-PublicCertificate.ps1, then this script again)" }
 Write-Host 'NOTE: key.pem keeps its existing entries (alber etc.); the service is only ADDED. Tighten by hand if desired.'
 Write-Host "NOTE: other operators' *.secret files under operator_credentials inherit Modify from build/; consider cutting inheritance there."
 
@@ -149,7 +154,7 @@ Cmd "sc.exe qc $Svc"
 if (-not $WhatIf) { sc.exe qc $Svc }
 Cmd "groups of ${Name}: Get-LocalGroup | where member"
 if (-not $WhatIf) { Get-LocalGroup | Where-Object { Get-LocalGroupMember -Group $_ -Member $Name -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty Name }
-foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, "$SecretsBase/tls/key.pem", $SecretFile)) {
+foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, "$SecretsBase/tls/key.pem", "$SecretsBase/tls-public", "$SecretsBase/tls-public/cert.key", $SecretFile)) {
     Cmd "icacls $d  (lines matching $Name)"
     if (-not $WhatIf -and (Test-Path -LiteralPath $d)) { icacls.exe $d | Select-String -SimpleMatch $Name }
 }
