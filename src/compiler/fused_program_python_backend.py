@@ -447,7 +447,13 @@ NUMPY_ABSTRACT_TENSOR_FUNCTIONS: dict[str, str] = {
     "where": "np.where",             # numpy_backend.where_
     "zeros_like": "np.zeros_like",
     "ones_like": "np.ones_like",
-    "zeros": "np.zeros",
+    "zeros": "_at_zeros",
+    "ones": "_at_ones",
+    "broadcast_shapes": "np.broadcast_shapes",
+    "broadcast_to": "np.broadcast_to",
+    "eye": "_at_eye",
+    "stack": "np.stack",
+    "cat": "np.concatenate",
 }
 
 #: ``x.<name>(...)`` tensor methods that NumPy arrays do not carry under that
@@ -455,18 +461,65 @@ NUMPY_ABSTRACT_TENSOR_FUNCTIONS: dict[str, str] = {
 NUMPY_TENSOR_METHODS: dict[str, str] = {
     "log": "np.log", "exp": "np.exp", "sqrt": "np.sqrt", "floor": "np.floor",
     "isfinite": "np.isfinite",
+    "dim": "np.ndim", "numel": "np.size", "clone": "np.copy",
+    "abs": "np.abs", "tanh": "np.tanh",
+    "unsqueeze": "np.expand_dims",
+    "detach": "np.asarray",
 }
 
 #: Reductions AbstractTensor spells ``dim=``/``keepdim=`` and NumPy ``axis=``/``keepdims=``.
 NUMPY_AXIS_METHODS = frozenset({"sum", "max", "min", "any", "all", "mean", "prod"})
 
 _NUMPY_PRELUDE = '''
-def _at_tensor(data):
+def _at_eye(n, m=None, *, dtype=None, device=None):
+    if device not in (None, "cpu"):
+        raise ValueError("NumPy lowering requires a CPU device")
+    return np.eye(n, m, dtype=dtype)
+
+
+def _at_zeros(*size, dtype=None, device=None):
+    if device not in (None, "cpu"):
+        raise ValueError("NumPy lowering requires a CPU device")
+    shape = size[0] if len(size) == 1 else size
+    return np.zeros(shape, dtype=dtype)
+
+
+def _at_ones(*size, dtype=None, device=None):
+    if device not in (None, "cpu"):
+        raise ValueError("NumPy lowering requires a CPU device")
+    shape = size[0] if len(size) == 1 else size
+    return np.ones(shape, dtype=dtype)
+
+
+def _at_to(value, *args, **kwargs):
+    if not isinstance(value, np.ndarray):
+        return value.to(*args, **kwargs)
+    if len(args) > 1 or set(kwargs) - {"dtype", "device"}:
+        raise TypeError("unsupported tensor conversion arguments")
+    dtype, device = kwargs.get("dtype"), kwargs.get("device")
+    if args:
+        if isinstance(args[0], str) and (args[0] == "cpu" or args[0].startswith("cuda")):
+            device = args[0]
+        else:
+            dtype = args[0]
+    if device not in (None, "cpu"):
+        raise ValueError("NumPy lowering requires a CPU device")
+    return value.astype(dtype) if dtype is not None else value
+
+
+def _at_tensor(data, *, dtype=None, device=None):
     """``AbstractTensor.tensor(data)`` on the NumPy backend, rule for rule: an
     array of any rank is copied as it is; a list or tuple is ``np.array``; a
     Python or NumPy scalar becomes a one-element array whose dtype is its kind
     (bool, int64, or float64 for every float width)."""
+    if device not in (None, "cpu"):
+        raise ValueError("NumPy lowering requires a CPU device")
+    if dtype is not None:
+        result = _at_tensor(data)
+        return result.astype(dtype)
     if isinstance(data, np.ndarray):
+        return np.array(data)
+    if hasattr(data, "__array__"):
         return np.array(data)
     if isinstance(data, (list, tuple)):
         return np.array(data)
@@ -474,6 +527,8 @@ def _at_tensor(data):
         return np.array([data], dtype=np.bool_)
     if isinstance(data, (int, np.integer)):
         return np.array([data], dtype=np.int64)
+    if isinstance(data, (complex, np.complexfloating)):
+        return np.array([data], dtype=np.complex128)
     return np.array([data], dtype=np.float64)
 
 
@@ -507,6 +562,7 @@ class _NumpyDialectRewriter(ast.NodeTransformer):
     #: Names bound to modules in the function's globals: ``math.sqrt(x)`` is a
     #: module function, not the tensor method ``x.sqrt()``.
     modules: frozenset = frozenset({"np", "numpy", "math"})
+    tensor_names: frozenset = frozenset({"AbstractTensor"})
 
     def visit_BinOp(self, node):
         node = self.generic_visit(node)
@@ -525,10 +581,18 @@ class _NumpyDialectRewriter(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Name(self, node):
-        if node.id == "AbstractTensor":
+        if node.id in self.tensor_names:
             return ast.copy_location(
                 ast.Attribute(ast.Name("np", ast.Load()), "ndarray", node.ctx), node
             )
+        return node
+
+    def visit_Attribute(self, node):
+        node = self.generic_visit(node)
+        if (node.attr == "linalg" and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "ndarray" and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "np"):
+            return ast.copy_location(ast.Attribute(ast.Name("np", ast.Load()), "linalg", node.ctx), node)
         return node
 
     def visit_Call(self, node):
@@ -547,11 +611,19 @@ class _NumpyDialectRewriter(ast.NodeTransformer):
         ):
             head = ast.parse(NUMPY_ABSTRACT_TENSOR_FUNCTIONS[function.attr], mode="eval").body
             node.func = ast.copy_location(head, function)
+            if function.attr in {"stack", "cat"}:
+                for keyword in node.keywords:
+                    if keyword.arg == "dim":
+                        keyword.arg = "axis"
             return node
         if function.attr in NUMPY_TENSOR_METHODS and not node.keywords:
             head = ast.parse(NUMPY_TENSOR_METHODS[function.attr], mode="eval").body
             return ast.copy_location(
                 ast.Call(head, [function.value, *node.args], []), node
+            )
+        if function.attr == "to":
+            return ast.copy_location(
+                ast.Call(ast.Name("_at_to", ast.Load()), [function.value, *node.args], node.keywords), node
             )
         if function.attr == "clamp":
             keywords = {k.arg: k.value for k in node.keywords}
@@ -647,7 +719,7 @@ def lower_functions_to_numpy(
     literals: dict[str, str] = {}
     injected: set[str] = set()
     sources: list[str] = []
-    defined: set[str] = {"_at_tensor", "_at_truediv"}  # the prelude's helpers
+    defined: set[str] = {"_at_tensor", "_at_truediv", "_at_to", "_at_zeros", "_at_ones", "_at_eye"}  # prelude helpers
     from ..common.tensors.numpy_backend import NumPyTensorOperations
 
     if NumPyTensorOperations.DIVIDE_MODE != NUMPY_DIVIDE_MODE:
@@ -679,6 +751,27 @@ def lower_functions_to_numpy(
         ]
         tree.decorator_list = []
         tree.bases = [ast.Name(f"_{cls.__name__}_base", ast.Load())]
+        # The generated class subclasses the authored class to retain its
+        # fields/type identity. Zero-argument super must nevertheless retain
+        # the authored lexical owner, not recurse into the authored method.
+        class PreserveSuper(ast.NodeTransformer):
+            receiver = None
+            def visit_FunctionDef(self, node):
+                previous = self.receiver
+                args = (*node.args.posonlyargs, *node.args.args)
+                self.receiver = args[0].arg if args else None
+                node = self.generic_visit(node)
+                self.receiver = previous
+                return node
+
+            def visit_Call(self, node):
+                node = self.generic_visit(node)
+                if isinstance(node.func, ast.Name) and node.func.id == "super" and not node.args and not node.keywords:
+                    if self.receiver is None:
+                        raise PythonLoweringShortfall('zero-argument super has no receiver')
+                    node.args = [ast.Name(f"_{cls.__name__}_base", ast.Load()), ast.Name(self.receiver, ast.Load())]
+                return node
+        tree = PreserveSuper().visit(tree)
         bases[cls.__name__] = cls
         defined.add(f"_{cls.__name__}_base")
         queue.append((cls.__name__, tree, sys.modules[cls.__module__].__dict__))
@@ -728,6 +821,10 @@ def lower_functions_to_numpy(
     while processed < len(queue):
         name, tree, globals_ = queue[processed]
         processed += 1
+        from ..common.tensors.abstraction import AbstractTensor
+        rewriter.tensor_names = frozenset({"AbstractTensor"}) | frozenset(
+            key for key, value in globals_.items() if value is AbstractTensor
+        )
         rewriter.modules = frozenset({"np", "numpy"}) | frozenset(
             key for key, value in globals_.items() if inspect.ismodule(value)
         ) | frozenset(
