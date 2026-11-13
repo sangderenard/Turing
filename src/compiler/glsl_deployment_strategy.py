@@ -35406,7 +35406,7 @@ def _retarget_all_cached_value_ids(
         if not any(
             key in attributes
             for key in (
-                "value_source_id", "aggregate_leaf_value_ids",
+                "value_source_id", "initial_value_id", "aggregate_leaf_value_ids",
                 "materialized_source_value_ids", "materialized_value_ids",
                 "loop_carried_bindings", "loop_target_initials",
                 "loop_state_effects", "loop_iteration_outputs",
