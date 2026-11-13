@@ -9,11 +9,12 @@
 // Without data-messenger="allow" on that script tag the module does nothing (one console line).  When the visitor lacks the
 // `message` capability (GET /api/whoami) it renders nothing at all.  Closed: only a small launcher button with an unread badge
 // (a light unread check every 60 s).  Open: contact list, add-contact field, incoming requests, one conversation at a time, and a
-// long poll that runs only while open.  All DOM is built with createElement/textContent (bodies are plain text: no links,
-// embeds or markup, and nothing is fetched or navigated from message content); all styles live in a closed Shadow DOM.
+// long poll that runs only while open.  All DOM is built with createElement/textContent. Message bodies are plain text;
+// validated file subjects render as download links. Styles live in a closed Shadow DOM.
 // Global surface: window.MeowdokuMessenger = {open, close, version}.
-const VERSION = "3";
+const VERSION = "4";
 const MAX_IMAGE_BYTES = 2097152;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
 function safeImageURL(image, id) {
   return image && image.locked === false && image.mime === "image/png" &&
     image.url === "/api/messages/image?id=" + id ? image.url : null;
@@ -25,6 +26,18 @@ async function pngAttachment(file) {
   let binary = "";
   for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
   return { data: btoa(binary) };
+}
+
+async function uploadPrivateFile(file) {
+  if (!file || file.size < 1 || file.size > MAX_FILE_BYTES) throw new Error("Choose a file from 1 byte to 8 MiB.");
+  const response = await fetch("/api/user-files", { method: "POST", credentials: "same-origin", cache: "no-store",
+    redirect: "error", headers: { "Content-Type": "application/octet-stream", "X-Meowdoku-Upload": "1",
+      "X-Meowdoku-Filename": encodeURIComponent(file.name) }, body: file });
+  let result;
+  try { result = await response.json(); } catch (error) { throw new Error("File upload response was invalid."); }
+  if (!response.ok) throw new Error(result.error || "File upload failed.");
+  if (!result || !/^[0-9a-f]{32}$/.test(result.id)) throw new Error("File upload receipt was invalid.");
+  return { id: result.id, name: result.name };
 }
 
 function allowed() {
@@ -240,11 +253,13 @@ async function start() {
     olderBtn = el("button", { type: "button", class: "small", text: "Load older", hidden: "", on: { click: () => loadThread(true) } });
     bodyEl.appendChild(olderBtn); bodyEl.appendChild(threadEl);
     const input = el("input", { type: "text", placeholder: "Message (Enter sends)", "aria-label": "Message to " + peer, maxlength: "4000", autocomplete: "off" });
-    const draft = drafts.get(peer) || { body: "", image: null };
+    const draft = drafts.get(peer) || { body: "", image: null, file: null };
     drafts.set(peer, draft);
     input.value = draft.body;
     let image = draft.image;
     let choosing = false;
+    let fileAttachment = draft.file;
+    let uploading = false;
     const imageStatus = el("div", { class: "note", text: "Images: loading chat setting..." });
     const toggle = el("button", { type: "button", text: "Enable images" });
     toggle.disabled = true;
@@ -252,14 +267,20 @@ async function start() {
     chooser.disabled = true;
     const selected = el("span", { class: "note", text: image ? "PNG attached" : "" });
     const removeImage = el("button", { type: "button", text: "Clear image" });
+    const fileChooser = el("input", { type: "file", "aria-label": "Attach a file (up to 8 MiB)" });
+    const fileStatus = el("span", { class: "note" });
+    const removeFile = el("button", { type: "button", text: "Clear file" });
     const updateControls = () => {
       const setting = view.imageState;
-      const busy = !!pendingSends.get(peer) || choosing || view.toggling;
+      const busy = !!pendingSends.get(peer) || choosing || uploading || view.toggling;
       toggle.disabled = !setting || busy || view.refreshing;
       chooser.disabled = !setting || !setting.enabled || busy;
       removeImage.disabled = busy || !image;
       toggle.textContent = setting && setting.enabled ? "Disable images" : "Enable images";
       selected.textContent = image ? "PNG attached" : "";
+      fileChooser.disabled = busy;
+      removeFile.disabled = busy || !fileAttachment;
+      fileStatus.textContent = uploading ? "Uploading privately…" : fileAttachment ? "Ready to send: " + fileAttachment.name : "File: none selected";
       imageStatus.textContent = "Images are server-readable. Both people must opt in. " +
         (!setting ? "Setting unavailable." : setting.available ? "Unlocked for this chat." : setting.enabled ? "Waiting for the other person to enable images." : "Off for you.");
     };
@@ -305,29 +326,51 @@ async function start() {
       if (removeImage.disabled) return;
       image = null; draft.image = null; updateControls();
     });
+    fileChooser.addEventListener("change", async () => {
+      if (fileChooser.disabled || !active()) return;
+      const file = fileChooser.files && fileChooser.files[0];
+      if (!file) return;
+      uploading = true; updateControls();
+      try {
+        const stored = await uploadPrivateFile(file);
+        if (active()) { fileAttachment = stored; draft.file = stored; viewNote("File stored privately. Send the message to share it with " + peer + "."); }
+      } catch (error) { viewNote(error.message); }
+      finally { uploading = false; fileChooser.value = ""; if (active()) updateControls(); }
+    });
+    removeFile.addEventListener("click", () => {
+      if (removeFile.disabled) return;
+      fileAttachment = null; draft.file = null; updateControls();
+    });
     input.addEventListener("input", () => { draft.body = input.value; });
     footEl.appendChild(imageStatus);
     footEl.appendChild(el("div", { class: "row" }, toggle, chooser));
     footEl.appendChild(el("div", { class: "row" }, selected, removeImage));
+    footEl.appendChild(el("div", { class: "row" }, fileChooser));
+    footEl.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
     let sending = false;
     let pending = pendingSends.get(peer) || null;
-    if (pending) { input.value = pending.body; image = pending.image || null; draft.image = image; }
+    if (pending) { input.value = pending.body; image = pending.image || null; draft.image = image;
+      fileAttachment = pending.file || null; draft.file = fileAttachment; }
     updateControls();
     const send = async () => {
-      const text = input.value;
-      if (sending || choosing || view.toggling || !text.trim()) return;
+      const text = input.value.trim() ? input.value : (fileAttachment ? "Shared file: " + fileAttachment.name : "");
+      if (sending || choosing || uploading || view.toggling || !text.trim()) return;
       if (location.protocol !== "https:") { viewNote("Messaging requires HTTPS."); return; }
       // A reopened pane can still hold the operation that completed in the old
       // pane. Clear that stale composer instead of treating it as a new send.
-      if (pending && pending.completed && pending.body === text && pending.image === image) { pending = null; input.value = ""; image = null; draft.body = ""; draft.image = null; updateControls(); viewNote("Sent."); return; }
+      if (pending && pending.completed && pending.body === text && pending.image === image && pending.file?.id === fileAttachment?.id) {
+        pending = null; input.value = ""; image = null; fileAttachment = null;
+        draft.body = ""; draft.image = null; draft.file = null; updateControls(); viewNote("Sent."); return;
+      }
       pending = pendingSends.get(peer) || null;
       if (pending && pending.inFlight) { viewNote("This message is still sending."); return; }
-      if (pending && (pending.body !== text || pending.image !== image)) {
-        viewNote("The previous message has an uncertain outcome. Retry its original text and image before sending another message.");
+      if (pending && (pending.body !== text || pending.image !== image || pending.file?.id !== fileAttachment?.id)) {
+        viewNote("The previous message has an uncertain outcome. Retry its original text and attachments before sending another message.");
         return;
       }
       if (!pending && image && (!view.imageState || !view.imageState.enabled)) { viewNote("Enable images in this chat first."); return; }
-      if (!pending) pending = { body: text, image, idempotency_key: crypto.randomUUID(), inFlight: false, completed: false, uncertain: false };
+      if (!pending) pending = { body: text, image, file: fileAttachment,
+        idempotency_key: crypto.randomUUID(), inFlight: false, completed: false, uncertain: false };
       pendingSends.set(peer, pending);
       pending.inFlight = true;
       const operation = pending;
@@ -340,7 +383,8 @@ async function start() {
           if (!relationship) throw new Error("You cannot message this user.");
           try {
             const receipt = await api("/api/messages/send", { body: pending.body, idempotency_key: pending.idempotency_key,
-              conversation_handle: relationship.conversation_handle, ...(pending.image ? {image: pending.image} : {}) });
+              conversation_handle: relationship.conversation_handle, ...(pending.image ? {image: pending.image} : {}),
+              ...(pending.file ? {subject: {kind: "file", ref: pending.file.id}} : {}) });
             if (!receipt || receipt.ok !== true || !Number.isInteger(receipt.id) || receipt.id <= 0 ||
                 typeof receipt.created !== "number" || !Number.isFinite(receipt.created)) {
               throw new Error("Invalid send receipt; message outcome may be uncertain.");
@@ -349,7 +393,7 @@ async function start() {
             if (pendingSends.get(peer) === pending) pendingSends.delete(peer);
             pending = null;
             input.value = "";
-            image = null; draft.body = ""; draft.image = null;
+            image = null; fileAttachment = null; draft.body = ""; draft.image = null; draft.file = null;
             viewNote("");
             break;
           } catch (e) {
