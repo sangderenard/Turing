@@ -716,6 +716,20 @@ def _post_callsite_activation(
     )
 
 
+def _control_specialization_scope(graph: Any) -> tuple:
+    """The deciding graph's own read scope: one per callsite copy."""
+
+    scope = graph.G.graph.get("lexical_read_scope") if hasattr(graph, "G") else (
+        getattr(graph, "graph", {}) or {}
+    ).get("lexical_read_scope")
+    if scope is None:
+        raise ValueError(
+            "source_control_specialization_concordance: the deciding graph "
+            "has no lexical_read_scope to key its decision by"
+        )
+    return tuple(scope)
+
+
 def _post_control_specialization(
     graph: Any, control_id: int, record: dict, predicate_id: Any, *,
     predicate_known: bool,
@@ -737,7 +751,7 @@ def _post_control_specialization(
 
     book = current_identity_book()
     function_name = str(graph.G.graph.get("function_name"))
-    row = (function_name, int(control_id))
+    row = (_control_specialization_scope(graph), int(control_id))
     cells: list = []
     try:
         if int(control_id) in graph.G:

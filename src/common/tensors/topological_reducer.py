@@ -1160,6 +1160,16 @@ def specialize_python_precision_widths(
         for name, descriptor in sorted(
             dict(metadata.get("planner_aggregate_descriptors") or {}).items()
         )
+    ) + tuple(
+        # Per-geometry copies (owner, 2026-11-13): two copies differing only
+        # by the literal a receiver field holds on entry are two numeric
+        # identities, as copies differing by a literal formal are.
+        (f"field:{formal}.{field}", stable(value))
+        for (formal, field), value in sorted(
+            dict(
+                metadata.get("planner_receiver_field_specializations") or {}
+            ).items()
+        )
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)
@@ -11359,6 +11369,51 @@ def _normalize_lexical_values(
             # operands. Recursive expression resolution preserves left/right
             # order, so acc.add(b) + acc.total still refuses its stale read.
             names = storing_call_names(expression)
+            if (
+                isinstance(result, int) and result in graph.G
+                and isinstance(graph.G.nodes[result].get("expr_obj"), ast.Call)
+                and not loop_field_entry_values
+                and not loop_body_storing_receivers
+            ):
+                # Program: YoungMan ``configure_geometry`` writes
+                # ``self.geometry`` then calls ``self.define_offsets(...)``,
+                # which reads it.  Rule: the call names, for each receiver it
+                # passes that no earlier call may have stored into, the
+                # field-state cells current at the call (writes and merges);
+                # the callsite planner keys the callee copy on the literal
+                # values of the fields that callee reads at entry.
+                # Every object the call passes (its method receiver and Name
+                # arguments), not only those it may store into: a callee that
+                # only reads the field is the case keyed here.
+                passed_names = {
+                    argument.id
+                    for argument in (
+                        *((expression.func.value,) if isinstance(
+                            expression.func, ast.Attribute,
+                        ) else ()),
+                        *expression.args,
+                        *(keyword.value for keyword in expression.keywords),
+                    )
+                    if isinstance(argument, ast.Name)
+                }
+                passed = {
+                    int(environment[name]) for name in passed_names
+                    if isinstance(environment.get(name), int)
+                    and int(environment[name]) not in storing_call_values
+                }
+                call_cells = tuple(
+                    cell for (cursor_receiver, _field), cell
+                    in field_state_cursor.items()
+                    if int(cursor_receiver) in passed
+                    and isinstance(state := field_state_at(cell), _FieldState)
+                    and state.kind in (
+                        _FieldStateKind.WRITTEN, _FieldStateKind.MERGED,
+                    )
+                )
+                if call_cells:
+                    graph.G.nodes[result].setdefault("attributes", {})[
+                        "call_receiver_field_state_cells"
+                    ] = call_cells
             storing_call_values.update(
                 int(environment[name]) for name in names
                 if isinstance(environment.get(name), int)
@@ -12276,6 +12331,36 @@ def _normalize_lexical_values(
                     and current_state.kind is not _FieldStateKind.OBSERVED
                     else None
                 )
+                receiver_node = graph.G.nodes.get(int(receiver)) or {}
+                receiver_input = receiver_node.get("attributes") or {}
+                if (
+                    (
+                        current_state is None
+                        or (
+                            isinstance(current_state, _FieldState)
+                            and current_state.kind is _FieldStateKind.OBSERVED
+                        )
+                    )
+                    and isinstance(expression.value, ast.Name)
+                    and str(receiver_node.get("type")) == "Input"
+                    and receiver_input.get("binding_kind") == "parameter"
+                    and receiver_input.get("binding_name") == expression.value.id
+                    and not call_stored_field
+                    and not stable_method_lookup
+                    and id(expression) not in method_lookup_ids
+                    and int(receiver) not in storing_call_values
+                    and not loop_field_entry_values
+                    and not loop_body_storing_receivers
+                ):
+                    # The field's value on entry to this function: no write,
+                    # no storing call and no loop precede the read, so a copy
+                    # keyed on the caller's literal for this field (planner
+                    # receiver-field specialization) reads that literal.
+                    graph.G.nodes[attribute_id].setdefault(
+                        "attributes", {},
+                    )["entry_field_read"] = (
+                        str(expression.value.id), str(expression.attr),
+                    )
                 if isinstance(current_state, _Unresolved) and current_state.reason == _LOOP_EXIT_FIELD_STATE_UNMERGED:
                     # An unknown final field VALUE does not make the known
                     # loop-exit ordering unknown. The unresolved book fact
@@ -18513,6 +18598,56 @@ def _normalize_lexical_values(
                     (ast.Return, ast.Raise, ast.Continue, ast.Break),
                 ):
                     return True
+                # Program: ``if g == 1: x = 3 else: raise ValueError(...)``
+                # then ``x * 2`` (YoungMan ``define_offsets``' unsupported-
+                # geometry arm).  Wrong record: exception ingestion spells an
+                # authored Raise as an ``exception_raise`` call (hoisted to
+                # ``tmp = exception_raise(...)``; ``tmp``), so the arm was not
+                # terminal, the merge lost ``x`` and its later read became an
+                # external input.  Rule: an arm ending in the call whose
+                # SOURCE_EXCEPTION_OPERATION receipt is ``exception_raise`` is
+                # terminal, exactly as the Raise it spells.
+                raise_call = None
+                if isinstance(terminal, ast.Expr) and isinstance(
+                    terminal.value, ast.Call,
+                ):
+                    raise_call = terminal.value
+                elif (
+                    len(statements) >= 2
+                    and isinstance(terminal, ast.Expr)
+                    and isinstance(terminal.value, ast.Name)
+                    and isinstance(statements[-2], ast.Assign)
+                    and len(statements[-2].targets) == 1
+                    and isinstance(statements[-2].targets[0], ast.Name)
+                    and statements[-2].targets[0].id == terminal.value.id
+                    and isinstance(statements[-2].value, ast.Call)
+                ):
+                    raise_call = statements[-2].value
+                if raise_call is not None and id(raise_call) in graph.G:
+                    from ...compiler.concorded_literals import (
+                        origin_cell as _raise_origin_cell,
+                    )
+                    from ...compiler.concordance_declarations import (
+                        SOURCE_EXCEPTION_OPERATION as _EXCEPTION_OPERATION,
+                    )
+                    raise_book = current_identity_book()
+                    try:
+                        raise_origin = _raise_origin_cell(
+                            raise_book,
+                            node_identity_cell(graph, int(id(raise_call))),
+                        )
+                    except ValueError:
+                        raise_origin = None
+                    receipt = (
+                        None if raise_origin is None
+                        else raise_book.latest_ref(
+                            _EXCEPTION_OPERATION, (raise_origin,),
+                        )
+                    )
+                    if receipt is not None and raise_book.page(
+                        _EXCEPTION_OPERATION,
+                    ).cell(receipt.row, receipt.column)[0] == "exception_raise":
+                        return True
                 if not isinstance(terminal, ast.If):
                     return False
                 return (
@@ -18564,6 +18699,14 @@ def _normalize_lexical_values(
                         # An unresolved arm state stays the cursor cell; the
                         # return site that reads it records the absence.
                         field_state_cursor[field_key] = live_cell
+                        continue
+                    if live_state.kind is _FieldStateKind.OBSERVED:
+                        # The live arm only read the field: nothing was
+                        # written, so no ARM_SELECTED version is minted (a
+                        # later merge would count it as a write).
+                        field_state_cursor[field_key] = before_field_cells.get(
+                            field_key, live_cell,
+                        )
                         continue
                     receiver_id, attribute_name = field_key
                     post_field_state(
@@ -18898,6 +19041,20 @@ def _normalize_lexical_values(
                                 (initial_cell, initial_state),
                             ) if not isinstance(state, _FieldState)
                         )
+                        continue
+                    if (
+                        body_state.kind is _FieldStateKind.OBSERVED
+                        and else_state.kind is _FieldStateKind.OBSERVED
+                    ):
+                        # Program: YoungMan ``define_offsets`` -- every
+                        # geometry arm reads ``dtype=self.precision`` and none
+                        # writes it.  Wrong record: the two arms' first reads
+                        # were merged into a MERGED version, which every
+                        # reader of the book counts as a write (the
+                        # single-write transfer then refused ``precision``).
+                        # Rule: two observations write nothing; the field's
+                        # state after the conditional is its state before.
+                        field_state_cursor[field_key] = initial_cell
                         continue
                     initial_value = _cell_node_id(initial_state.value)
                     body_value = _cell_node_id(body_state.value)

@@ -1369,6 +1369,18 @@ class CallBinding:
 PLANNER_SPECIALIZATION_PAGE = declare_page("planner_specialization", (
     RowField("callee_scope", K.SCOPE), RowField("parameter", K.NAME),
 ), SpecializationFact)
+#: Per COPY: the literal a receiver formal's field holds on entry, keyed by
+#: the callsite (owner, 2026-11-13: per-geometry kernels).  Row: (the copy's
+#: read scope, receiver formal, field); fact: the literal.  CONCORD, DERIVED
+#: from the caller's field-state cell current at the call and the caller
+#: value cell that proves its literal.  Read by the structural fold at the
+#: copy's ``entry_field_read`` reads; part of the copy's numeric scope.
+PLANNER_RECEIVER_FIELD_SPECIALIZATION = declare_page(
+    "planner_receiver_field_specialization", (
+        RowField("callee_scope", K.SCOPE), RowField("formal", K.NAME),
+        RowField("field", K.NAME),
+    ), object,
+)
 PLANNER_TENSOR_DESCRIPTOR = declare_page("planner_tensor_descriptor", (
     RowField("callee_scope", K.SCOPE), RowField("parameter", K.NAME),
 ), dict)                               # mode REVISE
@@ -1635,9 +1647,13 @@ PUBLIC_OWNED_SEQUENCE_RETURN = declare_page(
         RowField("sequence_id", K.VALUE_ID),
     ), PublicOwnedSequenceReturn,
 )
+#: Keyed by the deciding graph's own read scope (minted per callsite copy),
+#: not its function name: ``offsets(2, 3)`` and ``offsets(1, 3)`` decide the
+#: same If oppositely, and one name row let each copy read the other's arm
+#: ("node 7 is resident in the rejected orelse", pre-existing 2026-11-13).
 SOURCE_CONTROL_SPECIALIZATION = declare_page(
     "source_control_specialization_concordance", (
-        RowField("function", K.NAME), RowField("control", K.VALUE_ID),
+        RowField("read_scope", K.SCOPE), RowField("control", K.VALUE_ID),
     ), dict,                           # dict | Unresolved(PREDICATE_NOT_KNOWN)
 )
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(

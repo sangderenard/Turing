@@ -5269,6 +5269,18 @@ class CorrelationTable:
                     "retired-region-obligation", str(row[0]), int(row[1]),
                     "retired without its obligation and proven_literal cells",
                 ))
+        from .concordance_declarations import (
+            PLANNER_RECEIVER_FIELD_SPECIALIZATION, REDUCER_FIELD_STATE,
+        )
+        page = book.pages.get(PLANNER_RECEIVER_FIELD_SPECIALIZATION.name)
+        for row in (() if page is None else page.rows()):
+            cell = book.latest_ref(PLANNER_RECEIVER_FIELD_SPECIALIZATION, row)
+            sources = {source.page.name for source, _ in book.edges_into(cell)}
+            if REDUCER_FIELD_STATE.name not in sources:
+                found.append(Finding(
+                    "receiver-field-key", str(row[0]), None,
+                    f"{row[1]}.{row[2]} keyed without the caller's field-state cell",
+                ))
         page = book.pages.get(SOURCE_INT_RANGE.name)
         for row in (() if page is None else page.rows()):
             cell = book.latest_ref(SOURCE_INT_RANGE, row)

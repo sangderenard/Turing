@@ -29519,6 +29519,22 @@ def _class_surface_ssa_program(
             specialization_contract = (
                 *specialization_contract, int_range_specialization,
             )
+        # Program: ``a.configure(2)`` and ``b.configure(1)`` each calling
+        # ``self.offsets(3)`` (per-geometry kernels, owner 2026-11-13).  Wrong
+        # record: the two ``offsets`` copies differ only by the literal
+        # ``self.geometry`` holds on entry, carried one contract and lowered
+        # under one symbol, so both callers ran the geometry-1 copy.  Rule:
+        # a copy's receiver-field keys are part of its callsite contract.
+        receiver_field_specialization = (
+            graph_obj.graph.get("planner_receiver_field_specializations") or {}
+        )
+        if receiver_field_specialization:
+            specialization_contract = (
+                *specialization_contract,
+                ("receiver_fields", tuple(sorted(
+                    receiver_field_specialization.items(),
+                ))),
+            )
         # A record-only callsite variant IS a different executable contract.
         # root(Actual)->relay(Declared)->leaf(Declared) used to overwrite both
         # variants under one symbol because only literals/tensors were keyed.

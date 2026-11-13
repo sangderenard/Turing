@@ -31401,6 +31401,140 @@ def _mutated_sequence_node_ids(
     return frozenset(mutated_sequence_ids)
 
 
+def _node_names_identity(
+    graph: Any, node_id: int, target: Any, book: Any,
+) -> Any:
+    """The node's identity cell when it derives from ``target``, else None.
+
+    ``target`` is an identity cell a record names (a field-state value, at
+    ingestion); the node is the graph's own (canonical, possibly a fork's).
+    The join walks the node cell's derivations back through the identity
+    pages only -- never ids or spellings.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import CANONICAL_VALUE, INGESTION_VALUE
+
+    identity_pages = {INGESTION_VALUE.name, CANONICAL_VALUE.name}
+    try:
+        start = node_identity_cell(graph, int(node_id), book=book)
+    except ValueError:
+        return None
+    frontier, seen = [start], {start}
+    while frontier:
+        current = frontier.pop()
+        if current == target:
+            return start
+        for source, _stage in book.edges_into(current):
+            if (
+                source.page.name in identity_pages
+                and source not in seen and len(seen) < 64
+            ):
+                seen.add(source)
+                frontier.append(source)
+    return None
+
+
+def _caller_receiver_field_literals(
+    caller: Any, call_id: int, actual_id: int,
+) -> dict[str, tuple[Any, tuple]]:
+    """Field literals the actual's object holds at this call, with proof.
+
+    Reads the call's ``call_receiver_field_state_cells`` (the reducer's
+    field-state cells current at the call, for receivers no earlier call
+    may have stored into).  A cell belongs to this actual when the actual's
+    node derives from the cell row's receiver identity; its value is the
+    caller node deriving from the cell's value identity, when that node is
+    source-static (a literal, or a formal the caller copy is specialized
+    on).  Returns ``{field: (literal, cells)}``.
+    """
+
+    from .concordance_declarations import (
+        INGESTION_VALUE, PROVEN_LITERAL, REDUCER_FIELD_STATE, FieldState,
+        FieldStateKind,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    data = caller.G.nodes.get(int(call_id)) or {}
+    cells = (data.get("attributes") or {}).get(
+        "call_receiver_field_state_cells"
+    ) or ()
+    found: dict[str, tuple[Any, tuple]] = {}
+    for cell in cells:
+        if getattr(cell, "page", None) != REDUCER_FIELD_STATE:
+            continue
+        state = book.page(REDUCER_FIELD_STATE).cell(cell.row, cell.column)
+        if not isinstance(state, FieldState) or state.kind not in (
+            FieldStateKind.WRITTEN, FieldStateKind.MERGED,
+        ):
+            continue
+        receiver_cell = book.latest_ref(
+            INGESTION_VALUE, (cell.row[0], int(cell.row[1])),
+        )
+        if receiver_cell is None or _node_names_identity(
+            caller, int(actual_id), receiver_cell, book,
+        ) is None:
+            continue
+        for node_id in tuple(caller.G.nodes):
+            value_cell = _node_names_identity(
+                caller, int(node_id), state.value, book,
+            )
+            if value_cell is None:
+                continue
+            try:
+                literal = _source_static_literal(caller, int(node_id))
+            except (ValueError, KeyError):
+                break
+            if not (
+                literal is None
+                or isinstance(literal, (bool, int, float, str))
+            ):
+                break
+            node = caller.G.nodes[int(node_id)]
+            literal_cell = book.latest_ref(PROVEN_LITERAL, (
+                str(caller.G.graph.get("function_name")),
+                int(node.get("value_id", node_id)),
+            ))
+            found[str(cell.row[2])] = (literal, tuple(
+                item for item in (cell, value_cell, literal_cell)
+                if item is not None
+            ))
+            break
+    return found
+
+
+def _entry_field_reads(graph: Any) -> set[tuple[str, str]]:
+    """``(formal, field)`` pairs this function reads at entry and never
+    writes.
+
+    c2_call_between: ``bump`` reads ``self.mode`` and writes it back; keying
+    its copy on the entry literal left the caller's leased field storage
+    without the callee's read (``fed leased storage while caller owns``).  A
+    per-geometry kernel keys only fields the callee reads, never writes.
+    """
+
+    written = set()
+    for _node_id, data in graph.G.nodes(data=True):
+        if str(data.get("type")) not in {"SetAttr", "IndexedStore"}:
+            continue
+        attribute = (data.get("attributes") or {}).get("attribute")
+        for parent, role in data.get("parents") or ():
+            if str(role) not in {"object", "base"}:
+                continue
+            parent_data = graph.G.nodes.get(int(parent)) or {}
+            name = (parent_data.get("attributes") or {}).get("binding_name")
+            if str(parent_data.get("type")) == "Input" and name is not None:
+                written.add((str(name), str(attribute)))
+    return {
+        tuple(read)
+        for _node_id, data in graph.G.nodes(data=True)
+        for read in ((data.get("attributes") or {}).get("entry_field_read"),)
+        if isinstance(read, tuple) and len(read) == 2
+        and tuple(read) not in written
+    }
+
+
 def _fold_callsite_structural_values(
     graph: Any, *, _progress: Any = None,
 ) -> None:
@@ -31502,10 +31636,8 @@ def _fold_callsite_structural_values(
         """
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, INGESTION_VALUE, REDUCER_FIELD_STATE,
-            FieldState, FieldStateKind,
+            REDUCER_FIELD_STATE, FieldState, FieldStateKind,
         )
-        from ..common.tensors.topological_reducer import node_identity_cell
 
         cell = (data.get("attributes") or {}).get("observed_field_state_cell")
         if cell is None or getattr(cell, "page", None) != REDUCER_FIELD_STATE:
@@ -31515,26 +31647,10 @@ def _fold_callsite_structural_values(
             FieldStateKind.WRITTEN, FieldStateKind.MERGED,
         ):
             return unresolved, ()
-        identity_pages = {INGESTION_VALUE.name, CANONICAL_VALUE.name}
-
         def names_value(candidate: int) -> Any:
-            try:
-                start = node_identity_cell(graph, int(candidate), book=fold_book)
-            except ValueError:
-                return None
-            frontier, seen = [start], {start}
-            while frontier:
-                current = frontier.pop()
-                if current == state.value:
-                    return start
-                for source, _stage in fold_book.edges_into(current):
-                    if (
-                        source.page.name in identity_pages
-                        and source not in seen and len(seen) < 64
-                    ):
-                        seen.add(source)
-                        frontier.append(source)
-            return None
+            return _node_names_identity(
+                graph, int(candidate), state.value, fold_book,
+            )
 
         for parent, role in data.get("parents") or ():
             if str(role) != "after_write" or int(parent) not in graph.G:
@@ -32396,6 +32512,28 @@ def _fold_callsite_structural_values(
         if node_type in {"GetAttr", "Attribute"} or isinstance(
             expression, ast.Attribute,
         ):
+            # A field read's literal (through the field-state cell it
+            # observed, or the copy's receiver-field key) is exact; it comes
+            # before the declared record field's type fact.
+            observed_literal, observed_cells = observed_field_state_literal(
+                int(node_id), data,
+            )
+            if observed_literal is not unresolved:
+                concordant_literal_sources[int(node_id)] = observed_cells
+                return observed_literal
+            entry_read = (data.get("attributes") or {}).get("entry_field_read")
+            entry_key = tuple(entry_read) if isinstance(entry_read, tuple) else None
+            entry_fields = graph.G.graph.get(
+                "planner_receiver_field_specializations"
+            ) or {}
+            entry_cell = (graph.G.graph.get(
+                "planner_receiver_field_cells"
+            ) or {}).get(entry_key)
+            if entry_key in entry_fields and entry_cell is not None:
+                # The copy was keyed on this field's entry literal by its
+                # callsite; the read precedes any write or storing call.
+                concordant_literal_sources[int(node_id)] = (entry_cell,)
+                return copy.deepcopy(entry_fields[entry_key])
             parent = next((
                 int(parent)
                 for parent, role in (data.get("parents") or ())
@@ -32423,12 +32561,6 @@ def _fold_callsite_structural_values(
                 field_fact = declared_record_field(owner_fact, attribute)
                 if field_fact is not unresolved:
                     return field_fact
-            observed_literal, observed_cells = observed_field_state_literal(
-                int(node_id), data,
-            )
-            if observed_literal is not unresolved:
-                concordant_literal_sources[int(node_id)] = observed_cells
-                return observed_literal
         if node_type in {"Indexed", "indexed"} or isinstance(
             expression, ast.Subscript,
         ):
@@ -37946,6 +38078,32 @@ def _callsite_specialized_shell_type(
         if capture_descriptor is not None:
             tensor_descriptors[capture_name] = capture_descriptor
             bound_parameters.add(capture_name)
+    # Receiver field literals (owner, 2026-11-13: per-geometry kernels): the
+    # fields this callee reads on entry from a formal, keyed by the literal
+    # the caller's object holds in them at this call.
+    receiver_field_specializations: dict[tuple[str, str], Any] = {}
+    receiver_field_cells: dict[tuple[str, str], tuple] = {}
+    entry_reads = _entry_field_reads(original)
+    if entry_reads:
+        for parent, role_value in _expanded_callsite_argument_edges(
+            caller, int(node_id),
+        ):
+            parameter = _callsite_parameter_name(
+                str(role_value), receiver, positional,
+            )
+            fields = {
+                field for formal, field in entry_reads
+                if parameter is not None and formal == str(parameter)
+            }
+            if not fields:
+                continue
+            literals = _caller_receiver_field_literals(
+                caller, int(node_id), int(parent),
+            )
+            for field in sorted(fields & set(literals)):
+                literal, cells = literals[field]
+                receiver_field_specializations[(str(parameter), field)] = literal
+                receiver_field_cells[(str(parameter), field)] = cells
     for parameter, default in (
         original.G.graph.get("parameter_defaults") or {}
     ).items():
@@ -37967,7 +38125,7 @@ def _callsite_specialized_shell_type(
     if not (
         specializations or tensor_descriptors
         or aggregate_descriptors or record_descriptors
-        or parameter_int_ranges
+        or parameter_int_ranges or receiver_field_specializations
     ):
         return fallback
     # The called inventory records each proven actual interval as a call
@@ -38011,6 +38169,10 @@ def _callsite_specialized_shell_type(
         tuple(sorted(parameter_element_classes.items())),
         tuple(sorted(parameter_int_ranges.items())),
         tuple(sorted(parameter_optional_actuals)),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in receiver_field_specializations.items()
+        )),
     )
     key = (
         tuple(policy.items()), generation,
@@ -38152,6 +38314,29 @@ def _callsite_specialized_shell_type(
     _post_copy_planner_specializations(
         specialized, specializations, specialization_cells,
     )
+    specialized.G.graph["planner_receiver_field_specializations"] = dict(
+        receiver_field_specializations
+    )
+    if receiver_field_specializations:
+        from .concordance_declarations import (
+            PLANNER_RECEIVER_FIELD_SPECIALIZATION, PLANNER_SPECIALIZATION,
+        )
+        from .identity_concordance import Derived, Mode
+
+        field_book = current_identity_book()
+        field_scope = tuple(specialized.G.graph.get("lexical_read_scope") or ())
+        field_cells = {}
+        for (formal, field), literal in sorted(
+            receiver_field_specializations.items()
+        ):
+            field_cells[(formal, field)] = field_book.post(
+                PLANNER_RECEIVER_FIELD_SPECIALIZATION,
+                (field_scope, formal, field), copy.deepcopy(literal),
+                stage=PLANNER_SPECIALIZATION,
+                provenance=Derived(receiver_field_cells[(formal, field)]),
+                mode=Mode.CONCORD,
+            )
+        specialized.G.graph["planner_receiver_field_cells"] = field_cells
     specialized.G.graph["planner_parameter_classes"] = dict(
         parameter_classes
     )

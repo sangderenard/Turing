@@ -318,6 +318,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "phi_initial_binding": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "physical_call_input_adaptation_fixed_point": PageLifecycle(None, LOWERING, LOWERING),
     "planner_specialization": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "planner_receiver_field_specialization": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "planner_tensor_descriptor": PageLifecycle(None, None, REPAIRS),
     "planning_alias_transition_concordance": PageLifecycle(None, REPAIRS, REPAIRS),
     "planning_value_concordance": PageLifecycle(None, REPAIRS, REPAIRS),

@@ -292,12 +292,13 @@ def memberships(graph, *, book=None):
     }
     decided = {}
     if specialized_here:
-        function_name = str(target.graph.get('function_name'))
+        from .planner_concordance_posts import _control_specialization_scope
+        decision_scope = _control_specialization_scope(target)
         page = book.pages.get(SOURCE_CONTROL_SPECIALIZATION.name)
         for owner in specialized_here & {
             int(owner) for members in owners.values() for owner in members
         }:
-            decision = None if page is None else page.latest((function_name, owner))
+            decision = None if page is None else page.latest((decision_scope, owner))
             if not isinstance(decision, dict) or decision.get('selected_role') not in {'body', 'orelse'}:
                 raise ValueError(
                     f'structurally specialized control {owner} has no '
