@@ -381,6 +381,8 @@ class Sessions:
         self.spectral_root = Path(spectral_override).resolve() if spectral_override else ROOT.parent / "spectral-analyzer"
         if spectral_override and not self.spectral_root.is_dir():
             raise ValueError("SPECTRAL_ANALYZER_ROOT must name an existing checkout")
+        from meowdoku.wave_arena_service import WaveArenaService
+        self.wave_arena = WaveArenaService(self.spectral_root)
         self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, self.spectral_root,
                                                         users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
@@ -2154,6 +2156,24 @@ def make_handler(sessions: Sessions):
             hits.append(now)
             return True
 
+        def _wave_arena_route(self, method: str) -> None:
+            if not self._require("play"):
+                return
+            if self._is_viewer():
+                return self._refuse_viewer()
+            self._table()  # the existing site cookie owns this visitor's field
+            payload = None
+            if method == "POST":
+                payload = self._body_json(limit=4096)
+                if payload is None:
+                    return
+            try:
+                return self._json(sessions.wave_arena.command(self._token, payload))
+            except (ValueError, TypeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except (ImportError, OSError, RuntimeError) as error:
+                return self._json({"error": f"Native wave arena unavailable: {error}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             self._classify()                                      # [ACCESS]
@@ -2163,6 +2183,8 @@ def make_handler(sessions: Sessions):
                 return self._route_get()
             if path == "/api/studio/fabric":
                 return self._fabric_route("GET")
+            if path == "/api/wave_arena":
+                return self._wave_arena_route("GET")
             if path == "/browse" or path.startswith("/browse/"):  # [LISTING] gated per root inside; the shader tier gets 403, never the shader page
                 return self._browse_get()
             if self._tier == "shader" and self._shader_request(path, "GET"):
@@ -2668,6 +2690,8 @@ def make_handler(sessions: Sessions):
                 return self._route_post()
             if path0 == "/api/studio/fabric":
                 return self._fabric_route("POST")
+            if path0 == "/api/wave_arena":
+                return self._wave_arena_route("POST")
             # Worker-only payload mailbox: credentials are process-local and
             # distinct from browser ray credentials. Never accepts browser Origin.
             if path0.startswith("/api/client_rays/engine/"):
