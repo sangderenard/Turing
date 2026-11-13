@@ -103,7 +103,7 @@ except ImportError:
     _permission_spec.loader.exec_module(_permission_groups)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit")
 ROLES = ("admin", "member", "dev", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -185,6 +185,7 @@ class Principal:
     username: str | None
     origin: str               # lan | ip | dns
     tier: str                 # the origin tier string as access.py gives it
+    groups: frozenset[str] = frozenset()
 
 
 # ---- policy -------------------------------------------------------------------------------------------------------------
@@ -245,6 +246,10 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
         caps.discard("account_manage")
     if principal.role not in ("admin", "service"):
         caps.discard("paper_train")
+    if "nodus" not in principal.groups or principal.user_id is None:
+        caps.discard("nodus_edit")
+    else:
+        caps.add("nodus_edit")
     # Unstable source attempts require an explicit account-role grant, never an origin tier.
     if (principal.user_id is None or principal.role == "guest"
             or "compile_unstable" not in policy["role_caps"].get(principal.role, ())):
@@ -367,7 +372,14 @@ def revoke_admin(db_path, username: str, granted_by: str) -> int:
 def principal_from(account, origin: str, tier: str, db_path) -> Principal:
     if account is None:
         return Principal("guest", None, None, origin, tier)
-    return Principal(role_of(db_path, account["id"]), account["id"], account["username"], origin, tier)
+    db = _connect(db_path)
+    try:
+        rank = _permission_groups.authority(db, account["id"])
+    finally:
+        db.close()
+    role = "service" if rank["service"] else rank["highest"]
+    groups = frozenset(rank["groups"])
+    return Principal(role, account["id"], account["username"], origin, tier, groups)
 
 
 def grant_role(db_path, username: str, role: str, granted_by: str) -> int:

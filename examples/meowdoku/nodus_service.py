@@ -50,9 +50,10 @@ class NotSupported(NodusError):
 class ConsoleClient:
     """One connection to a host console.  ``with ConsoleClient(host, port, token, timeout) as c: c.json_verb("DIGEST")``."""
 
-    def __init__(self, host: str, port: int, token: str, timeout: float = TIMEOUT):
+    def __init__(self, host: str, port: int, token: str, timeout: float = TIMEOUT, *, actions: bool = False):
         self._host, self._port, self._timeout = host, int(port), float(timeout)
         self._token = str(token)
+        self._actions = actions
         self._sock = None
         self._file = None
         self.name = None
@@ -72,7 +73,8 @@ class ConsoleClient:
             self._sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
             self._sock.settimeout(self._timeout)
             self._file = self._sock.makefile("rb")
-            self._sock.sendall(f"HELLO {PROTOCOL} {self._token}\n".encode("utf-8"))
+            protocol = "nodus-console/2" if self._actions else PROTOCOL
+            self._sock.sendall(f"HELLO {protocol} {self._token}\n".encode("utf-8"))
             line = self._line()
         except (OSError, EOFError):
             self.close()
@@ -83,6 +85,34 @@ class ConsoleClient:
         parts = line.split(" ", 3)
         self.name = parts[2] if len(parts) > 2 else None
         self._token = ""
+
+    def action(self, body: dict) -> dict:
+        if not self._actions:
+            raise NodusError("this console connection is read-only", 403)
+        payload = json.dumps(body, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(payload) > 4096:
+            raise NodusError("canvas action is too large", 400)
+        try:
+            self._sock.sendall(b"ACTION %d\n" % len(payload) + payload)
+            line = self._line()
+            if line.startswith("REFUSED"):
+                if line == "REFUSED action outcome uncertain":
+                    raise NodusError("canvas action outcome uncertain; inspect the graph before retrying", 503)
+                raise NotSupported("canvas actions")
+            parts = line.split(" ")
+            if len(parts) != 3 or parts[:2] != ["JSON", "ACTION"]:
+                raise NodusError("the console sent an unexpected action reply", 502)
+            size = int(parts[2])
+            if not 0 <= size <= 4096:
+                raise NodusError("the console action reply is too large", 502)
+            result = json.loads(self._file.read(size))
+            if not isinstance(result, dict):
+                raise ValueError("action reply must be an object")
+            return result
+        except (OSError, EOFError):
+            raise NodusError("the console is unreachable", 503) from None
+        except (ValueError, UnicodeError):
+            raise NodusError("the console sent an unexpected action reply", 502) from None
 
     def close(self) -> None:
         for item in (self._file, self._sock):
@@ -207,6 +237,11 @@ class Cache:
                     del self._items[k]
         return value
 
+    def invalidate_instance(self, name: str) -> None:
+        with self._lock:
+            for key in [key for key in self._items if len(key) > 1 and key[1] == name]:
+                del self._items[key]
+
 
 CACHE = Cache()
 
@@ -248,6 +283,23 @@ def activity(db, paths, name=None, *, cache=CACHE, timeout=TIMEOUT) -> dict:
     where = locate(db, paths, name)
     inst, payload = cache.get(("activity", where["name"]), 1.0, lambda: _fetch(db, paths, where["name"], "ACTIVITY", timeout))
     return _result(inst, payload)
+
+
+def ui_action(db, paths, name, body: dict, *, cache=CACHE, timeout=TIMEOUT) -> dict:
+    try:
+        size = len(json.dumps(body, allow_nan=False).encode("utf-8")) if isinstance(body, dict) else 0
+    except (TypeError, ValueError):
+        size = 0
+    if not size or size > 4096:
+        raise NodusError("canvas action must be a bounded object", 400)
+    where = locate(db, paths, name)
+    with ConsoleClient(where["host"], where["port"], _read_token(where["token_path"]),
+                       timeout, actions=True) as client:
+        result = client.action(body)
+    if "error" in result:
+        raise NodusError(result["error"], 409 if result["error"] == "canvas revision changed" else 400)
+    cache.invalidate_instance(where["name"])
+    return _result(where["name"], result)
 
 
 # ---- the generic identity graph ---------------------------------------------------------------------------------------------------

@@ -23,7 +23,7 @@ USERS_DDL = """
                 created_at REAL NOT NULL
             );
 """
-ALL = set(authz.CAPS) - {"compile_unstable"}
+ALL = set(authz.CAPS) - {"compile_unstable", "nodus_edit"}
 
 
 @pytest.fixture
@@ -168,6 +168,23 @@ def test_paper_credential_boundary_uses_rank_and_service_status(db):
         assert groups.paper_credential_owner(conn, 2, 1) == 1
         with pytest.raises(RuntimeError):
             groups.paper_credential_owner(conn, 2, None)
+
+
+def test_nodus_grant_is_admin_controlled_and_independent_of_rank(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 2, "nodus", True)
+        granted = groups.set_grant(conn, 1, 2, "nodus", True)
+        assert granted["highest"] == "member"
+        assert granted["groups"] == ["member", "nodus"]
+    member = authz.principal_from({"id": 2, "username": "bob"}, "dns", "shader", db)
+    assert "nodus_edit" in authz.capabilities(member, authz.DEFAULT_POLICY)
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "nodus", False)
+    member = authz.principal_from({"id": 2, "username": "bob"}, "dns", "shader", db)
+    assert "nodus_edit" not in authz.capabilities(member, authz.DEFAULT_POLICY)
 
 
 def test_require_raises_403_with_cap():

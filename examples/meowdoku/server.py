@@ -1353,6 +1353,7 @@ def make_handler(sessions: Sessions):
                             ("make", "order"): ("/api/paper/orders", "POST"),
                             ("make", "mock_order"): ("/api/paper/mock/orders", "POST"),
                             ("use", "reconcile"): ("/api/paper/orders/reconcile", "POST")}
+                dispatch[("use", "nodus_ui")] = ("/api/nodus/action", "POST")
                 if command not in dispatch:
                     return self._json({"error": "unknown paper DM command"}, HTTPStatus.BAD_REQUEST)
                 path, method = dispatch[command]
@@ -1376,6 +1377,8 @@ def make_handler(sessions: Sessions):
                     body = {}
                 elif method == "GET" and body:
                     return self._json({"error": "look accepts an empty input"}, HTTPStatus.BAD_REQUEST)
+                if path == "/api/nodus/action":
+                    return self._nodus_action(body)
             db = paper_arena_mod.connect(sessions.state.sql_dir / "paper_arena.sqlite")
             try:
                 bot_id = self.headers.get("X-Meowdoku-Bot") or None
@@ -1761,14 +1764,14 @@ def make_handler(sessions: Sessions):
         # ---- end [WORLDMAP]
 
         # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
-        # web/nodus.html).  Read-only view of a running Nodus canvas host's console: capability dev_ui; share also needs `message`.  No action reaches a canvas.
+        # web/nodus.html).  Read access needs dev_ui or the admin-granted nodus group; UI actions need nodus_edit.
         def _nodus_db(self):
             import sqlite3
             return sqlite3.connect(Path(sessions.accounts_db).as_uri() + "?mode=ro", uri=True, timeout=5)
 
         def _nodus_get(self, path: str) -> None:
             from urllib.parse import parse_qs
-            if not self._require("dev_ui"):
+            if not ({"dev_ui", "nodus_edit"} & self._caps()) and not self._require("nodus_edit"):
                 return
             self._set_cookie = []
             name = path[len("/api/nodus/"):]
@@ -1800,6 +1803,17 @@ def make_handler(sessions: Sessions):
                 db.close()
 
         def _nodus_post(self, path: str) -> None:
+            if path == "/api/nodus/action":
+                if not self._require("nodus_edit"):
+                    return
+                expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                if self.headers.get("Origin") not in (None, expected_origin) or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "cross-origin Nodus actions are not allowed"}, HTTPStatus.FORBIDDEN)
+                self._set_cookie = []
+                if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                    return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                body = self._body_json(4096)
+                return self._nodus_action(body) if body is not None else None
             if path != "/api/nodus/share":
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             if not self._require("dev_ui") or not self._require("message"):
@@ -1818,6 +1832,24 @@ def make_handler(sessions: Sessions):
             try:
                 return self._json(nodus_mod.share(db, sessions.state, sessions.accounts_db, self._principal().user_id,
                                                   body.get("instance") or None, body.get("to"), body.get("note", "")))
+            except nodus_mod.NodusError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+
+        def _nodus_action(self, body: dict) -> None:
+            if not self._require("nodus_edit"):
+                return
+            if (not isinstance(body, dict) or set(body) != {"instance", "action"}
+                    or not isinstance(body["instance"], str) or not isinstance(body["action"], dict)):
+                return self._json({"error": "expected instance and action"}, HTTPStatus.BAD_REQUEST)
+            try:
+                db = self._nodus_db()
+            except Exception:
+                return self._json({"error": "the supervisor records are unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            try:
+                result = nodus_mod.ui_action(db, sessions.state, body["instance"] or None, body["action"])
+                return self._json(result)
             except nodus_mod.NodusError as error:
                 return self._json({"error": error.message}, error.status)
             finally:

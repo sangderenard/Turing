@@ -21,11 +21,17 @@ AUDIT_DDL = """CREATE TABLE IF NOT EXISTS account_permission_audit (
     id INTEGER PRIMARY KEY, actor_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
     group_name TEXT NOT NULL, enabled INTEGER NOT NULL, created_at REAL NOT NULL
 )"""
+NODUS_DDL = """CREATE TABLE IF NOT EXISTS account_nodus_grants (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    granted_by INTEGER NOT NULL REFERENCES users(id),
+    created_at REAL NOT NULL
+)"""
 
 
 def prepare(db):
     db.execute(DDL)
     db.execute(AUDIT_DDL)
+    db.execute(NODUS_DDL)
 
 
 def authority(db, user_id):
@@ -46,20 +52,27 @@ def authority(db, user_id):
         "SELECT group_name FROM account_permission_grants WHERE user_id=?", (user_id,)))
     highest = max(direct, key=RANKS.__getitem__)
     groups = [name for name in ORDER if RANKS[name] <= RANKS[highest]]
-    return {"highest": highest, "direct": sorted(direct, key=RANKS.__getitem__),
-            "groups": groups, "service": role == "service"}
+    nodus = db.execute("SELECT 1 FROM account_nodus_grants WHERE user_id=?", (user_id,)).fetchone() is not None
+    return {"highest": highest, "direct": [*sorted(direct, key=RANKS.__getitem__), *(["nodus"] if nodus else [])],
+            "groups": [*groups, *(["nodus"] if nodus else [])], "service": role == "service"}
 
 
 def set_grant(db, actor_id, user_id, group_name, enabled):
     """Admin-only caller sets a dev/operator grant; admin uses grant_admin."""
-    if group_name not in ("dev", "operator") or type(enabled) is not bool:
-        raise ValueError("expected dev or operator and boolean enabled")
+    if group_name not in ("dev", "operator", "nodus") or type(enabled) is not bool:
+        raise ValueError("expected dev, operator or nodus and boolean enabled")
     actor = authority(db, actor_id)
     if actor["highest"] != "admin":
         raise PermissionError("admin permission group required")
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         raise LookupError("account not found")
-    if enabled:
+    if group_name == "nodus":
+        if enabled:
+            db.execute("INSERT INTO account_nodus_grants(user_id,granted_by,created_at) VALUES(?,?,?) "
+                       "ON CONFLICT(user_id) DO NOTHING", (user_id, actor_id, time.time()))
+        else:
+            db.execute("DELETE FROM account_nodus_grants WHERE user_id=?", (user_id,))
+    elif enabled:
         db.execute("INSERT INTO account_permission_grants(user_id,group_name,granted_by,created_at) "
                    "VALUES(?,?,?,?) ON CONFLICT(user_id,group_name) DO NOTHING",
                    (user_id, group_name, actor_id, time.time()))

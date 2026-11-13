@@ -150,6 +150,26 @@ def test_ranked_authority_endpoint_and_admin_grant(server):
     assert _call(port, "/api/account/authority", headers=member_headers)[1]["groups"] == ["member"]
 
 
+def test_nodus_action_requires_admin_granted_group(server):
+    port = server.port
+    boss, member = _signup(port, "nodus_boss"), _signup(port, "nodus_member")
+    assert _call(port, "/api/admin/account/grant", "POST", {"Host": "127.0.0.1", "X-Meowdoku-Admin": TOKEN},
+                 {"username": "nodus_boss"})[0] == 200
+    admin_headers = {**PUBLIC_XFF, "Cookie": boss}
+    member_headers = {**PUBLIC_XFF, "Cookie": member}
+    action = {"instance": "missing-instance", "action": {"op": "viewport", "expected_revision": 0, "width": 800, "height": 600}}
+    assert _call(port, "/api/nodus/action", "POST", member_headers, action)[0] == 403
+    grant = {"username": "nodus_member", "group": "nodus", "enabled": True}
+    assert _call(port, "/api/account/authority/grant", "POST", admin_headers, grant)[0] == 200
+    assert _call(port, "/api/account/authority", headers=member_headers)[1]["groups"] == ["member", "nodus"]
+    assert _call(port, "/api/nodus/action", "POST", {**member_headers, "Origin": "https://elsewhere.example"}, action)[0] == 403
+    assert _call(port, "/api/nodus/action", "POST", member_headers, action)[0] != 403
+    assert _call(port, "/api/paper/dm", "POST", member_headers,
+                 {"verb": "use", "target": "nodus_ui", "input": action})[0] != 403
+    assert _call(port, "/api/account/authority/grant", "POST", admin_headers, {**grant, "enabled": False})[0] == 200
+    assert _call(port, "/api/nodus/action", "POST", member_headers, action)[0] == 403
+
+
 def test_route_flag_sets_the_route_cookie_on_cookie_setting_responses(server):
     server.sessions.route = "a"
     status, _, cookies, _ = _call(server.port, "/api/account/signup", "POST", body={"username": "route_one", "password": "correcthorse1"})

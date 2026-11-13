@@ -246,9 +246,18 @@ const dmTemplates = {
   "make:order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
   "make:mock_order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
   "use:reconcile": () => ({ id: "" }),
+  "use:nodus_ui": () => ({ instance: "nodus-messenger", action: { op: "viewport", expected_revision: 0, width: 800, height: 600 } }),
 };
-$("dm-command").addEventListener("change", () => {
-  $("dm-input").value = JSON.stringify(dmTemplates[$("dm-command").value](), null, 2);
+$("dm-command").addEventListener("change", async () => {
+  const command = $("dm-command").value;
+  const template = dmTemplates[command]();
+  if (command === "use:nodus_ui") {
+    try {
+      const response = await fetch(`/api/nodus/digest?instance=${encodeURIComponent(template.instance)}`, { credentials: "same-origin", cache: "no-store" });
+      if (response.ok) template.action.expected_revision = (await response.json()).revision;
+    } catch (_) { /* The action response reports unavailable hosts. */ }
+  }
+  if ($("dm-command").value === command) $("dm-input").value = JSON.stringify(template, null, 2);
 });
 $("dm-form").addEventListener("submit", async (event) => {
   event.preventDefault();
