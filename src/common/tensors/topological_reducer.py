@@ -6991,16 +6991,62 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         incumbent = range_page.latest(key)
         if incumbent is not None and tuple(incumbent) == tuple(interval):
             continue
+        if incumbent is not None and (
+            int(interval[0]) <= int(incumbent[0])
+            and int(incumbent[1]) <= int(interval[1])
+        ):
+            # The same specialization scope is also solved on a graph the
+            # fold has not run on (the function-table entry beside the
+            # folded shell copy).  Its wider interval contains the fold's
+            # revision and so agrees with it; the revision stands only when
+            # the book says the fold caused it.
+            from ...compiler.concordance_declarations import PROVEN_LITERAL
+            incumbent_cell = book.latest_ref(SOURCE_INT_RANGE, key)
+            if any(
+                source.page == PROVEN_LITERAL
+                for source, _stage in book.edges_into(incumbent_cell)
+            ):
+                for unit, node_id in members[key]:
+                    unit.G.nodes[node_id].setdefault("attributes", {})[
+                        "python_int_range"
+                    ] = (int(incumbent[0]), int(incumbent[1]))
+                continue
         unit, node_id = members[key][0]
         node_cell = node_identity_cell(unit.wrapper, int(node_id))
+        # Program: ``if geometry == "square": count = 4 else: count = 3``
+        # in a copy specialized ``geometry="tetrahedron"``.  Wrong record:
+        # the copy's merge was proved (3, 4) before the structural fold; the
+        # fold made it the literal 3 and the re-solve's (3, 3) was refused as
+        # a CONCORD disagreement.  Rule: a value the fold turned into a
+        # literal is revised from its ``proven_literal`` cell -- the fold is
+        # the recorded cause; any other disagreement stays a refusal.
+        fold_cell = None
+        if incumbent is not None:
+            from ...compiler.concordance_declarations import PROVEN_LITERAL
+            for member_unit, member_id in members[key]:
+                member_attributes = (
+                    member_unit.G.nodes[member_id].get("attributes") or {}
+                )
+                if not member_attributes.get("structural_specialization"):
+                    continue
+                fold_cell = book.latest_ref(PROVEN_LITERAL, (
+                    str(member_unit.G.graph.get("function_name")),
+                    int(member_unit.G.nodes[member_id].get(
+                        "value_id", member_id,
+                    )),
+                ))
+                if fold_cell is not None:
+                    break
         book.post(
             SOURCE_INT_RANGE, key, (int(interval[0]), int(interval[1])),
             stage=_REDUCTION,
             provenance=_Derived(tuple(
-                cell for cell in (class_cell, node_cell, edge_cells.get(key))
+                cell for cell in (
+                    class_cell, node_cell, edge_cells.get(key), fold_cell,
+                )
                 if cell is not None
             )),
-            mode=_Mode.CONCORD,
+            mode=_Mode.CONCORD if fold_cell is None else _Mode.REVISE,
         )
         posted.append(key)
     # Second pass: the proof's own inputs, now that every row has a cell
@@ -12256,6 +12302,32 @@ def _normalize_lexical_values(
                     and last_write != attribute_id
                 ):
                     read_inputs.append((last_write, "after_write"))
+                    # Program: YoungMan ``configure_geometry`` --
+                    # ``if geometry is not None: self.geometry = geometry``
+                    # then ``if self.geometry == "network_configured"``.
+                    # Wrong record: the read named only an ordering edge, so
+                    # a specialized copy whose merge folded to a literal
+                    # still compared a runtime string and kept the dead
+                    # ``network_geometry`` arm.  Rule: the read observes the
+                    # cursor cell -- the field's current value -- when no
+                    # call resolved so far may store into this receiver and
+                    # no loop is open (a later iteration's write is not in
+                    # the cursor yet).  The cell is the record; the fold
+                    # reads the value through it.
+                    if (
+                        current_state.kind in (
+                            _FieldStateKind.WRITTEN, _FieldStateKind.MERGED,
+                        )
+                        and not call_stored_field
+                        and int(receiver) not in storing_call_values
+                        and not loop_field_entry_values
+                        and not loop_body_storing_receivers
+                    ):
+                        graph.G.nodes[attribute_id].setdefault(
+                            "attributes", {},
+                        )["observed_field_state_cell"] = field_state_cursor[
+                            (int(receiver), str(expression.attr))
+                        ]
                 _replace_inputs(
                     graph,
                     attribute_id,

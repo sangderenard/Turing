@@ -1166,6 +1166,14 @@ REGION_OWNERSHIP_UNKNOWN = declare_reason("region_ownership_unknown")
 REGION_VALUE_DTYPE_AWAITS_SETTLEMENT = declare_reason(
     "region_value_dtype_awaits_settlement"
 )
+#: An outstanding region-value obligation whose value the structural fold
+#: turned into a literal that nothing consumes any more (its consumer was
+#: folded or removed with a rejected arm).  No operation reads it as a host
+#: scalar, so no dtype is owed; DERIVED from the obligation's cell, the
+#: node's identity cell and its ``proven_literal`` cell.
+REGION_VALUE_RETIRED_UNCONSUMED = declare_reason(
+    "region_value_retired_unconsumed"
+)
 HIERARCHY_PLAN_FREEZE = declare_stage("hierarchy_plan_freeze")
 
 

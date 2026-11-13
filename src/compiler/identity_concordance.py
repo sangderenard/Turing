@@ -1578,6 +1578,7 @@ class CorrelationTable:
         found.extend(self._source_page_declaration_findings(module))
         found.extend(self._graph_work_publication_findings(module))
         found.extend(self._tile_storage_findings(module))
+        found.extend(self._structural_fold_revision_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._source_parameter_default_findings(module))
@@ -5233,6 +5234,51 @@ class CorrelationTable:
                     None,
                     "source page cell disagrees with its authored module, "
                     "page name, fact class, or RowField source edges",
+                ))
+        return found
+
+    @staticmethod
+    def _structural_fold_revision_findings(module: Any) -> list[Finding]:
+        """Records the structural fold revises must cite the fold.
+
+        A region-value obligation retired as unconsumed derives from the
+        obligation it retires and the folded literal's ``proven_literal``
+        cell; an int range REVISED after a CONCORD proof derives from a
+        ``proven_literal`` cell (the fold that narrowed the value).
+        """
+
+        from .concordance_declarations import (
+            PLAN_REGION_VALUE_DTYPE, PROVEN_LITERAL,
+            REGION_VALUE_RETIRED_UNCONSUMED, SOURCE_INT_RANGE,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.pages.get(PLAN_REGION_VALUE_DTYPE.name)
+        for row in (() if page is None else page.rows()):
+            fact = page.latest(row)
+            if getattr(fact, "reason", None) != REGION_VALUE_RETIRED_UNCONSUMED:
+                continue
+            cell = book.latest_ref(PLAN_REGION_VALUE_DTYPE, row)
+            sources = {source.page.name for source, _ in book.edges_into(cell)}
+            if (PROVEN_LITERAL.name not in sources
+                    or PLAN_REGION_VALUE_DTYPE.name not in sources):
+                found.append(Finding(
+                    "retired-region-obligation", str(row[0]), int(row[1]),
+                    "retired without its obligation and proven_literal cells",
+                ))
+        page = book.pages.get(SOURCE_INT_RANGE.name)
+        for row in (() if page is None else page.rows()):
+            cell = book.latest_ref(SOURCE_INT_RANGE, row)
+            if cell is None or cell.column == 0:
+                continue
+            sources = {source.page.name for source, _ in book.edges_into(cell)}
+            if PROVEN_LITERAL.name not in sources:
+                found.append(Finding(
+                    "int-range-revision", str(row[0]), int(row[1]),
+                    "a revised interval cites no proven_literal cell",
                 ))
         return found
 

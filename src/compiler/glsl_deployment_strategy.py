@@ -5143,7 +5143,70 @@ def _owe_host_scalar_class(graph: Any, value_id: int) -> bool:
     return True
 
 
-def _refuse_unsettled_host_scalars(graph: Any, planned_dtypes: Any) -> None:
+def _retire_unconsumed_folded_obligation(
+    graph: Any, value_id: int, retained_values: Any,
+) -> bool:
+    """Retire the obligation of a folded literal nothing consumes any more.
+
+    Program: YoungMan ``configure_geometry`` specialized
+    ``geometry="tetrahedron"``.  Wrong record: the pre-specialization freeze
+    owed a host-scalar class for the ``self.geometry`` read its comparison
+    consumed; the fold made the read the literal and removed the comparison,
+    and the terminal freeze still refused the literal's missing class.  Rule:
+    a structurally folded literal with no consumer, no return slot and no
+    control use owes no dtype; the obligation is revised to
+    ``REGION_VALUE_RETIRED_UNCONSUMED`` from its own cell, the node's cell and
+    the fold's ``proven_literal`` cell.  Anything else is still owed.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        HIERARCHY_PLAN_FREEZE, PLAN_REGION_VALUE_DTYPE, PROVEN_LITERAL,
+        REGION_VALUE_RETIRED_UNCONSUMED,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, current_identity_book,
+    )
+
+    value_id = int(value_id)
+    data = graph.G.nodes[value_id]
+    if (
+        str(data.get("type")) not in {"Constant", "Const", "const"}
+        or not (data.get("attributes") or {}).get("structural_specialization")
+        or graph.G.out_degree(value_id) != 0
+        or value_id in set(map(int, retained_values or ()))
+        or value_id in {
+            int(slot)
+            for slots in (graph.G.graph.get("return_slot_values") or {}).values()
+            for slot in slots if slot is not None
+        }
+        or value_id in set(map(int, getattr(graph, "roots", ()) or ()))
+    ):
+        return False
+    book = current_identity_book()
+    literal_cell = book.latest_ref(PROVEN_LITERAL, (
+        str(graph.G.graph.get("function_name")),
+        int(data.get("value_id", value_id)),
+    ))
+    row = _region_value_dtype_row(graph, value_id, mint=False)
+    obligation = (
+        None if row is None else book.latest_ref(PLAN_REGION_VALUE_DTYPE, row)
+    )
+    if literal_cell is None or obligation is None:
+        return False
+    cells = (obligation, node_identity_cell(graph, value_id), literal_cell)
+    book.post(
+        PLAN_REGION_VALUE_DTYPE, row,
+        Unresolved(REGION_VALUE_RETIRED_UNCONSUMED, read=cells),
+        stage=HIERARCHY_PLAN_FREEZE, provenance=Derived(cells),
+        mode=Mode.REVISE,
+    )
+    return True
+
+
+def _refuse_unsettled_host_scalars(
+    graph: Any, planned_dtypes: Any, *, retained_values: Any = (),
+) -> None:
     """The terminal freeze: settle each owed host-scalar class or refuse it.
 
     Reads, in order, the resolver's semantic class answer and the planner's
@@ -5162,6 +5225,10 @@ def _refuse_unsettled_host_scalars(graph: Any, planned_dtypes: Any) -> None:
     scope = _source_numeric_scope(graph.G)
     for value_id in outstanding_region_value_obligations(graph):
         if int(value_id) not in graph.G:
+            continue
+        if _retire_unconsumed_folded_obligation(
+            graph, int(value_id), retained_values,
+        ):
             continue
         # An obligation can be opened while a tensor union is still
         # settling.  Repository ``lz_encode`` value 165 is observed first
@@ -5685,7 +5752,9 @@ def _settle_region_value_obligation(
 def outstanding_region_value_obligations(graph: Any) -> tuple[int, ...]:
     """Region values of ``graph`` whose dtype is still an open obligation."""
 
-    from .concordance_declarations import PLAN_REGION_VALUE_DTYPE
+    from .concordance_declarations import (
+        PLAN_REGION_VALUE_DTYPE, REGION_VALUE_RETIRED_UNCONSUMED,
+    )
     from .identity_concordance import Unresolved, current_identity_book
 
     scope = graph.G.graph.get("lexical_read_scope")
@@ -5699,6 +5768,7 @@ def outstanding_region_value_obligations(graph: Any) -> tuple[int, ...]:
         int(row[1]) for item in scopes
         for row in page.scope_rows(tuple(item))
         if isinstance(page.latest(row), Unresolved)
+        and page.latest(row).reason != REGION_VALUE_RETIRED_UNCONSUMED
     )
 
 
@@ -8587,7 +8657,9 @@ def _build_shell_hierarchy_plan(
     }
 
     if terminal:
-        _refuse_unsettled_host_scalars(graph, planned_scalar_dtypes())
+        _refuse_unsettled_host_scalars(
+            graph, planned_scalar_dtypes(), retained_values=control_values,
+        )
 
     planned = PlanClosure(
         name=str(
@@ -31416,6 +31488,82 @@ def _fold_callsite_structural_values(
         except KeyError:
             return unresolved
 
+    def observed_field_state_literal(
+        node_id: int, data: Mapping[str, Any],
+    ) -> tuple[Any, tuple]:
+        """A field read's value through the field-state cell it observed.
+
+        The reducer stamps ``observed_field_state_cell`` on a read only when
+        that cell is the field's current value there (no storing call, no
+        open loop).  The cell names its value node by ingestion identity; the
+        graph node it is here is found through the book's identity
+        derivations from that node's own cell, never by id or spelling.  The
+        read is the value's literal when the fold holds one for that node.
+        """
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, REDUCER_FIELD_STATE,
+            FieldState, FieldStateKind,
+        )
+        from ..common.tensors.topological_reducer import node_identity_cell
+
+        cell = (data.get("attributes") or {}).get("observed_field_state_cell")
+        if cell is None or getattr(cell, "page", None) != REDUCER_FIELD_STATE:
+            return unresolved, ()
+        state = fold_book.page(REDUCER_FIELD_STATE).cell(cell.row, cell.column)
+        if not isinstance(state, FieldState) or state.kind not in (
+            FieldStateKind.WRITTEN, FieldStateKind.MERGED,
+        ):
+            return unresolved, ()
+        identity_pages = {INGESTION_VALUE.name, CANONICAL_VALUE.name}
+
+        def names_value(candidate: int) -> Any:
+            try:
+                start = node_identity_cell(graph, int(candidate), book=fold_book)
+            except ValueError:
+                return None
+            frontier, seen = [start], {start}
+            while frontier:
+                current = frontier.pop()
+                if current == state.value:
+                    return start
+                for source, _stage in fold_book.edges_into(current):
+                    if (
+                        source.page.name in identity_pages
+                        and source not in seen and len(seen) < 64
+                    ):
+                        seen.add(source)
+                        frontier.append(source)
+            return None
+
+        for parent, role in data.get("parents") or ():
+            if str(role) != "after_write" or int(parent) not in graph.G:
+                continue
+            # The candidate is fixed by the state's kind, never searched:
+            # a MERGED state's value IS its effect (the merge the read is
+            # ordered after); a WRITTEN state's value is that SetAttr's
+            # ``value`` operand.  c422: also offering the merge's operands
+            # let its body arm's literal stand for a runtime merge.
+            if state.kind is FieldStateKind.MERGED:
+                candidates = (int(parent),)
+            else:
+                candidates = tuple(
+                    int(grand) for grand, grand_role in
+                    graph.G.nodes[int(parent)].get("parents") or ()
+                    if str(grand_role) == "value"
+                )
+            for candidate in candidates:
+                value = known.get(int(candidate), unresolved)
+                if value is unresolved or not (
+                    value is None
+                    or isinstance(value, (bool, int, float, str))
+                ):
+                    continue
+                value_cell = names_value(int(candidate))
+                if value_cell is not None:
+                    return value, (cell, value_cell)
+        return unresolved, ()
+
     def positional(data: Mapping[str, Any]) -> tuple[int, ...]:
         indexed = []
         for parent, role_value in data.get("parents") or ():
@@ -32275,6 +32423,12 @@ def _fold_callsite_structural_values(
                 field_fact = declared_record_field(owner_fact, attribute)
                 if field_fact is not unresolved:
                     return field_fact
+            observed_literal, observed_cells = observed_field_state_literal(
+                int(node_id), data,
+            )
+            if observed_literal is not unresolved:
+                concordant_literal_sources[int(node_id)] = observed_cells
+                return observed_literal
         if node_type in {"Indexed", "indexed"} or isinstance(
             expression, ast.Subscript,
         ):
