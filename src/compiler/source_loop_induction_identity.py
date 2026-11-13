@@ -65,6 +65,38 @@ def loop_induction_sources(module, function_name, actual, source, use_block):
                 bindings.append(cell)
         if len(bindings) != 1:
             return None
+        native = native_loop_induction_sources(module, name, actual, loop, use_block)
+        if native is None:
+            return None
+        return tuple(sorted({source, *programs, *bindings, *native}, key=repr))
+    except (KeyError,TypeError,ValueError,AttributeError,IndexError):
+        return None
+
+
+def native_loop_induction_sources(module, function_name, actual, loop, use_block):
+    """Prove native loop scope only; callers must prove authored row binding."""
+    from .ssa_record_return_state import function_scope_of
+    name = str(function_name)
+    function = module.functions.get(name)
+    book = dict(getattr(module, 'metadata', {}) or {}).get('identity_book')
+    if function is None or book is None or actual.page != SSA_VALUE or loop.page != CANONICAL_VALUE:
+        return None
+    def fact(cell):
+        return book.page(cell.page).cell(cell.row, cell.column)
+    try:
+        if actual.row[0] != function_scope_of(function) or book.latest_ref(SSA_VALUE, actual.row) != actual:
+            return None
+        mint = book.mint_of(actual)
+        if mint is None or mint[0] != PHI_LOOP_HEADER or len(mint[1]) != 1:
+            return None
+        bundle = mint[1][0]
+        if bundle.page != CELL_SET:
+            return None
+        parents = tuple(p for p, _ in book.edges_into(bundle))
+        if set(fact(bundle)) != {p.key for p in parents}:
+            return None
+        if [p for p in parents if p.page == CANONICAL_VALUE] != [loop]:
+            return None
         boundary = book.latest_ref(LOOP_SCOPE, (name, int(loop.row[-1]), 'boundary'))
         if boundary is None or loop not in {p for p, _ in book.edges_into(boundary)}:
             return None
@@ -98,7 +130,7 @@ def loop_induction_sources(module, function_name, actual, source, use_block):
                 or exit_block in dominators.get(str(use_block), set())
                 or header not in dominators.get(latch, set())):
             return None
-        proof = {actual, source, loop, bundle, *parents, *programs, *bindings, boundary}
+        proof = {actual, loop, bundle, *parents, boundary}
         for label in region | {header}:
             block = function.blocks[label]
             cell = book.latest_ref(SSA_BLOCK_GEOMETRY, (actual.row[0], name, str(label)))

@@ -170,6 +170,25 @@ def publish_borrowed_record_span_role(builder, target_id, role, projection, hand
 
 
 def borrowed_record_string_view(builder, value_id):
+    """Keep builder admission using the same explicit proof core."""
+    book, scope = builder._book(), builder._scope()
+    source = borrowed_record_string_source(book, builder.lexical_read_scope, value_id)
+    if source is None:
+        return None
+    parent_id = int(source[1].row[-1])
+    selection = builder.child_table_selections.get(int(value_id))
+    pool = getattr(builder, 'borrowed_record_field_pools', {}).get((parent_id, source[4][3]))
+    if selection is None or pool is None or selection[0] != pool:
+        return None
+    return _validate_borrowed_record_string_view(
+        book, scope, builder.lexical_read_scope, value_id,
+        builder.sequence_descriptors, pool, int(selection[1].id), builder.blocks,
+        builder._sequence_contract_cell(parent_id))
+
+
+def _validate_borrowed_record_string_view(book, scope, lexical_scope, value_id,
+                                         descriptors, pool, handle, blocks, contract,
+                                         binding_cells=None, resident_view=None, retired_recipe=None, proof_parts=False):
     """Validate a live readonly field view back to independent input storage.
 
     This is not an owned-return receipt. It establishes that a destination
@@ -181,8 +200,7 @@ def borrowed_record_string_view(builder, value_id):
         BORROWED_RECORD_SPAN_ROLE, ADDRESS, CONTROL_EXPRESSION, CONTROL_CAST,
     )
     from .source_sequence_lifetime import _validate
-    book, scope = builder._book(), builder._scope()
-    source = borrowed_record_string_source(book, builder.lexical_read_scope, value_id)
+    source = borrowed_record_string_source(book, lexical_scope, value_id)
     if source is None:
         return None
     control, parent, canonical, induction, projection, classes = source
@@ -191,13 +209,11 @@ def borrowed_record_string_view(builder, value_id):
     if lifetime_cell is None:
         return None
     lifetime = _validate(book, lifetime_cell)
-    root = builder.sequence_descriptors.get(parent_id)
-    view = builder.sequence_descriptors.get(int(value_id))
-    selection = builder.child_table_selections.get(int(value_id))
-    pool = getattr(builder, 'borrowed_record_field_pools', {}).get((parent_id, projection[3]))
+    root = descriptors.get(parent_id)
+    view = descriptors.get(int(value_id))
     if (lifetime.kind is not SequenceLifetimeKind.BORROWED or lifetime.source_cell != parent
-            or root is None or view is None or pool is None or selection is None
-            or selection[0] != pool or pool.writable or view.writable
+            or root is None or view is None or pool is None or handle is None
+            or pool.writable or view.writable
             or pool.key_columns or any(value is not None for value in (
                 pool.shape_value_id, pool.rank_value_id, pool.shape_stride_value_id,
                 pool.status_value_id, pool.live_flags_value_id))
@@ -210,7 +226,6 @@ def borrowed_record_string_view(builder, value_id):
             or view.column_dtypes != pool.column_dtypes):
         return None
     handle_arena = root.column_value_ids[pool.handle_column]
-    contract = builder._sequence_contract_cell(parent_id)
     expected_base = {book.latest_ref(SSA_VALUE, (scope, handle_arena)), contract}
     proof = {control, parent, canonical, lifetime_cell, *classes, *expected_base}
     pool_source = None
@@ -241,9 +256,9 @@ def borrowed_record_string_view(builder, value_id):
                 or set(_fact(book, bundle)) != {p.key for p in causes}):
             return None
         original_source, = source_cells
-        if original_source.page != CANONICAL_VALUE or original_source.row[0] != builder.lexical_read_scope:
+        if original_source.page != CANONICAL_VALUE or original_source.row[0] != lexical_scope:
             return None
-        original = borrowed_record_string_source(book, builder.lexical_read_scope,
+        original = borrowed_record_string_source(book, lexical_scope,
                                                  int(original_source.row[-1]))
         if (original is None or original[2] != original_source or original[1] != parent
                 or original[4][:5] != projection[:5] or original[4][6] != projection[6]
@@ -259,7 +274,7 @@ def borrowed_record_string_view(builder, value_id):
         proof.update((role_cell, original[0], original_source, *original[5]))
         proof.update((current, bundle))
     definitions = {}
-    for block in builder.blocks.values():
+    for block in blocks.values():
         for op in block.instrs:
             if op.res is not None:
                 definitions.setdefault(int(op.res.id), []).append(op)
@@ -313,16 +328,33 @@ def borrowed_record_string_view(builder, value_id):
             return None
         proof.add(book.latest_ref(SSA_VALUE, (scope, int(value))))
         return op
-    handle = selection[1].id
-    load = operation(handle, 'Load')
-    if load is None or len(load.args) != 1:
+    if retired_recipe is None:
+        load = operation(handle, 'Load')
+        if load is None or len(load.args) != 1:
+            return None
+        address = operation(load.args[0].id, 'GetElementPtr')
+        if address is None or len(address.args) != 2 or address.args[0].id != handle_arena:
+            return None
+        index_id = address.args[1].id
+    else:
+        # A caller must first establish a complete per-use descriptor alias.
+        # This validates a retired recipe only as the authored side of that
+        # alias; it cannot establish a live view on its own. CELL_SET is
+        # unordered: roles select base/index/handle/stride here, not imagined
+        # historical argument order. Only the live resident ops prove order.
+        if resident_view is None or binding_cells is None or len(retired_recipe) != 3:
+            return None
+        index_id, offset_id, address_id = retired_recipe
+        if not mint_operands(address_id, ADDRESS, (handle_arena, index_id)):
+            return None
+    if not mint_operands(handle, CONTROL_EXPRESSION, (handle_arena, index_id)):
         return None
-    address = operation(load.args[0].id, 'GetElementPtr')
-    if address is None or len(address.args) != 2 or address.args[0].id != handle_arena:
-        return None
-    if not mint_operands(handle, CONTROL_EXPRESSION, (handle_arena, address.args[1].id)):
-        return None
-    logical = book.latest_ref(CONTROL_VALUE_BINDING, (scope, int(value_id)))
+    def binding(value):
+        if binding_cells is not None:
+            cell = binding_cells.get(int(value))
+            return cell if cell is not None and cell.page == CONTROL_VALUE_BINDING and cell.row == (scope, int(value)) else None
+        return book.latest_ref(CONTROL_VALUE_BINDING, (scope, int(value)))
+    logical = binding(value_id)
     column_cell = book.latest_ref(SSA_VALUE, (scope, view.column_value_ids[0]))
     handle_cell = book.latest_ref(SSA_VALUE, (scope, handle))
     if (logical is None or _fact(book, logical).kind is not BindingKind.SEQUENCE_RESULT
@@ -330,12 +362,12 @@ def borrowed_record_string_view(builder, value_id):
             or not {canonical, handle_cell, column_cell} <= {p for p, _ in book.edges_into(logical)}):
         return None
     proof.add(logical)
-    row_source = builder._canonical_cell(int(projection[5]))
-    row_binding = book.latest_ref(CONTROL_VALUE_BINDING, (scope, int(projection[5])))
+    row_source = book.latest_ref(CANONICAL_VALUE, (lexical_scope, int(projection[5])))
+    row_binding = binding(projection[5])
     if row_binding is None or row_source is None:
         return None
     row_fact = _fact(book, row_binding)
-    index_cell = book.latest_ref(SSA_VALUE, (scope, address.args[1].id))
+    index_cell = book.latest_ref(SSA_VALUE, (scope, index_id))
     if (row_fact.kind is not BindingKind.LOOP_CONTROL or row_fact.ssa_value != index_cell
             or (parent, row_source, induction, 'induction') not in
             _fact(book, control).projected_iterable_bindings
@@ -344,15 +376,56 @@ def borrowed_record_string_view(builder, value_id):
         return None
     proof.update((row_source, row_binding, index_cell))
     # The same selected handle addresses the independent glyph row and length.
-    column = operation(view.column_value_ids[0], 'GetElementPtr')
-    if column is None or len(column.args) != 2 or column.args[0].id != pool.column_value_ids[0]:
+    if retired_recipe is None:
+        column = operation(view.column_value_ids[0], 'GetElementPtr')
+        if column is None or len(column.args) != 2 or column.args[0].id != pool.column_value_ids[0]:
+            return None
+        if operation(column.args[1].id, 'Mul', (handle, pool.row_stride_value_id)) is None:
+            return None
+        if operation(view.length_address_id, 'GetElementPtr', (pool.length_value_id, handle)) is None:
+            return None
+        if operation(view.capacity_value_id, 'Cast', (pool.row_stride_value_id,)) is None:
+            return None
+    elif not all((
+        mint_operands(view.column_value_ids[0], ADDRESS, (pool.column_value_ids[0], offset_id)),
+        mint_operands(offset_id, CONTROL_EXPRESSION, (handle, pool.row_stride_value_id)),
+        mint_operands(view.length_address_id, ADDRESS, (pool.length_value_id, handle)),
+        mint_operands(view.capacity_value_id, CONTROL_CAST, (pool.row_stride_value_id,)),
+    )):
         return None
-    if operation(column.args[1].id, 'Mul', (handle, pool.row_stride_value_id)) is None:
-        return None
-    if operation(view.length_address_id, 'GetElementPtr', (pool.length_value_id, handle)) is None:
-        return None
-    if operation(view.capacity_value_id, 'Cast', (pool.row_stride_value_id,)) is None:
-        return None
+    authored_proof = set(proof)
+    if resident_view is not None:
+        # An independently authorized per-use alias may select another read
+        # of the same field/row. Revalidate its full immutable native recipe;
+        # this does not replace the authored view's logical binding.
+        from dataclasses import replace
+        if replace(resident_view, sequence_id=view.sequence_id,
+                   column_value_ids=view.column_value_ids,
+                   length_address_id=view.length_address_id,
+                   capacity_value_id=view.capacity_value_id) != view:
+            return None
+        resident_length = operation(resident_view.length_address_id, 'GetElementPtr')
+        if (resident_length is None or len(resident_length.args) != 2
+                or resident_length.args[0].id != pool.length_value_id):
+            return None
+        resident_handle = resident_length.args[1].id
+        resident_load = operation(resident_handle, 'Load')
+        if resident_load is None or len(resident_load.args) != 1:
+            return None
+        resident_address = operation(resident_load.args[0].id, 'GetElementPtr',
+                                     (handle_arena, index_id))
+        if (resident_address is None or not mint_operands(
+                resident_handle, CONTROL_EXPRESSION, (handle_arena, index_id))):
+            return None
+        resident_column = operation(resident_view.column_value_ids[0], 'GetElementPtr')
+        if (resident_column is None or len(resident_column.args) != 2
+                or resident_column.args[0].id != pool.column_value_ids[0]
+                or operation(resident_column.args[1].id, 'Mul',
+                             (resident_handle, pool.row_stride_value_id)) is None
+                or operation(resident_view.capacity_value_id, 'Cast',
+                             (pool.row_stride_value_id,)) is None):
+            return None
     if None in proof:
         return None
-    return tuple(sorted(proof, key=lambda cell: repr(cell.key)))
+    ordered = tuple(sorted(proof, key=lambda cell: repr(cell.key)))
+    return (tuple(sorted(authored_proof, key=repr)), ordered) if proof_parts else ordered
