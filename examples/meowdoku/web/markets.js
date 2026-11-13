@@ -91,7 +91,9 @@ function drawQualification(payload) {
     const checks = document.createElement("ol"); checks.className = "checks";
     for (const check of (run.progress || []).filter((item) => item.validation_mean != null).slice(-8)) {
       const line = document.createElement("li");
-      line.textContent = `seed ${check.seed}, epoch ${check.epoch}: validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
+      const position = [check.seed != null ? `seed ${check.seed}` : null,
+                        check.epoch != null ? `epoch ${check.epoch}` : null].filter(Boolean).join(", ");
+      line.textContent = `${position ? position + ": " : ""}validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
       checks.append(line);
     }
     card.append(title, meta, bar, checks); root.append(card);
