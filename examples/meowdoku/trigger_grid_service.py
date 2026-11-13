@@ -8,7 +8,7 @@ _lock = RLock()
 _panels = {}
 
 
-def command(account_id: int, request: dict, spectral_root) -> dict:
+def command(account_id: int, request: dict, spectral_root, *, radio_snapshot=None) -> dict:
     if not isinstance(account_id, int) or account_id <= 0:
         raise ValueError("the camera routing grid requires a signed-in account")
     action = request.get("action")
@@ -34,6 +34,13 @@ def command(account_id: int, request: dict, spectral_root) -> dict:
             return panel.event(request.get("name"), request.get("x", 0), request.get("y", 0),
                                button=request.get("button", 1), wheel_y=request.get("wheel_y", 0),
                                shift=request.get("shift", False))
+        if action == "radio":
+            panel = _panels.get(account_id)
+            if panel is None:
+                raise ValueError("open the camera routing grid before connecting radio")
+            if radio_snapshot is None:
+                raise ValueError("radio measurement source is unavailable")
+            return panel.radio(radio_snapshot())
         if action == "pulse":
             panel = _panels.get(account_id)
             if panel is None:

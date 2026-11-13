@@ -31,6 +31,33 @@ export function mountMarbleTriggerGrid({doc,getReceivers}) {
   const previewSpeed=doc.getElementById('camera-trigger-preview-speed');
   const generatorPanel=doc.getElementById('camera-trigger-generators');
   let graph=null,pulse=null,started=0,playbackRate=50,chain=Promise.resolve(),opened=false;
+  let radioEnabled=false,radioLevels=null,radioAt=0,radioPending=false,radioEpoch=0;
+  const radioJack=doc.createElement('button');radioJack.type='button';
+  radioJack.textContent='Connect Nodus Radio';radioJack.setAttribute('aria-pressed','false');
+  status.after(radioJack);
+  radioJack.addEventListener('click',()=>{
+    radioEnabled=!radioEnabled;radioEpoch++;radioLevels=null;
+    radioJack.setAttribute('aria-pressed',String(radioEnabled));
+    radioJack.textContent=radioEnabled?'Disconnect Nodus Radio':'Connect Nodus Radio';
+    status.textContent=radioEnabled?'Open your radio widget. Patch radio:rms or radio:band sources in this grid to light receivers.':'Radio disconnected; normal light settings restored.';
+  });
+  doc.defaultView.addEventListener('nodus-radio-signal',async event=>{
+    if(!radioEnabled||!opened)return;
+    if(event.detail?.status!=='live'){radioLevels=null;radioEpoch++;return;}
+    if(radioPending)return;
+    const epoch=radioEpoch;radioPending=true;
+    try {
+      // Only the event clock is used. Measurements come from the authenticated
+      // server's configured Nodus feed, never from browser-supplied numbers.
+      const result=await request({action:'radio'});
+      if(!radioEnabled||epoch!==radioEpoch)return;
+      show(result);
+      radioLevels=result.status==='live'?{active:new Set(result.active),gains:result.gains,shopCutoff:false}:null;
+      radioAt=performance.now();
+    } catch(error){if(epoch===radioEpoch){radioLevels=null;status.textContent=error.message;}}
+    finally{radioPending=false;}
+  });
+  doc.defaultView.addEventListener('pagehide',()=>{radioEpoch++;radioLevels=null;radioEnabled=false;});
   let generatorSpecs=GENERATOR_KEYS.map(DEFAULT_GENERATOR);
   try {
     const saved=JSON.parse(localStorage.getItem(GENERATOR_STORE));
@@ -111,14 +138,16 @@ export function mountMarbleTriggerGrid({doc,getReceivers}) {
   return {
     graph:()=>{
       if(!opened||!graph)return undefined;
-      const current=["Sync","Flash","Gate",...LIGHTING_BUSES.map(bus=>`rack:${bus.id}`),...getReceivers(),...GENERATOR_KEYS];
+      if(graph.edges?.some(edge=>edge.src.startsWith('radio:')&&Math.abs(edge.w)>1e-12))
+        throw Error('Radio routing currently drives the live preview. Unpatch radio sources before a timed ray exposure; radio signal recording is not connected yet.');
+      const current=["Sync","Flash","Gate",...LIGHTING_BUSES.map(bus=>`rack:${bus.id}`),...getReceivers(),...GENERATOR_KEYS,...(graph.nodes??[]).filter(key=>key.startsWith("radio:"))];
       if(current.length!==graph.nodes?.length||current.some(key=>!graph.nodes.includes(key)))
         throw Error('Light receivers changed. Reopen camera flash routing and reset or reconnect the current lights.');
       return structuredClone(graph);
     },
     generators:()=>structuredClone(currentGenerators()),play,
     levels:now=>{
-      if(!pulse)return null;
+      if(!pulse)return radioEnabled&&now-radioAt<2000?radioLevels:null;
       const index=Math.floor((now-started)/(pulse.step_ms*playbackRate));
       if(index<0||index>=pulse.duration_ms){pulse=null;values.textContent='Manual flash complete.';return null;}
       const active=new Set((graph?.edges??[]).filter(edge=>Math.abs(edge.w)>1e-12).map(edge=>edge.dst)
