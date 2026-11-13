@@ -1001,10 +1001,21 @@ def _promote_conditional_sequence_aliases(
     kind_by_value: dict[int, str] = {}
     for node_id, data in graph_obj.nodes(data=True):
         attributes = data.get("attributes") or {}
+        value_id = int(data.get("value_id", node_id))
         kind = str(attributes.get("aggregate_kind") or "")
+        if (not kind and str(data.get("op") or data.get("type") or "").casefold()
+                == "input"):
+            # Authored nullable parameter annotations publish the same exact
+            # collection contract in the linked ABI ledger, rather than a
+            # frontend aggregate attribute. The absent arm retains its tag;
+            # in-place versions still resolve through the storage proof below.
+            receipt = dict(graph_obj.graph.get("linked_value_abi") or {}).get(
+                value_id, {},
+            )
+            if receipt.get("storage") == "span":
+                kind = str(receipt.get("aggregate_kind") or "")
         if kind not in sequence_kinds:
             continue
-        value_id = int(data.get("value_id", node_id))
         resident_by_value[value_id] = value_id
         kind_by_value[value_id] = kind
     for value_id, kind in dict(call_result_kinds or {}).items():

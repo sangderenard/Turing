@@ -6438,6 +6438,20 @@ def _authored_annotation_field_receipt(
                 "mutable": False, "token_vocabulary": vocabulary,
             }
         return None
+    if container == "Union":
+        members = (tuple(annotation.slice.elts)
+                   if isinstance(annotation.slice, ast.Tuple)
+                   else (annotation.slice,))
+        concrete = tuple(member for member in members
+                         if not (isinstance(member, ast.Constant)
+                                 and member.value is None))
+        if len(concrete) == 1 and len(concrete) != len(members):
+            receipt = _authored_annotation_field_receipt(
+                concrete[0], python_bindings, authored_record_identities,
+                authored_scalar_identities,
+            )
+            return None if receipt is None else {**dict(receipt), "optional": True}
+        return None
     if container == "Optional":
         receipt = _authored_annotation_field_receipt(
             annotation.slice, python_bindings, authored_record_identities,
@@ -6743,6 +6757,14 @@ def _authored_annotation_python_types(annotation: ast.AST) -> tuple[str, ...]:
             *_authored_annotation_python_types(annotation.slice),
             "builtins.NoneType",
         ))))
+    if container == "Union":
+        members = (tuple(annotation.slice.elts)
+                   if isinstance(annotation.slice, ast.Tuple)
+                   else (annotation.slice,))
+        return tuple(sorted(dict.fromkeys(
+            identity for member in members
+            for identity in _authored_annotation_python_types(member)
+        )))
     concrete = {
         "Dict": "dict", "FrozenSet": "frozenset", "List": "list",
         "Set": "set", "Tuple": "tuple",
