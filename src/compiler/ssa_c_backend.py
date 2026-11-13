@@ -8916,6 +8916,21 @@ def emit_ssa_module_to_c(
         value_id for sequence in output_heap_sequences for value_id in sequence[:4]
     }
     release_entry_name = f"{name}_release_owned_results" if owned_sequence_ports else None
+    # Match LLVM: a selected native pointer cell is not an owned public
+    # sequence until the exact escape/length/release contract exists.
+    from .ir_sequence_tables import SSASequenceCapacityPolicy
+    root_sequence_table = getattr(module, "sequence_tables", {}).get(function_name)
+    if root_sequence_table is not None:
+        for value in native_outputs[function_name]:
+            descriptor = root_sequence_table.sequences.get(int(value.id))
+            if (descriptor is not None
+                    and descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+                    and descriptor.heap_owner_value_id is not None
+                    and is_compiler_owned_storage(value)
+                    and int(value.id) not in owned_port_ids
+                    and int(value.id) not in {r.output_data_id for r in sequence_capacity_relations}):
+                shortfalls.append(CEmissionShortfall(
+                    "Ret", f"owned sequence {value.id} has no validated public ownership escape contract"))
     # Guarded topk(values, k).indices has a dynamic logical extent even
     # when its allocation is bounded by the input tensor. The bound and
     # result binding identify that storage separately from the computed
