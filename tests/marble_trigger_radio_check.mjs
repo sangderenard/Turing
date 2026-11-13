@@ -45,4 +45,6 @@ resolveRadio({status:'live',active:['studio:0'],gains:{'studio:0':.4}});await ag
 await win.handlers['nodus-radio-signal']({detail:{status:'unavailable'}});
 assert.equal(controller.levels(performance.now()),null,'closing widget releases override');
 win.handlers.pagehide();assert.equal(controller.levels(performance.now()),null);
+graph.edges=[{src:'radio:rms',dst:'studio:0',w:1}];
+assert.throws(()=>controller.graph(),/radio signal recording is not connected yet/);
 console.log('PASS: opt-in, server-source only, stale/disconnect/late-response radio lighting lifecycle');
