@@ -2210,6 +2210,10 @@ def adapt_physical_call_inputs(
     state = _adaptation_state_signature(functions)
     seen_states = {state: -1}
     for round_index in range(round_bound):
+        # The helper may borrow caller-owned descriptor spans. Publish the
+        # actual call positions before demanding its formal physical layout.
+        from .identity_concordance import publish_formal_actual_occurrences
+        publish_formal_actual_occurrences(functions, book=book, call_table=call_records)
         sources = round_sources()
         if not sources:
             raise ConcordanceRefusal("physical call-input adaptation has no recorded call inputs")

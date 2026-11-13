@@ -1,0 +1,9 @@
+2026-11-13 PRESERVE EXACT SOURCE EFFECT AT SHARED SEQUENCE HELPER CALLS (MEASURED):
+
+A helper formal's CONTROL_EXPRESSION provenance names the control that first registered the shared helper, not each subsequent invocation. Ordinary mutation status REGION_CALL_RESULT previously named only argument cells and an optional constructor snapshot. The new writer retains the exact canonical mutation effect and current CONTROL_BLOCK in its existing CELL_SET only when that latest control contains a unique exact mutation tuple and cites the canonical target, arguments and effect. Missing, stale, wrong or ambiguous source evidence leaves incumbent source-less lowering unchanged; it provides no new ownership authority.
+
+At baseline HEAD 1b4f2e69 plus other coordinated working-tree changes, candidate tests/test_sequence_mutation_call_provenance.py, tests/test_nested_sequence_descriptor_alias.py and tests/test_optional_sequence_iteration.py: 25 passed in 87.94s. Removing only the status operand addition: 23 passed, 2 failed in 87.87s. The two failures prove absence of the new source receipts, not two historical native runtime faults. The 23 incumbent native/source cases pass both. Exact byte restoration verified. New tests include repeated equal literal 7 writers sharing one helper, distinct source effects, exact all-position FORMAL_ACTUAL_OCCURRENCE causes, and missing/wrong/duplicated active control refusal.
+
+No selected owned-record native execution, public ownership grant, GraphSolver LLVM completion or string result support is claimed. Full descriptor closed-use and actual writer-class proofs, projection audit and lifecycle tests remain separate uncommitted work. No unrelated prototype files belong to this change.
+
+Mapping audit: 28 rows across 2 functions, 0 findings, 0 unsourced facts/identities; latch CLOSED.

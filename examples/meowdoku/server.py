@@ -1048,7 +1048,8 @@ def make_handler(sessions: Sessions):
             from meowdoku.nodus_radio_jukebox_runner import Runner
             if sessions.radio_jukebox is None:
                 sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
-                sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs)
+                sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs,
+                                                       state=sessions.state)
             return sessions.radio_jukebox, sessions.radio_jukebox_runner
 
         def _radio_playback(self, method):
@@ -2583,6 +2584,22 @@ def make_handler(sessions: Sessions):
                 return self._radio_jukebox("GET")
             if path == "/api/radio/playback":
                 return self._radio_playback("GET")
+            if path.startswith("/api/radio/hls/"):
+                if not self._require("view_site"):
+                    return
+                from meowdoku import nodus_radio_hls
+                try:
+                    data, content_type = nodus_radio_hls.read(sessions.state, path.removeprefix("/api/radio/hls/"))
+                except (OSError, ValueError, AttributeError):
+                    return self._json({"error": "Radio stream unavailable"}, HTTPStatus.NOT_FOUND)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path == "/api/radio":
                 if not self._require("view_site"):
                     return

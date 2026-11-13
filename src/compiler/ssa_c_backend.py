@@ -8894,6 +8894,19 @@ def emit_ssa_module_to_c(
     output_extent_sources: list[tuple[int, int]] = []
     sequence_capacity_relations = public_sequence_capacity_sources(module, function_name)
     sequence_input_ports = public_sequence_input_ports(module, function_name)
+    # These exact proof-backed descriptor ports are scalar cells, even
+    # when a helper's one-cell storage view contributes shape (1,).
+    bounded_extent_members = {
+        int(value_id)
+        for relation in sequence_capacity_relations
+        for value_id in (relation.output_length_id, relation.output_capacity_id)
+    }
+    bounded_public_members = {
+        int(value_id)
+        for relation in sequence_capacity_relations
+        for value_id in (relation.output_data_id, relation.output_length_id,
+                         relation.output_capacity_id)
+    }
     owned_sequence_ports = public_owned_sequence_returns(module, function_name)
     output_heap_sequences = tuple(
         (ports.data_id, ports.length_id, ports.capacity_id, ports.owner_id,
@@ -8903,6 +8916,21 @@ def emit_ssa_module_to_c(
         value_id for sequence in output_heap_sequences for value_id in sequence[:4]
     }
     release_entry_name = f"{name}_release_owned_results" if owned_sequence_ports else None
+    # Match LLVM: a selected native pointer cell is not an owned public
+    # sequence until the exact escape/length/release contract exists.
+    from .ir_sequence_tables import SSASequenceCapacityPolicy
+    root_sequence_table = getattr(module, "sequence_tables", {}).get(function_name)
+    if root_sequence_table is not None:
+        for value in native_outputs[function_name]:
+            descriptor = root_sequence_table.sequences.get(int(value.id))
+            if (descriptor is not None
+                    and descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+                    and descriptor.heap_owner_value_id is not None
+                    and is_compiler_owned_storage(value)
+                    and int(value.id) not in owned_port_ids
+                    and int(value.id) not in {r.output_data_id for r in sequence_capacity_relations}):
+                shortfalls.append(CEmissionShortfall(
+                    "Ret", f"owned sequence {value.id} has no validated public ownership escape contract"))
     # Guarded topk(values, k).indices has a dynamic logical extent even
     # when its allocation is bounded by the input tensor. The bound and
     # result binding identify that storage separately from the computed
@@ -8934,6 +8962,7 @@ def emit_ssa_module_to_c(
     buffer_dtypes: list[str] = []
     entry_lines: list[str] = []
     root_allocations: list[tuple[str, str, int]] = []
+    root_allocation_proofs: dict[str, tuple] = {}
     # The wrapper's units are posted under the root function's row.
     wrapper = recorders.get(function_name) or emission_recorder(
         emission, root, Backend.C_MODULE, stage=EMISSION_C,
@@ -8967,7 +8996,7 @@ def emit_ssa_module_to_c(
         return _is_structural_abi_value(root, value)
 
     def is_private_root_storage(value) -> bool:
-        if int(value.id) in owned_port_ids:
+        if int(value.id) in owned_port_ids | bounded_public_members:
             return False
         accounting = dict(value.accounting or {})
         return (
@@ -9029,6 +9058,19 @@ def emit_ssa_module_to_c(
                                 int(element_count or 0),
                                 len(record_entry.fields),
                             )
+                pointer_cell = None
+                if element_count is None:
+                    from .source_sequence_pointer_cells import (
+                        sequence_pointer_cell, sequence_child_pointer_cell,
+                    )
+                    pointer_cell = sequence_pointer_cell(module, function_name, value_id)
+                    if pointer_cell is None:
+                        pointer_cell = sequence_child_pointer_cell(module, function_name, value_id)
+                    if pointer_cell is not None:
+                        # The dynamic payload keeps its unknown extent. Only
+                        # its exact descriptor's native pointer CELL is sized.
+                        element_count = pointer_cell.element_count
+                        held = c_lane_storage_for_llvm_type("ptr")
                 if element_count is None:
                     # Lane D, item D1. Wrong record: a private root arena
                     # with no storage requirement (or a dynamic or ranked
@@ -9051,6 +9093,8 @@ def emit_ssa_module_to_c(
                     ))
                     element_count = 1
                 owned = activation_array(held, element_count)
+                if pointer_cell is not None:
+                    root_allocation_proofs[owned] = pointer_cell.proof_cells
                 owned_storage_names[value_id] = owned
                 copied_from = (
                     rendered_root_value(int(split_source))
@@ -9088,7 +9132,8 @@ def emit_ssa_module_to_c(
             continue
         buffer_order.append(value_id)
         buffer_shapes.append(tuple(
-            requirement.shape if requirement is not None else formal.shape or ()
+            () if value_id in bounded_extent_members and _declared_span_rank(formal) == 0
+            else requirement.shape if requirement is not None else formal.shape or ()
         ))
         held = solved_buffer_type(function_name, formal)
         buffer_dtypes.append(_public_buffer_dtype(solved_buffer_dtype(function_name, formal, held)))
@@ -9150,7 +9195,8 @@ def emit_ssa_module_to_c(
                 output_extent_sources.append((output_id, int(origin[1])))
         buffer_order.append(output_id)
         buffer_shapes.append(tuple(
-            storage_requirements.get(output_id).shape
+            () if output_id in bounded_extent_members and _declared_span_rank(output) == 0
+            else storage_requirements.get(output_id).shape
             if output_id in storage_requirements else output.shape or ()
         ))
         element_type = solved_buffer_type(function_name, output)
@@ -9417,8 +9463,12 @@ def emit_ssa_module_to_c(
     wrapper_header_unit = wrapper.unit(
         UnitKind.FUNCTION_HEADER, wrapper_header, spelling=name,
     )
-    for line in entry_lines[:wrapper_prefix]:
-        wrapper.unit(UnitKind.DECLARATION, line)
+    for index, line in enumerate(entry_lines[:wrapper_prefix]):
+        allocation_index = (index if index < len(root_allocations)
+                            else (index - len(root_allocations)) // 2)
+        allocation_name = root_allocations[allocation_index][1]
+        wrapper.unit(UnitKind.DECLARATION, line,
+                     extra_cells=root_allocation_proofs.get(allocation_name, ()))
     wrapper.unit(
         UnitKind.RETURN, "\n".join((*entry_lines[len(entry_lines) - wrapper_tail:], "}")),
     )

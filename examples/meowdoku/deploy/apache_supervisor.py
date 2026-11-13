@@ -257,7 +257,7 @@ class Instance:
             return f"unknown kind {self.kind!r}"
         if self.kind == "nodus":
             n = self.spec.get("nodus") or {}
-            if not n.get("canvas") or not _abs(n["canvas"]).exists():
+            if not n.get("canvas") or (not n.get("create_canvas", False) and not _abs(n["canvas"]).exists()):
                 return f"canvas not found: {n.get('canvas')}"
             if not Path(n.get("tool", "")).exists():
                 return f"run_canvas tool not found: {n.get('tool')}"
