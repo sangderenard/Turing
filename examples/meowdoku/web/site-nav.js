@@ -66,6 +66,7 @@ const CSS = `
 .binding.active { border-color: #ffd166; background: #80551e; }
 .radio-bands { display: flex; gap: 4px; align-items: center; min-height: 30px; }
 .radio-bands meter { flex: 1; min-width: 0; width: 40px; height: 24px; }
+.radio-audio { width: 100%; margin: 8px 0; }
 [hidden] { display: none !important; }
 .note { padding: 4px 10px; color: #ffb3a8; font-size: 12px; }
 `;
@@ -157,7 +158,7 @@ function mountControlSuite(wrap, host, spec) {
 }
 
 // Nodus owns capture/FFT; Python reads its existing UDP relay inbox.
-// This widget shows NRAD bands, not a browser FFT or an invented audio stream.
+// This widget shows NRAD bands and an opt-in HLS player for the authored file station.
 function mountRadio(wrap, host, canControl = false) {
   const chip = el("button", {class: "chip", type: "button", text: "Nodus Radio", "aria-expanded": "false"});
   const panel = el("section", {class: "suite", hidden: "", "aria-label": "Nodus Radio"});
@@ -165,8 +166,13 @@ function mountRadio(wrap, host, canControl = false) {
   const title = el("strong", {text: "Nodus Radio"});
   const status = el("p", {role: "status", text: "Waiting for Nodus"});
   const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
-  panel.append(close, title, status, bands,
-    el("p", {text: "Live spectrum from Nodus. This feed carries levels, not playable audio."}));
+  const audio = el("audio", {class: "radio-audio", controls: "", preload: "none", "aria-label": "Nodus Radio audio"});
+  const nativeHls = !!audio.canPlayType("application/vnd.apple.mpegurl");
+  const audioNote = el("p", {text: nativeHls
+    ? "Audio begins only when you press Play."
+    : "This browser has no native HLS player yet."});
+  audio.hidden = audioNote.hidden = true;
+  panel.append(close, title, status, bands, audio, audioNote);
   const queueStatus = el("p", {role: "status", text: "Jukebox: checking configuration"});
   const songs = el("select", {"aria-label": "Song to request"});
   const request = el("button", {class: "chip", type: "button", text: "Request song"});
@@ -282,6 +288,13 @@ function mountRadio(wrap, host, canControl = false) {
       if (epoch !== generation || panel.hidden) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: data}));
       title.textContent = data.title || "Nodus Radio";
+      const available = data.audio === true;
+      audio.hidden = !available || !nativeHls;
+      audioNote.hidden = !available;
+      if (available && nativeHls && !audio.getAttribute("src")) audio.src = "/api/radio/hls/radio.m3u8";
+      if (!available && audio.getAttribute("src")) {
+        audio.pause(); audio.removeAttribute("src"); audio.load();
+      }
       status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
         : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
         : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
@@ -304,6 +317,7 @@ function mountRadio(wrap, host, canControl = false) {
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
     generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
+    if (!open) { audio.pause(); audio.removeAttribute("src"); audio.load(); }
     if (!open) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
     if (open) {poll(generation); pollPA(generation);}
@@ -393,9 +407,11 @@ async function main() {
   }
 
   let route = {};
-  if (caps.has("dev_ui")) { try { route = await getJson("/api/route"); } catch (e) { route = {}; } }
+  const pageRouteControl = who.signed_in && (caps.has("dev_ui") || location.pathname === "/" ||
+    location.pathname === "/index.html");
+  if (pageRouteControl) { try { route = await getJson("/api/route"); } catch (e) { route = {}; } }
   const onDev = !!(route.dev_route && route.route === route.dev_route);
-  const serverName = caps.has("dev_ui") ? (onDev ? "development" : "stable") : "";
+  const serverName = pageRouteControl ? (onDev ? "development" : "stable") : "";
   const chip = el("button", { class: "chip", "aria-haspopup": "true", "aria-expanded": "false",
     text: who.username + (serverName ? " · " + serverName : "") });
   const menu = el("div", { class: "menu", role: "menu", hidden: "" });
@@ -428,6 +444,7 @@ async function main() {
   } }));
   for (const item of [
     link("Home", "/"),
+    link("Games", "/games.html", !onDev || caps.has("dev_ui")),
     link("Profile and servers", "/profile.html"),
     link("Keys", "/keys.html", caps.has("message")),
     link("My files", "/files.html", caps.has("message")),
@@ -442,7 +459,7 @@ async function main() {
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
     link("Account and password", "/login.html"),
   ]) if (item) menu.append(item);
-  if (caps.has("dev_ui")) {
+  if (pageRouteControl) {
     menu.append(el("div", { class: "sep" }), el("div", { class: "head", text: "Server: " + (who.instance || serverName) }),
       serverButton("Stable server", "stable", !onDev, false),
       serverButton("Development server", "dev", onDev, route.dev_available === false));

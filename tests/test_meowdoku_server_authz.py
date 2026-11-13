@@ -17,6 +17,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import proxy_trust  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
+from meowdoku import nodus_radio_hls  # noqa: E402
 
 TOKEN = "t" * 40
 PUBLIC_XFF = {"X-Forwarded-For": "8.8.8.8", "X-Forwarded-Proto": "https", "Host": "cats.example.org"}
@@ -68,6 +69,24 @@ def _signup(port, name):
     status, _, cookies, _ = _call(port, "/api/account/signup", "POST", body={"username": name, "password": "correcthorse1"})
     assert status == 201
     return next(c.split(";")[0] for c in cookies if c.startswith(srv.ACCOUNT_COOKIE))
+
+
+def test_radio_hls_uses_existing_view_site_gate_and_fixed_file_names(server):
+    config = server.sessions.state.radio_json
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(json.dumps({'enabled': True, 'source': 'file',
+        'jukebox': {'native': {'hls': {'enabled': True}}}}), encoding='utf-8')
+    directory = nodus_radio_hls.output_dir(server.sessions.state)
+    directory.mkdir(parents=True)
+    (directory / 'radio.m3u8').write_bytes(b'#EXTM3U\n')
+    (directory / 'radio_001.ts').write_bytes(b'aac-segment')
+    status, body, _, content_type = _call(server.port, '/api/radio/hls/radio.m3u8', headers=PUBLIC_XFF)
+    assert (status, body, content_type) == (200, b'#EXTM3U\n', 'application/vnd.apple.mpegurl')
+    status, body, _, content_type = _call(server.port, '/api/radio/hls/radio_001.ts', headers=PUBLIC_XFF)
+    assert (status, body, content_type) == (200, b'aac-segment', 'video/mp2t')
+    assert _call(server.port, '/api/radio/hls/secret.txt', headers=PUBLIC_XFF)[0] == 404
+    (server.web.parent / 'access.json').write_text(json.dumps({'policy': {'dns': 'shader'}}), encoding='utf-8')
+    assert _call(server.port, '/api/radio/hls/radio.m3u8', headers=PUBLIC_XFF)[0] != 200
 
 
 def test_direct_peer_with_spoofed_forwarding_header_keeps_todays_classification(server):

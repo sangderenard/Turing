@@ -481,6 +481,9 @@ class Store:
                 return row['generation']
             if db.execute('SELECT 1 FROM workspace_review_tickets t LEFT JOIN workspace_snapshot_retirements r USING(ticket_id) WHERE t.workspace_id=? AND r.ticket_id IS NULL', (workspace_id,)).fetchone():
                 raise Refused('retained review snapshots prevent release')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='authored_pages'").fetchone():
+                if db.execute('SELECT 1 FROM authored_pages WHERE workspace_id=?', (workspace_id,)).fetchone():
+                    raise Refused('published pages prevent workspace release')
             db.execute("UPDATE workspace_leases SET state='releasing',generation=generation+1,updated_at=? WHERE workspace_id=?", (time.time(), workspace_id))
             return row['generation'] + 1
 

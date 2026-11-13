@@ -89,6 +89,8 @@ from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe ow
 from meowdoku.rest_api import reports as shared_reports
 from meowdoku.rest_api import groups as shared_groups
 from meowdoku import account_content
+from meowdoku import authored_pages
+from meowdoku.game_pages import GAMES
 from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
@@ -134,7 +136,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "marble_madness", "tipjar", "purrline", "mobroad"],
+            "games": list(GAMES),
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -731,6 +733,8 @@ def make_handler(sessions: Sessions):
 
         def _shader_request(self, path: str, method: str) -> bool:
             """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
+            if method == "GET" and path in ("/", "/index.html", "/pages.js"):
+                return False                              # the released author feed is public
             # Content routes enforce session/group/public policy themselves. This
             # grants no other shader-tier capability or access to other APIs.
             if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/") or path in ("/api/account/authority", "/api/account/authority/grant"):
@@ -849,7 +853,7 @@ def make_handler(sessions: Sessions):
         # ---- [ROUTE] Stable server / Development server selection behind the Apache front (cookie meowdoku_route; the proxy's rewrite rule
         # sends route b to the Development server).  Two shared instances of the whole service.  Not the dev page vs shader page (access tier
         # + role) and not a per-user leased server.  Stored preference values: 'stable' | 'dev'.
-        _ROUTE_OPEN = ("/login.html", "/login.js", "/api/account/login", "/api/account/logout", "/api/account/me", "/api/whoami", "/api/route")
+        _ROUTE_OPEN = ("/login.html", "/login.js", "/api/account/login", "/api/account/logout", "/api/account/me", "/api/whoami", "/api/route", "/site-nav.js")
 
         def _route_stable(self) -> str:
             return getattr(sessions, "stable_route", "") or "a"
@@ -867,6 +871,12 @@ def make_handler(sessions: Sessions):
                 return False
             self._classify()
             if cap in self._caps():
+                return False
+            # An author may preview their own publication on the development
+            # host. This does not admit the rest of that host's tools.
+            if self._principal().user_id is not None and (path in ("/", "/index.html", "/pages.js", "/api/pages")
+                                                         or path.startswith("/p/") or path.startswith("/site/programs/")
+                                                         or path.startswith("/api/pages/")):
                 return False
             self.close_connection = True
             self._set_cookie = []
@@ -886,12 +896,12 @@ def make_handler(sessions: Sessions):
                 conn.close()
 
         def _route_after_login(self, user_id: int) -> None:
-            """On login: a dev_ui account with a stored preference gets that server's route (Development only when a dev route is configured); everyone else the Stable server's."""
+            """Restore a signed-in author's site preference when that route is enabled."""
             role = authz_mod.role_of(sessions.accounts_db, user_id)
             lift = {"member": "play", "service": "play", "operator": "dev", "admin": "edit"}
             tier = lift.get(role, "shader") if self._origin_tier == "shader" else self._origin_tier
             principal = authz_mod.Principal(role, user_id, None, self._origin, tier)
-            site = self._route_pref(user_id) if "dev_ui" in authz_mod.capabilities(principal, sessions.authz_policy.get()) else None
+            site = self._route_pref(user_id)
             self._route_set(self._route_site_route(site))
 
         def _route_get(self) -> None:
@@ -899,7 +909,7 @@ def make_handler(sessions: Sessions):
             from http.cookies import SimpleCookie
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             account = self._account()
-            pref = self._route_pref(account["id"]) if account is not None and "dev_ui" in self._caps() else None
+            pref = self._route_pref(account["id"]) if account is not None else None
             self._json({"route": sessions.route or None, "routes": list(getattr(sessions, "routes", [])),
                         "selected": jar[proxy_trust_mod.ROUTE_COOKIE].value if proxy_trust_mod.ROUTE_COOKIE in jar else None,
                         "preference": pref, "stable_route": self._route_stable(),
@@ -907,12 +917,20 @@ def make_handler(sessions: Sessions):
                         "dev_available": bool(getattr(sessions, "dev_route", ""))})
 
         def _route_post(self) -> None:
-            """POST /api/route {route} or {site: stable|dev}: dev_ui only; sets the cookie (whatever this instance's own route is) and stores the account's Stable/Development server preference."""
-            if not self._require("dev_ui"):
+            """Select a server; authors may select a site, dev_ui may select an instance route."""
+            if not self._require("view_site"):
                 return
+            if self._principal().user_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            if "dev_ui" not in self._caps():
+                expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                if self.headers.get("Origin") != expected_origin or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "same-origin server selection required"}, HTTPStatus.FORBIDDEN)
             body = self._body_json()
             if body is None:
                 return
+            if "dev_ui" not in self._caps() and set(body) != {"site"}:
+                return self._json({"error": "authors select stable or dev"}, HTTPStatus.FORBIDDEN)
             self._set_cookie = []
             routes = list(getattr(sessions, "routes", []))
             site = body.get("site")
@@ -1065,7 +1083,8 @@ def make_handler(sessions: Sessions):
             from meowdoku.nodus_radio_jukebox_runner import Runner
             if sessions.radio_jukebox is None:
                 sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
-                sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs)
+                sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs,
+                                                       state=sessions.state)
             return sessions.radio_jukebox, sessions.radio_jukebox_runner
 
         def _radio_playback(self, method):
@@ -1217,6 +1236,88 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "invalid upload request"}, HTTPStatus.BAD_REQUEST)
             except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
                 return self._json({"error": "file storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _pages_route(self, path: str, method: str) -> None:
+            """Shared account authorship, with dev previews and release-only stable reads."""
+            import base64
+            import binascii
+            import re
+            import sqlite3
+            from urllib.parse import parse_qs
+
+            self._set_cookie = []
+            self._classify()
+            actor = self._principal().user_id
+            site = "dev" if getattr(sessions, "require_cap", "") == "dev_ui" else "release"
+            db = None
+            try:
+                db = authored_pages.connect(sessions.accounts_db)
+                if method == "GET" and path == "/api/pages":
+                    query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                    if set(query) - {"author", "mine"} or any(len(v) != 1 for v in query.values()):
+                        raise authored_pages.PageError("invalid feed query")
+                    author = query.get("author", [None])[0]
+                    if author is not None and (not isinstance(author, str) or not 3 <= len(author) <= 32):
+                        raise authored_pages.PageError("invalid author")
+                    mine = query.get("mine", ["0"])[0] == "1"
+                    if query.get("mine", ["0"])[0] not in ("0", "1"):
+                        raise authored_pages.PageError("invalid feed query")
+                    return self._json({"pages": authored_pages.listing(db, site=site, actor=actor, author=author, mine=mine)})
+                if method == "GET" and (path.startswith("/p/") or path.startswith("/site/programs/")):
+                    if path.startswith("/p/"):
+                        match = re.fullmatch(r"/p/([0-9a-f]{32})(?:/(.*))?", path)
+                        if match is None:
+                            raise authored_pages.PageError("page not found", 404)
+                        data, content_type = authored_pages.read(db, match[1], site=site, actor=actor,
+                                                                  path=match[2] or "index.html")
+                    else:
+                        data, content_type = authored_pages.read_bundle_url(db, path, site=site, actor=actor)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: https: http:; style-src 'unsafe-inline' https: http:; img-src data: blob: https: http:; connect-src https: http:; media-src data: blob: https: http:; worker-src blob:; object-src 'none'; base-uri 'none'")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if method == "POST":
+                    if not self._is_secure():
+                        return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+                    expected = "https://" + self.headers.get("Host", "")
+                    if self.headers.get("Origin") != expected or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                        return self._json({"error": "same-origin publication required"}, HTTPStatus.FORBIDDEN)
+                    if actor is None:
+                        return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+                    if path == "/api/pages":
+                        body = self._body_json(limit=750000)
+                        if body is None:
+                            return
+                        if set(body) != {"title", "description", "content_type", "content_base64", "confirmed_public_copy"} or body["confirmed_public_copy"] is not True:
+                            raise authored_pages.PageError("explicit public-copy confirmation required")
+                        raw = base64.b64decode(body["content_base64"], validate=True)
+                        return self._json(authored_pages.upload(db, actor, title=body["title"],
+                                                                description=body["description"], content=raw,
+                                                                content_type=body["content_type"]), HTTPStatus.CREATED)
+                    match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/stage", path)
+                    if match:
+                        body = self._body_json()
+                        if body is None:
+                            return
+                        if set(body) != {"stage"}:
+                            raise authored_pages.PageError("expected stage")
+                        return self._json(authored_pages.stage(db, actor, match[1], body["stage"]))
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except authored_pages.PageError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (ValueError, TypeError, binascii.Error):
+                return self._json({"error": "invalid page request"}, HTTPStatus.BAD_REQUEST)
+            except (OSError, sqlite3.Error, authored_pages.schema_version.SchemaVersionError):
+                return self._json({"error": "page storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -2553,6 +2654,8 @@ def make_handler(sessions: Sessions):
             self._classify()                                      # [ACCESS]
             if self._route_gate(path):                            # [ROUTE]
                 return
+            if path == "/api/pages" or path.startswith("/p/") or path.startswith("/site/programs/"):
+                return self._pages_route(path, "GET")
             if path == "/api/route":                              # [ROUTE]
                 return self._route_get()
             if path == "/api/studio/fabric":
@@ -2607,6 +2710,22 @@ def make_handler(sessions: Sessions):
                 return self._radio_jukebox("GET")
             if path == "/api/radio/playback":
                 return self._radio_playback("GET")
+            if path.startswith("/api/radio/hls/"):
+                if not self._require("view_site"):
+                    return
+                from meowdoku import nodus_radio_hls
+                try:
+                    data, content_type = nodus_radio_hls.read(sessions.state, path.removeprefix("/api/radio/hls/"))
+                except (OSError, ValueError, AttributeError):
+                    return self._json({"error": "Radio stream unavailable"}, HTTPStatus.NOT_FOUND)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path == "/api/radio":
                 if not self._require("view_site"):
                     return
@@ -3069,6 +3188,8 @@ def make_handler(sessions: Sessions):
             path0 = self.path.split("?", 1)[0]
             if self._route_gate(path0):                           # [ROUTE]
                 return
+            if path0 == "/api/pages" or path0.startswith("/api/pages/"):
+                return self._pages_route(path0, "POST")
             if path0 == "/api/radio/jukebox":
                 return self._radio_jukebox("POST")
             if path0 == "/api/radio/playback":
@@ -3956,6 +4077,7 @@ def main(argv: list[str] | None = None) -> int:
         sessions.accounts_db = Path(args.accounts_db)
         sessions.accounts = accounts_mod.Accounts(sessions.accounts_db)
         sessions.authz_policy = authz_mod.Policy.beside(sessions.accounts_db)
+    authored_pages.connect(sessions.accounts_db).close()                          # [PAGES] declare once before concurrent feed requests
     sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
     from meowdoku import service_jobs                                # [JOBS] the server-wide job table: what a restart waits for
