@@ -1,0 +1,10 @@
+# The mail table's own schedule, read by the Nodus cron tool attached to the `mail` prefix (nodus include/cron_tool.h).
+# Installed as <state>/jobs/mail/cron.table by Enable-MailTable.ps1 when that file does not exist yet; edit the installed copy.
+#
+#   <name> <minute> <hour> <day-of-month> <month> <day-of-week> [missed=skip|once|all] [max_late=SECONDS] [max_catch_up=N]
+#
+# Times are UTC.
+
+# Every five minutes: file what came in and was not filed, and submit outgoing mail that is due (new, or deferred by
+# the retry schedule in mail.json). A send or a receipt asks the table at once; this catches whatever that ask missed.
+mail.sweep */5 * * * * missed=once

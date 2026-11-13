@@ -75,7 +75,7 @@ def test_shipped_instances_dry_run_lists_all():
     out = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     names = [i["name"] for i in json.loads(out.stdout)["instances"]]
-    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "nodus-ui-mirror", "task-worker", "udp-router", "relay"]
+    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "nodus-ui-mirror", "task-worker", "udp-router", "mail", "relay"]
 
 
 def test_lifecycle_account_lease_stdin_eof(tmp_path):
@@ -234,7 +234,8 @@ def test_federation_from_hands_contract_port_and_canvas_to_dependent(tmp_path):
              "args": [], "leases": [], "python": sys.executable,
              "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1}}
     dependent = {"name": "meow-stub", "kind": "command", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-meow-stub",
-                 "args": [sys.executable, str(recorder), str(record)], "leases": [], "federation_from": "nodus-stub"}
+                 "args": [sys.executable, str(recorder), str(record)], "leases": [], "federation_from": "nodus-stub",
+                 "mail_prefix": "py.stub"}
     db, state, inst = tmp_path / "accounts.db", tmp_path / "state", tmp_path / "instances.json"
     inst.write_text(json.dumps([dependent, nodus]), encoding="utf-8")      # dependent listed first: the supervisor starts the source first
     proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -243,6 +244,7 @@ def test_federation_from_hands_contract_port_and_canvas_to_dependent(tmp_path):
         argv = json.loads(record.read_text(encoding="utf-8"))
         assert argv[argv.index("--federation-port") + 1] == "47777"
         assert argv[argv.index("--federation-canvas") + 1] == str(canvas)
+        assert argv[argv.index("--mail-port") + 1] == "47777"            # [MAIL] the declared mail table's port
         row = _rows(db, "SELECT contract_prefix, contract_port FROM service_instances WHERE name = 'nodus-stub'")[0]
         assert row == {"contract_prefix": "py.stub", "contract_port": 47777}
         status = subprocess.run(_cmd(db, state, inst, "--status"), capture_output=True, text=True, timeout=60)

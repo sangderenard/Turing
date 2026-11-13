@@ -11,7 +11,9 @@ library_manage, see DEFAULT_POLICY).  A request's PRINCIPAL is (role, user_id, u
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
-photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit, compile_unstable, message.  ``capabilities(principal, policy)`` is the one place they are computed:
+photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit, compile_unstable, message,
+mail_send (sending mail, mail.py: admin by default; another role gets it when an admin adds it to that role's list
+in the policy file, which REPLACES the default list, so write the role's whole list plus mail_send).  ``capabilities(principal, policy)`` is the one place they are computed:
 
     effective = tier_caps[tier] | role_caps[role]
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
@@ -103,7 +105,8 @@ except ImportError:
     _permission_spec.loader.exec_module(_permission_groups)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit",
+        "mail_send")
 ROLES = ("admin", "member", "dev", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -115,7 +118,7 @@ DEFAULT_POLICY = {
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
         "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message",
-                                              "core_git", "paper_train")],
+                                              "core_git", "paper_train", "mail_send")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],

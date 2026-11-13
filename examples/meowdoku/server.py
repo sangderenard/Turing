@@ -428,6 +428,7 @@ class Sessions:
     # ---- [FEDERATE begin] what this instance promises a federating peer (see _contract_socket)
     federation_port: int | None = None          # --federation-port: the local Nodus host's 127.0.0.1 contract port (not read from the supervisor yet)
     federation_canvas: str | None = None        # --federation-canvas: the running Nodus instance's canvas file
+    mail_submit = None                          # [MAIL] submit(task, message_id) to the Nodus mail table, when --mail-port is given
 
     def system_map(self) -> dict:
         """[SITE] the running Nodus canvas as the Living Data map: the same document GET /api/nodus/map returns."""
@@ -1658,6 +1659,17 @@ def make_handler(sessions: Sessions):
             return relay.http_route(self, path, method, accounts_db=sessions.accounts_db,
                                     config=relay.load_config(declared if declared.is_file() else None))
 
+        def _mail_route(self, path: str, method: str) -> None:
+            """[MAIL] the session account's mailbox: inbox, read, send, remove (mail.py). Rows in mail.db beside
+            accounts.db; routing through the Nodus mail table when this instance was given its port."""
+            from meowdoku import mail
+            self._classify()
+            declared = HERE / "deploy" / "mail.json"
+            return mail.http_route(self, path, method, accounts_db=sessions.accounts_db,
+                                   mail_db=mail.mail_db_beside(sessions.accounts_db),
+                                   config=mail.load_config(declared if declared.is_file() else None),
+                                   submit=sessions.mail_submit)
+
         def _instance_control(self, method: str, cancel: bool = False) -> None:
             import sqlite3
             from meowdoku import instance_control
@@ -2588,6 +2600,8 @@ def make_handler(sessions: Sessions):
                 return self._git_route(path, "GET")
             if path.startswith("/api/relay/"):                    # [RELAY]
                 return self._relay_route(path, "GET")
+            if path.startswith("/api/mail/"):                     # [MAIL]
+                return self._mail_route(path, "GET")
             if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
                 from meowdoku import file_index
                 self._classify()
@@ -3082,6 +3096,8 @@ def make_handler(sessions: Sessions):
                 return self._git_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
                 return self._relay_route(path0, "POST")
+            if path0.startswith("/api/mail/"):                    # [MAIL]
+                return self._mail_route(path0, "POST")
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")
             if path0 == "/api/control/instances/cancel":
@@ -3846,6 +3862,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--nodus-ui", action="append", default=[], metavar="INSTANCE:PORT",
                         help="loopback Nodus UI feed for an instance's inner console wall; repeat for multiple instances")
     parser.add_argument("--studio-nodus-prefix", default="studio.product", help="[SHOW] the Studio contract prefix on that port")
+    parser.add_argument("--mail-port", type=int, default=None,
+                        help="[MAIL] the local Nodus host's contract port of the mail table (appended by the supervisor from mail_prefix)")
+    parser.add_argument("--mail-jobs-dir", default=None, help="[MAIL] the mail table's directory (one request file per task)")
     parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
     parser.add_argument("--studio-defaults", default=None,
                         help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
@@ -3922,6 +3941,11 @@ def main(argv: list[str] | None = None) -> int:
     sessions.jobs = service_jobs.Registry(sessions.accounts_db, sessions.instance)
     sessions.marble_photos.registry = sessions.jobs
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
+    if args.mail_port and args.mail_jobs_dir:                        # [MAIL] a send asks the Nodus mail table to route it
+        from meowdoku import mail as mail_mod
+        sessions.mail_submit = mail_mod.table_submitter(port=args.mail_port, jobs_dir=args.mail_jobs_dir,
+                                                        engine_id=mail_mod.ENGINE_IDS["server"])
+        print(f"[mail] sends are routed through Nodus port {args.mail_port} (the mail table)", flush=True)
     # A supervised instance restart keeps the supervisor's loaded spec. The
     # deployed product is discoverable from this instance's own state root,
     # so installing the native row does not require a whole-stack restart.

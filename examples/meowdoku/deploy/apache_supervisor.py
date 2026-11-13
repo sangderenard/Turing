@@ -425,6 +425,14 @@ class Instance:
                 flags += ["--userlist-port", str(port)]
             else:
                 self.sup.log(f"{self.name}: userlist_prefix {userlist!r}: the host declares no such contract port; searched directly")
+        mail = self.spec.get("mail_prefix")          # [MAIL] the email manager table: its host, or an engine that queues mail
+        if mail:
+            port = getattr(source, "contract_ports", {}).get(mail)
+            if port:
+                self.sup.log(f"{self.name}: the mail table is {source_name!r} contract port {port} ({mail})")
+                flags += ["--mail-port", str(port)]
+            else:
+                self.sup.log(f"{self.name}: mail_prefix {mail!r}: the host declares no such contract port; mail waits for the sweep")
         return flags
 
     def poll(self):

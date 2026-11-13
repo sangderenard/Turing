@@ -31,12 +31,15 @@
         "--fabric-udp-port",
         "48768",
         "--nodus-ui",
-        "nodus-messenger:47614"
+        "nodus-messenger:47614",
+        "--mail-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/mail"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
       "studio_prefix": "studio.product",
+      "mail_prefix": "mail",
       "env": {
         "GIT_CONFIG_COUNT": "5",
         "GIT_CONFIG_KEY_0": "safe.directory",
@@ -113,7 +116,9 @@
         "--compile-python",
         "C:/dev/Powershell/srv/python/python.exe",
         "--cron",
-        "cron:7201:C:/dev/Powershell/srv/state/jobs/cron"
+        "cron:7201:C:/dev/Powershell/srv/state/jobs/cron",
+        "--cron",
+        "mail:7204:C:/dev/Powershell/srv/state/jobs/mail"
       ],
       "leases": [],
       "nodus": {
@@ -123,7 +128,8 @@
           "gui.proof:4:54000",
           "studio.product:4:7200",
           "cron:4:36000",
-          "userlist:4:3600"
+          "userlist:4:3600",
+          "mail:4:36000"
         ],
         "rate": 60,
         "console_port": 47612,
@@ -228,6 +234,28 @@
         "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
         "0.0.0.0",
         "47699"
+      ]
+    },
+    {
+      "name": "mail",
+      "kind": "command",
+      "enabled": false,
+      "port": null,
+      "route": "",
+      "bind": "0.0.0.0",
+      "account": "svc-mail",
+      "federation_from": "nodus-messenger",
+      "mail_prefix": "mail",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/deploy/mail_service.py",
+        "--config",
+        "C:/dev/Powershell/turing/examples/meowdoku/deploy/mail.json",
+        "--accounts-db",
+        "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--mail-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/mail"
       ]
     },
     {
