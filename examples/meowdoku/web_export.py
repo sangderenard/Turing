@@ -566,6 +566,8 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("mathlab.html", "mathlab.js", "mathlab_wgsl_timing.js", "divider.html", "divider.js", "login.html", "login.js", "messenger-widget.js", "site-nav.js", "profile.html", "profile.js", "worldmap.html", "worldmap.js", "nodus.html", "nodus.js"):                              # [MATHLAB] the math lab page (server.py /api/mathlab/*)
         shutil.copyfile(HERE / "web" / name, out / name)
+    for name in ("files.html", "files.js"):
+        shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("browse.html", "browse.js"):                                                            # [LISTING] the /browse page (server.py /browse/*, listing.py)
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("issues.html", "issues.js", "reviews.html", "reviews.js", "reports.html", "reports.js"):   # [REVIEWS] change reviews; [REPORTS] the report reader

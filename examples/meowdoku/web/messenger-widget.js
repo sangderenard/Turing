@@ -199,7 +199,12 @@ async function start() {
   function msgNode(m) {
     const mine = m.from === who.username;
     const node = el("div", { class: "msg" + (mine ? " mine" : "") + (m.removed ? " removed" : "") });
-    if (!m.removed && m.subject) node.appendChild(el("div", { class: "note", text: m.subject.kind + ": " + m.subject.ref }));
+    if (!m.removed && m.subject) {
+      if (m.subject.kind === "file" && /^[0-9a-f]{32}$/.test(m.subject.ref)) {
+        node.appendChild(el("a", { class: "note", href: "/api/user-files/" + m.subject.ref,
+                                   text: "Download shared file" }));
+      } else node.appendChild(el("div", { class: "note", text: m.subject.kind + ": " + m.subject.ref }));
+    }
     node.appendChild(document.createTextNode(m.removed ? "[removed by an administrator]" : (m.type && m.type !== "note" ? "[" + m.type + "] " : "") + m.body));
     if (!m.removed && m.image) {
       const url = safeImageURL(m.image, m.id);

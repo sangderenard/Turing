@@ -90,6 +90,7 @@ from meowdoku import account_content
 from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
+from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
@@ -1125,6 +1126,61 @@ def make_handler(sessions: Sessions):
                                               accounts_db=sessions.accounts_db)
         # ---- end [MESSAGES]
 
+        def _user_files_route(self, path: str, method: str) -> None:
+            from urllib.parse import quote, unquote
+            import sqlite3
+            self._set_cookie = []
+            if not self._require("message"):
+                return
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            owner_id = self._principal().user_id
+            if owner_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            db = None
+            try:
+                db = user_files_mod.connect(sessions.accounts_db)
+                if method == "GET" and path == "/api/user-files":
+                    return self._json({"files": user_files_mod.list_owned(db, owner_id)})
+                if method == "GET" and path.startswith("/api/user-files/"):
+                    item, data = user_files_mod.readable(db, sessions.state.users_dir, owner_id,
+                                                         path[len("/api/user-files/"):])
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(item["name"], safe=""))
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "private, no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if method == "POST" and path == "/api/user-files":
+                    origin = self.headers.get("Origin")
+                    expected = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                    if origin != expected or self.headers.get("X-Meowdoku-Upload") != "1":
+                        return self._json({"error": "same-origin upload required"}, HTTPStatus.FORBIDDEN)
+                    if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                        return self._json({"error": "one Content-Length is required"}, HTTPStatus.LENGTH_REQUIRED)
+                    if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "application/octet-stream":
+                        return self._json({"error": "binary upload required"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    length = int(self.headers["Content-Length"])
+                    if not 0 < length <= user_files_mod.MAX_FILE_BYTES:
+                        return self._json({"error": "file must be between 1 byte and 8 MiB"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    name = unquote(self.headers.get("X-Meowdoku-Filename", ""), errors="strict")
+                    return self._json(user_files_mod.put(db, sessions.state.users_dir, owner_id,
+                                                          name, self.rfile.read(length)), HTTPStatus.CREATED)
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except user_files_mod.FileError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (ValueError, UnicodeError):
+                return self._json({"error": "invalid upload request"}, HTTPStatus.BAD_REQUEST)
+            except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "file storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
         # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
         # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
         def _profile_route(self, path: str, method: str) -> None:
@@ -2070,6 +2126,8 @@ def make_handler(sessions: Sessions):
                 return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]
                 return self._messages_route(path, "GET")
+            if path == "/api/user-files" or path.startswith("/api/user-files/"):
+                return self._user_files_route(path, "GET")
             if path.startswith("/api/profile/"):                  # [PROFILE]
                 return self._profile_route(path, "GET")
             if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
@@ -2558,6 +2616,8 @@ def make_handler(sessions: Sessions):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
+            if path0 == "/api/user-files":
+                return self._user_files_route(path0, "POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]
                 return self._nodus_post(path0)
             if path0.startswith("/api/profile/"):              # [PROFILE]
