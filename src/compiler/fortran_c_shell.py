@@ -44679,8 +44679,22 @@ def _class_surface_ssa_program(
                 constructor_anchors[(str(symbol), int(node_id))] = None
                 continue
             if fields:
+                # A record's fields alone do not identify the constructor
+                # which assembled them. Preserve that exact source call and
+                # its declared field/operand evidence for return ownership
+                # proofs; identical numeric ids in other scopes are not proof.
+                from .concordance_declarations import PROCESS_GRAPH_OPERANDS
+                constructor_cell = _frame_graph_cell(graph, int(node_id))
+                constructor_operands = (
+                    None if constructor_cell is None else book.latest_ref(
+                        PROCESS_GRAPH_OPERANDS, constructor_cell.row,
+                    )
+                )
                 field_cells = identity_cells(
                     function,
+                    constructor_cell, constructor_operands,
+                    *(field_declaration_cell(record, field_name)
+                      for field_name, _field in field_contracts),
                     *literal_source_cells,
                     *(value_id for field in fields for value_id in field.value_ids),
                     *(
