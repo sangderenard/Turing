@@ -20,6 +20,53 @@ class OwnedRecordReturnSource:
     owner_id: int
 
 
+
+def _owned_sequence_declaration_identity(table, sequence_id, function_name):
+    """Current owning declaration, not the union of mutation-history causes.
+
+    Mirrors the selection reader's direct descriptor/contract/source join.
+    Old mutations can mention other canonical values without becoming
+    alternative identities for this resident allocation.
+    """
+    from .concordance_declarations import (
+        CANONICAL_VALUE, SEQUENCE_CONTRACT_CONCORDANCE, SEQUENCE_DESCRIPTOR,
+    )
+    sid, book = int(sequence_id), table.book
+    descriptor = table.sequences.get(sid)
+    cell = book.latest_ref(SEQUENCE_DESCRIPTOR, (table.owner, sid))
+    if descriptor is None or cell is None or book.page(cell.page).cell(cell.row, cell.column) != descriptor:
+        return None
+    contracts = [p for p, _ in book.edges_into(cell) if p.page == SEQUENCE_CONTRACT_CONCORDANCE]
+    if len(contracts) != 1 or int(contracts[0].row[-1]) != sid:
+        return None
+    contract, = contracts
+    # Contracts are scoped by the actual lowered function, not by the numeric
+    # sequence id or the (separately minted) table-owner ordinal.
+    if contract.row != (str(function_name), sid):
+        return None
+    from .identity_concordance import committed_sequence_contract, SequenceContract
+    page = book.page(SEQUENCE_CONTRACT_CONCORDANCE)
+    fact = page.cell(contract.row, contract.column)
+    expected = SequenceContract(
+        policy="unique" if descriptor.key_columns else "duplicates",
+        column_count=len(descriptor.column_value_ids),
+        writable=bool(descriptor.writable),
+    )
+    try:
+        if (not isinstance(fact, tuple) or len(fact) != 4
+                or fact[:3] != (expected.policy, expected.column_count, expected.writable)
+                or committed_sequence_contract(str(function_name), sid, page=page) != expected):
+            return None
+    except (TypeError, ValueError, IndexError):
+        return None
+    sources = [p for p, _ in book.edges_into(contract) if p.page == CANONICAL_VALUE]
+    if len(sources) != 1 or int(sources[0].row[-1]) != sid:
+        return None
+    source, = sources
+    if book.latest_ref(source.page, source.row) != source:
+        return None
+    return descriptor, cell, contract, source
+
 def owned_record_return_sources(module, function_name):
     """Join explicit keyword constructor fields to exact returned resident sequences.
 
@@ -32,7 +79,6 @@ def owned_record_return_sources(module, function_name):
     )
     from .concorded_literals import origin_cell
     from .identity_concordance import Ref
-    from .ssa_storage_requirements import _sequence_descriptor_identity
     function = module.functions.get(str(function_name))
     sequences = (getattr(module, 'sequence_tables', {}) or {}).get(str(function_name))
     records = (getattr(module, 'record_tables', {}) or {}).get(str(function_name))
@@ -53,7 +99,7 @@ def owned_record_return_sources(module, function_name):
             sequence_id = field.sequence_id if field.sequence_id is not None else (ids[0] if len(ids) == 1 else None)
             if sequence_id is None or int(sequence_id) not in returned:
                 continue
-            joined = _sequence_descriptor_identity(sequences, int(sequence_id), ingestion_origin=False)
+            joined = _owned_sequence_declaration_identity(sequences, int(sequence_id), function_name)
             if joined is None:
                 continue
             descriptor, descriptor_cell, _contract, source = joined
@@ -124,7 +170,6 @@ def validate_owned_record_return_source(module, function_name, proof):
         SEQUENCE_DESCRIPTOR, CANONICAL_VALUE,
     )
     from .concorded_literals import origin_cell
-    from .ssa_storage_requirements import _sequence_descriptor_identity
     if not isinstance(proof, OwnedRecordReturnSource):
         return False
     sequences = (getattr(module, 'sequence_tables', {}) or {}).get(str(function_name))
@@ -150,7 +195,7 @@ def validate_owned_record_return_source(module, function_name, proof):
             return False
         # The selected resident is deliberately preserved by a public projection.
         # Stale or changed source descriptors require a new source proof.
-        identity = _sequence_descriptor_identity(sequences, proof.sequence_id, ingestion_origin=False)
+        identity = _owned_sequence_declaration_identity(sequences, proof.sequence_id, function_name)
         if (identity is None or identity[1] != proof.descriptor_cell
                 or identity[0].heap_owner_value_id != proof.owner_id):
             return False

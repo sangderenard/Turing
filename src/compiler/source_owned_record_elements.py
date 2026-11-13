@@ -130,15 +130,13 @@ def validated_field_sequence_element(book, binding):
                                        'builtins.' + annotation.slice.id)
 
 
-def owned_record_primitive_element(module, function_name, source):
-    """An exact scalar-item contract, not a physical int64 interpretation."""
+def owned_record_field_sequence_element(module, function_name, source):
+    """Exact authored field binding only; grants no projection or native transfer."""
     from .source_owned_record_returns import validate_owned_record_return_source
     from .concordance_declarations import CLASS_FIELD_DECLARATION, SOURCE_FIELD_SEQUENCE_ELEMENT
     if not validate_owned_record_return_source(module, function_name, source):
         return None
     book = module.sequence_tables[function_name].book
-    # Constructor materialization cites its precise field declarations directly.
-    # Do not search the book by an unqualified class spelling.
     fields = tuple(cell for cell, _ in book.edges_into(source.record_cell)
                    if cell.page == CLASS_FIELD_DECLARATION
                    and cell.row[2] == source.field_name)
@@ -147,15 +145,25 @@ def owned_record_primitive_element(module, function_name, source):
     field, = fields
     if book.latest_ref(field.page, field.row) != field:
         return None
-    matches=[]
-    for field in fields:
-        binding=book.latest_ref(SOURCE_FIELD_SEQUENCE_ELEMENT,(field,))
-        if binding is None:
-            continue
-        proof=validated_field_sequence_element(book,binding)
-        if proof is not None and proof.semantic_class in {'builtins.int','builtins.float','builtins.bool'}:
-            matches.append(proof)
-    return matches[0] if len(matches)==1 else None
+    binding = book.latest_ref(SOURCE_FIELD_SEQUENCE_ELEMENT, (field,))
+    if binding is None:
+        return None
+    return validated_field_sequence_element(book, binding)
+
+
+def owned_record_primitive_element(module, function_name, source):
+    """Primitive admission remains exactly int/float/bool, never physical int64."""
+    proof = owned_record_field_sequence_element(module, function_name, source)
+    return proof if proof is not None and proof.semantic_class in {
+        'builtins.int', 'builtins.float', 'builtins.bool'
+    } else None
+
+
+def owned_record_glyph_element(module, function_name, source):
+    """Authored str field only; no child storage, writer, or ownership authority."""
+    proof = owned_record_field_sequence_element(module, function_name, source)
+    return proof if proof is not None and proof.semantic_class == 'builtins.str' else None
+
 
 
 def source_field_sequence_element_findings(module):

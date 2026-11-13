@@ -883,3 +883,14 @@ affected. I disclosed the overlap, stopped subsequent edits, and required an
 exact incumbent rerun on the fixed final source. The concrete cost is that extra
 regression run and delayed integration. I should have included the active freeze
 and an explicit release condition in the runtime assignment.
+
+
+## 2026-11-13 — assumed help flag on unrelated scanner
+
+While preparing the scoped owned-record declaration commit, the worker ran
+`python tools/scan_managed_duplicates.py --help` before reading its argument
+handling. The script does not parse that flag and began unrelated source
+lowering. The worker interrupted it, claimed no scan/native result, and kept
+the completed focused tests and mapping audit separate. Cost: approximately
+20 seconds of unrelated work. Prevention: inspect the scanner entry point and
+its actual scope before invoking it; use the named mapping audit for this slice.
