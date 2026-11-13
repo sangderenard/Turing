@@ -101,7 +101,13 @@ globalThis.livingDataStaticHost = Object.freeze({
     const camera={position:[...position],facing:normalized3(facing),width,height};
     livingDataStaticCheckPinned();
     // Only renderer-local camera variables change. Never set an actor pose.
-    updateShaderViewer(camera);
+    let focus=null;
+    if(request.optics){
+      const {renderLivingDataFocus}=await import('./living_data_focus.js');
+      focus=await renderLivingDataFocus({gl:shaderViewer.gl,canvas:shaderViewer.canvas,
+        mesh:this.meshSnapshot(),camera:{...camera,optics:request.optics},check:livingDataStaticCheckPinned,
+        draw:(beforeDraw,afterDraw)=>updateShaderViewer({...camera,beforeDraw,afterDraw})});
+    }else updateShaderViewer(camera);
     livingDataStaticCheckPinned();
     const gl=shaderViewer.gl, pixels=new Uint8Array(width*height*4);
     gl.finish();gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
@@ -111,7 +117,7 @@ globalThis.livingDataStaticHost = Object.freeze({
     for(let y=0;y<height;y++)frame.data.set(pixels.subarray((height-1-y)*width*4,(height-y)*width*4),y*width*4);
     context.putImageData(frame,0,0);
     livingDataStaticCheckPinned();
-    return {...livingDataStaticReceipt(),camera,width,height,
+    return {...livingDataStaticReceipt(),camera:{...camera,...(focus?{optics:focus}:{})},width,height,
       data_url:output.toDataURL('image/png')};
   }
 });

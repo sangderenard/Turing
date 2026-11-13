@@ -53,6 +53,21 @@ def _vector(value, facing=False):
     return list(value)
 
 
+def _optics(value):
+    _fields(value, {'autofocus', 'f_stop', 'sensor_height_m', 'focus_distance_m'})
+    result = {'autofocus': value.get('autofocus', True), 'f_stop': value.get('f_stop', 8),
+              'sensor_height_m': value.get('sensor_height_m', .024),
+              'focus_distance_m': value.get('focus_distance_m', 3)}
+    if type(result['autofocus']) is not bool:
+        raise CursorError('autofocus must be boolean')
+    for key, low, high in [('f_stop', .5, 128), ('sensor_height_m', .001, .3),
+                           ('focus_distance_m', .041, 128)]:
+        x = result[key]
+        if type(x) not in (int, float) or not math.isfinite(x) or not low <= x <= high:
+            raise CursorError(f'{key} outside optical bounds')
+    return result
+
+
 class StaticWorlds:
     def __init__(self, clock=time.monotonic):
         self.clock = clock
@@ -131,7 +146,7 @@ class StaticWorlds:
 
     def command(self, owner, identity, body):
         _fields(body, {'request_id', 'operation', 'at', 'layer', 'radius', 'limit', 'offset',
-                       'edge_offset', 'position', 'facing', 'width', 'height'})
+                       'edge_offset', 'position', 'facing', 'width', 'height', 'optics'})
         request_id = _rid(body.get('request_id')); digest = _digest(body)
         operation = body.get('operation')
         if operation not in ('inspect', 'render-phong'):
@@ -163,10 +178,12 @@ class StaticWorlds:
                     raise CursorError('analytic object response exceeds 2 MiB', 413)
                 entry['result'] = result
             else:
-                _fields(body, {'request_id', 'operation', 'position', 'facing', 'width', 'height'})
+                _fields(body, {'request_id', 'operation', 'position', 'facing', 'width', 'height', 'optics'})
                 camera = {'position': _vector(body.get('position')), 'facing': _vector(body.get('facing'), True),
                           'width': _integer(body.get('width', 512), 64, 1024, 'width'),
                           'height': _integer(body.get('height', 384), 64, 1024, 'height')}
+                if 'optics' in body:
+                    camera['optics'] = _optics(body['optics'])
                 for pending in world['commands'].values():
                     self._receipt(world, pending)
                     if pending['state'] in ('queued', 'rendering'):
@@ -231,7 +248,31 @@ class StaticWorlds:
             if actual is None:
                 raise CursorError('actual camera receipt required')
             if actual is not None:
-                _fields(actual, {'position', 'facing', 'width', 'height'})
+                _fields(actual, {'position', 'facing', 'width', 'height', 'optics'})
+                requested = entry['camera'].get('optics')
+                resolved = actual.get('optics')
+                if requested is not None:
+                    _fields(resolved, {'autofocus', 'f_stop', 'sensor_height_m', 'focus_distance_m',
+                                      'measured_rays', 'coverage', 'contrast', 'method', 'depth_mode', 'fov_degrees'})
+                    _optics({k: resolved.get(k) for k in requested})
+                    if any(resolved.get(k) != requested[k] for k in ('autofocus', 'f_stop', 'sensor_height_m')):
+                        raise CursorError('resolved optics differ from requested optics', 409)
+                    if not requested['autofocus'] and resolved['focus_distance_m'] != requested['focus_distance_m']:
+                        raise CursorError('manual focus differs from request', 409)
+                    if resolved.get('method') != 'studio-gaussian-rangefinder-phong-contrast' or resolved.get('depth_mode') != 'opaque':
+                        raise CursorError('unsupported optical receipt')
+                    if resolved.get('fov_degrees') != 2 * math.atan(.70) * 180 / math.pi:
+                        raise CursorError('focus receipt changed native field of view', 409)
+                    _integer(resolved.get('measured_rays'), 1 if requested['autofocus'] else 0, 9, 'measured_rays')
+                    if requested['autofocus']:
+                        for key in ('coverage', 'contrast'):
+                            x = resolved.get(key)
+                            if type(x) not in (int, float) or not math.isfinite(x) or x < 0:
+                                raise CursorError('invalid focus measurement')
+                        if resolved['coverage'] > 1 or resolved['contrast'] <= 0:
+                            raise CursorError('invalid focus objective')
+                elif resolved is not None:
+                    raise CursorError('unsolicited optical result', 409)
                 _vector(actual.get('position')); _vector(actual.get('facing'), True)
                 if any(actual.get(k) != entry['camera'][k] for k in ('position', 'width', 'height')):
                     raise CursorError('rendered camera position or dimensions mismatch', 409)

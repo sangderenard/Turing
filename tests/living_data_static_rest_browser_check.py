@@ -1,6 +1,6 @@
 """Real Chrome -> actual authenticated REST -> native static Phong round trip."""
 from pathlib import Path
-import base64, hashlib, json, subprocess, sys, tempfile, threading
+import base64, hashlib, json, subprocess, sys, tempfile, threading, shutil
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -46,6 +46,7 @@ CHECK=r'''<script>
  }
  const frames=[];
  for(const [index,camera] of viewpoints.entries()){
+  if(window.staticTestAutofocus)camera.optics={autofocus:true,f_stop:2,sensor_height_m:.024,focus_distance_m:3};
   const request_id='render'+index;
   await call(url+'/commands',{request_id,operation:'render-phong',...camera});
   const work=await call(url+'/host',{host_token:attached.host_token,action:'poll'});
@@ -55,7 +56,9 @@ CHECK=r'''<script>
    png_base64:rendered.data_url.split(',')[1],width:rendered.width,height:rendered.height,
    source_sha256:rendered.source_sha256,renderer_identity:rendered.renderer_identity,
    position:work.camera.position,facing:work.camera.facing,actual_camera:rendered.camera}});
-  const receipt=await call(url+'/commands/'+request_id,null,'GET');frames.push(receipt);
+  const receipt=await call(url+'/commands/'+request_id,null,'GET');
+  if(window.staticTestAutofocus&&!(receipt.result.actual_camera.optics?.contrast>0))throw Error('Optical receipt missing');
+  frames.push(receipt);
  }
  const changed=[...turingWorld.objects.values()][0], oldLabel=changed.label;
  changed.label=String(changed.label)+' test-only mutation';
@@ -70,13 +73,21 @@ CHECK=r'''<script>
 </script>'''
 
 
-def run(stage):
+def run(stage, *, autofocus=False, compute_assets=None, external_browser=False):
  stage=Path(stage);page=(stage/'index.html').read_bytes()
  worker=b'<script>window.staticTestWorkers=[];const StaticNativeWorker=window.Worker;window.Worker=class extends StaticNativeWorker{constructor(...args){super(...args);window.staticTestWorkers.push(String(args[0]));}};</script>'
  page=page.replace(b'<head>',b'<head>'+worker,1).replace(b'</body>',CHECK.encode()+b'</body>',1)
  received=[];done=threading.Event()
  with tempfile.TemporaryDirectory(prefix='living-static-rest-',ignore_cleanup_errors=True) as root:
   root=Path(root);web=root/'web';web.mkdir();(web/'index.html').write_bytes(page)
+  if autofocus:
+   page=page.replace(b'<head>',b'<head><script>window.staticTestAutofocus=true;</script>',1)
+   (web/'index.html').write_bytes(page)
+   for asset in (ROOT/'examples/meowdoku/web').glob('*.js'):shutil.copy2(asset,web/asset.name)
+   if compute_assets is None:raise ValueError('Verified existing Studio compute artifacts required')
+   compute=web/'client-ray-plain';compute.mkdir()
+   for name in ('studio_bvh_query.json','studio_hit_tri_batch.json','studio_hit_tri_batch.wasm'):
+    shutil.copy2(Path(compute_assets)/name,compute/name)
   (web/'boards.json').write_text('{"boards":[],"levels":{}}',encoding='utf8')
   sessions=srv.Sessions(web,None);sessions.lifecycle=SimpleNamespace(token='t'*40,restore_for=lambda token:None)
   sessions.access.lookup=lambda url:None
@@ -89,12 +100,20 @@ def run(stage):
     if not 0<size<8*1024*1024:self.send_error(400);return
     received.append(json.loads(self.rfile.read(size)));self.send_response(200);self.end_headers();done.set()
   httpd=ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=httpd.serve_forever,daemon=True).start()
-  browser=next(p for p in [r'C:\Program Files\Google\Chrome\Application\chrome.exe',r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'] if Path(p).exists())
+  from tests.test_meowdoku_profile_dashboard import _call
+  check=_call(httpd.server_port,'/index.html');print('Static page preflight',check[0],str(check[2])[:160],flush=True)
   try:
-   profile=root/'profile';process=subprocess.Popen([browser,'--headless=new','--no-first-run','--disable-extensions','--use-angle=swiftshader','--enable-unsafe-swiftshader',f'--user-data-dir={profile}',f'http://127.0.0.1:{httpd.server_port}/index.html'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-   try:
-    if not done.wait(50):raise TimeoutError('No static REST browser receipt')
-   finally:process.terminate();process.wait(timeout=10)
+   if external_browser:
+    print(f'OPEN_BROWSER http://127.0.0.1:{httpd.server_port}/index.html',flush=True)
+    if not done.wait(180):raise TimeoutError('No static REST browser receipt')
+   else:
+    browser=next(p for p in [r'C:\Program Files\Google\Chrome\Application\chrome.exe',r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'] if Path(p).exists())
+    profile=root/'profile';process=subprocess.Popen([browser,'--headless=new','--no-first-run','--disable-extensions','--use-angle=swiftshader','--enable-unsafe-swiftshader',f'--user-data-dir={profile}',f'http://127.0.0.1:{httpd.server_port}/index.html'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+    try:
+     if not done.wait(50):raise TimeoutError('No static REST browser receipt')
+    finally:
+     process.terminate();_,errors=process.communicate(timeout=10)
+     if not received:print(errors.decode(errors='replace')[-4000:],flush=True)
   finally:httpd.shutdown();httpd.server_close();sessions.accounts._conn.close()
   assert not sessions.tables,'Static REST created game Tables'
  if not received or not received[0].get('ok'):raise RuntimeError(received)

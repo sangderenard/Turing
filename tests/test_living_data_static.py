@@ -134,3 +134,26 @@ def test_static_layout_keeps_authored_story_descriptions():
                                                    'layer': 'layout', 'at': 'story-room'})
     assert receipt['result']['object']['implied_code'][0]['source'] == 'A copper kettle hums.'
     assert receipt['result']['object']['metaphor'] == 'illuminated page'
+
+
+def test_optical_request_is_carried_and_requires_matching_result():
+    service = StaticWorlds()
+    world = service.register(1, registration()); wid = world['world_id']
+    command = {**render_command(), 'optics': {'autofocus': True, 'f_stop': 4}}
+    service.command(1, wid, command)
+    work = service.host(1, wid, {'action': 'poll', 'host_token': world['host_token']})
+    assert work['camera']['optics'] == {'autofocus': True, 'f_stop': 4, 'sensor_height_m': .024, 'focus_distance_m': 3}
+    payload = result()
+    complete = {'action': 'complete', 'host_token': world['host_token'], 'request_id': 'frame', 'result': payload}
+    with pytest.raises(CursorError): service.host(1, wid, complete)
+    payload['actual_camera']['optics'] = {**work['camera']['optics'], 'focus_distance_m': 2,
+        'measured_rays': 9, 'coverage': .7, 'contrast': 20, 'fov_degrees': 2 * __import__('math').atan(.70) * 180 / __import__('math').pi,
+        'method': 'studio-gaussian-rangefinder-phong-contrast', 'depth_mode': 'opaque'}
+    assert service.host(1, wid, complete)['state'] == 'complete'
+    with pytest.raises(CursorError): service.command(1, wid, {**command, 'optics': {'f_stop': 8}})
+
+
+@pytest.mark.parametrize('optics', [{'f_stop': 0}, {'autofocus': 'yes'}, {'focus_distance_m': -1}, {'sensor_height_m': float('inf')}, {'unknown': True}])
+def test_optical_bad_request_is_refused(optics):
+    service = StaticWorlds(); world = service.register(1, registration())
+    with pytest.raises(CursorError): service.command(1, world['world_id'], {**render_command(), 'optics': optics})
