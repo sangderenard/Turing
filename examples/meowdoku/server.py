@@ -1732,6 +1732,20 @@ def make_handler(sessions: Sessions):
             return shared_rest.picture_route(self, path, method, service=sessions.studio_pictures, owners=keys,
                                              recheck=recheck, PictureError=PictureError, MAX_BODY=MAX_BODY)
 
+        def _compute_route(self, path, method):
+            from meowdoku.studio_pictures import PictureError
+            from meowdoku.living_data_query import MAX_BODY
+            self._classify()
+            account, origin, tier = self._account(), self._origin, self._tier
+            keys = ["account:" + str(account["id"])] if account is not None else []
+            def recheck_for(capability):
+                def recheck():
+                    principal = authz_mod.principal_from(account, origin, tier, sessions.accounts_db)
+                    return account is not None and capability in authz_mod.capabilities(principal, sessions.authz_policy.get())
+                return recheck
+            return shared_rest.compute_route(self, path, method, service=sessions.studio_pictures,
+                owners=keys, recheck_for=recheck_for, ComputeError=PictureError, MAX_BODY=MAX_BODY)
+
         # ---- [SITE] /site/<map>/...: a declared map as pages (speaktome_api.site); each map names its own capability.
         def _site_get(self, path):
             return shared_rest.site_route(self, path, site=sessions.site, maps=sessions.site_maps)
@@ -2535,6 +2549,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_dm(path, "GET")
             if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path, "GET")
+            if path.startswith("/api/compute/requests/"):
+                return self._compute_route(path, "GET")
             if path.startswith("/api/show/pictures/"):
                 return self._picture_route(path, "GET")
             if path == "/api/control/instances":
@@ -3074,6 +3090,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_cursor(path0, "POST")
             if path0 == "/api/living-data/query":
                 return self._living_data_query()
+            if path0 == "/api/compute/requests":
+                return self._compute_route(path0, "POST")
             if path0 == "/api/show/pictures":
                 return self._picture_route(path0, "POST")
             if path0 == "/api/reviews" or path0.startswith("/api/reviews/"):   # [REVIEWS]
@@ -3942,7 +3960,7 @@ def main(argv: list[str] | None = None) -> int:
             products=studio_agent.StudioAgentProducts(Path(args.studio_assets),
                                                       defaults=Path(args.studio_defaults) if args.studio_defaults else None),
             store_dir=sessions.state.jobs_dir / "studio-product", photo_jobs=sessions.marble_photos,
-            saved_objects_for=sessions.marble_objects.for_account,
+            saved_objects_for=sessions.marble_objects.for_account, registry=sessions.jobs,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
         print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
     site_compiler = None
