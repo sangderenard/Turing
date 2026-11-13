@@ -6752,6 +6752,39 @@ def _authored_annotation_python_types(annotation: ast.AST) -> tuple[str, ...]:
     return () if concrete is None else (f"builtins.{concrete}",)
 
 
+def _authored_annotation_runtime_class_names(annotation: ast.AST) -> frozenset[str]:
+    """Names occupying runtime arms, not classes nested in container elements.
+
+    Annotation provenance includes every named class dependency.  That does
+    not make ``list[Node]`` a union of list and Node.  Keep the provenance
+    join, but select only the names at the annotation's value boundary.
+    """
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            annotation = ast.parse(annotation.value, mode="eval").body
+        except SyntaxError:
+            return frozenset()
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return (_authored_annotation_runtime_class_names(annotation.left)
+                | _authored_annotation_runtime_class_names(annotation.right))
+    if isinstance(annotation, ast.Name):
+        return frozenset((annotation.id,))
+    if isinstance(annotation, ast.Attribute):
+        return frozenset((ast.unparse(annotation),))
+    if isinstance(annotation, ast.Subscript):
+        head = (annotation.value.id if isinstance(annotation.value, ast.Name)
+                else annotation.value.attr if isinstance(annotation.value, ast.Attribute)
+                else "")
+        if head in {"Optional", "Union"}:
+            members = (annotation.slice.elts if isinstance(annotation.slice, ast.Tuple)
+                       else (annotation.slice,))
+            return frozenset().union(*(
+                _authored_annotation_runtime_class_names(member) for member in members
+            ))
+        return _authored_annotation_runtime_class_names(annotation.value)
+    return frozenset()
+
+
 def _authored_fixed_tuple_member_annotations(
     annotation: ast.AST,
 ) -> tuple[ast.AST, ...]:
@@ -24893,6 +24926,7 @@ def _class_surface_ssa_program(
                 if isinstance(authored_identity, tuple)
                 and len(authored_identity) == 2 else None
             )
+            runtime_class_names = _authored_annotation_runtime_class_names(annotation)
             declared_class_cells = tuple(dict.fromkeys(
                 source
                 for source, _stage in (
@@ -24900,6 +24934,7 @@ def _class_surface_ssa_program(
                     if parameter_annotation_cell is not None else ()
                 )
                 if source.page == _PARAMETER_CLASS_DECLARATION
+                and str(source.row[-1]) in runtime_class_names
             ))
             declared_types.update(
                 ".".join(map(str, cell.row))
