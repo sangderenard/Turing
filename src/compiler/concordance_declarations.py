@@ -1782,6 +1782,14 @@ CALLSITE_DESCRIPTOR_REUSE = declare_page("callsite_descriptor_reuse", (
     RowField("caller", K.SCOPE), RowField("callee", K.SCOPE),
     RowField("call", K.VALUE_ID), RowField("round", K.INDEX),
 ), tuple)
+#: ``_returned_aggregate_call_cell``: a call whose authored tuple result its
+#: caller returns unchanged, so callsite specialization publishes the call's
+#: members (the caller's output carries the callee's member identities).
+#: Fact: (callee name, "tuple", call identity cell, callee return-site
+#: container cells); DERIVED from those cells.
+RETURNED_AGGREGATE_CALL = declare_page("returned_aggregate_call", (
+    RowField("caller", K.SCOPE), RowField("call", K.VALUE_ID),
+), tuple)
 
 # ============================================================================
 # Step 5: control SSA builder (plan 80, part B) -- owned by the step-5 lane

@@ -1124,6 +1124,72 @@ def _concorded_tensor_result_class(
     }, cell
 
 
+def _returned_aggregate_call_cell(
+    caller: Any, node_id: int, callee: Any,
+) -> Any:
+    """The cell proving a call's tuple result is its caller's output, or None.
+
+    Two records together: the caller's positional output is this exact call
+    value (the last identity of an output binding, read from the caller's
+    identity table), and every return site of the callee is an authored
+    tuple (its RETURN_SITE_CONTAINER rows).  The answer derives from the
+    call's identity cell and those container rows.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _operand_position_scope, node_identity_cell,
+    )
+    from .concordance_declarations import RETURN_SITE_CONTAINER
+    from .identity_concordance import Derived, current_identity_book
+
+    G = caller.G
+    call_value = int(G.nodes[int(node_id)].get("value_id", node_id))
+    identities = G.graph.get("identity_table") or {}
+    returned = any(
+        tuple(identities.get(str(name), ()))
+        and int(tuple(identities.get(str(name), ()))[-1]) == call_value
+        for name in G.graph.get("positional_output_names") or ()
+    )
+    if not returned:
+        return None
+    kinds = set(dict(callee.G.graph.get("return_container_kinds") or {}).values())
+    if kinds != {"tuple"}:
+        return None
+    book = current_identity_book()
+    scope = _operand_position_scope(callee)
+    container = book.pages.get(RETURN_SITE_CONTAINER.name)
+    if scope is None or container is None:
+        return None
+    container_cells = tuple(
+        cell for cell in (
+            book.latest_ref(RETURN_SITE_CONTAINER, row)
+            for row in container.scope_rows(scope)
+        ) if cell is not None
+    )
+    try:
+        call_cell = node_identity_cell(caller, int(node_id))
+    except ValueError:
+        call_cell = None
+    if call_cell is None or not container_cells:
+        return None
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, RETURNED_AGGREGATE_CALL,
+    )
+    from .identity_concordance import Mode, shape_scope_of
+
+    return book.post(
+        RETURNED_AGGREGATE_CALL,
+        (shape_scope_of(caller), call_value),
+        (
+            str(callee.G.graph.get("function_name") or ""), "tuple",
+            call_cell, container_cells,
+        ),
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived((call_cell, *container_cells)),
+        mode=Mode.CONCORD,
+    )
+
+
 def _planned_scalar_actual_descriptor(caller: Any, argument_id: int) -> Any:
     """A scalar actual's rank-0 descriptor from the caller's proven dtype.
 
@@ -2265,13 +2331,29 @@ def _post_call_result_projections(graph, node_id):
     return caller_paths
 
 
-def _call_result_bindings(graph, node_id, output_paths):
-    """One projection operator for authored bodies and accepted native headers."""
+def _call_result_bindings(graph, node_id, output_paths, *, result_is_output=False):
+    """One projection operator for authored bodies and accepted native headers.
+
+    ``result_is_output``: the callee has one output and every return site
+    returns a value, not a tuple display (RETURN_SITE_CONTAINER VALUE), so
+    the call's result IS that output.  Program: ``def mid(): t = (a, e);
+    return t`` (or ``def outer(): return mid()``), then ``a, e = mid();
+    use(e, a)`` (scratch n3/n4).  Wrong record: the output's member paths
+    are ``(0, k)`` and the caller's ``r[k]`` is ``(k,)``, so no member bound
+    and ``use``'s formal had no dtype.  Rule: output path ``(0, *p)`` is the
+    caller's projection path ``(*p)``, as one output over returns of
+    different arity already binds (``_return_output_arms_members``).
+    """
     caller_paths = _post_call_result_projections(graph, node_id)
     if tuple(output_paths) == ((0,),) and not (
         graph.G.nodes[int(node_id)].get("attributes") or {}
     ).get("authored_return_container"):
         return ((output_paths[(0,)], int(node_id)),)
+    if result_is_output and output_paths and all(
+        len(path) >= 2 and path[0] == 0 for path in output_paths
+    ):
+        return tuple((output_paths[path], caller_paths[path[1:]])
+                     for path in output_paths if path[1:] in caller_paths)
     return tuple((output_paths[path], caller_paths[path])
                  for path in output_paths if path in caller_paths)
 
@@ -6594,6 +6676,13 @@ def _build_shell_hierarchy_plan(
                 )
                 result_bindings = _call_result_bindings(
                     graph, node_id, child_output_paths,
+                    result_is_output=(
+                        len(child_outputs) == 1
+                        and set(dict(
+                            child_graph.graph.get("return_container_kinds")
+                            or {}
+                        ).values()) == {"value"}
+                    ),
                 )
                 arms_members = _return_output_arms_members(
                     child.process_graph, child_outputs,
@@ -24840,13 +24929,30 @@ def _propagate_callsite_tensor_specializations(
         tensor_result_class, tensor_result_class_cell = (
             _concorded_tensor_result_class(caller, call_value)
         )
+        # Program: ``def mid(): ...; return a, e`` and ``def outer(): return
+        # mid()``, then ``a, e = outer(); use(e, a)`` (scratch n3; YoungMan's
+        # ``_configure_geometry`` returning ``configure_geometry(...)``).
+        # Wrong record: ``outer``'s call has no tensor-bearing actual, so this
+        # gate skipped it; ``outer`` holds no projection of the call, so its
+        # one output had no member identities and ``root``'s projections were
+        # bound to nothing (``use``'s formal ``a`` refused with no dtype).  A
+        # direct ``a, e = mid()`` works only because the caller's own
+        # projections bind ``mid``'s members.  Rule: a call whose aggregate
+        # result its caller returns unchanged is that caller's output; its
+        # members are published on the call (the member ledger below), so
+        # the output carries the callee's member identities.
+        returned_aggregate_cell = None
         if (
             not descriptors
             and not aggregate_descriptors
             and not record_descriptors
             and not tensor_result_class
         ):
-            return ()
+            returned_aggregate_cell = _returned_aggregate_call_cell(
+                caller, int(node_id), callee,
+            )
+            if returned_aggregate_cell is None:
+                return ()
 
         def any_descriptor(item: Any) -> bool:
             if isinstance(item, tuple):
@@ -25286,6 +25392,7 @@ def _propagate_callsite_tensor_specializations(
             provenance=Derived(tuple(
                 cell for cell in (
                     reuse_policy_cell, tensor_result_class_cell,
+                    returned_aggregate_cell,
                 ) if cell is not None
             )),
             mode=Mode.CONCORD,

@@ -1684,6 +1684,7 @@ class CorrelationTable:
         found.extend(self._source_call_field_state_transfer_findings(module))
         found.extend(self._source_field_transfer_object_step_findings(module))
         found.extend(self._source_gradient_tracking_mark_findings(module))
+        found.extend(self._returned_aggregate_call_findings(module))
         found.extend(self._source_mapping_get_read_findings(module))
         found.extend(self._source_mapping_get_key_version_demand_findings(module))
         found.extend(self._source_mapping_get_copy_state_demand_findings(module))
@@ -2834,6 +2835,44 @@ class CorrelationTable:
                 found.append(Finding(
                     "source-mapping-get-read", str(row[0]), row[1],
                     "mapping get lost its transferred store, key, call, or pure-prefix proof",
+                ))
+        return found
+
+    @staticmethod
+    def _returned_aggregate_call_findings(module: Any) -> list[Finding]:
+        """Check each call whose authored tuple result its caller returns unchanged."""
+        from .concordance_declarations import (
+            RETURN_SITE_CONTAINER, RETURNED_AGGREGATE_CALL, ContainerKind,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(RETURNED_AGGREGATE_CALL)
+        containers = book.page(RETURN_SITE_CONTAINER)
+        for row in page.rows():
+            receipt = book.latest_ref(RETURNED_AGGREGATE_CALL, row)
+            fact = page.cell(receipt.row, receipt.column)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            valid = isinstance(fact, tuple) and len(fact) == 4
+            if valid:
+                _callee, kind, call_cell, container_cells = fact
+                valid = (
+                    kind == "tuple"
+                    and isinstance(call_cell, Ref) and call_cell in sources
+                    and isinstance(container_cells, tuple) and bool(container_cells)
+                    and all(
+                        isinstance(cell, Ref) and cell.page == RETURN_SITE_CONTAINER
+                        and cell in sources
+                        and containers.cell(cell.row, cell.column) is ContainerKind.TUPLE
+                        for cell in container_cells
+                    )
+                )
+            if not valid:
+                found.append(Finding(
+                    "returned-aggregate-call", str(row), 0,
+                    "returned aggregate call lost its call cell or a tuple return-site row",
                 ))
         return found
 

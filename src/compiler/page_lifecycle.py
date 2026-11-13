@@ -139,6 +139,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "callsite_argument": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "callsite_argument_role": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "callsite_descriptor_reuse": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "returned_aggregate_call": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "callsite_return_member": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "callsite_return_specialization": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "callsite_tensor_result_specialization": PageLifecycle(LOWERING, None, LOWERING),
