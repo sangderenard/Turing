@@ -14,9 +14,11 @@ import sys
 import tempfile
 import time
 import wave
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples'))
 from meowdoku.nodus_radio_pcm import Subscription
+from meowdoku.nodus_radio_playback import Playback
 
 
 def port(kind):
@@ -26,7 +28,8 @@ def port(kind):
 
 
 def main():
-    radio, scope, fft, router = (str(Path(p).resolve()) for p in sys.argv[1:])
+    radio, scope, fft, router = (str(Path(p).resolve()) for p in sys.argv[1:5])
+    sink = Playback(sys.argv[5]) if len(sys.argv) > 5 else None
     control, destination = port(socket.SOCK_STREAM), port(socket.SOCK_DGRAM)
     processes, sub = [], None
     with tempfile.TemporaryDirectory(prefix='radio-end-proof-') as td:
@@ -39,6 +42,8 @@ def main():
         log = Path(td) / 'native.log'
         with log.open('w') as output:
             try:
+                if sink:
+                    with patch.dict(os.environ, SDL_AUDIODRIVER='dummy'): sink.start()
                 processes.append(subprocess.Popen([router, '127.0.0.1', str(control)],
                     cwd=td, stdout=output, stderr=output))
                 deadline = time.perf_counter() + 5
@@ -70,6 +75,7 @@ def main():
                     value = sub.take_due()
                     if value is not None:
                         blocks += 1; nonzero += any(value); last_size = len(value)
+                        if sink: sink.write(value)
                     time.sleep(.0005)
                 producer.wait(timeout=3)
                 assert producer.returncode == 0
@@ -79,9 +85,13 @@ def main():
                 assert nonzero == blocks and state['lost'] == state['late'] == state['resyncs'] == 0, state
                 assert sub.invalid == sub.foreign == 0 and sub.error is None
                 assert sub.take_due() is None
+                if sink:
+                    sink.finish()
+                    print('PASS owned native PA sink:', '\n'.join(sink.events))
                 print('PASS native canvas / RTP+RTCP / router / adaptive readback:', state)
                 print('Final block bytes:', last_size, '; no post-EOF silence; SDL dummy only')
             finally:
+                if sink: sink.stop()
                 if sub: sub.close()
                 for process in reversed(processes):
                     if process.poll() is None: process.terminate(); process.wait(timeout=3)
