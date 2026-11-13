@@ -25264,7 +25264,68 @@ def _propagate_callsite_tensor_specializations(
                         f"selected_node={specialized.G.nodes[value_id]!r}",
                         file=sys.stderr, flush=True,
                     )
-                if not _descriptor_states_tensor_contract(descriptor):
+                selected_merge = str(
+                    specialized.G.nodes[value_id].get("type") or ""
+                ) == "Phi"
+                if (
+                    selected_merge
+                    and not _descriptor_states_tensor_contract(descriptor)
+                ):
+                    # Program: ``if g == "tetra": e = tensor(6x2) elif g ==
+                    # "ico": e = tensor(5x2) else: raise`` then ``return e,
+                    # 4`` with ``g`` a runtime value (scratch n8; YoungMan
+                    # ``configure_geometry``'s ``edge_pairs``, where the
+                    # icosahedron's (30, 2) reached ``_build_triangle_map``
+                    # for a tetrahedron).  Wrong record: the returned value is
+                    # the control-owned merge of the arms; it states no
+                    # contract, and the identity walk below took the LAST
+                    # arm's (5, 2) as the call's proven member.  Rule: a
+                    # merge's contract is its arms' contract only when every
+                    # arm states the same one; arms that disagree leave the
+                    # merge without one, and no single arm stands in for it.
+                    def merge_contract(node_id: int, seen: frozenset = frozenset()):
+                        node = specialized.G.nodes.get(int(node_id)) or {}
+                        if str(node.get("type") or "") != "Phi":
+                            answer = _structured_output_descriptor(
+                                specialized, int(node_id),
+                            )
+                            return (
+                                answer
+                                if isinstance(answer, Mapping)
+                                and _descriptor_states_tensor_contract(answer)
+                                else None
+                            )
+                        if int(node_id) in seen:
+                            return None
+                        arms = tuple(
+                            int(parent)
+                            for parent, role in node.get("parents") or ()
+                            if str(role) in {"body", "orelse"}
+                            and int(parent) in specialized.G
+                        )
+                        answers = tuple(
+                            merge_contract(arm, seen | {int(node_id)})
+                            for arm in arms
+                        )
+                        if not answers or any(item is None for item in answers):
+                            return None
+                        facts = {
+                            (
+                                tuple(item.get("shape") or ()),
+                                str(item.get("dtype") or "unknown"),
+                                int(item.get("rank", len(tuple(
+                                    item.get("shape") or ()
+                                ))) or 0),
+                                item.get("metadata_state"),
+                            )
+                            for item in answers
+                        }
+                        return answers[0] if len(facts) == 1 else None
+
+                    agreed = merge_contract(value_id)
+                    if agreed is not None:
+                        descriptor = copy.deepcopy(dict(agreed))
+                elif not _descriptor_states_tensor_contract(descriptor):
                     # The identity table lists every value that IS this
                     # binding; they are one storage by construction.  The last
                     # resident one is what the return names, but a store or a
@@ -30447,9 +30508,27 @@ def _tensor_descriptor_rule(
                         source_expression
                     )
                     if aggregate_shape is not None:
+                        # Program: ``AbstractTensor.tensor([(0, 1), ...],
+                        # dtype="int64")`` (YoungMan ``edge_pairs``; scratch
+                        # n7).  Wrong record: this branch stated float64 for
+                        # every authored literal, so the int64 edge table
+                        # crossed the call boundary as float64.  Rule: the
+                        # exact ``dtype=`` argument names the element class,
+                        # read as ``zeros``/``arange`` read it; float64
+                        # remains the class of an unnamed literal.
+                        named_dtype = next((
+                            named
+                            for parent, role in data.get("parents") or ()
+                            if str(role).casefold() == "kw:dtype"
+                            and int(parent) in graph.G
+                            for named in (
+                                _dtype_argument_name(graph, int(parent), seen),
+                            )
+                            if named is not None
+                        ), None)
                         return {
                             "shape": tuple(map(int, aggregate_shape)),
-                            "dtype": "float64",
+                            "dtype": named_dtype or "float64",
                             "rank": len(aggregate_shape),
                         }
                 from .planner_concordance_posts import materialized_sequence_row_dtype
