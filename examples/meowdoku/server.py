@@ -390,6 +390,8 @@ class Sessions:
         self.spectral_root = Path(spectral_override).resolve() if spectral_override else ROOT.parent / "spectral-analyzer"
         if spectral_override and not self.spectral_root.is_dir():
             raise ValueError("SPECTRAL_ANALYZER_ROOT must name an existing checkout")
+        from meowdoku.wave_arena_service import WaveArenaService
+        self.wave_arena = WaveArenaService(self.spectral_root)
         self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, self.spectral_root,
                                                         users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
@@ -627,6 +629,22 @@ def make_handler(sessions: Sessions):
                 self._set_cookie = []
                 self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
                 return None
+
+        def _wave_arena_route(self, method: str) -> None:
+            if not self._require("dev_ui"):
+                return
+            if method == "POST" and self.headers.get("Sec-Fetch-Site") == "cross-site":
+                return self._json({"error": "same-origin request required"}, HTTPStatus.FORBIDDEN)
+            self._table()
+            body = self._body_json() if method == "POST" else None
+            if method == "POST" and body is None:
+                return
+            try:
+                return self._json(sessions.wave_arena.command(self._token, body))
+            except (ValueError, TypeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except RuntimeError as error:
+                return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
 
         def _fabric_route(self, method: str) -> None:
             from urllib.parse import parse_qs
@@ -1833,6 +1851,20 @@ def make_handler(sessions: Sessions):
             return shared_rest.picture_route(self, path, method, service=sessions.studio_pictures, owners=keys,
                                              recheck=recheck, PictureError=PictureError, MAX_BODY=MAX_BODY)
 
+        def _compute_route(self, path, method):
+            from meowdoku.studio_pictures import PictureError
+            from meowdoku.living_data_query import MAX_BODY
+            self._classify()
+            account, origin, tier = self._account(), self._origin, self._tier
+            keys = ["account:" + str(account["id"])] if account is not None else []
+            def recheck_for(capability):
+                def recheck():
+                    principal = authz_mod.principal_from(account, origin, tier, sessions.accounts_db)
+                    return account is not None and capability in authz_mod.capabilities(principal, sessions.authz_policy.get())
+                return recheck
+            return shared_rest.compute_route(self, path, method, service=sessions.studio_pictures,
+                owners=keys, recheck_for=recheck_for, ComputeError=PictureError, MAX_BODY=MAX_BODY)
+
         # ---- [SITE] /site/<map>/...: a declared map as pages (speaktome_api.site); each map names its own capability.
         def _site_get(self, path):
             return shared_rest.site_route(self, path, site=sessions.site, maps=sessions.site_maps)
@@ -2628,6 +2660,8 @@ def make_handler(sessions: Sessions):
                 return self._route_get()
             if path == "/api/studio/fabric":
                 return self._fabric_route("GET")
+            if path == "/api/wave_arena":
+                return self._wave_arena_route("GET")
             if path == "/browse" or path.startswith("/browse/"):  # [LISTING] gated per root inside; the shader tier gets 403, never the shader page
                 return self._browse_get()
             if self._tier == "shader" and self._shader_request(path, "GET"):
@@ -2638,6 +2672,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_dm(path, "GET")
             if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path, "GET")
+            if path.startswith("/api/compute/requests/"):
+                return self._compute_route(path, "GET")
             if path.startswith("/api/show/pictures/"):
                 return self._picture_route(path, "GET")
             if path == "/api/control/instances":
@@ -3162,6 +3198,8 @@ def make_handler(sessions: Sessions):
                 return self._route_post()
             if path0 == "/api/studio/fabric":
                 return self._fabric_route("POST")
+            if path0 == "/api/wave_arena":
+                return self._wave_arena_route("POST")
             # Worker-only payload mailbox: credentials are process-local and
             # distinct from browser ray credentials. Never accepts browser Origin.
             if path0.startswith("/api/client_rays/engine/"):
@@ -3195,6 +3233,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_cursor(path0, "POST")
             if path0 == "/api/living-data/query":
                 return self._living_data_query()
+            if path0 == "/api/compute/requests":
+                return self._compute_route(path0, "POST")
             if path0 == "/api/show/pictures":
                 return self._picture_route(path0, "POST")
             if path0 == "/api/reviews" or path0.startswith("/api/reviews/"):   # [REVIEWS]
@@ -4064,7 +4104,7 @@ def main(argv: list[str] | None = None) -> int:
             products=studio_agent.StudioAgentProducts(Path(args.studio_assets),
                                                       defaults=Path(args.studio_defaults) if args.studio_defaults else None),
             store_dir=sessions.state.jobs_dir / "studio-product", photo_jobs=sessions.marble_photos,
-            saved_objects_for=sessions.marble_objects.for_account,
+            saved_objects_for=sessions.marble_objects.for_account, registry=sessions.jobs,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
         print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
     site_compiler = None

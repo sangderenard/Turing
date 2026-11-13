@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 8;
+const VERSION = 9;
 
 function allowed() {
   const here = import.meta.url;
@@ -455,6 +455,7 @@ async function main() {
     link("Math lab", "/mathlab.html", caps.has("compile_submit")),
     link("Source divider", "/divider.html", caps.has("compile_submit")),
     link("Marble studio", "/marble_studio.html", caps.has("dev_ui")),
+    link("T4 wave arena", "/wave_arena.html", caps.has("dev_ui")),
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
     link("Account and password", "/login.html"),
   ]) if (item) menu.append(item);
