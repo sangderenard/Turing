@@ -1620,9 +1620,24 @@ def post_control_program(
         kind, owner, reason, fields = described
         fallback = owner is None
         owner = program_cell if fallback else owner
-        fact = ControlBlockFact(kind, *fields)
+        mutations = tuple(getattr(block, "sequence_mutations", ()) or ())
+        if isinstance(block, SequenceMutationBlock):
+            mutations = (*mutations, block.mutation)
+        mutation_facts = tuple(
+            (cell(mutation.sequence_value_id), str(mutation.operator),
+             tuple(cell(value) for value in mutation.argument_value_ids),
+             cell(mutation.effect_node_id), mutation.policy,
+             str(mutation.argument_kind), mutation.object_contract_cell)
+            for mutation in mutations
+        )
+        fact = ControlBlockFact(kind, *fields, sequence_mutations=mutation_facts)
         row = (scope, kind, owner)
-        sources = tuple(dict.fromkeys((owner, *fact_cells(fields), *cause)))
+        mutation_sources = tuple(
+            value for target, _op, arguments, effect, _policy, _kind, receipt
+            in mutation_facts for value in (target, *arguments, effect, receipt)
+            if isinstance(value, Ref)
+        )
+        sources = tuple(dict.fromkeys((owner, *fact_cells(fields), *mutation_sources, *cause)))
         latest = book.latest_ref(CONTROL_BLOCK, row)
         if latest is None:
             return book.post(

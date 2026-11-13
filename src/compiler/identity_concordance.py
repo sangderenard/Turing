@@ -1604,6 +1604,8 @@ class CorrelationTable:
         found.extend(self._source_private_dynamic_sequence_findings(module))
         found.extend(self._source_sequence_constructor_snapshot_findings(module))
         found.extend(self._source_sequence_capacity_bound_findings(module))
+        from .source_comprehension_capacity import source_comprehension_capacity_findings
+        found.extend(source_comprehension_capacity_findings(module))
         found.extend(self._source_bytes_concat_class_findings(module))
         found.extend(self._source_eager_bytes_return_findings(module))
         found.extend(self._source_owned_sequence_return_findings(module))

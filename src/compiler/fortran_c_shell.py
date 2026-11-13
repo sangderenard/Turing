@@ -32839,6 +32839,11 @@ def _class_surface_ssa_program(
             _int_range_scopes as _int_range_scope,
         )
 
+        # The final control ledger, not a copied graph attribute, proves
+        # one publication per exact input row for bounded comprehensions.
+        from .source_comprehension_capacity import publish_source_comprehension_capacity
+        publish_source_comprehension_capacity(graph_obj, control)
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -33923,7 +33928,7 @@ def _class_surface_ssa_program(
                     argument.accounting = {
                         **dict(argument.accounting or {}),
                         "caller_provided_workspace": True,
-                        "workspace_operation": "source_bytes_slice_result",
+                        "workspace_operation": "source_sequence_bounded_result",
                         "source_sequence_capacity_bound": relation.bound_cell,
                     }
             source_output_value_ids = tuple(
@@ -58900,15 +58905,39 @@ def _class_surface_ssa_program(
                         # shape; the planner's graph extent (1,) would
                         # contradict the storage this row now posts.
                         formal_shape = tuple(formal.shape or ())
+                        formal_sources = (_frame_value_cell(caller, fed.id),)
                         if (formal_physical.get("storage") == "scalar"
-                                and formal_physical.get("rank") == 0
-                                and not tuple(fed.shape or ())):
-                            formal_shape = ()
+                                and formal_physical.get("rank") == 0):
+                            if not tuple(fed.shape or ()):
+                                formal_shape = ()
+                            elif tuple(fed.shape or ()) == (1,):
+                                # The caller's declared scalar record slot is
+                                # authoritative even before the completed-
+                                # module record-shape normalizer runs.  Do not
+                                # infer scalar storage from a singleton array:
+                                # require the exact descriptor field identity,
+                                # and retain its receipt on the formal row.
+                                from .concordance_declarations import RECORD_DESCRIPTOR
+                                record_table = all_record_tables.get(caller.name)
+                                scalar_descriptors = () if record_table is None else tuple(
+                                    record_table.book.current_ref(
+                                        RECORD_DESCRIPTOR, (record_table.owner, record_id),
+                                    )
+                                    for record_id, descriptor in record_table.records.items()
+                                    if any(
+                                        str(getattr(field.storage, "value", field.storage)) == "scalar"
+                                        and int(fed.id) in field.value_ids
+                                        for field in descriptor.fields
+                                    )
+                                )
+                                if scalar_descriptors:
+                                    formal_shape = ()
+                                    formal_sources = (*formal_sources, *scalar_descriptors)
                         _revise_ssa_value(
                             callee, formal.id, dtype=formal.dtype,
                             shape=formal_shape,
                             stage=FRAME_BINDING,
-                            sources=(_frame_value_cell(caller, fed.id),),
+                            sources=formal_sources,
                             physical=formal_physical,
                         )
                         formal.shape = formal_shape

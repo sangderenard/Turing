@@ -8894,6 +8894,19 @@ def emit_ssa_module_to_c(
     output_extent_sources: list[tuple[int, int]] = []
     sequence_capacity_relations = public_sequence_capacity_sources(module, function_name)
     sequence_input_ports = public_sequence_input_ports(module, function_name)
+    # These exact proof-backed descriptor ports are scalar cells, even
+    # when a helper's one-cell storage view contributes shape (1,).
+    bounded_extent_members = {
+        int(value_id)
+        for relation in sequence_capacity_relations
+        for value_id in (relation.output_length_id, relation.output_capacity_id)
+    }
+    bounded_public_members = {
+        int(value_id)
+        for relation in sequence_capacity_relations
+        for value_id in (relation.output_data_id, relation.output_length_id,
+                         relation.output_capacity_id)
+    }
     owned_sequence_ports = public_owned_sequence_returns(module, function_name)
     output_heap_sequences = tuple(
         (ports.data_id, ports.length_id, ports.capacity_id, ports.owner_id,
@@ -8967,7 +8980,7 @@ def emit_ssa_module_to_c(
         return _is_structural_abi_value(root, value)
 
     def is_private_root_storage(value) -> bool:
-        if int(value.id) in owned_port_ids:
+        if int(value.id) in owned_port_ids | bounded_public_members:
             return False
         accounting = dict(value.accounting or {})
         return (
@@ -9088,7 +9101,8 @@ def emit_ssa_module_to_c(
             continue
         buffer_order.append(value_id)
         buffer_shapes.append(tuple(
-            requirement.shape if requirement is not None else formal.shape or ()
+            () if value_id in bounded_extent_members and _declared_span_rank(formal) == 0
+            else requirement.shape if requirement is not None else formal.shape or ()
         ))
         held = solved_buffer_type(function_name, formal)
         buffer_dtypes.append(_public_buffer_dtype(solved_buffer_dtype(function_name, formal, held)))
@@ -9150,7 +9164,8 @@ def emit_ssa_module_to_c(
                 output_extent_sources.append((output_id, int(origin[1])))
         buffer_order.append(output_id)
         buffer_shapes.append(tuple(
-            storage_requirements.get(output_id).shape
+            () if output_id in bounded_extent_members and _declared_span_rank(output) == 0
+            else storage_requirements.get(output_id).shape
             if output_id in storage_requirements else output.shape or ()
         ))
         element_type = solved_buffer_type(function_name, output)

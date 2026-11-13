@@ -3163,6 +3163,9 @@ class ControlBlockFact:
     cases: tuple = ()
     diagnostics: tuple = ()
     target: Ref | None = None
+    # Exact resident mutations, including loop-owned publications. Each entry
+    # names canonical target/arguments/effect and the accepted object receipt.
+    sequence_mutations: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -5529,3 +5532,26 @@ SCALAR_BATCH_LOWERING = declare_stage('scalar_batch_lowering')
 SCALAR_BATCH_CONTRACT = declare_page('scalar_batch_contract', (
     RowField('function', K.SCOPE),
 ), ScalarBatchContract)
+
+
+@dataclass(frozen=True)
+class SourceComprehensionCapacityBound:
+    """One scalar mapping row per iteration of an exact source sequence."""
+
+    destination_cell: Ref
+    source_cell: Ref
+    loop_cell: Ref
+    materializer_cell: Ref
+    publication_cell: Ref
+    loop_operands_cell: Ref
+    control_cell: Ref
+    placement_cell: Ref
+    publication_path: tuple[Ref, ...] = ()
+
+
+SOURCE_COMPREHENSION_CAPACITY_BOUND = declare_page(
+    "source_comprehension_capacity_bound", (
+        RowField("source_scope", K.SCOPE),
+        RowField("destination_value_id", K.VALUE_ID),
+    ), SourceComprehensionCapacityBound,
+)

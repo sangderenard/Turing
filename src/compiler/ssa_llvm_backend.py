@@ -6531,6 +6531,19 @@ def _emit_repository_call_module(
     output_length_sources = tuple(
         (item.output_data_id, item.output_length_id) for item in sequence_capacity_relations
     )
+    # These exact proof-backed descriptor ports are scalar cells, even
+    # when a helper's one-cell storage view contributes shape (1,).
+    bounded_extent_members = {
+        int(value_id)
+        for relation in sequence_capacity_relations
+        for value_id in (relation.output_length_id, relation.output_capacity_id)
+    }
+    bounded_public_members = {
+        int(value_id)
+        for relation in sequence_capacity_relations
+        for value_id in (relation.output_data_id, relation.output_length_id,
+                         relation.output_capacity_id)
+    }
     storage_requirements = function_storage_requirements(module, function_name)
     # Storage introduced while linking a nested repository call belongs to
     # the root function's native frame, not to the authored program ABI.  It
@@ -6540,7 +6553,8 @@ def _emit_repository_call_module(
     root_public_args = tuple(
         value for value in root.args
         if not (
-            is_compiler_owned_storage(value)
+            int(value.id) not in bounded_public_members
+            and is_compiler_owned_storage(value)
             and storage_requirements.get(int(value.id)) is not None
             and (
                 storage_requirements[int(value.id)].element_count is not None
@@ -6551,7 +6565,8 @@ def _emit_repository_call_module(
     root_internal_storage = tuple(
         value for value in root.args
         if (
-            is_compiler_owned_storage(value)
+            int(value.id) not in bounded_public_members
+            and is_compiler_owned_storage(value)
             and storage_requirements.get(int(value.id)) is not None
             and (
                 storage_requirements[int(value.id)].element_count is not None
@@ -6612,7 +6627,8 @@ def _emit_repository_call_module(
         # genuinely shapeless/dynamic root outputs.
         root_shape = tuple(value.shape or ())
         buffer_shapes.append(tuple(
-            root_shape
+            () if value_id in bounded_extent_members and _declared_span_rank(value) == 0
+            else root_shape
             if root_shape
             else requirement.shape
             if requirement is not None
