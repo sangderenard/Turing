@@ -152,14 +152,29 @@ def server(tmp_path):
     sessions = srv.Sessions(web, None)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    _sign_in(httpd.server_address[1])
     yield httpd.server_address[1], sessions
     httpd.shutdown()
     httpd.server_close()
 
 
+SIGNED_IN = {}       # port -> account cookie: a visitor with no account is a guest and cannot upload (owner, 2026-11-13)
+
+
+def _sign_in(port):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("POST", "/api/account/signup", body=json.dumps({"username": "anim_cat", "password": "correcthorse1"}).encode(),
+                 headers={"Content-Type": "application/json"})
+    r = conn.getresponse()
+    r.read()
+    assert r.status == 201
+    SIGNED_IN[port] = next(c.split(";")[0] for c in r.msg.get_all("Set-Cookie") if c.startswith(srv.ACCOUNT_COOKIE))
+    conn.close()
+
+
 def _post(port, body, headers=None, length=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
-    h = {"X-Meowdoku-Loading": "1", "Content-Type": "application/octet-stream", **(headers or {})}
+    h = {"X-Meowdoku-Loading": "1", "Content-Type": "application/octet-stream", "Cookie": SIGNED_IN[port], **(headers or {})}
     if length is not None:
         h["Content-Length"] = str(length)
     conn.request("POST", "/api/loading_anim", body=body, headers=h)

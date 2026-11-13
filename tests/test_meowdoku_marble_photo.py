@@ -246,14 +246,18 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     port = httpd.server_address[1]
 
-    cookie = ""
+    # a visitor with no account is a guest and never holds photo_submit (owner, 2026-11-13): this browser is signed in
+    jar = {server.ACCOUNT_COOKIE: sessions.accounts.create_session(sessions.accounts.ensure_user("photo_cat", "correcthorse1"))}
     def request(method, path, body=b"", content_type="application/octet-stream"):
-        nonlocal cookie
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        conn.request(method, path, body=body, headers={"Content-Type": content_type, "Cookie": cookie})
+        conn.request(method, path, body=body, headers={"Content-Type": content_type,
+                                                       "Cookie": "; ".join(f"{k}={v}" for k, v in jar.items())})
         response = conn.getresponse()
         # Requests from one browser retain its ownership cookie.
-        cookie = "; ".join(v.split(";")[0] for k,v in response.getheaders() if k.lower()=="set-cookie") or cookie
+        for k, v in response.getheaders():
+            if k.lower() == "set-cookie":
+                name, _, value = v.split(";")[0].partition("=")
+                jar[name] = value
         data = response.read()
         status = response.status
         conn.close()

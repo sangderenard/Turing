@@ -78,8 +78,8 @@ def test_direct_peer_with_spoofed_forwarding_header_keeps_todays_classification(
     finally:
         proxy_trust.TRUSTED_PROXIES.update(saved)
     assert status == 200 and who["origin"] == "lan" and who["tier"] == "edit" and who["role"] == "guest"
-    assert who["edit"] is True and "owner_tools" in who["capabilities"]
-    assert who["capabilities"] == sorted(who["capabilities"]) and "account_manage" not in who["capabilities"]
+    # a guest's caps are capped by role_caps['guest'] (owner, 2026-11-13): the LAN edit tier no longer means edit for a guest
+    assert who["edit"] is False and who["capabilities"] == ["photo_read", "play", "view_site"]
 
 
 def test_trusted_proxy_forwarding_a_public_client_is_dns_and_guest(server):
@@ -117,7 +117,7 @@ def test_admin_bootstrap_then_owner_tools_from_a_dns_origin(server):
     member = _call(port, "/api/whoami", headers={**PUBLIC_XFF, "Cookie": plain})[1]
     assert member["role"] == "member" and "owner_tools" not in member["capabilities"] and "studio_write" in member["capabilities"]
     # account management: members and guests are refused; the admin grants and revokes
-    for cookie in (plain, ""):
+    for cookie in (plain, ""):           # the guest gate answers as the handler's capability check would
         status, out, _, _ = _call(port, "/api/account/admin/list", headers={**PUBLIC_XFF, "Cookie": cookie})
         assert status == 403 and out == {"error": "this needs account_manage"}
     admin_headers = {**PUBLIC_XFF, "Cookie": boss}
@@ -264,3 +264,40 @@ def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
     assert status == 403 and out == {"error": "this needs dev_ui"}
     assert _call(port, "/api/account/logout", "POST", public, {})[0] == 200
     assert _call(port, "/api/whoami", headers=public)[1]["role"] == "guest"
+
+
+def test_a_guest_keeps_pages_game_and_machine_routes_and_nothing_else(server):
+    port = server.port
+    if getattr(srv.shared_catalog, "guest_endpoint", None) is None:
+        pytest.skip("the loaded SpeakToMe catalog declares no guest entries (set SPEAKTOME_REPO to a checkout that does)")
+    local = {"Host": "127.0.0.1"}                                 # an anonymous LAN visitor: once the edit tier, now a guest
+    status, page, _, ctype = _call(port, "/shader.html", headers=local)
+    assert status == 200 and b"SHADER-PAGE" in page                # pages are answered by the static handler
+    for path in ("/api/whoami", "/api/route", "/api/state", "/api/catalog"):
+        assert _call(port, path, headers=local)[0] == 200, path
+    # writes and everything outside the guest set: refused before any handler runs, from any origin
+    for headers in (local, PUBLIC_XFF):
+        for method, path, body in (("POST", "/api/reports", {"request_id": "r1"}), ("POST", "/api/relay/send", {}),
+                                   ("POST", "/api/tickets", {}), ("POST", "/api/obj_assets", {}), ("POST", "/api/marble_photo", {}),
+                                   ("POST", "/api/loading_library/activate", {}), ("POST", "/api/messages/send", {}),
+                                   ("GET", "/api/log", None), ("GET", "/api/user-files", None), ("GET", "/api/relay/addresses", None)):
+            status, out, _, _ = _call(port, path, method, headers, body)
+            # answered as the handler would first: a capability the guest lacks (403), else sign in (401)
+            assert (status, out["error"][:9]) in ((403, "this need"), (401, "sign in f")), (method, path, status, out)
+        assert _call(port, "/api/state", "HEAD", headers)[0] == 403
+        assert _call(port, "/api/relay/send", "POST", headers, {})[0] == 401
+        assert _call(port, "/api/obj_assets", "POST", headers, {})[1] == {"error": "this needs studio_write"}
+    # a machine route is answered by its own credential: the loopback admin token, not a tier capability
+    status, out, _, _ = _call(port, "/api/admin/lifecycle", "POST", local, {"op": "status"})
+    assert status == 401 and out == {"error": "bad admin token"}
+    status, out, _, _ = _call(port, "/api/admin/lifecycle", "POST", {**local, "X-Meowdoku-Admin": TOKEN, "X-Forwarded-For": "8.8.8.8"},
+                              {"op": "status"})
+    assert status == 403 and "localhost only" in out["error"]
+    # sockets are declared in access.py: the game's pass the gate, an undeclared one does not
+    assert _call(port, "/ws/other", headers=local)[0] == 401
+    status, out, _, _ = _call(port, "/ws/contract/abc", headers=local)        # no upgrade, no grant: the bridge itself refuses
+    assert not (isinstance(out, dict) and str(out.get("error", "")).startswith("sign in for this"))
+    index = _call(port, "/api/index", headers=local)[1]
+    reachable = {e["name"] for e in srv.shared_catalog.ENDPOINTS if srv.shared_catalog.reachable_by_guest(e)}
+    assert index["guest"] is True and {e["name"] for e in index["endpoints"] if e["allowed"]} <= reachable
+    assert "play_action" in {e["name"] for e in index["endpoints"] if e["allowed"]}

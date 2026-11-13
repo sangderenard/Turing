@@ -846,21 +846,48 @@ def make_handler(sessions: Sessions):
             """[KIOSK] True for a kiosk account (authz.KIOSK_ROLES); speaktome_api.routes.index_route reads it too."""
             return authz_mod.kiosk(self._principal())
 
+        def _guest_gated(self) -> bool:
+            """[GUEST] True for a visitor with no account (authz.guest_gated); speaktome_api.routes.index_route reads it too."""
+            return authz_mod.guest_gated(self._principal())
+
         def _kiosk_gate(self, path: str, method: str) -> bool:
-            """[KIOSK] True when the request was refused here: a kiosk role (authz.KIOSK_ROLES, the intern guest agent) is answered
-            only on the catalog endpoints declared kiosk (speaktome_api.catalog.kiosk_endpoint).  Every other method and path is
-            refused before any handler runs, including handlers that ask for no capability; without the catalog nothing is answered."""
-            if not self._kiosk():
+            """[KIOSK] True when the request was refused here.  A kiosk role (authz.KIOSK_ROLES, the intern) is answered only on the
+            catalog endpoints declared kiosk (speaktome_api.catalog.kiosk_endpoint).  [GUEST] A visitor with no account is answered
+            on the pages (GET/HEAD outside /api/ and /ws) and on the guest-reachable entries (catalog.guest_endpoint: kiosk, guest,
+            and credential entries such as the loopback admin-token lifecycle, whose handler's own check is the authority) and on
+            the sockets access.GUEST_SOCKETS and access.CREDENTIAL_SOCKETS declare.
+            Every other method and path is refused before any handler runs, including handlers that ask for no capability;
+            without the catalog nothing but the pages is answered."""
+            if self._kiosk():
+                match = getattr(shared_catalog, "kiosk_endpoint", None)
+            elif self._guest_gated():
+                if method in ("GET", "HEAD") and not (path == "/api" or path.startswith("/api/") or path.startswith("/ws")):
+                    return False                                   # the pages; the static handler and its own checks answer them
+                if method == "GET" and (path in access_mod.GUEST_SOCKETS or path.startswith(access_mod.CREDENTIAL_SOCKETS)):
+                    return False                                   # the declared sockets; the grant-checked bridge decides for itself
+                match = getattr(shared_catalog, "guest_endpoint", None)
+            else:
                 return False
-            match = getattr(shared_catalog, "kiosk_endpoint", None)
             if method in ("GET", "POST") and match is not None and match(method, path) is not None:
                 return False
             self.close_connection = True
             self._set_cookie = []
             if method == "HEAD":
                 self.send_response(HTTPStatus.FORBIDDEN); self.send_header("Content-Length", "0"); self.end_headers()
-            else:
+                return True
+            if self._kiosk():
                 self._json({"error": "this account may use only the kiosk endpoints; see /api/index"}, HTTPStatus.FORBIDDEN)
+                return True
+            # [GUEST] answer as the refused entry's handler would first: its capability (403, as authz.require words it), else sign in (401)
+            entry = getattr(shared_catalog, "endpoint_for", lambda m, p: None)(method, path)
+            need = entry.get("capability") if entry else None
+            needs = [need] if isinstance(need, str) else list(need or ())
+            caps = self._caps()
+            if needs and not (all if entry.get("capability_all") else any)(c in caps for c in needs):
+                self._json({"error": "this needs " + (" and " if entry.get("capability_all") else " or ").join(needs)}, HTTPStatus.FORBIDDEN)
+            else:
+                self._json({"error": "sign in for this; without an account only the pages, the game and the kiosk endpoints answer "
+                                     "(see /api/index)"}, HTTPStatus.UNAUTHORIZED)
             return True
 
         def _route_gate(self, path: str) -> bool:
@@ -2992,8 +3019,10 @@ def make_handler(sessions: Sessions):
         def _lifecycle_post(self, path: str, length: int) -> None:
             lc = sessions.lifecycle
             if path == "/api/admin/lifecycle":
-                if not self._require("owner_tools"):               # [AUTHZ] edit-tier equivalent; the loopback + admin token below stays the authority
-                    return
+                # [GUEST] the loopback + admin token check below is the authority (catalog credential admin_token): the supervisor and
+                # Stop-Meowdoku.ps1 call it with no account, and a guest no longer holds owner_tools from the LAN edit tier.
+                if lc is None:
+                    return self._json({"error": "operator actions are not available on this server"}, HTTPStatus.SERVICE_UNAVAILABLE)
                 forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
                 ok, status, why = lifecycle_mod.admin_authorize(self.client_address[0], self.headers.get("Host", ""), forwarded,
                                                                 self.headers.get("X-Meowdoku-Admin"), lc.token)

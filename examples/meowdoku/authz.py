@@ -17,10 +17,11 @@ photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, 
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
     account_manage additionally requires role == 'admin'
     compile_unstable requires a signed-in non-guest account and an explicit role grant; no defaults grant it
-    guest gets tier_caps only
+    guest gets tier_caps capped by role_caps['guest'] (view_site, photo_read, play): no tier lifts a visitor with no account
+    above that (owner, 2026-11-13), so a LAN visit no longer means edit for a guest
     a KIOSK role (intern) gets role_caps only: no tier caps, so a LAN or edit-tier visit adds nothing
 
-Today's "LAN is edit" behaviour is preserved as POLICY (``tier_caps['edit']``, the default), not as code: a policy file can strip it.
+The LAN "edit" tier is POLICY (``tier_caps['edit']``, the default), not code; it applies to accounts, never above the guest ceiling.
 The policy file ``authz_policy.json`` (beside accounts.db by default; re-read when its mtime changes, like access.py) holds
 ``{"tier_caps": {tier: [caps]}, "role_caps": {role: [caps]}}``; entries merge over the defaults.
 
@@ -74,7 +75,16 @@ KIOSK.  ``intern`` is a read-only guest agent, like a kiosk at an amusement park
 its origin tier, takes no permission group (permission_groups.authority keeps it off the human ladder, like service), and the
 server answers it only on the catalog endpoints declared ``kiosk`` (speaktome_api.catalog.kiosk_endpoint): every other
 method and path is refused before any handler runs, failing closed when the catalog is not loaded.  An intern therefore
-cannot write, submit, message or touch the lifecycle even where a handler asks for no capability.  It keeps no personal
+cannot write, submit, message or touch the lifecycle even where a handler asks for no capability.
+
+GUEST.  A visitor with no account (a cookie guest, or a guest agent: a guest agent has no account, owner 2026-11-13) holds at
+most role_caps['guest'] and is answered only on the server's pages (paths outside /api/ and /ws) and on the catalog entries
+that speaktome_api.catalog.guest_endpoint finds: the kiosk entries, the entries declared guest (the pages' and the game
+table's calls, sign-up) and the entries declared with a credential (admin_token, engine_secret), whose handler's own
+check is the authority.  Sockets are not REST entries: access.GUEST_SOCKETS (the game's) and access.CREDENTIAL_SOCKETS (the
+federation bridge, opened with a peer grant) declare them.  Everything else is refused before any handler runs.
+
+An intern keeps no personal
 storage (owner, 2026-11-13): no user_files folder, no reports, no relay addresses; what it reads is burned on delivery.
 
 CLI: ``python authz.py grant-admin <user> --db accounts.db --granted-by operator:<prefix>``; ``revoke-admin``; ``show``; ``caps``.
@@ -140,7 +150,9 @@ DEFAULT_POLICY = {
         # intern: a guest agent's kiosk account.  These are its only caps (no tier caps are added); the server's kiosk gate
         # still limits it to the catalog's kiosk endpoints.
         "intern": ["view_site", "photo_read"],
-        "guest": [],
+        # guest: a visitor with no account.  Not added to its tier caps but their CEILING (capabilities() intersects), and the
+        # server answers a guest only on its pages and the catalog's guest-reachable entries (GUEST in the docstring).
+        "guest": ["view_site", "photo_read", "play"],
     },
 }
 
@@ -249,8 +261,16 @@ def kiosk(principal: Principal) -> bool:
     return principal.role in KIOSK_ROLES
 
 
+def guest_gated(principal: Principal) -> bool:
+    """True for a visitor with no account: the server answers it only on its pages and the catalog's guest-reachable entries."""
+    return principal.role == "guest"
+
+
 def capabilities(principal: Principal, policy: dict) -> frozenset:
     caps = set() if kiosk(principal) else set(policy["tier_caps"].get(principal.tier, ()))
+    if guest_gated(principal):
+        return frozenset(c for c in caps & set(policy["role_caps"].get("guest", ())) if c in CAPS and c not in (
+            "lifecycle_admin", "account_manage", "paper_train", "nodus_edit", "compile_unstable"))
     if principal.role in _permission_groups.RANKS:
         for group in _permission_groups.ORDER:
             if _permission_groups.RANKS[group] <= _permission_groups.RANKS[principal.role]:

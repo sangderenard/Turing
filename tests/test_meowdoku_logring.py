@@ -76,6 +76,9 @@ def _server(tmp_path, policy):
     sessions.access.config()["policy"].update(policy)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    # a visitor with no account is a guest and never holds dev_ui (owner, 2026-11-13): the tiers are tried as a signed-in member
+    uid = sessions.accounts.ensure_user("log_cat", "correcthorse1")
+    httpd.member = {"Cookie": f"{srv.ACCOUNT_COOKIE}={sessions.accounts.create_session(uid)}"}
     return httpd
 
 
@@ -93,14 +96,15 @@ def test_log_endpoint_tier_gate(tmp_path, monkeypatch):
     for tier, ok in (("edit", True), ("dev", True), ("play", False), ("shader", False)):
         httpd = _server(tmp_path, {"lan": tier})
         try:
-            status, body = _get(httpd, "/api/log?since=1&limit=10")
+            assert _get(httpd, "/api/log?since=1&limit=10")[0] == 403                     # a guest, on any tier
+            status, body = _get(httpd, "/api/log?since=1&limit=10", httpd.member)
             assert (status == 200) == ok, (tier, status)
             if ok:
                 assert [e["text"] for e in json.loads(body)["entries"]] == ["[meowdoku] two"]
             else:
                 assert status == 403 and b"meowdoku" not in body
             if ok:
-                status, _ = _get(httpd, "/api/log", {srv.share_mod.VIEWER_HEADER: "x"})      # a view-only link is refused even on a dev tier
+                status, _ = _get(httpd, "/api/log", {**httpd.member, srv.share_mod.VIEWER_HEADER: "x"})   # a view-only link is refused even on a dev tier
                 assert status == 403
         finally:
             httpd.shutdown(); httpd.server_close()
