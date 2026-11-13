@@ -37,6 +37,11 @@ async function refresh() {
       catch (error) { status(error.message); }
     });
     line.append(link, node("small", `${(file.bytes / 1024).toFixed(1)} KiB`));
+    if (fileName === "alpaca-paper-key.json" || fileName === "secret.json") {
+      const openKeys = node("a", "Open on Keys page");
+      openKeys.href = "/keys.html?import=" + encodeURIComponent(file.id);
+      line.append(openKeys);
+    }
     const select = document.createElement("select");
     select.setAttribute("aria-label", `Share ${fileName} with a contact`);
     select.append(new Option("Choose a contact", ""));

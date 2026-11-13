@@ -55,7 +55,7 @@ $("paper-store").addEventListener("click", async () => {
   const button = $("paper-store"); button.disabled = true;
   try { const file = await fileCrypto.upload("alpaca-paper-key.json",
       new TextEncoder().encode(JSON.stringify(paperFile())));
-    $("paper-form").reset(); say("Encrypted paper key stored privately. Share it from My files when ready (" + file.id.slice(0, 8) + "…)."); }
+    $("paper-form").reset(); say("Encrypted paper key stored privately. Open it from My files to connect or share it later (" + file.id.slice(0, 8) + "…)."); }
   catch (error) { say(error.message); }
   finally { button.disabled = false; }
 });
