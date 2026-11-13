@@ -18730,6 +18730,19 @@ def _normalize_lexical_values(
 
             body_terminal = terminal_branch(body_statement.body)
             else_terminal = terminal_branch(body_statement.orelse)
+            # Program: ``if True: c = ...`` then ``total += c`` (scratch
+            # iftrue/c1; exception ingestion's guards that are true by
+            # construction are spelled this way).  Wrong record: the merge
+            # joined the body's ``c`` with the empty else arm, which no
+            # execution takes, so ``c`` after the If had no producer ("region
+            # value ... Add has no settled dtype", also before 2716cd06).  Rule:
+            # the arm a literal-constant test never takes does not reach the
+            # statement after the If -- it is terminal, as a raising arm is.
+            if isinstance(body_statement.test, ast.Constant):
+                if bool(body_statement.test.value):
+                    else_terminal = True
+                else:
+                    body_terminal = True
 
             # A guard clause -- `if cond: body else: raise` or its mirror --
             # has only one arm that can ever reach the statement after the
