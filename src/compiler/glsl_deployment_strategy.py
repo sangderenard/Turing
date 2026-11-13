@@ -11859,7 +11859,7 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
 
 # Serialized ProcessGraphs retain this derived cache. Bump its schema when
 # classification semantics change, so a compiler replay recomputes old facts.
-_DISPATCH_METADATA_CACHE_SCHEMA = 5
+_DISPATCH_METADATA_CACHE_SCHEMA = 6
 
 
 def _dispatch_metadata_node_classifier(graph: Any):
@@ -12000,6 +12000,42 @@ def _resident_string_comparison_cells(graph: Any, node_id: int) -> tuple:
     cells = []
     for parent, _role in parents:
         value_id = int(graph.G.nodes[int(parent)].get("value_id", parent))
+        identity = node_identity_cell(graph, int(parent))
+        # Literal glyphs have their own exact materialization recipe. Their
+        # scalar token descriptor is not the storage of that glyph alternate.
+        from .concordance_declarations import (
+            SOURCE_GLYPH_SEQUENCE, SourceGlyphSequence,
+            CANONICAL_VALUE, INGESTION_VALUE,
+        )
+        from .concorded_literals import origin_cell
+        literal_row = (graph.G.nodes[int(parent)].get("attributes") or {}).get(
+            "source_literal_glyph_sequence_row"
+        )
+        if isinstance(literal_row, (tuple, list)) and len(literal_row) == 2 and int(literal_row[1]) == value_id:
+            literal_cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, tuple(literal_row))
+            recipe = book.page(SOURCE_GLYPH_SEQUENCE).latest(tuple(literal_row))
+            exact_literal = (
+                isinstance(recipe, SourceGlyphSequence)
+                and len(recipe.components) == 1
+                and recipe.components[0].kind == "literal"
+                and int(recipe.components[0].component_value_id) == value_id
+            )
+            pending = [literal_cell] if literal_cell is not None else []
+            visited = set()
+            grounded = False
+            while pending:
+                candidate = pending.pop()
+                if candidate in visited:
+                    continue
+                visited.add(candidate)
+                for cause, _stage in book.edges_into(candidate):
+                    if cause.page == SOURCE_GLYPH_SEQUENCE:
+                        pending.append(cause)
+                    elif cause.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                        grounded |= origin_cell(book, cause) == origin_cell(book, identity)
+            if exact_literal and grounded:
+                cells.extend((identity, literal_cell))
+                continue
         evidence = require_class(_source_numeric_scope(graph.G), value_id, book=book)
         if (not isinstance(evidence, ClassEvidence)
                 or evidence.class_identity != "builtins.str"

@@ -3965,6 +3965,13 @@ class _ControlSSABuilder(TiledObject):
                 glyph_column = self.sequence_storage_values[
                     int(sequence_id)
                 ][0]
+                self.static_sequence_capacities[int(sequence_id)] = len(glyphs)
+                if not glyphs:
+                    # An empty literal still owns an arena passed to span
+                    # helpers, but has no element stores to define it.
+                    self.emit(Handler.Const, [], glyph_column, attributes={
+                        "values": [], "binding": "ssa_sequence_empty_literal_glyph",
+                    })
                 for offset, glyph in enumerate(glyphs):
                     index = self.constant_value(int(offset), glyph_column)
                     address = self.fresh_value(
@@ -29154,6 +29161,10 @@ def _materialize_control_constants(
                 # retaining ``Const(value=[])`` under the arena's identity
                 # gives one value two incompatible physical producers.
                 if value_id in resident_sequence_ids:
+                    # Preserve the initializer of an empty glyph arena, not
+                    # the authored scalar token sharing this source identity.
+                    if instruction.attributes.get("binding") == "ssa_sequence_empty_literal_glyph":
+                        retained.append(instruction)
                     continue
                 literal = constant_values[value_id]
                 matches = (

@@ -13904,6 +13904,10 @@ def _attach_graph_control_expressions(
             and str(expression.op) != "value"
         ):
             return ControlExpression("value", value_id=int(expression.value_id))
+        if expression.value_id is not None and int(expression.value_id) in graph_obj:
+            from .glsl_deployment_strategy import _resident_string_comparison_cells
+            if _resident_string_comparison_cells(SimpleNamespace(G=graph_obj), int(expression.value_id)):
+                return ControlExpression("value", value_id=int(expression.value_id), read=expression.read)
         operands = tuple(read_merges(operand) for operand in expression.operands)
         if operands == tuple(expression.operands):
             return expression
@@ -14398,6 +14402,8 @@ def _attach_graph_control_expressions(
                 predicate_expression=predicate,
             )
 
+        if isinstance(block, SequenceMutationBlock):
+            return replace(block, mutation=merged_mutation(block.mutation))
         if isinstance(block, LoopBlock):
             return replace(
                 block, body=attach(block.body),
