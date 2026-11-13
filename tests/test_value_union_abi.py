@@ -106,6 +106,48 @@ def test_optional_sequence_of_bare_collections_uses_reference_elements():
     }
 
 
+@pytest.mark.parametrize("alias, builtin", [
+    ("List[str]", "list[str]"),
+    ("typing.List[str]", "list[str]"),
+    ("Tuple[int, int]", "tuple[int, int]"),
+    ("typing.Tuple[int, ...]", "tuple[int, ...]"),
+    ("List[List[float]]", "list[list[float]]"),
+    ("list[typing.List[float]]", "list[list[float]]"),
+    ("Dict[str, List[int]]", "dict[str, list[int]]"),
+    ("Set[float]", "set[float]"),
+    ("FrozenSet[int]", "frozenset[int]"),
+])
+@pytest.mark.parametrize("wrapper", ["{}", "Optional[{}]", "{} | None"])
+def test_authored_container_alias_has_same_identity_and_storage(
+    alias, builtin, wrapper,
+):
+    from src.compiler.fortran_c_shell import (
+        _authored_annotation_field_receipt,
+        _authored_annotation_python_types,
+    )
+
+    original = ast.parse(wrapper.format(alias), mode="eval").body
+    canonical = ast.parse(wrapper.format(builtin), mode="eval").body
+    expected = _authored_annotation_field_receipt(canonical)
+    assert expected is not None
+    assert _authored_annotation_python_types(original) == (
+        _authored_annotation_python_types(canonical)
+    )
+    assert _authored_annotation_field_receipt(original) == expected
+
+
+def test_optional_typing_list_keeps_exact_span_receipt():
+    from src.compiler.fortran_c_shell import _authored_annotation_field_receipt
+
+    # The real compile_nodes.output_node_keys API must not lose the list arm's
+    # physical layout merely because its authored annotation uses typing.List.
+    annotation = ast.parse('"Optional[List[str]]"', mode="eval").body
+    assert _authored_annotation_field_receipt(annotation) == {
+        "storage": "span", "dtype": "int64", "rank": 1,
+        "mutable": True, "aggregate_kind": "list", "optional": True,
+    }
+
+
 def test_value_union_table_keeps_per_arm_physical_storage():
     descriptor = SSAValueUnionDescriptor(
         union_id=40,
@@ -617,3 +659,44 @@ def test_mapping_value_column_uses_writer_union_abi():
         instruction.attributes.get("native_type_tag_sequence")
         for instruction in stores
     )
+
+
+@pytest.mark.parametrize("spelling", ["List[str]", "list[str]"])
+def test_optional_list_alias_lowers_with_concorded_span_arm(spelling):
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import concordance_report
+
+    repository = Path(__file__).resolve().parents[1]
+    contract = ExtractionContract(
+        repository / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        "from typing import Optional, List\n"
+        f"def accepts(output_node_keys: Optional[{spelling}]) -> bool:\n"
+        "    return output_node_keys is None\n",
+        "accepts", extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+    function = module.functions[exports[0]]
+    fact = function.metadata["native_value_type_abi"][0]
+    assert tuple(
+        (arm.identity, arm.storage, arm.dtype)
+        for arm in fact.physical_alternatives
+    ) == (
+        ("builtins.NoneType", "none", ""),
+        ("builtins.list", "span", "int64"),
+    )
+    assert all(arm.source_cells for arm in fact.physical_alternatives)
+    assert "0 finding(s)" in concordance_report(module).splitlines()[0]
+
+
+@pytest.mark.parametrize("annotation", [
+    "Optional[List[Unknown]]", "Tuple[int, str]", "Optional[Custom[str]]",
+])
+def test_container_alias_does_not_invent_missing_physical_layout(annotation):
+    from src.compiler.fortran_c_shell import _authored_annotation_field_receipt
+
+    assert _authored_annotation_field_receipt(
+        ast.parse(annotation, mode="eval").body,
+    ) is None

@@ -1617,7 +1617,12 @@ def _source_sequence_snapshots(graph_obj: Any):
         if destination_kind == "bytearray":
             accepted = source_kind in {"list", "tuple", "array", "bytes", "bytearray"}
         else:
-            accepted = source_kind in {"list", "tuple", "array"}
+            # list(set) is also a snapshot. Without it, the materialization
+            # alias pass gives the list the set's arena but separate counters.
+            # Its copy uses the existing iterator/insert path, not bulk keyed
+            # replacement: source uniqueness is not destination uniqueness.
+            accepted = (source_kind in {"list", "tuple", "array"}
+                        or (destination_kind == "list" and source_kind == "set"))
         if not accepted:
             continue
         snapshot_cell = None
@@ -1686,6 +1691,7 @@ def _source_sequence_snapshots(graph_obj: Any):
         mutations.append(ControlSequenceMutation(
             int(node_id), "replace", (source,), int(node_id),
             policy="duplicates", snapshot_cell=snapshot_cell,
+            argument_kind="set_snapshot" if source_kind == "set" else "value",
         ))
     return tuple(mutations)
 

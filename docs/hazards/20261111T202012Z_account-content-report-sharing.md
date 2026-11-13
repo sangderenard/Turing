@@ -1,0 +1,16 @@
+2026-11-11 ACCOUNT CONTENT GROUPS AND REPORT SHARING (OFFLINE VERIFIED; NOT DEPLOYED)
+
+- Reports retain immutable content and owner. Shared account_content policy adds personal/group/public read scope, owner-only CAS sharing, explicit public sign-off, and fresh same-transaction group/session/admin checks. System admin read is explicit scope=all; it never grants another author's publication rights.
+- Account groups are flat memberships, not friends or linked identities. Invite + required request message + recipient acceptance precede group content and roster access. No messaging relationship, role, network grant, or direct server-to-server connection is created. Existing content/messaging APIs retain their original rules; only reports consume the new read policy in this change.
+- Public report endpoints omit author/sign-off account IDs. /reports.html defaults public, including for admins; private records require explicit all scope. Untrusted text uses textContent. Sign-off, cancel, duplicate clicks, navigation races and readback covered without browser rendering.
+- Independent audit found account enumeration through member removal and hidden stale invitation quota retention. Membership changes now resolve only existing accepted group members; demotion/removal/leave deletes the inviter's pending invitations in that group. Re-promotion cannot revive those receipts.
+- Paired deployment: Turing requires SpeakToMe reports API_VERSION 2 and groups API_VERSION 1. Report schema is 2; shared account_content schema is 1. Old code refuses newer schema. No live database direct writes, restart, network/firewall change, default branch update or publication performed.
+
+Verification (service Python, no GPU/render):
+- pytest --noconftest tests/test_experience_reports.py tests/test_meowdoku_accounts_transactions.py tests/test_meowdoku_authz.py tests/test_meowdoku_server_authz.py tests/test_meowdoku_access.py tests/test_meowdoku_messaging.py -q: 97 passed, 13 subtests, 51.51 seconds. Existing missing native tensor-core and cffi deprecation warnings only.
+- Paired SpeakToMe contract/catalog/MCP/manual focused tests: 100 passed, 0.70 seconds; TURING_REPO points at this worktree, so catalog source check was not skipped.
+- node tests/test_reports_ui.cjs passed; node --check reports.js and git diff --check passed.
+- Normal SpeakToMe pytest conftest attempted automatic project environment setup, then failed before tests because poetry was absent. Standalone pure contract tests ran with --noconftest using the existing service interpreter. No claim of full project setup or full suite pass.
+- The hazards helper still rejects pre-existing malformed filename 20261109T_material-library-paused-checkpoint.md. Existing newest receipts and baseline were read; this correctly named entry was created without modifying that older file.
+
+Remaining: authorized paired review/deployment and static-asset publication, live readback with ordinary/admin accounts, explicit owner-reviewed report publication, UI visual verification (not performed under the no-render instruction). Future private partnership request-message/maturity policy and adoption by other content stores remain separate work.
