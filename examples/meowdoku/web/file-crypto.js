@@ -86,7 +86,7 @@ async function recipientKey(username) {
   const known = localStorage.getItem(pin);
   if (known && known !== peer.fingerprint) throw new Error("Contact file key changed. Verify it with them before sending.");
   if (!known) {
-    const verified = window.confirm("Check " + peer.username + "'s file-key fingerprint with them on their Keys page:\n" +
+    const verified = window.confirm("Compare " + peer.username + "'s file-key fingerprint with them through a channel outside Meowdoku:\n" +
       peer.fingerprint + "\n\nChoose OK only after it matches.");
     if (!verified) throw new Error("Recipient file key was not verified.");
     localStorage.setItem(pin, peer.fingerprint);

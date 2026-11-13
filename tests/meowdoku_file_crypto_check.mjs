@@ -48,7 +48,7 @@ actor = "alice"; await alice.setup("long unique alice recovery phrase");
 actor = "bob"; await bob.setup("long unique bob recovery phrase");
 actor = "mallory"; await mallory.setup("long unique mallory recovery phrase");
 actor = "alice";
-const secret = new TextEncoder().encode('{"type":"alpaca-paper-key-v1","key_id":"paper-example","secret_key":"never-print-this"}');
+const secret = new TextEncoder().encode('{"type":"alpaca-paper-key-v1","issuer":"Alpaca","purpose":"paper trading","key_id":"paper-example","secret_key":"never-print-this"}');
 const uploaded = await alice.upload("alpaca-paper-key.json", secret, "bob");
 const stored = files.get(uploaded.id);
 assert.equal(stored.cipher.includes(Buffer.from("never-print-this")), false);

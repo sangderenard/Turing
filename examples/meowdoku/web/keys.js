@@ -43,6 +43,7 @@ function paperValues() {
   if (!key_id || !secret_key || /[\r\n]/.test(key_id + secret_key)) throw new Error("Enter a paper key ID and secret without line breaks.");
   return { key_id, secret_key };
 }
+const paperFile = () => ({ type: "alpaca-paper-key-v1", issuer: "Alpaca", purpose: "paper trading", ...paperValues() });
 $("paper-connect").addEventListener("click", async () => {
   const button = $("paper-connect"); button.disabled = true;
   try { await post("/api/user-secrets/alpaca-paper", paperValues(), { "X-Meowdoku-Secret": "1" });
@@ -53,7 +54,7 @@ $("paper-connect").addEventListener("click", async () => {
 $("paper-store").addEventListener("click", async () => {
   const button = $("paper-store"); button.disabled = true;
   try { const file = await fileCrypto.upload("alpaca-paper-key.json",
-      new TextEncoder().encode(JSON.stringify({ type: "alpaca-paper-key-v1", ...paperValues() })));
+      new TextEncoder().encode(JSON.stringify(paperFile())));
     $("paper-form").reset(); say("Encrypted paper key stored privately. Share it from My files when ready (" + file.id.slice(0, 8) + "…)."); }
   catch (error) { say(error.message); }
   finally { button.disabled = false; }
@@ -72,8 +73,8 @@ async function sendEncrypted(name, content, recipient, body) {
 }
 $("paper-share").addEventListener("click", async () => {
   const button = $("paper-share"); button.disabled = true;
-  try { const values = paperValues(); const peer = $("paper-recipient").value;
-    await sendEncrypted("alpaca-paper-key.json", { type: "alpaca-paper-key-v1", ...values }, peer,
+  try { const content = paperFile(); const peer = $("paper-recipient").value;
+    await sendEncrypted("alpaca-paper-key.json", content, peer,
       "Shared an encrypted Alpaca paper key");
     $("paper-form").reset(); say("Encrypted paper key sent to " + peer + "."); }
   catch (error) { say(error.message); }
@@ -82,10 +83,10 @@ $("paper-share").addEventListener("click", async () => {
 $("general-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = $("general-form").querySelector("button"); button.disabled = true;
-  try { const purpose = $("secret-purpose").value.trim(), content = $("secret-content").value;
-    if (!purpose || !content) throw new Error("Enter a purpose and secret content.");
+  try { const issuer = $("secret-issuer").value.trim(), purpose = $("secret-purpose").value.trim(), content = $("secret-content").value;
+    if (!issuer || !purpose || !content) throw new Error("Enter an issuer, purpose and secret content.");
     const peer = $("general-recipient").value;
-    await sendEncrypted("secret.json", { type: "secret-text-v1", purpose, content }, peer,
+    await sendEncrypted("secret.json", { type: "external-secret-v1", issuer, purpose, content }, peer,
       "Shared an encrypted secret");
     $("general-form").reset(); say("Encrypted secret sent to " + peer + "."); }
   catch (error) { say(error.message); }
@@ -93,9 +94,9 @@ $("general-form").addEventListener("submit", async (event) => {
 });
 $("general-store").addEventListener("click", async () => {
   const button = $("general-store"); button.disabled = true;
-  try { const purpose = $("secret-purpose").value.trim(), content = $("secret-content").value;
-    if (!purpose || !content) throw new Error("Enter a purpose and secret content.");
-    await fileCrypto.upload("secret.json", new TextEncoder().encode(JSON.stringify({ type: "secret-text-v1", purpose, content })));
+  try { const issuer = $("secret-issuer").value.trim(), purpose = $("secret-purpose").value.trim(), content = $("secret-content").value;
+    if (!issuer || !purpose || !content) throw new Error("Enter an issuer, purpose and secret content.");
+    await fileCrypto.upload("secret.json", new TextEncoder().encode(JSON.stringify({ type: "external-secret-v1", issuer, purpose, content })));
     $("general-form").reset(); say("Encrypted secret stored privately. Share it from My files when ready."); }
   catch (error) { say(error.message); }
   finally { button.disabled = false; }
@@ -110,10 +111,10 @@ async function loadImport(id) {
   imported = data;
   $("import-box").hidden = false;
   $("import-connect").hidden = data.type !== "alpaca-paper-key-v1";
-  $("import-reveal").hidden = data.type !== "secret-text-v1";
+  $("import-reveal").hidden = data.type !== "external-secret-v1";
   $("import-state").textContent = data.type === "alpaca-paper-key-v1" ?
-    "Encrypted Alpaca paper key received. Key ID ending " + String(data.key_id || "").slice(-4) + "." :
-    data.type === "secret-text-v1" ? "Encrypted secret for: " + String(data.purpose || "unknown") : "Unsupported secret type.";
+    "Encrypted Alpaca-issued paper key received. Key ID ending " + String(data.key_id || "").slice(-4) + "." :
+    data.type === "external-secret-v1" ? "Encrypted credential from " + String(data.issuer || "unknown") + " for " + String(data.purpose || "unknown") + "." : "Unsupported secret type.";
 }
 $("import-connect").addEventListener("click", async () => {
   if (imported?.type !== "alpaca-paper-key-v1") return;
@@ -123,7 +124,7 @@ $("import-connect").addEventListener("click", async () => {
   catch (error) { say(error.message); }
 });
 $("import-reveal").addEventListener("click", () => {
-  if (imported?.type !== "secret-text-v1") return;
+  if (imported?.type !== "external-secret-v1") return;
   $("import-content").value = imported.content;
   $("import-content").hidden = false;
 });
