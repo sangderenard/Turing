@@ -754,6 +754,11 @@ def _retarget_cached_value_ids(
         if entries and any(int(entry) == old_value_id for entry in entries):
             attributes[ledger] = substitute(entries)
     if single is not None:
+        # A conditional's initial value is the same retained collection
+        # whose continuation edge moves here. Leaving its ListComp id behind
+        # misclassifies a one-branch rebind as an unrelated two-list merge.
+        if attributes.get("initial_value_id") == old_value_id:
+            attributes["initial_value_id"] = single
         if attributes.get("value_source_id") == old_value_id:
             attributes["value_source_id"] = single
         carried = attributes.get("loop_carried_bindings")

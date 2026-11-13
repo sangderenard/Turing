@@ -6409,6 +6409,17 @@ def _authored_annotation_field_receipt(
         if isinstance(annotation.value, ast.Attribute)
         else ""
     )
+    # compile_nodes.output_node_keys: Optional[List[str]] already declares
+    # builtins.list in the semantic annotation reader.  Derive its physical
+    # container from that SAME identity: a separate spelling whitelist lost
+    # the List/Tuple receipts and left an otherwise exact union arm unbacked.
+    # Protocols retain their existing layouts; they declare no concrete class.
+    declared_types = _authored_annotation_python_types(annotation)
+    if len(declared_types) == 1 and declared_types[0] in {
+        "builtins.dict", "builtins.list", "builtins.tuple",
+        "builtins.set", "builtins.frozenset",
+    }:
+        container = declared_types[0].removeprefix("builtins.")
     if container == "Literal":
         members = (
             tuple(annotation.slice.elts)
@@ -6594,6 +6605,12 @@ def _authored_annotation_field_receipt(
             if isinstance(element.value, ast.Attribute)
             else ""
         )
+        nested_types = _authored_annotation_python_types(element)
+        if len(nested_types) == 1 and nested_types[0] in {
+            "builtins.list", "builtins.tuple", "builtins.set",
+            "builtins.frozenset",
+        }:
+            nested_container = nested_types[0].removeprefix("builtins.")
         if nested_container in {
             "list", "tuple", "Sequence", "Iterable",
             "set", "Set", "frozenset", "FrozenSet",
@@ -6733,6 +6750,39 @@ def _authored_annotation_python_types(annotation: ast.AST) -> tuple[str, ...]:
         "set": "set", "tuple": "tuple",
     }.get(container)
     return () if concrete is None else (f"builtins.{concrete}",)
+
+
+def _authored_annotation_runtime_class_names(annotation: ast.AST) -> frozenset[str]:
+    """Names occupying runtime arms, not classes nested in container elements.
+
+    Annotation provenance includes every named class dependency.  That does
+    not make ``list[Node]`` a union of list and Node.  Keep the provenance
+    join, but select only the names at the annotation's value boundary.
+    """
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            annotation = ast.parse(annotation.value, mode="eval").body
+        except SyntaxError:
+            return frozenset()
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return (_authored_annotation_runtime_class_names(annotation.left)
+                | _authored_annotation_runtime_class_names(annotation.right))
+    if isinstance(annotation, ast.Name):
+        return frozenset((annotation.id,))
+    if isinstance(annotation, ast.Attribute):
+        return frozenset((ast.unparse(annotation),))
+    if isinstance(annotation, ast.Subscript):
+        head = (annotation.value.id if isinstance(annotation.value, ast.Name)
+                else annotation.value.attr if isinstance(annotation.value, ast.Attribute)
+                else "")
+        if head in {"Optional", "Union"}:
+            members = (annotation.slice.elts if isinstance(annotation.slice, ast.Tuple)
+                       else (annotation.slice,))
+            return frozenset().union(*(
+                _authored_annotation_runtime_class_names(member) for member in members
+            ))
+        return _authored_annotation_runtime_class_names(annotation.value)
+    return frozenset()
 
 
 def _authored_fixed_tuple_member_annotations(
@@ -7642,6 +7692,11 @@ def _authored_sequence_record_views(
             if isinstance(annotation.value, ast.Attribute)
             else ""
         )
+        identities = _authored_annotation_python_types(annotation)
+        if len(identities) == 1 and identities[0] in {
+            "builtins.list", "builtins.tuple",
+        }:
+            container = identities[0].removeprefix("builtins.")
         if container not in {"list", "tuple", "Sequence", "Iterable"}:
             return None
         element = annotation.slice
@@ -7670,6 +7725,14 @@ def _authored_sequence_record_views(
                 "mutable": bool(mutable),
                 "source_derived": True,
             }
+            if any(str(field.get("storage")) == "record"
+                   for field in dict(schema.get("fields") or {}).values()):
+                from .extraction_contract import record_row_columns
+                view = views[qualified_name][str(binding_name)]
+                # Reuse the contract's recursive SoA leaf order; a nested
+                # record is not an unknown scalar or an opaque new handle.
+                view["row_columns"] = record_row_columns(schemas, identity)
+                view["program_abi_table_row"] = True
 
         for argument in (
             *definition.args.posonlyargs,
@@ -7905,6 +7968,10 @@ def _record_row_physical_columns(
 ) -> tuple[tuple[str, str], ...]:
     """Return the exact flat ABI columns for one declared record row."""
 
+    if record.get("row_columns"):
+        return tuple((str(column["name"]), str(column["dtype"]))
+                     for column in record["row_columns"])
+
     columns: list[tuple[str, str]] = []
     for field_name, receipt_value in dict(record.get("fields") or {}).items():
         receipt = dict(receipt_value)
@@ -7940,6 +8007,11 @@ def _record_row_sequence_columns(
     record: Mapping[str, Any],
 ) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
     """Logical SoA columns for one record row, retaining shaped fields."""
+
+    if record.get("row_columns"):
+        return tuple((str(column["name"]), str(column["dtype"]),
+                      tuple(map(int, column.get("shape") or ())))
+                     for column in record["row_columns"])
 
     columns: list[tuple[str, str, tuple[int, ...]]] = []
     for field_name, receipt_value in dict(record.get("fields") or {}).items():
@@ -18634,17 +18706,11 @@ def _record_sequence_projection_bindings(
         else:
             _parameter_name, record = selected
             origin_sequence_id = int(iterable_id)
-        field_contracts = tuple(dict(record.get("fields") or {}).items())
+        row_columns = _sequence_record_storage_columns(record)
         field_columns = {}
-        physical_column = 0
-        for field_name, field_receipt in field_contracts:
-            if bool(field_receipt.get("optional")):
-                # Presence precedes value.  Attribute access selects the value
-                # column; an explicit ``is None`` field test can consume the
-                # adjacent presence column without overloading its payload.
-                physical_column += 1
-            field_columns[str(field_name)] = physical_column
-            physical_column += 1
+        for column, (name, _dtype, _shape) in enumerate(row_columns):
+            field_columns.setdefault(name, column)
+        field_dtypes = {name: dtype for name, dtype, _shape in row_columns}
         # Loop targets with the same authored spelling are distinct SSA
         # identities (two separate ``for row in ...`` bindings are the common
         # case).  The graph's GetAttr receiver already carries the exact target
@@ -18660,26 +18726,32 @@ def _record_sequence_projection_bindings(
                 int(origin_sequence_id), int(target_id), str(induction),
                 "induction",
             ))
-        for node_id, data in graph_obj.nodes(data=True):
+        def projected_field_path(
+            node_id: int, active: frozenset[int] = frozenset(),
+        ) -> str | None:
+            # Follow exact receiver edges to this loop's row identity. Names
+            # only select declared leaf columns after that identity matches.
+            if node_id in active or node_id not in graph_obj:
+                return None
+            data = graph_obj.nodes[node_id]
+            if int(data.get("value_id", node_id)) in target_aliases:
+                return ""
             if str(data.get("op") or data.get("type") or "").casefold() != "getattr":
-                continue
-            attribute = str(
-                (data.get("attributes") or {}).get("attribute") or ""
-            )
-            if attribute not in field_columns or not any(
-                int(graph_obj.nodes[parent].get("value_id", parent))
-                in target_aliases
-                and str(role) in {"value", "object", "base", "receiver"}
-                for parent, role in (data.get("parents") or ())
-                if parent in graph_obj
-            ):
+                return None
+            receiver = next((int(parent) for parent, role in data.get("parents") or ()
+                             if str(role) in {"value", "object", "base", "receiver"}), None)
+            prefix = (None if receiver is None else
+                      projected_field_path(receiver, active | {node_id}))
+            if prefix is None:
+                return None
+            attribute = str((data.get("attributes") or {}).get("attribute") or "")
+            return f"{prefix}.{attribute}" if prefix else attribute
+
+        for node_id, data in graph_obj.nodes(data=True):
+            attribute = projected_field_path(int(node_id))
+            if attribute not in field_columns:
                 continue
             result_id = int(data.get("value_id", node_id))
-            receipt = dict(next(
-                field_receipt
-                for field_name, field_receipt in field_contracts
-                if str(field_name) == attribute
-            ))
             bindings.append((
                 int(origin_sequence_id), result_id, str(induction),
                 (
@@ -18691,7 +18763,7 @@ def _record_sequence_projection_bindings(
                 ),
             ))
             fields.append((
-                result_id, attribute, str(receipt.get("dtype") or "unknown")
+                result_id, attribute, str(field_dtypes[attribute])
             ))
     def expression_values(expression):
         if expression is None:
@@ -24901,6 +24973,7 @@ def _class_surface_ssa_program(
                 if isinstance(authored_identity, tuple)
                 and len(authored_identity) == 2 else None
             )
+            runtime_class_names = _authored_annotation_runtime_class_names(annotation)
             declared_class_cells = tuple(dict.fromkeys(
                 source
                 for source, _stage in (
@@ -24908,6 +24981,7 @@ def _class_surface_ssa_program(
                     if parameter_annotation_cell is not None else ()
                 )
                 if source.page == _PARAMETER_CLASS_DECLARATION
+                and str(source.row[-1]) in runtime_class_names
             ))
             declared_types.update(
                 ".".join(map(str, cell.row))
@@ -66507,10 +66581,10 @@ def _lower_ast_source_to_ssa_impl(
                     f"{module_name}.{qualified_name}"
                 )
 
-    def authored_tensor_boundary_values(
+    def authored_span_boundary_values(
         entry: Any, function_graph: Any,
     ) -> dict[str, dict[str, Any]]:
-        """Tensor annotations are ABI declarations only at source entries.
+        """Tensor and primitive span annotations declare source-entry storage.
 
         An entry selected by the caller or supplied as a compositional tensor
         source owns an external call frame. Nested helpers instead receive
@@ -66528,7 +66602,29 @@ def _lower_ast_source_to_ssa_impl(
         }
         if not spellings.intersection(tensor_parameter_boundary_names):
             return {}
-        return _authored_tensor_parameter_value_abi(function_graph)
+        selected = _authored_tensor_parameter_value_abi(function_graph)
+        # An authored text/bytes source entry owns a borrowed glyph/octet
+        # span just as its record-field annotation declares. Publishing only
+        # tensor entry annotations left parameter_abi_kind unresolved while
+        # the physical str row was already span/int64/rank1; its length and
+        # capacity were then misclassified as private frame storage. Reuse
+        # the existing annotation receipt at this boundary, not at nested
+        # helpers where exact call edges may carry a scalar key token.
+        for parameter, spelling in _current_authored_parameter_annotations(
+            function_graph
+        ).items():
+            try:
+                annotation = ast.parse(str(spelling), mode="eval").body
+            except SyntaxError:
+                continue
+            receipt = _authored_annotation_field_receipt(annotation)
+            if receipt is not None and (
+                receipt.get("storage") == "span"
+                and receipt.get("aggregate_kind") in {"str", "bytes", "bytearray"}
+                and not receipt.get("optional")
+            ):
+                selected[str(parameter)] = dict(receipt)
+        return selected
 
     def numeric_parameter_record_views(
         function_graph: Any,
@@ -66616,7 +66712,7 @@ def _lower_ast_source_to_ssa_impl(
         extraction_policy.program_abi.receipt()
     )
     has_authored_tensor_parameters = any(
-        authored_tensor_boundary_values(entry, function_graph)
+        authored_span_boundary_values(entry, function_graph)
         for entry in graph.function_table
         for function_graph in (
             getattr(getattr(entry, "graph", None), "G", None),
@@ -66742,7 +66838,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
-                authored_tensor_boundary_values(
+                authored_span_boundary_values(
                     entry, function_graph,
                 ).items()
                 if parameter in parameters
@@ -66926,7 +67022,7 @@ def _lower_ast_source_to_ssa_impl(
             selected_values = {
                 parameter: dict(receipt)
                 for parameter, receipt in
-                authored_tensor_boundary_values(
+                authored_span_boundary_values(
                     entry, function_graph,
                 ).items()
                 if parameter in parameters
