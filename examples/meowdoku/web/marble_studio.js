@@ -1,3 +1,4 @@
+import {mountStudioAutofocus} from './marble_autofocus.js';
 import {shiftedProjection,studioCameraPose} from './marble_camera_movements.js';
 import {STUDIO_SCENE_PART_GROUP,computeStudioFixtureRoles,buildStudioFixtureFaces,createStudioSceneGeometry,buildStudioPhotoFixtures,initializeStudioFixtureRows} from './studio_scene_builder.js';
 // Reuse the server loading panel; its boot hold covers Studio asset/GPU setup.
@@ -90,6 +91,10 @@ const exposureClock={active:false,dt:0,modelNow:0,waiters:[],
 const photo = createMarblePhoto(document, currentCameraOptions,
   () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock,
   ()=>triggerGrid?.graph(),()=>triggerGrid?.generators());
+const autofocus=mountStudioAutofocus({doc:document,canvas,photo,getScene:captureCurrentStudioScene,
+  getKey:()=>JSON.stringify([lastStudioFrame?.revision,lastStudioFrame?.view,lastStudioFrame?.model,lastStudioFrame?.fovDegrees,lastStudioFrame?.aspect,lastStudioFrame?.tilt_shift,lastStudioFrame?.lighting]),
+});
+window.addEventListener('pagehide',e=>{if(e.persisted)autofocus.cancel();else autofocus.dispose();});
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),
@@ -1615,6 +1620,7 @@ function frame(now=0) {
     try {dofCamera=photo.applyLensCamera(dofCamera,w/h);lastDofOptics={fov_degrees:dofCamera.fov_degrees,
       focus_distance_m:dofCamera.focus_distance_m,aperture_radius_m:dofCamera.aperture_radius_m};}
     catch(error){opticsError=error.message;if(lastDofOptics)dofCamera={...dofCamera,...lastDofOptics};}
+    dofCamera=autofocus.camera(dofCamera);
     const viewFovDegrees=dofCamera.fov_degrees;
     const clip=studioCameraClip(subject,cameraDistance,studioRoomBounds(studioRoomScale(),studioFloorDrop()),studioOrbitTarget);
     const viewFar=simOn?30:clip.far,viewNear=chase?Math.min(.01,chase.radius*.2):simOn ? .01 : clip.near;
@@ -1840,11 +1846,13 @@ function frame(now=0) {
         `Phong DOF: focus ${(dofCamera.focus_distance_m*1000).toFixed(1)} mm, pupil diameter ${(dofCamera.aperture_radius_m*2000).toFixed(2)} mm. Opaque-depth approximation; 64 px blur-radius limit.`);
     }catch(error){studioDof.cancel();$("studio-dof").checked=false;dofStatus(`Phong DOF unavailable: ${error.message}`);}
     else if(!$("studio-dof")?.checked&&!$("studio-dof-status")?.textContent.startsWith("Phong DOF unavailable"))dofStatus("Phong DOF off. Photos and live rays retain their lens settings.");
+    if(dofActive && !opticsError)autofocus.frame(dofCamera);
   }
     // Copies the finished primary/secondary/DOF output, never the ray overlay.
     if(P&&interior)phongCapture.frame();
     if(message.textContent.startsWith('Studio preview unavailable: '))message.textContent='';
   } catch(error) {
+    autofocus.cancel(`Autofocus stopped: ${error.message}`);
     phongCapture.fail(error);
     lastStudioFrame=null;message.textContent='Studio preview unavailable: '+(error.message||String(error));
   } finally {secondaryField?.cancel();if(dofActive)studioDof.cancel();P=ordinaryPrimary;if(P)gl.useProgram(P);}

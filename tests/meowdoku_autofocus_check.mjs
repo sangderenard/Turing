@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import {autofocusSamples,autofocusCoverage,autofocusCandidates,autofocusContrast} from '../examples/meowdoku/web/marble_autofocus.js';
+const camera={focus_distance_m:.1,aperture_radius_m:.002,fov_degrees:50};
+const rays=autofocusSamples();
+assert.equal(rays.length,9);assert.equal(rays[4].weight,1);assert.equal(rays[0].weight,rays[8].weight);
+const samples=rays.map(s=>({...s,depth:.1}));
+assert.equal(autofocusCoverage(samples,camera,.1,1080,1),1);
+assert.equal(autofocusCoverage(samples,camera,1,1080,1),0);
+const candidates=autofocusCandidates(samples,camera,{height:1080,aspect:1});
+assert.ok(candidates.length>0);assert.ok(candidates.every(c=>c.coverage===1));
+assert.ok(candidates.some(c=>Math.abs(c.focus-.1)<1e-12));
+const mixed=rays.map((s,i)=>({...s,depth:i<3?.12:.1}));
+const narrow=autofocusCandidates(mixed,camera,{height:1080,aspect:1});
+const small=autofocusCandidates(mixed,{...camera,aperture_radius_m:.00001},{height:1080,aspect:1});
+assert.ok(small[0].coverage>narrow[0].coverage,'stopping down increases achievable coverage');
+const tilted={...camera,lens_tilt:[.1,.2],tilt_shift:[.1,-.1]};
+const tiltedSamples=rays.map(s=>{const t=Math.tan(camera.fov_degrees*Math.PI/360);return {...s,depth:.1/(1-(2*s.u-1+.1)*t*Math.tan(.2)-(1-2*s.v-.1)*t*Math.tan(.1))};});
+assert.equal(autofocusCoverage(tiltedSamples,tilted,.1,1080,1),1);
+const flat={width:8,height:8,data:new Uint8ClampedArray(8*8*4).fill(100)};
+assert.equal(autofocusContrast(flat),0);
+const edged={...flat,data:flat.data.slice()};for(let y=0;y<8;y++)for(let x=4;x<8;x++)for(let c=0;c<3;c++)edged.data[(y*8+x)*4+c]=200;
+assert.ok(autofocusContrast(edged)>0);
+assert.throws(()=>autofocusCandidates([],camera,{height:1080,aspect:1}));
+assert.throws(()=>autofocusCandidates(samples,{...camera,aperture_radius_m:0},{height:1080,aspect:1}));
+console.log('Autofocus Gaussian rays, coverage intervals, aperture, tilt/shift, image feedback and invalid input checks passed.');
+// Controller lifecycle uses a DOM/canvas adapter, not a real-browser claim.
+import {mountStudioAutofocus} from '../examples/meowdoku/web/marble_autofocus.js';
+class E {constructor(){this.handlers=new Map();this.checked=true;this.value='unchanged';}addEventListener(t,f){this.handlers.set(t,[...(this.handlers.get(t)||[]),f]);}removeEventListener(t,f){this.handlers.set(t,(this.handlers.get(t)||[]).filter(x=>x!==f));}emit(t,target=this){for(const f of this.handlers.get(t)||[])f({target});}closest(){return null;}}
+const elements=new Map(['studio-autofocus','studio-autofocus-run','studio-autofocus-status','studio-dof','photo-lens'].map(k=>[k,new E()]));
+const doc=new E(),canvas=new E();canvas.width=canvas.height=160;
+let current=camera,applied=null,key='one',clock=0,calls=0;
+doc.getElementById=id=>elements.get(id);
+doc.createElement=()=>({getContext:()=>({drawImage(){},getImageData(x,y,width,height){const data=new Uint8ClampedArray(width*height*4);const amplitude=Math.max(1,200-10000*Math.abs(current.focus_distance_m-.1));for(let y=0;y<height;y++)for(let x=width/2|0;x<width;x++)for(let c=0;c<3;c++)data[4*(y*width+x)+c]=amplitude;return {data,width,height};}})});
+const controller=mountStudioAutofocus({doc,canvas,getScene:()=>({}),getKey:()=>key,now:()=>clock,photo:{lensMinimumFocus:()=>.001,focusLensAt:(f,o)=>{applied={f,o};}},createBackend:async()=>({query:async()=>{calls++;return {hits:[{axialDistanceM:.1,behindOpaque:false}]};},close(){}})});
+current=controller.camera(camera);controller.frame(current);clock=800;controller.frame(current);
+for(let i=0;i<30;i++)await Promise.resolve();assert.equal(calls,9);
+for(let i=0;i<100&&!applied;i++){current=controller.camera(camera);controller.frame(current);}
+assert.ok(applied);assert.equal(applied.o.camera.aperture_radius_m,camera.aperture_radius_m);assert.ok(Math.abs(applied.f-.1)<.005);
+applied=null;elements.get('studio-autofocus-run').emit('click');for(let i=0;i<30;i++)await Promise.resolve();key='changed';current=controller.camera(camera);controller.frame(current);assert.equal(applied,null);assert.equal(controller.camera(camera),camera);
+elements.get('studio-autofocus-run').emit('click');doc.emit('input');for(let i=0;i<30;i++)await Promise.resolve();assert.equal(elements.get('studio-autofocus').checked,false);assert.equal(controller.camera(camera),camera);controller.dispose();
+console.log('Autofocus controller: one-shot, nine existing queries, image feedback, final lens application, stale rejection, manual cancellation and disposal passed (DOM adapter).');

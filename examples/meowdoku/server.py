@@ -1772,7 +1772,7 @@ def make_handler(sessions: Sessions):
             if not getattr(self, "path", "").startswith(("/api/", "/browse")):    # [LISTING] /browse sets its own no-store
                 path = getattr(self, "path", "").split("?", 1)[0]
                 self.send_header("Cache-Control", "no-store" if path in
-                                 ("/marble_studio.html", "/marble_studio.js", "/marble_drive_input.js", "/marble_chase_camera.js", "/marble_studio_scene.js", "/marble_studio_transition.js", "/marble_studio_phong.js", "/marble_studio_dof.js", "/marble_camera_toolbox.js", "/marble_camera_toolbox_mount.js", "/marble_spot_sample.js", "/marble_rangefinder.js", "/marble_rangefinder_panel.js", "/marble_camera_binding.js", "/marble_object.js",
+                                 ("/marble_studio.html", "/marble_studio.js", "/marble_drive_input.js", "/marble_chase_camera.js", "/marble_studio_scene.js", "/marble_studio_transition.js", "/marble_studio_phong.js", "/marble_studio_dof.js", "/marble_autofocus.js", "/marble_camera_toolbox.js", "/marble_camera_toolbox_mount.js", "/marble_spot_sample.js", "/marble_rangefinder.js", "/marble_rangefinder_panel.js", "/marble_camera_binding.js", "/marble_object.js",
                                   "/marble_mesh.js", "/dice_mesh.js", "/marble_photo.js", "/marble_live.js", "/marble_downloads.js", "/marble_autosave.js", "/marble_object_snapshot.js", "/marble_imported_object.js", "/marble_geometry_policy.js", "/marble_film_response.js", "/marble_film_science.js",
                                   "/marble_room.js", "/marble_studio_lighting.js", "/marble_light_strengths.js", "/marble_backdrop.js",
                                   "/marble_glass_preview.js", "/marble_materials.js", "/marble_studio_surfaces.js",

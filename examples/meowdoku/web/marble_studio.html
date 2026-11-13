@@ -362,6 +362,11 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
       <label>Focal length / zoom (mm)<input id="photo-focal-mm" type="number" min="10.069" max="500" step="any" value="75.76501818" disabled><input id="photo-focal-slider" aria-label="Focal length and zoom" type="range" min="10.07" max="500" step="any" value="75.76501818" disabled></label>
       <label>Aperture (f-number)<input id="photo-f-number" type="number" min="1" max="64" step="any" value="18.94125455" disabled><input id="photo-aperture-slider" aria-label="Aperture f-number, logarithmic slider" type="range" min="0" max="6" step="0.001" value="4.24346" disabled></label>
       <button id="photo-frame-focus" type="button" class="wide">Frame &amp; focus marble</button>
+      <div id="studio-autofocus-controls" class="wide">
+        <label><input id="studio-autofocus" type="checkbox" checked> Auto focus once when the scene settles</label>
+        <button id="studio-autofocus-run" type="button">Focus now</button>
+        <output id="studio-autofocus-status" role="status">Gaussian scene rays, then Phong contrast search. Manual controls release autofocus. Aperture stays unchanged.</output>
+      </div>
       <button id="photo-focus-target" type="button" class="wide">Focus camera target (Custom analytical)</button>
       <p id="photo-focus-diagnostic" class="wide" role="status" aria-live="polite"></p>
       <label>Shift (sensor half-size) X<input id="photo-shift-x" type="number" min="-1" max="1" step="0.01" value="0"></label>
