@@ -36,6 +36,6 @@ current=controller.camera(camera);controller.frame(current);clock=800;controller
 for(let i=0;i<30;i++)await Promise.resolve();assert.equal(calls,9);
 for(let i=0;i<100&&!applied;i++){current=controller.camera(camera);controller.frame(current);}
 assert.ok(applied);assert.equal(applied.o.camera.aperture_radius_m,camera.aperture_radius_m);assert.ok(Math.abs(applied.f-.1)<.005);
-applied=null;elements.get('studio-autofocus-run').emit('click');for(let i=0;i<30;i++)await Promise.resolve();key='changed';current=controller.camera(camera);controller.frame(current);assert.equal(applied,null);assert.equal(controller.camera(camera),camera);
+applied=null;const before=calls;elements.get('studio-autofocus-run').emit('click');assert.equal(calls,before,'manual search waits for displayed frame');current=controller.camera(camera);controller.frame(current);for(let i=0;i<30;i++)await Promise.resolve();key='changed';current=controller.camera(camera);controller.frame(current);assert.equal(applied,null);assert.equal(controller.camera(camera),camera);
 elements.get('studio-autofocus-run').emit('click');doc.emit('input');for(let i=0;i<30;i++)await Promise.resolve();assert.equal(elements.get('studio-autofocus').checked,false);assert.equal(controller.camera(camera),camera);controller.dispose();
 console.log('Autofocus controller: one-shot, nine existing queries, image feedback, final lens application, stale rejection, manual cancellation and disposal passed (DOM adapter).');

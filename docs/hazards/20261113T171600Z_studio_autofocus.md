@@ -52,3 +52,32 @@ service modification. The isolated localhost test server was stopped and its
 browser tab closed. Subsequent controller-only coarse-to-fine/cancellation edits
 were retested in the DOM adapter; the original GPU geometry/metric remains as
 measured. This receipt is not a claim that the complete feature is deployed.
+
+## Isolated full-page QA follow-up
+
+Actual Chrome Studio page with original published assets rendered 72,960 triangles.
+Initial default autofocus completed at 1590.35 mm with 73.5% weighted sampled
+coverage within one preview pixel. Existing photo controls changed to Custom
+analytical and the same axial focus. Manual focus input disabled automatic mode.
+
+Found and repaired an interaction race: Focus now must wait for the next completed
+Studio frame, not try capturing from the click handler after an edit. It now queues
+on the existing frame callback. Regression test checks no ray query before that frame.
+After repair, actual manual search completed at 975.20 mm with 73.5% coverage;
+Cancel focus search then preserved 975.196016622237 mm. A separate run hit the
+30-second guard and retained its authored focus. The search is bounded, not guaranteed
+to complete under every GPU load. UI screenshots were inspected, including scene
+and cancellation status. Test tab closed and own static server stopped.
+
+Backend limitation: attempted fresh-state dev server startup with --no-wasm still
+entered prepare_lanes and began a damped_axis compilation. Stopped that owned process
+promptly; no further backend start or compiler run. The actual UI test instead used
+Python static serving on loopback with no mocked API responses: catalogue, accounts,
+and photo jobs API were unavailable (404). Thus authenticated server integration and
+ray submission/render acceptance remain UNTESTED. No live service was restarted or
+modified. No ray-traced render was requested.
+
+Shared focus path confirmed in source: photo.focusLensAt delegates to existing
+lensControls.focusAt; photographic options use the same lensControls.applyCamera
+before contract submission (marble_photo.js). Existing lens-control tests pass.
+This is source/unit verification, not evidence of a rendered ray exposure.

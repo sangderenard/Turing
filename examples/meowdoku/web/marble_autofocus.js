@@ -53,11 +53,11 @@ export function autofocusContrast({data,width,height}) {
 export function mountStudioAutofocus({doc,canvas,getScene,getKey,photo,
   createBackend=()=>StudioRangefinder.create(new URL('./client-ray-plain/',import.meta.url)),now=()=>performance.now()}) {
   const enabled=doc.getElementById('studio-autofocus'),button=doc.getElementById('studio-autofocus-run'),status=doc.getElementById('studio-autofocus-status');
-  let backend=null,creating=null,run=null,attempted=false,stableKey=null,stableSince=0,lastCamera=null,disposed=false;
+  let backend=null,creating=null,run=null,requestedFrame=false,attempted=false,stableKey=null,stableSince=0,lastCamera=null,disposed=false;
   const preview=doc.createElement('canvas');preview.width=160;preview.height=160;
   const context=preview.getContext('2d',{willReadFrequently:true});
   const say=text=>{status.textContent=text;};
-  function cancel(text){if(run){run.abort.abort();run=null;}button.textContent='Focus now';if(text)say(text);}
+  function cancel(text){requestedFrame=false;if(run){run.abort.abort();run=null;}button.textContent='Focus now';if(text)say(text);}
   async function start(camera,key){
     if(run||disposed)return;attempted=true;
     if(!doc.getElementById('studio-dof')?.checked){say('Enable Phong depth of field to search the actual preview.');return;}
@@ -93,13 +93,14 @@ export function mountStudioAutofocus({doc,canvas,getScene,getKey,photo,
   canvas.addEventListener('pointerdown',manual);canvas.addEventListener('wheel',manual);
   const toggle=()=>{cancel();attempted=!enabled.checked;stableSince=now();};
   enabled.addEventListener('change',toggle);
-  const requested=()=>{if(run){cancel('Autofocus canceled; original focus retained.');return;}if(lastCamera)start(lastCamera,getKey());};
+  const requested=()=>{if(run||requestedFrame){cancel('Autofocus canceled; original focus retained.');return;}requestedFrame=true;button.textContent='Cancel focus search';say('Autofocus: waiting for the next completed Studio frame.');};
   button.addEventListener('click',requested);
   return {
     camera(camera){lastCamera=camera;return run?.candidate?{...camera,focus_distance_m:run.candidate}:camera;},
     frame(camera){
       if(disposed)return;
       const key=getKey();
+      if(requestedFrame){requestedFrame=false;start(camera,key);return;}
       if(run){
         const task=run;
         if(key!==task.key||now()-task.started>30000){cancel('Autofocus stopped: scene changed or the 30-second search budget expired.');return;}
