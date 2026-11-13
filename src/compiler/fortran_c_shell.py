@@ -7725,6 +7725,14 @@ def _authored_sequence_record_views(
                 "mutable": bool(mutable),
                 "source_derived": True,
             }
+            if any(str(field.get("storage")) == "record"
+                   for field in dict(schema.get("fields") or {}).values()):
+                from .extraction_contract import record_row_columns
+                view = views[qualified_name][str(binding_name)]
+                # Reuse the contract's recursive SoA leaf order; a nested
+                # record is not an unknown scalar or an opaque new handle.
+                view["row_columns"] = record_row_columns(schemas, identity)
+                view["program_abi_table_row"] = True
 
         for argument in (
             *definition.args.posonlyargs,
@@ -7960,6 +7968,10 @@ def _record_row_physical_columns(
 ) -> tuple[tuple[str, str], ...]:
     """Return the exact flat ABI columns for one declared record row."""
 
+    if record.get("row_columns"):
+        return tuple((str(column["name"]), str(column["dtype"]))
+                     for column in record["row_columns"])
+
     columns: list[tuple[str, str]] = []
     for field_name, receipt_value in dict(record.get("fields") or {}).items():
         receipt = dict(receipt_value)
@@ -7995,6 +8007,11 @@ def _record_row_sequence_columns(
     record: Mapping[str, Any],
 ) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
     """Logical SoA columns for one record row, retaining shaped fields."""
+
+    if record.get("row_columns"):
+        return tuple((str(column["name"]), str(column["dtype"]),
+                      tuple(map(int, column.get("shape") or ())))
+                     for column in record["row_columns"])
 
     columns: list[tuple[str, str, tuple[int, ...]]] = []
     for field_name, receipt_value in dict(record.get("fields") or {}).items():
@@ -18659,17 +18676,11 @@ def _record_sequence_projection_bindings(
         else:
             _parameter_name, record = selected
             origin_sequence_id = int(iterable_id)
-        field_contracts = tuple(dict(record.get("fields") or {}).items())
+        row_columns = _sequence_record_storage_columns(record)
         field_columns = {}
-        physical_column = 0
-        for field_name, field_receipt in field_contracts:
-            if bool(field_receipt.get("optional")):
-                # Presence precedes value.  Attribute access selects the value
-                # column; an explicit ``is None`` field test can consume the
-                # adjacent presence column without overloading its payload.
-                physical_column += 1
-            field_columns[str(field_name)] = physical_column
-            physical_column += 1
+        for column, (name, _dtype, _shape) in enumerate(row_columns):
+            field_columns.setdefault(name, column)
+        field_dtypes = {name: dtype for name, dtype, _shape in row_columns}
         # Loop targets with the same authored spelling are distinct SSA
         # identities (two separate ``for row in ...`` bindings are the common
         # case).  The graph's GetAttr receiver already carries the exact target
@@ -18685,26 +18696,32 @@ def _record_sequence_projection_bindings(
                 int(origin_sequence_id), int(target_id), str(induction),
                 "induction",
             ))
-        for node_id, data in graph_obj.nodes(data=True):
+        def projected_field_path(
+            node_id: int, active: frozenset[int] = frozenset(),
+        ) -> str | None:
+            # Follow exact receiver edges to this loop's row identity. Names
+            # only select declared leaf columns after that identity matches.
+            if node_id in active or node_id not in graph_obj:
+                return None
+            data = graph_obj.nodes[node_id]
+            if int(data.get("value_id", node_id)) in target_aliases:
+                return ""
             if str(data.get("op") or data.get("type") or "").casefold() != "getattr":
-                continue
-            attribute = str(
-                (data.get("attributes") or {}).get("attribute") or ""
-            )
-            if attribute not in field_columns or not any(
-                int(graph_obj.nodes[parent].get("value_id", parent))
-                in target_aliases
-                and str(role) in {"value", "object", "base", "receiver"}
-                for parent, role in (data.get("parents") or ())
-                if parent in graph_obj
-            ):
+                return None
+            receiver = next((int(parent) for parent, role in data.get("parents") or ()
+                             if str(role) in {"value", "object", "base", "receiver"}), None)
+            prefix = (None if receiver is None else
+                      projected_field_path(receiver, active | {node_id}))
+            if prefix is None:
+                return None
+            attribute = str((data.get("attributes") or {}).get("attribute") or "")
+            return f"{prefix}.{attribute}" if prefix else attribute
+
+        for node_id, data in graph_obj.nodes(data=True):
+            attribute = projected_field_path(int(node_id))
+            if attribute not in field_columns:
                 continue
             result_id = int(data.get("value_id", node_id))
-            receipt = dict(next(
-                field_receipt
-                for field_name, field_receipt in field_contracts
-                if str(field_name) == attribute
-            ))
             bindings.append((
                 int(origin_sequence_id), result_id, str(induction),
                 (
@@ -18716,7 +18733,7 @@ def _record_sequence_projection_bindings(
                 ),
             ))
             fields.append((
-                result_id, attribute, str(receipt.get("dtype") or "unknown")
+                result_id, attribute, str(field_dtypes[attribute])
             ))
     def expression_values(expression):
         if expression is None:
