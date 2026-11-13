@@ -359,7 +359,8 @@ async function main() {
   const caps = new Set(who.capabilities || []);
 
   if (!who.signed_in) {
-    actions.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }));
+    actions.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }),
+      el("a", { class: "chip quiet", href: "/register.html", text: "Register" }));   // MOCKUP: registration is by invitation
     reserveSpace();
     return;
   }
@@ -440,6 +441,7 @@ async function main() {
     link("Marble studio", "/marble_studio.html", caps.has("dev_ui")),
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
     link("Account and password", "/login.html"),
+    link("Invite someone", "/invite.html"),                                         // MOCKUP: any account may invite
   ]) if (item) menu.append(item);
   if (caps.has("dev_ui")) {
     menu.append(el("div", { class: "sep" }), el("div", { class: "head", text: "Server: " + (who.instance || serverName) }),
