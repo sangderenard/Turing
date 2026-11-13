@@ -121,6 +121,38 @@ def materialize_owned_record_transfers(module, function_name):
         end_identity_book(token)
 
 
+def integrate_owned_record_public_returns(module, outputs, exports):
+    """Finalize only explicitly exported, independently proven source roots.
+
+    Unsupported sources remain unchanged and retain the existing backend
+    escape refusal. A materialized projection must be admitted completely;
+    failures are never swallowed as an unsupported source.
+    """
+    from .source_owned_record_projection_validation import publish_record_owned_public_returns
+    book = module.metadata['identity_book']
+    completed = []
+    for export in dict.fromkeys(map(str, exports)):
+        if public_source_entry(module, export) is None:
+            continue
+        projected = materialize_owned_record_transfers(module, export)
+        if not projected:
+            continue
+        admitted = publish_record_owned_public_returns(module, export)
+        if {cell.row for cell in admitted} != {cell.row for cell in projected}:
+            raise ValueError('materialized owned record return lacks complete public admission')
+        function = module.functions[export]
+        arguments = {int(value.id): value for value in function.args}
+        replacements = {}
+        for cell in projected:
+            fact = book.page(cell.page).cell(cell.row, cell.column)
+            replacements[fact.source_sequence_id] = arguments[int(cell.row[1])]
+        if export in outputs:
+            outputs[export] = type(outputs[export])(
+                replacements.get(int(value.id), value) for value in outputs[export])
+        completed.extend(admitted)
+    return tuple(completed)
+
+
 def _materialize_verified_plans(module, name, plans, elements, writers, book):
     from dataclasses import replace
     from ..transmogrifier.ssa import SSAValue, Instr, SSARecordFieldStorage

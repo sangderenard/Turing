@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from tests.test_owned_record_return_source import SOURCE
 from src.compiler.extraction_contract import ExtractionContract
-from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from tests.owned_record_test_support import lower_before_owned_record_boundary as lower_ast_source_to_ssa
 from src.compiler.source_owned_record_projection import (public_source_entry,
     public_source_entry_findings, validated_public_source_entry)
 

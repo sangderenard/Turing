@@ -1,7 +1,7 @@
 """Exact constructor return evidence is distinct from a transfer permission."""
 from pathlib import Path
 from src.compiler.extraction_contract import ExtractionContract
-from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from tests.owned_record_test_support import lower_before_owned_record_boundary as lower_ast_source_to_ssa
 from src.compiler.ssa_storage_requirements import public_owned_sequence_returns
 
 SOURCE = """from dataclasses import dataclass

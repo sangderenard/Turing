@@ -68360,6 +68360,12 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
 
             publish_module_structures(module)
             module.metadata["identity_book"].settle_derivations()
+            # Public owned-record transfers are final root ABI projections,
+            # after call/loop/frame settlement and before the final audit.
+            # Their source proof independently excludes private/internal roots.
+            if isinstance(result, tuple) and len(result) == 3:
+                from .source_owned_record_transfer import integrate_owned_record_public_returns
+                integrate_owned_record_public_returns(module, result[1], result[2])
             try:
                 from .identity_concordance import CorrelationTable
                 _bars.substage("build final concordance correlation table")

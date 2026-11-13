@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 import pytest
 from src.compiler.extraction_contract import ExtractionContract
-from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from tests.owned_record_test_support import lower_before_owned_record_boundary as lower_ast_source_to_ssa
 from src.compiler.source_owned_record_returns import owned_record_return_sources
 from src.compiler.source_owned_record_elements import owned_record_primitive_element
 

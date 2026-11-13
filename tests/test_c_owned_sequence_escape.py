@@ -9,7 +9,8 @@ from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 
 def test_selected_owned_record_return_requires_public_escape(tmp_path):
     from tests.test_owned_record_return_source import SOURCE
-    m,_,names=lower_ast_source_to_ssa(SOURCE,'root',extraction_contract=ExtractionContract(
+    from tests.owned_record_test_support import lower_before_owned_record_boundary
+    m,_,names=lower_before_owned_record_boundary(SOURCE,'root',extraction_contract=ExtractionContract(
         Path(__file__).resolve().parents[1]/'extraction_contracts/program_extraction.yaml'),progress=lambda _:None,progress_bars=False)
     artifact=emit_ssa_module_to_c(m,names[0])
     assert not artifact.complete
