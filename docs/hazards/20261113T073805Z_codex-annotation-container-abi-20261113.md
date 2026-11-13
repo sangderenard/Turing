@@ -1,0 +1,9 @@
+# Membership queries retain their exact comprehension owner
+
+Observed in compile_nodes: the membership test for k in node_keys was inserted in the enclosing if arm before the comprehension that defines k. The lexical inserter recognized arg:* dependencies but not comparison lhs/rhs and selected a conditional arm without descending into its retained target-owning loop. The result was an unexplained root formal for k, correctly refused by concordance. Numeric-only reduced cases reproduce it.
+
+Repair: include exact comparison operands when resolving existing loop_target_bindings. When the chosen branch contains that one exact retained owner loop, insert within the loop; if the branch is itself inside the loop, keep the query in that branch. No new binding, source identity, or value substitution is invented. Ambiguous owners retain existing conservative placement/refusal.
+
+Verification: six native tests pass for in/not-in with plain comprehensions, an outer conditional, and a conditional inside a loop. Cases include empty collections, duplicates, negative numbers, disabled branches, repeated calls and unchanged caller buffers. Expanded loop-composer plus literal-filter suite:100 passed,20 failed. Immediate HEAD comparison:96 passed,24 failed. Exactly four new plain/outer-guard tests are fixed; the two inner-guard tests already pass; no candidate-only failure. Mapping audit:28 rows across2 functions,zero findings,zero unsourced,latch CLOSED.
+
+Actual GraphSolver compile_nodes now passes final concordance and reaches LLVM emission. It is NOT runnable: emission still refuses the optional list iterable-extent Call, the constructed returned result with no public extent, and a private sequence with no proven capacity. These are three different shortfalls, not three Calls (the divider summary displays only the first). Direct list[str] membership separately exposes a stale formal-occurrence IndexError. No push, merge or deployment.
