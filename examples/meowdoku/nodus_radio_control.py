@@ -21,6 +21,7 @@ class Manager:
     def __init__(self, config_path, jobs, *, subscription=Subscription, playback=Playback):
         self.config_path, self.jobs = Path(config_path), jobs
         self.subscription, self.playback = subscription, playback
+        self.source_provider = None
         self.lock = threading.Lock()
         self.worker = None
         self.cancel = threading.Event()
@@ -36,19 +37,20 @@ class Manager:
         pa = config.get('playback', {})
         if config.get('enabled') is not True or config.get('source') != 'file' or pa.get('enabled') is not True:
             raise ControlError('Radio PA is disabled; an operator must select a file-source station', 503)
-        for key in ('router_port', 'listen_port', 'peer_port'):
+        follow = self.source_provider is not None
+        for key in (() if follow else ('router_port', 'listen_port', 'peer_port')):
             if type(pa.get(key)) is not int or not 0 < pa[key] < 65536:
                 raise ControlError('Invalid configured Radio PA port', 503)
-        if type(pa.get('ssrc')) is not int or not 0 <= pa['ssrc'] <= 0xffffffff:
+        if not follow and (type(pa.get('ssrc')) is not int or not 0 <= pa['ssrc'] <= 0xffffffff):
             raise ControlError('Invalid configured Radio PA source', 503)
-        if pa.get('peer_host') != '127.0.0.1':
+        if not follow and pa.get('peer_host') != '127.0.0.1':
             raise ControlError('Radio PA currently requires the private loopback producer', 503)
         if type(pa.get('device_id')) is not int or not 0 <= pa['device_id'] <= 0xffffffff:
             raise ControlError('Invalid configured Radio PA device', 503)
         executable = pa.get('executable')
         if not isinstance(executable, str) or not Path(executable).is_absolute() or not Path(executable).is_file():
             raise ControlError('The configured native Radio PA sink is unavailable', 503)
-        return pa
+        return dict(pa, follow_jukebox=follow)
 
     def status(self, owner):
         with self.lock:
@@ -98,6 +100,18 @@ class Manager:
         sub = sink = None
         error = None
         try:
+            if config.get('follow_jukebox'):
+                sub = self.source_provider.subscribe_pcm()
+                if self.cancel.is_set(): return
+                sink = self.playback(config['executable'], device_id=config['device_id'])
+                sink.start()
+                with self.lock:
+                    if self.cancel.is_set(): return
+                    self.state['status'] = 'playing'
+                while not self.cancel.is_set():
+                    block = sub.take()
+                    if block is not None: sink.write(block)
+                return
             sub = self.subscription(router_port=config['router_port'], listen_port=config['listen_port'],
                 peer=(config['peer_host'], config['peer_port']), ssrc=config['ssrc'])
             if not sub.ready.wait(3) or sub.error:

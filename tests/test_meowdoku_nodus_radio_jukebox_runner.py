@@ -54,6 +54,14 @@ class RunnerTests(unittest.TestCase):
         self.store.request(1,'a');runner.resume(9);self.assertTrue(entered.wait(2));runner.skip(9)
         self.wait(self.finished)
         with self.store.connect() as db:self.assertEqual(db.execute('SELECT status FROM radio_plays').fetchone()[0],'skipped')
+    def test_pcm_tap_is_bounded_and_close_releases_pending(self):
+        from meowdoku.nodus_radio_jukebox_runner import PcmTap
+        tap=PcmTap()
+        for _ in range(65):tap.put(b'1234')
+        self.assertEqual(tap.blocks.qsize(),64)
+        with self.assertRaisesRegex(RuntimeError,'fell behind'):tap.take()
+        tap.close();self.assertEqual(tap.blocks.qsize(),0)
+
     def test_previous_current_refuses_implicit_replay(self):
         self.store.request(1,'a');self.store.pause(9,False);self.store.claim()
         runner=Runner(self.store,self.config,self.jobs,track=Mock())

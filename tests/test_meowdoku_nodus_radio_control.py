@@ -51,6 +51,22 @@ class ControlTests(unittest.TestCase):
         self.manager.start(7);self.manager.worker.join(2)
         self.sub.close.assert_called_once();self.jobs.end.assert_called_once()
         self.assertEqual(self.manager.status(7)['status'],'failed')
+    def test_jukebox_tap_follows_tracks_without_new_receiver_or_autoplay(self):
+        from meowdoku.nodus_radio_jukebox_runner import PcmTap
+        tap=PcmTap();provider=Mock();provider.subscribe_pcm.return_value=tap
+        self.manager.source_provider=provider
+        self.manager.status(7);provider.subscribe_pcm.assert_not_called()
+        self.manager.start(7)
+        first=b'\1\0\2\0';second=b'\3\0\4\0'
+        tap.put(first);tap.put(second)
+        import time
+        end=time.monotonic()+2
+        while self.sink.write.call_count<2 and time.monotonic()<end:time.sleep(.005)
+        self.assertEqual([c.args[0] for c in self.sink.write.call_args_list],[first,second])
+        self.manager.stop(7);self.manager.close()
+        self.assertTrue(tap.closed);self.sf.assert_not_called()
+        self.sink.start.assert_called_once();self.sink.stop.assert_called_once()
+
     def handler(self, user=7, caps=('account_manage',), body=None):
         h=Mock();h._principal.return_value=SimpleNamespace(user_id=user);h._caps.return_value=caps
         h._is_secure.return_value=True;h._body_json.return_value=body or {'action':'start'}

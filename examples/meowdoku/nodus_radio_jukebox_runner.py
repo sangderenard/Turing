@@ -23,6 +23,7 @@ class NativeTrack:
         self.lines = queue.Queue(maxsize=64)
         self.reader = None
         self.spectrum_peer = None
+        self.on_pcm = None
         self.config, self.song = config, song
         self.subscription, self.popen = subscription, popen
 
@@ -69,7 +70,8 @@ class NativeTrack:
         exit_at = None
         while not cancel.is_set():
             if self.sub.error: raise RuntimeError(self.sub.error)
-            self.sub.take_due()
+            block = self.sub.take_due()
+            if block is not None and self.on_pcm is not None: self.on_pcm(block)
             ended = self.sub.buffer.status()['ended']
             code = self.process.poll()
             if code is not None:
@@ -91,6 +93,31 @@ class NativeTrack:
         if self.sub is not None: self.sub.close()
 
 
+class PcmTap:
+    """Bounded fanout of already paced PCM, not a second jitter/transport engine."""
+    def __init__(self):
+        self.blocks = queue.Queue(maxsize=64)
+        self.error = None
+        self.closed = False
+
+    def put(self, block):
+        if self.closed or self.error: return
+        try: self.blocks.put_nowait(block)
+        except queue.Full: self.error = 'PA reader fell behind the bounded PCM feed'
+
+    def take(self, timeout=.05):
+        if self.error: raise RuntimeError(self.error)
+        if self.closed: raise RuntimeError('Jukebox PCM feed closed')
+        try: return self.blocks.get(timeout=timeout)
+        except queue.Empty: return None
+
+    def close(self):
+        self.closed = True
+        while True:
+            try: self.blocks.get_nowait()
+            except queue.Empty: break
+
+
 class Runner:
     def __init__(self, store, config_path, jobs, *, track=NativeTrack):
         self.store, self.config_path, self.jobs, self.track = store, Path(config_path), jobs, track
@@ -102,6 +129,18 @@ class Runner:
         self.error = None
         self.current_track = None
         self.current_song = None
+        self.taps = set()
+
+    def subscribe_pcm(self):
+        # This does not start the source or a device. The authorized PA manager
+        # owns the returned tap and releases it when its explicit request ends.
+        with self.lock:
+            tap = PcmTap(); self.taps.add(tap); return tap
+
+    def _publish_pcm(self, block):
+        with self.lock:
+            self.taps = {tap for tap in self.taps if not tap.closed}
+            for tap in self.taps: tap.put(block)
 
     def status(self):
         with self.lock:
@@ -160,6 +199,9 @@ class Runner:
         with self.lock:
             self.stop.set(); self.outcome = 'interrupted'; self.cancel.set()
         if self.worker: self.worker.join(timeout=8)
+        with self.lock:
+            for tap in self.taps: tap.close()
+            self.taps.clear()
 
     def _run(self, config):
         while not self.stop.is_set():
@@ -178,12 +220,16 @@ class Runner:
                 path = Path(song['path'])
                 if not path.is_absolute() or not path.is_file(): raise RuntimeError('Catalogue source unavailable')
                 owned = self.track(config, song)
+                owned.on_pcm = self._publish_pcm
                 with self.lock:
                     self.current_track, self.current_song = owned, song
                 owned.run(self.cancel)
                 status = self.outcome if self.cancel.is_set() else 'completed'
             except Exception as exc:
                 self.error = str(exc)
+                print(f'[radio-jukebox] Source failed: {exc}', flush=True)
+                with self.lock:
+                    for tap in self.taps: tap.error = 'Jukebox source failed'
                 status = 'failed'
                 # Stop on a failure instead of burning every queued request.
                 self.stop.set()

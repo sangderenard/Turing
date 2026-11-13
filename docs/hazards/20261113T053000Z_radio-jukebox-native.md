@@ -31,3 +31,39 @@ but has not completed beyond CMake Checking File Globs at this receipt; native
 handshake and full-frame end-to-end proof are NOT yet verified. The bounded silent
 proof is tools/test_nodus_radio_jukebox_native.py. No live configuration, audible
 playback, restart, public exposure or network-denial bypass was performed.
+
+## Follow-song PA update
+
+The explicit PA Manager can now attach to Runner.subscribe_pcm(): a bounded
+64-block tap of the same already-paced PCM readback. This does not re-decode,
+open a second UDP port or compete for source FIFO tokens. It feeds the existing
+native Playback sink only after the user's explicit server-speaker Start action.
+The tap follows subsequent songs; Stop releases it. Overflow fails visibly rather
+than hiding gaps or accumulating unbounded memory. No source or speaker starts
+from GET, menu opening, or runner construction. The fixed-source standalone mode
+is preserved when no jukebox provider is configured. This supersedes the earlier
+fixed-peer PA limitation in this receipt. Browser audio remains a separate task.
+
+14 focused Python control/runner tests pass after the update, including inert
+status, two sequential PCM blocks across the shared feed, explicit cancellation,
+no duplicate receiver and bounded overflow. These use fake native sink boundaries.
+Standalone CMake VerifyGlobs completed immediately. MSBuild /m:1 /nr:false now
+progresses through native compilation; prior hung worker launches were not evidence
+of a source compile failure. Native full proof remains pending until build finishes.
+
+## Final measured native proof
+
+Release nodus_radio/nodus_headless build completed successfully with MSBuild
+/m:1 /nr:false. The earlier build-worker hang is resolved for this invocation;
+no shader/compiler implementation was changed to resolve it.
+
+Real native source -> canvas FIFO -> RTP/RTCP -> private native router -> pinned
+Subscription delivered all 48007 frames in188 packets, including the seven-frame
+tail. EOF was verified, with zero lost/late/rejected/resync counts. The optional
+native PA proof then ran two tracks (fresh sender/SSRC each) through one bounded
+tap into the existing native Playback sink:96014 frames accepted including both
+short tails. Both source and sink explicitly used SDL dummy. No audible output.
+
+41 focused radio Python tests passed; git diff --check passed. Native proof uses
+disposable fixture/temp directory and isolated owned processes, all closed after
+the test. Real speakers, public HTTP deployment and browser audio are unverified.
