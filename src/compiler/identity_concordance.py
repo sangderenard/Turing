@@ -22644,19 +22644,20 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
     return tuple(receipts)
 
 
-def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
-    """Account for hidden formals proved to be compiler-owned at every call.
+def publish_formal_actual_occurrences(
+    functions: Mapping[str, Any], *, book: Any, call_table: Any = None,
+) -> None:
+    """Publish exact incoming call positions without classifying hidden formals.
 
-    A structural value such as a tensor dtype can survive specialization as a
-    scalar formal even when it is not an authored parameter.  If every exact
-    incoming call position supplies linked frame storage, the concordance can
-    classify that formal without guessing from its numerical dtype or use.
+    Program: the structural full-content string equality helper borrows its
+    caller's descriptor storage. Its early physical-layout demand needs the
+    real call occurrence before late hidden-formal classification. This is
+    the existing occurrence census, with the same source and rebind checks;
+    it does not create storage or classify any formal.
     """
 
-    functions = getattr(module, "functions", {}) or {}
-    book = identity_book(module)
     from .concordance_declarations import (
-        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION,
+        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE,
         FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, REGION_SIGNATURE, SSA_VALUE,
     )
     # Persisted books own their vocabulary. Add this scoped relation through
@@ -22737,7 +22738,6 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                         callsite_id = instruction.attributes.get(
                             "plan_callsite_id"
                         )
-                        call_table = getattr(module, "call_table", None)
                         records = (
                             () if call_table is None
                             else call_table.get(str(caller_name), ())
@@ -22784,6 +22784,35 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                                     else Unsourced(FRAME_SOURCE_CELL_ABSENT)),
                         mode=occurrence_mode,
                     )
+
+
+def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
+    """Account for hidden formals proved to be compiler-owned at every call.
+
+    A structural value such as a tensor dtype can survive specialization as a
+    scalar formal even when it is not an authored parameter.  If every exact
+    incoming call position supplies linked frame storage, the concordance can
+    classify that formal without guessing from its numerical dtype or use.
+    """
+
+    functions = getattr(module, "functions", {}) or {}
+    book = identity_book(module)
+    publish_formal_actual_occurrences(
+        functions, book=book, call_table=getattr(module, "call_table", None),
+    )
+    from .concordance_declarations import (
+        FORMAL_ACTUAL_OCCURRENCE, FORMAL_STORAGE_RESOLUTION, FRAME_BINDING,
+        SSA_VALUE,
+    )
+
+    occurrence_page = FORMAL_ACTUAL_OCCURRENCE
+    incoming_page = book.page(occurrence_page)
+
+    def caller_scope(function: Any) -> str:
+        return str(
+            function.metadata.get("tensor_shape_concordance_scope")
+            or function.name
+        )
 
     receipts: list[dict] = []
     for function_name, function in functions.items():

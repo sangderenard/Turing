@@ -1309,6 +1309,7 @@ class MetadataRule(Enum):
     ATTRIBUTE = "attribute"
     PYTHON_ROUTING_INDEX = "python_routing_index"
     PYTHON_SHAPE_INDEX = "python_shape_index"
+    RESIDENT_STRING_COMPARISON = "resident_string_comparison"
     COMPARES_NONE = "compares_none"
     NON_NUMERIC_CONSTANT_OPERAND = "non_numeric_constant_operand"
     COORDINATOR_ACCESSOR = "coordinator_accessor"

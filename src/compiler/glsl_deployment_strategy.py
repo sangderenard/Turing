@@ -11859,7 +11859,7 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
 
 # Serialized ProcessGraphs retain this derived cache. Bump its schema when
 # classification semantics change, so a compiler replay recomputes old facts.
-_DISPATCH_METADATA_CACHE_SCHEMA = 4
+_DISPATCH_METADATA_CACHE_SCHEMA = 5
 
 
 def _dispatch_metadata_node_classifier(graph: Any):
@@ -11921,6 +11921,8 @@ def _dispatch_metadata_node_classifier(graph: Any):
                 f"executable_node: no source cell for {row!r} -- {exc}"
             ) from exc
         cells = [cell]
+        if rule is MetadataRule.RESIDENT_STRING_COMPARISON:
+            cells.extend(_resident_string_comparison_cells(graph, node_id))
         if rule is MetadataRule.COORDINATOR_NODE_TYPE:
             # An Input the reducer declared scalar: the rule read that row.
             scalar = book.latest_ref(SCALAR_PARAMETER, (cell.row[0], int(node_id)))
@@ -11979,6 +11981,41 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     return _dispatch_metadata_rule(graph, node_id) not in _EXECUTABLE_RULES
+
+
+def _resident_string_comparison_cells(graph: Any, node_id: int) -> tuple:
+    """Prove full-content glyph-span equality, not scalar vocabulary tokens."""
+    from ..common.tensors.topological_reducer import _source_numeric_scope, node_identity_cell
+    from .identity_concordance import SHAPE_STATE_PAGE, current_identity_book, shape_scope_of
+    from .planner_concordance_posts import _class_proves_value
+    from .source_evidence_resolver import ClassEvidence, require_class
+
+    data = graph.G.nodes[int(node_id)]
+    if str(data.get("op") or data.get("type")).casefold() not in {"equal", "not_equal"}:
+        return ()
+    parents = tuple(data.get("parents", ()))
+    if len(parents) != 2:
+        return ()
+    book = current_identity_book()
+    cells = []
+    for parent, _role in parents:
+        value_id = int(graph.G.nodes[int(parent)].get("value_id", parent))
+        evidence = require_class(_source_numeric_scope(graph.G), value_id, book=book)
+        if (not isinstance(evidence, ClassEvidence)
+                or evidence.class_identity != "builtins.str"
+                or evidence.precision_limbs != 1):
+            return ()
+        identity = node_identity_cell(graph, int(parent))
+        if not _class_proves_value(book, evidence.class_cell, identity):
+            return ()
+        descriptor = _tensor_descriptor(graph, int(parent))
+        if descriptor is None or descriptor.get("rank") != 1 or descriptor.get("dtype") != "int64":
+            return ()
+        shape_cell = book.latest_ref(SHAPE_STATE_PAGE, (shape_scope_of(graph), value_id))
+        if shape_cell is None:
+            return ()
+        cells.extend((identity, evidence.class_cell, *evidence.proof_cells, shape_cell))
+    return tuple(dict.fromkeys(cells))
 
 
 def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
@@ -12424,6 +12461,8 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
         return Rule.PYTHON_ROUTING_INDEX
     if python_shape_index:
         return Rule.PYTHON_SHAPE_INDEX
+    if _resident_string_comparison_cells(graph, node_id):
+        return Rule.RESIDENT_STRING_COMPARISON
     if compares_none:
         return Rule.COMPARES_NONE
     if non_numeric_constant_operand:
