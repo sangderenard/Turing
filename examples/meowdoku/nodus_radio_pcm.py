@@ -32,14 +32,30 @@ class PcmPacket:
 
 def decode_rtp(data: bytes) -> PcmPacket:
     # This is the explicitly negotiated fixed Radio profile, not all RTP.
-    if len(data) != 12 + BLOCK_BYTES:
-        raise ValueError('Radio RTP packet must contain 256 stereo L16 frames')
+    if not 16 <= len(data) <= 12 + BLOCK_BYTES or (len(data) - 12) % 4:
+        raise ValueError('Radio RTP packet must contain 1..256 stereo L16 frames')
     first, second, seq, timestamp, ssrc = struct.unpack_from('!BBHII', data)
     if first != 0x80 or second & 0x7f != 96:
         raise ValueError('Radio requires RTP v2/PT96 without CSRC, extension or padding')
     samples = array('h'); samples.frombytes(data[12:])
     samples.byteswap()  # Swap the network-order bytes to little-endian bytes.
     return PcmPacket(seq, timestamp, ssrc, samples.tobytes())
+
+
+def decode_end(data, ssrc):
+    """Strict negotiated compound RTCP SR/SDES/BYE (RTP/RTCP mux).
+
+    SR RTP timestamp is the finite source's exclusive sample endpoint. This
+    permits final short L16 blocks without padding or guessing from idle time.
+    Endpoint/SSRC pinning is still required: RTCP is not authentication.
+    """
+    if (len(data) != 52 or data[:4] != b'\x80\xc8\x00\x06' or
+            data[28:32] != b'\x81\xca\x00\x03' or
+            data[36:44] != b'\x01\x05radio\0' or
+            data[44:48] != b'\x81\xcb\x00\x01' or
+            any(struct.unpack_from('!I', data, at)[0] != ssrc for at in (4, 32, 48))):
+        raise ValueError('invalid Radio terminal RTCP compound or SSRC')
+    return struct.unpack_from('!I', data, 16)[0]
 
 
 def distance(seq, base):
@@ -69,6 +85,7 @@ class JitterBuffer:
         self.rate_offset = self.filtered_error = 0.
         self.deadline = self.last_read = self.last_poll = None
         self.end_sequence = None
+        self.end_timestamp = None
         self.ended = False
         self.read_blocks = self.clock_rebuffers = 0
 
@@ -92,6 +109,21 @@ class JitterBuffer:
                 raise ValueError('EOF precedes queued PCM')
             self.end_sequence = last_sequence
             self.ended = delta == -1
+
+    def finish_timestamp(self, timestamp):
+        with self.lock:
+            if not 0 <= timestamp <= 0xffffffff or self.timestamp is None:
+                raise ValueError('terminal timestamp requires PCM sequence')
+            if self.end_timestamp is not None:
+                if self.end_timestamp != timestamp:
+                    raise ValueError('conflicting terminal timestamp')
+                return
+            delta = ((timestamp - self.timestamp + 0x80000000) & 0xffffffff) - 0x80000000
+            if delta < -255 or delta > self.capacity * SAMPLES:
+                raise ValueError('terminal timestamp outside readback window')
+            remaining = max(0, (delta + SAMPLES - 1) // SAMPLES)
+            self.finish((self.expected + remaining - 1) & 65535)
+            self.end_timestamp = timestamp
 
     def take_due(self, now=None):
         """Return one unchanged PCM block when due; None means wait or ended.
@@ -173,6 +205,10 @@ class JitterBuffer:
             block = self.pending.pop(self.expected, None)
             if block is None:
                 self.lost += 1; block = SILENCE
+                if self.expected == self.end_sequence and self.end_timestamp is not None:
+                    frames = (self.end_timestamp - self.timestamp) & 0xffffffff
+                    if 0 < frames < SAMPLES:
+                        block = block[:frames * CHANNELS * 2]
             self.expected = (self.expected + 1) & 65535
             self.timestamp = (self.timestamp + SAMPLES) & 0xffffffff
             if self.end_sequence is not None and self.expected == ((self.end_sequence + 1) & 65535):
@@ -185,7 +221,8 @@ class JitterBuffer:
                     'lost': self.lost, 'late': self.late, 'rejected': self.rejected, 'resyncs': self.resyncs,
                     'read_rate': 1. + self.rate_offset, 'next_read_at': self.deadline,
                     'read_blocks': self.read_blocks, 'clock_rebuffers': self.clock_rebuffers,
-                    'end_sequence': self.end_sequence, 'ended': self.ended}
+                    'end_sequence': self.end_sequence, 'end_timestamp': self.end_timestamp,
+                    'ended': self.ended}
 
 
 def unpack_batch(data):
@@ -223,6 +260,7 @@ class Subscription:
         self.port, self.peer = listen_port, tuple(peer)
         self.buffer = JitterBuffer(ssrc=ssrc, capacity=capacity, prefill=prefill)
         self.error = None; self.invalid = self.foreign = 0
+        self.terminal_timestamp = None
         self.ready = threading.Event(); self.stopped = threading.Event()
         self.socket = socket.create_connection(('127.0.0.1', router_port), timeout=3)
         self.socket.settimeout(None)
@@ -260,7 +298,17 @@ class Subscription:
                         if peer != self.peer:
                             self.foreign += 1; continue
                         try:
-                            self.buffer.put(decode_rtp(packet))
+                            if len(packet) > 1 and packet[1] == 200:
+                                endpoint = decode_end(packet, self.buffer.ssrc)
+                                if self.terminal_timestamp is not None and self.terminal_timestamp != endpoint:
+                                    raise ValueError('conflicting RTCP end')
+                                if self.buffer.expected is not None:
+                                    self.buffer.finish_timestamp(endpoint)
+                                self.terminal_timestamp = endpoint
+                            else:
+                                self.buffer.put(decode_rtp(packet))
+                            if self.terminal_timestamp is not None and self.buffer.expected is not None:
+                                self.buffer.finish_timestamp(self.terminal_timestamp)
                         except ValueError:
                             self.invalid += 1
         except (OSError, EOFError, ValueError, struct.error) as error:

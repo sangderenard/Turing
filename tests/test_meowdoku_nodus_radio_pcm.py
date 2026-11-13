@@ -52,6 +52,40 @@ class PcmTests(unittest.TestCase):
             self.assertEqual(sub.take_due(),decode_rtp(packet()).pcm_s16le)
         t.join(2);listener.close();self.assertFalse(t.is_alive());self.assertEqual(outcome,[(OPEN,49123)])
 class ReadbackTests(unittest.TestCase):
+    def test_standard_terminal_rtcp_and_short_final_block(self):
+        import struct
+        b = JitterBuffer(ssrc=42)
+        b.put(decode_rtp(packet(65535, 0xffffff00)))
+        short = struct.pack('!BBHII', 128, 96, 0, 0, 42) + struct.pack('!14h', *range(14))
+        p = decode_rtp(short)
+        self.assertEqual(len(p.pcm_s16le), 28)
+        terminal = (struct.pack('!BBH6I', 128, 200, 6, 42, 0, 0, 7, 2, 1052) +
+                    struct.pack('!BBHI', 129, 202, 3, 42) + b'\x01\x05radio\0' +
+                    struct.pack('!BBHI', 129, 203, 1, 42))
+        endpoint = decode_end(terminal, 42)
+        self.assertEqual(endpoint, 7)
+        b.finish_timestamp(endpoint)  # RTCP may overtake the final UDP packet.
+        self.assertTrue(b.put(p))
+        self.assertEqual(len(b.take_due(0)), 1024)
+        self.assertEqual(b.take_due(b.deadline), p.pcm_s16le)
+        self.assertTrue(b.ended)
+        self.assertIsNone(b.take_due(b.deadline + 1))
+        b.finish_timestamp(endpoint)  # Repeated BYE is idempotent.
+        self.assertEqual(b.lost, 0)
+        for bad in (terminal[:-1], terminal+b'x', terminal[:28]+b'x'+terminal[29:]):
+            with self.assertRaises(ValueError): decode_end(bad, 42)
+        with self.assertRaises(ValueError): decode_end(terminal, 43)
+        with self.assertRaises(ValueError): b.finish_timestamp(8)
+
+    def test_lost_short_final_block_has_exact_endpoint_length(self):
+        b = JitterBuffer(ssrc=42)
+        b.put(decode_rtp(packet(0, 0)))
+        b.finish_timestamp(SAMPLES + 7)
+        b.take_due(0)
+        self.assertEqual(b.take_due(b.deadline), bytes(28))
+        self.assertEqual(b.lost, 1)
+        self.assertTrue(b.ended)
+
     def test_high_resolution_clock_and_policy(self):
         now = [0.]
         b = JitterBuffer(ssrc=42, prefill=1, clock=lambda: now[0])
