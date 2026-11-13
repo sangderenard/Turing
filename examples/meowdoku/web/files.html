@@ -26,7 +26,8 @@
   <p id="identity">Checking your account…</p>
   <section class="card" id="upload-box" hidden>
     <h2>Alpaca paper key from a phone</h2>
-    <p>Paste the two values from Alpaca. This saves a private file named <code>alpaca-paper.env</code> in your account. Leave it unshared.</p>
+    <p>Paste the two values from Alpaca. They go to your account's credential store and cannot be downloaded or sent in Messages.</p>
+    <p id="paper-key-state">Checking paper connection…</p>
     <form id="paper-key-form">
       <p><label for="paper-id">Paper key ID</label><br><input id="paper-id" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required></p>
       <p><label for="paper-secret">Paper secret</label><br><input id="paper-secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></p>
@@ -34,7 +35,7 @@
     </form>
     <hr>
     <h2>Upload a private file</h2>
-    <p>Files begin private. You can share one with an accepted contact through Messages. Maximum 8 MiB per file, 64 MiB and 128 files per account.</p>
+    <p>Files begin private. You can share one with an accepted contact through Messages. Do not put passwords or API keys here. Maximum 8 MiB per file, 64 MiB and 128 files per account.</p>
     <form id="upload-form" class="row">
       <input id="chosen-file" type="file" required aria-label="Choose a file">
       <button id="upload-button" type="submit">Upload</button>

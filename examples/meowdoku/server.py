@@ -91,6 +91,7 @@ from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the decl
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
+from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
@@ -1181,6 +1182,35 @@ def make_handler(sessions: Sessions):
                 if db is not None:
                     db.close()
 
+        def _paper_credentials_route(self, method: str) -> None:
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            account_id = self._principal().user_id
+            if account_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            if method == "GET":
+                return self._json({"configured": alpaca_credentials_mod.configured(sessions.state.secrets_dir, account_id)})
+            origin = self.headers.get("Origin")
+            expected = "https://" + self.headers.get("Host", "")
+            if origin != expected or self.headers.get("X-Meowdoku-Secret") != "1":
+                return self._json({"error": "same-origin secret submission required"}, HTTPStatus.FORBIDDEN)
+            if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            body = self._body_json(2048)
+            if body is None:
+                return
+            if set(body) != {"key_id", "secret_key"}:
+                return self._json({"error": "provide paper key ID and secret"}, HTTPStatus.BAD_REQUEST)
+            try:
+                alpaca_credentials_mod.save_paper(sessions.state.secrets_dir, account_id,
+                                                   body["key_id"], body["secret_key"])
+                return self._json({"configured": True})
+            except alpaca_credentials_mod.CredentialError as error:
+                return self._json({"error": str(error)}, error.status)
+            except OSError:
+                return self._json({"error": "credential storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+
         # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
         # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
         def _profile_route(self, path: str, method: str) -> None:
@@ -2128,6 +2158,8 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path, "GET")
             if path == "/api/user-files" or path.startswith("/api/user-files/"):
                 return self._user_files_route(path, "GET")
+            if path == "/api/user-secrets/alpaca-paper":
+                return self._paper_credentials_route("GET")
             if path.startswith("/api/profile/"):                  # [PROFILE]
                 return self._profile_route(path, "GET")
             if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
@@ -2618,6 +2650,8 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path0, "POST")
             if path0 == "/api/user-files":
                 return self._user_files_route(path0, "POST")
+            if path0 == "/api/user-secrets/alpaca-paper":
+                return self._paper_credentials_route("POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]
                 return self._nodus_post(path0)
             if path0.startswith("/api/profile/"):              # [PROFILE]

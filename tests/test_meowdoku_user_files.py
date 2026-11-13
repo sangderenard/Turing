@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
-from meowdoku import messaging, user_files  # noqa: E402
+from meowdoku import alpaca_credentials, messaging, user_files  # noqa: E402
 
 
 class UserFilesTest(unittest.TestCase):
@@ -51,6 +51,17 @@ class UserFilesTest(unittest.TestCase):
         with self.assertRaises(user_files.FileError):
             user_files.put(self.db, self.files_root, 1, "big.bin", b"x" * (user_files.MAX_FILE_BYTES + 1))
         self.assertEqual(user_files.list_owned(self.db, 1), [])
+
+    def test_paper_credentials_stay_outside_downloadable_files(self):
+        secrets_root = self.root / "secrets"
+        self.assertFalse(alpaca_credentials.configured(secrets_root, 1))
+        alpaca_credentials.save_paper(secrets_root, 1, "paper-key-id", "paper-secret-key")
+        self.assertTrue(alpaca_credentials.configured(secrets_root, 1))
+        self.assertFalse(alpaca_credentials.configured(secrets_root, 2))
+        self.assertEqual(alpaca_credentials.load_paper(secrets_root, 1), ("paper-key-id", "paper-secret-key"))
+        self.assertEqual(user_files.list_owned(self.db, 1), [])
+        with self.assertRaises(alpaca_credentials.CredentialError):
+            alpaca_credentials.save_paper(secrets_root, 1, "bad\nkey-id", "paper-secret-key")
 
 
 if __name__ == "__main__":

@@ -92,11 +92,14 @@ $("paper-key-form").addEventListener("submit", async (event) => {
   button.disabled = true;
   status("Saving privately…");
   try {
-    const bytes = new TextEncoder().encode(`APCA_API_KEY_ID=${keyId}\nAPCA_API_SECRET_KEY=${secret}\n`);
-    await upload("alpaca-paper.env", bytes);
+    await json("/api/user-secrets/alpaca-paper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Meowdoku-Secret": "1" },
+      body: JSON.stringify({ key_id: keyId, secret_key: secret }),
+    });
     $("paper-key-form").reset();
-    status("Paper key saved privately. Do not share it in Messages.");
-    await refresh();
+    $("paper-key-state").textContent = "Paper key configured for this account.";
+    status("Paper key saved. Its value is not shown or available for download.");
   } catch (error) { status(error.message); }
   finally { button.disabled = false; }
 });
@@ -111,6 +114,8 @@ try {
     $("identity").textContent = `Signed in as ${who.username}.`;
     $("upload-box").hidden = false;
     $("files-box").hidden = false;
+    const connection = await json("/api/user-secrets/alpaca-paper");
+    $("paper-key-state").textContent = connection.configured ? "Paper key configured for this account." : "No paper key configured yet.";
     await refresh();
   }
 } catch (error) { status(error.message); }
