@@ -140,7 +140,8 @@ def _web(tmp_path):
     web.mkdir(parents=True)
     (web / "boards.json").write_text(json.dumps({"boards": [], "levels": {}}), encoding="utf-8")
     (web / "shader.html").write_text("<html>SHADER-PAGE</html>", encoding="utf-8")
-    (web / "index.html").write_text("<html>GAME-PAGE</html>", encoding="utf-8")
+    (web / "index.html").write_text("<html>FEED-PAGE</html>", encoding="utf-8")
+    (web / "play.html").write_text("<html>GAME-PAGE</html>", encoding="utf-8")
     (web / "loading_panel.js").write_text("// panel", encoding="utf-8")
     (web / "secret.json").write_text("{}", encoding="utf-8")
     return web
@@ -189,7 +190,10 @@ def test_whoami_reports_the_tier_and_nothing_else(tiered):
 def test_shader_tier_gets_the_shader_page_or_403(tiered):
     port, set_tier, _ = tiered
     set_tier("shader")
-    for path in ("/", "/index.html", "/app.js", "/boards.json", "/secret.json", "/whatever/else"):
+    for path in ("/", "/index.html"):
+        status, body = _get(port, path)
+        assert status == 200 and "FEED-PAGE" in body, path
+    for path in ("/play.html", "/app.js", "/boards.json", "/secret.json", "/whatever/else"):
         status, body = _get(port, path)
         assert status == 200 and "SHADER-PAGE" in body, path                              # the game page and its files are not served
     assert _get(port, "/loading_panel.js")[1] == "// panel"                              # its own asset is
@@ -207,7 +211,8 @@ def test_normal_tiers_serve_the_game(tiered):
     port, set_tier, _ = tiered
     for tier in ("edit", "dev", "play"):
         set_tier(tier)
-        assert "GAME-PAGE" in _get(port, "/index.html")[1]
+        assert "FEED-PAGE" in _get(port, "/index.html")[1]
+        assert "GAME-PAGE" in _get(port, "/play.html")[1]
         assert _get(port, "/api/catalog")[0] == 200
 
 
