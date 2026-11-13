@@ -70,7 +70,8 @@ def key_bundle(db: sqlite3.Connection, user_id: int) -> dict:
 
 
 def register_key(db: sqlite3.Connection, user_id: int, bundle: dict) -> dict:
-    if not isinstance(bundle, dict) or bundle.get("iterations") != 600000:
+    if (not isinstance(bundle, dict) or set(bundle) != {"public_spki", "encrypted_private", "salt", "iv", "iterations"}
+            or bundle.get("iterations") != 600000):
         raise FileError("invalid file key bundle")
     public = _bytes(bundle.get("public_spki"), 300, 800)
     _bytes(bundle.get("encrypted_private"), 1000, 4000)
