@@ -16819,12 +16819,12 @@ class CorrelationTable:
                 "runtime-result-abi", str(entry), None, detail,
             ))
             if (
-                backend is not Backend.C_MODULE
+                backend not in {Backend.C_MODULE, Backend.LLVM_MODULE}
                 or not isinstance(fact, ArtifactFact)
                 or len(fact.location) != 1
                 or not isinstance(fact.location[0], dict)
             ):
-                issue("runtime ABI lacks an exact C entry and description")
+                issue("runtime ABI lacks an exact native entry and description")
                 continue
             description = fact.location[0]
             payload = repr(description).encode("utf-8")
@@ -16832,7 +16832,12 @@ class CorrelationTable:
                 fact.sha256 != hashlib.sha256(payload).hexdigest()
                 or fact.byte_length != len(payload)
                 or description.get("entry") != str(entry)
-                or description.get("backend") != "c"
+                or description.get("backend") != (
+                    "c" if backend is Backend.C_MODULE else "llvm"
+                )
+                or description.get("extents", {}).get("type") != (
+                    "int64_t" if backend is Backend.C_MODULE else "int32_t"
+                )
                 or description.get("schema") not in {
                     "turing-runtime-abi-v2", "turing-runtime-abi-v3",
                 }
