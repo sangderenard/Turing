@@ -195,3 +195,80 @@ setInterval(() => { if (!document.hidden) now().catch((error) => { $("status").t
 setInterval(() => { if (!document.hidden) history().catch((error) => { $("status").textContent = error.message; }); }, 300000);
 update();
 credentialState().catch((error) => { $("key-state").textContent = error.message; });
+
+const dmTemplates = {
+  "look:account": () => ({}), "look:bots": () => ({}), "look:presence": () => ({}),
+  "look:strategies": () => ({}),
+  "look:orders": () => ({}), "look:mock_orders": () => ({}),
+  "look:mock_ledger": () => ({ strategy_id: "" }),
+  "look:scoreboard": () => ({}), "look:map": () => ({}),
+  "examine:node": () => ({ radius: 1 }),
+  "make:strategy": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Strategy", risk: "cautious" }),
+  "make:bot": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Market bot", kind: "python", source: { ref: "divider:YOUR_JOB_ID" } }),
+  "make:order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
+  "make:mock_order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
+  "use:reconcile": () => ({ id: "" }),
+};
+$("dm-command").addEventListener("change", () => {
+  $("dm-input").value = JSON.stringify(dmTemplates[$("dm-command").value](), null, 2);
+});
+$("dm-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("dm-form").querySelector("button");
+  button.disabled = true;
+  try {
+    const input = JSON.parse($("dm-input").value);
+    if (input === null || Array.isArray(input) || typeof input !== "object") throw new Error("Input must be a JSON object.");
+    const [verb, target] = $("dm-command").value.split(":");
+    const response = await fetch("/api/paper/dm", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ verb, target, input }),
+    });
+    const result = await response.json();
+    $("dm-output").textContent = JSON.stringify(result, null, 2);
+    if (!response.ok) $("dm-output").textContent = `Command failed (${response.status})\n` + $("dm-output").textContent;
+  } catch (error) { $("dm-output").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+let latestPresence = null;
+let presenceCards = [];
+function drawPresence() {
+  const root = $("bot-presence"); root.replaceChildren();
+  presenceCards = [];
+  const bots = latestPresence?.bots || [];
+  for (const bot of bots) {
+    const age = Math.max(0, Date.now() / 1000 - bot.last_seen);
+    if (age >= (latestPresence?.fade_seconds || 300)) continue;
+    const card = document.createElement("div"); card.className = "bot-unit";
+    card.style.opacity = String(Math.max(.12, 1 - age / (latestPresence.fade_seconds || 300)));
+    const avatar = document.createElement("span"); avatar.className = "bot-avatar";
+    const head = document.createElement("span"); head.className = "bot-head";
+    const body = document.createElement("span"); body.className = "bot-body";
+    avatar.append(head, body);
+    const copy = document.createElement("span"); copy.className = "bot-copy";
+    const name = document.createElement("strong"); name.textContent = bot.name;
+    const kind = document.createElement("small"); kind.textContent = bot.kind.replaceAll("_", " ");
+    const source = document.createElement("small");
+    const channel = bot.activity?.channel === "mcp_reported" ? "MCP (reported)" : bot.activity?.channel || "REST";
+    source.textContent = `${channel} · ${bot.activity?.interaction || "active"}`;
+    copy.append(name, kind, source); card.append(avatar, copy); root.append(card);
+    presenceCards.push({ card, seen: bot.last_seen });
+  }
+  $("bot-presence-state").textContent = root.childElementCount ? `${root.childElementCount} bots active in the last five minutes.` : "No registered bots active in the last five minutes.";
+}
+function fadePresence() {
+  const seconds = latestPresence?.fade_seconds || 300;
+  for (const item of presenceCards) {
+    const age = Math.max(0, Date.now() / 1000 - item.seen);
+    item.card.style.opacity = age >= seconds ? "0" : String(Math.max(.12, 1 - age / seconds));
+  }
+}
+async function updatePresence() {
+  latestPresence = await api("/api/paper/presence");
+  drawPresence();
+}
+setInterval(fadePresence, 1000);
+setInterval(() => { if (!document.hidden) updatePresence().catch((error) => { $("bot-presence-state").textContent = error.message; }); }, 15000);
+updatePresence().catch((error) => { $("bot-presence-state").textContent = error.message; });

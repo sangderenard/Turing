@@ -12,7 +12,7 @@
   h1 { margin-bottom: .25rem; }
   .muted { color: #acbad0; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; }
-  select, input, button { font: inherit; background: #1b2b40; color: inherit; padding: .35rem; border: 1px solid #60718e; border-radius: 5px; }
+  select, input, button, textarea { font: inherit; background: #1b2b40; color: inherit; padding: .35rem; border: 1px solid #60718e; border-radius: 5px; }
   button { cursor: pointer; }
   .panel { border: 1px solid #33445e; border-radius: 10px; background: #162238; padding: 1rem; margin: 1rem 0; }
   canvas { display: block; width: 100%; height: 22rem; background: #101b2c; border-radius: 6px; }
@@ -24,13 +24,24 @@
   #book-levels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .3rem 1rem; margin-top: .7rem; }
   #book-levels span { font-variant-numeric: tabular-nums; }
   [hidden] { display: none !important; }
+  #dm-input { display: block; width: min(100%, 48rem); min-height: 7rem; box-sizing: border-box; margin: .7rem 0; }
+  #dm-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow: auto; }
+  #bot-presence { display: grid; grid-template-columns: repeat(auto-fill,minmax(12rem,1fr)); gap: .8rem; }
+  .bot-unit { display: flex; align-items: center; gap: .65rem; padding: .65rem; border: 1px solid #50678c; border-radius: 10px; background: #213451; transition: opacity 1s linear; min-width: 0; }
+  .bot-avatar { position: relative; flex: 0 0 2.7rem; width: 2.7rem; height: 3rem; }
+  .bot-avatar::before { content: ""; position: absolute; left: 1.25rem; top: 0; width: .2rem; height: .45rem; background: #7fc5ff; }
+  .bot-head { position: absolute; top: .4rem; left: .2rem; width: 2.3rem; height: 1.35rem; border: 2px solid #7fc5ff; border-radius: .45rem; background: #122239; }
+  .bot-head::before, .bot-head::after { content: ""; position: absolute; top: .48rem; width: .34rem; height: .34rem; border-radius: 50%; background: #7ce3c3; }
+  .bot-head::before { left: .42rem; } .bot-head::after { right: .42rem; }
+  .bot-body { position: absolute; top: 1.95rem; left: .5rem; width: 1.7rem; height: .85rem; border-radius: .25rem; background: #3e6d9b; }
+  .bot-copy { min-width: 0; } .bot-copy strong, .bot-copy small { display: block; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 <main>
   <p><a href="/">← Meowdoku</a></p>
   <h1>Paper market watch</h1>
-  <p class="muted">BTC/USD, broad ETFs, and one stock candidate in one view. Read-only market data; no orders or training run from this page.</p>
+  <p class="muted">BTC/USD, broad ETFs, and one stock candidate in one view. Paper strategy commands are below the market charts.</p>
   <section class="panel">
     <h2>Your Alpaca paper key</h2>
     <p class="muted">Enter the paper key ID and secret from your phone. They are stored for your signed-in account. To create or receive an encrypted, shareable credential file, use <a href="/keys.html">Keys</a>.</p>
@@ -58,6 +69,39 @@
     <p class="muted" id="book-state">Waiting for an available book…</p>
     <canvas id="book" aria-label="Bitcoin order-book bid and ask sizes"></canvas>
     <div id="book-levels" aria-label="Bitcoin bid and ask price levels"></div>
+  </section>
+  <section class="panel">
+    <h2>Paper Dungeon Master</h2>
+    <p class="muted">Commands use your signed-in account. “Make capped buy order” sends to Alpaca paper trading. “Make internal mock order” fills only in Meowdoku's simulated ledger. Both use strategy risk limits. Reuse the same request ID when checking an uncertain Alpaca result.</p>
+    <form id="dm-form">
+      <label>Command <select id="dm-command">
+        <option value="look:account">Look at paper account</option>
+        <option value="look:bots">Look at my bots</option>
+        <option value="look:presence">Look at active bots</option>
+        <option value="look:strategies">Look at strategies</option>
+        <option value="look:orders">Look at orders</option>
+        <option value="look:mock_orders">Look at internal mock fills</option>
+        <option value="look:mock_ledger">Look at internal mock ledger</option>
+        <option value="look:scoreboard">Look at scoreboard</option>
+        <option value="look:map">Look at living map</option>
+        <option value="examine:node">Examine map node</option>
+        <option value="make:strategy">Make strategy</option>
+        <option value="make:bot">Register a bot</option>
+        <option value="make:order">Make capped buy order</option>
+        <option value="make:mock_order">Make internal mock order</option>
+        <option value="use:reconcile">Reconcile order</option>
+      </select></label>
+      <label for="dm-input">Command input (JSON object)</label>
+      <textarea id="dm-input" maxlength="3500" spellcheck="false">{}</textarea>
+      <button type="submit">Send command</button>
+    </form>
+    <pre id="dm-output" role="status">Choose a command to inspect your paper arena.</pre>
+  </section>
+  <section class="panel">
+    <h2>Active market bots</h2>
+    <p class="muted">Register Python with an owned <a href="/divider.html">Divider</a> job ID, symbolic math with a <a href="/mathlab.html">Math Lab</a> job ID, a compiled product hash, or an HTTPS API URL. Registration records the source; it does not execute it. Bots appear when they use the paper API with their bot ID and fade over five minutes. MCP is a reported entry path; it does not grant authority.</p>
+    <div id="bot-presence" aria-live="polite"></div>
+    <p id="bot-presence-state" class="muted">Checking bot activity…</p>
   </section>
   <p class="muted" id="rate"></p>
 </main>

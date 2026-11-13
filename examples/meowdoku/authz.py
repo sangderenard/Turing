@@ -103,7 +103,7 @@ except ImportError:
     _permission_spec.loader.exec_module(_permission_groups)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train")
 ROLES = ("admin", "member", "dev", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -115,14 +115,14 @@ DEFAULT_POLICY = {
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
         "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message",
-                                              "core_git")],
+                                              "core_git", "paper_train")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],
         "dev": ["studio_write", "photo_submit", "share_live", "compile_submit", "message", "dev_ui"],
         # service: a supervisor-owned instance account (deploy/apache_supervisor.py).  Member caps plus library_manage, so the
         # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
-        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate", "compile_submit", "message"],
+        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate", "compile_submit", "message", "paper_train"],
         # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
         "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate", "compile_submit", "message",
                      "core_git"],      # core_git: Git in the core through core_git.py; no service account and no tier holds it
@@ -243,6 +243,8 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
         caps.discard("lifecycle_admin")
     if principal.role != "admin":
         caps.discard("account_manage")
+    if principal.role not in ("admin", "service"):
+        caps.discard("paper_train")
     # Unstable source attempts require an explicit account-role grant, never an origin tier.
     if (principal.user_id is None or principal.role == "guest"
             or "compile_unstable" not in policy["role_caps"].get(principal.role, ())):

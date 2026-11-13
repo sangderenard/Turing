@@ -42,6 +42,7 @@ import struct
 import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -94,6 +95,9 @@ from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES]
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
+from meowdoku import paper_arena as paper_arena_mod
+from meowdoku import paper_broker as paper_broker_mod
+from meowdoku import paper_mock as paper_mock_mod
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
@@ -577,7 +581,7 @@ def make_handler(sessions: Sessions):
             self._principal_cache = None
             if self._origin_tier == "shader":                    # [LOGIN] a signed-in account lifts the shader lock; its caps still come from its role
                 account = self._account()
-                lift = {"member": "play", "service": "play", "operator": "dev", "admin": "edit"}
+                lift = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "admin": "edit"}
                 if account is not None:
                     self._tier = lift.get(authz_mod.role_of(sessions.accounts_db, account["id"]), "shader")
 
@@ -1272,6 +1276,15 @@ def make_handler(sessions: Sessions):
             account_id = self._principal().user_id
             if account_id is None:
                 return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            activity_db = paper_arena_mod.connect(sessions.state.sql_dir / "paper_arena.sqlite")
+            try:
+                channel = "mcp_reported" if self.headers.get("X-Meowdoku-Entry") == "mcp" else "rest"
+                paper_arena_mod.record_activity(activity_db, account_id, self.headers.get("X-Meowdoku-Bot") or None,
+                                                channel, "get " + path)
+            except paper_arena_mod.ArenaError as error:
+                return self._json({"error": str(error)}, error.status)
+            finally:
+                activity_db.close()
             stock = (parse_qs(self.path.partition("?")[2]).get("stock") or ["AAPL"])[0]
             try:
                 action = market_data_mod.history if path.endswith("/history") else market_data_mod.now
@@ -1280,6 +1293,237 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": str(error)}, error.status)
             except alpaca_credentials_mod.CredentialError as error:
                 return self._json({"error": str(error)}, error.status)
+
+        def _paper_route(self, path: str, method: str) -> None:
+            def positive_fill(value) -> bool:
+                try:
+                    return Decimal(str(value)) > 0
+                except (InvalidOperation, TypeError):
+                    return False
+
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            account = self._account()
+            if account is None:
+                return self._json({"error": "sign in to use paper trading"}, HTTPStatus.UNAUTHORIZED)
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if method == "POST":
+                expected = "https://" + self.headers.get("Host", "")
+                if self.headers.get("Origin") not in (None, expected) or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "cross-origin paper writes are not allowed"}, HTTPStatus.FORBIDDEN)
+                if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "application/json":
+                    return self._json({"error": "application/json required"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                body = self._body_json(4096)
+                if body is None:
+                    return
+            else:
+                body = None
+            dm_query = None
+            entry_channel = "dm" if path == "/api/paper/dm" else "mcp_reported" if self.headers.get("X-Meowdoku-Entry") == "mcp" else "rest"
+            if path == "/api/paper/dm" and method == "POST":
+                if not isinstance(body, dict) or set(body) != {"verb", "target", "input"} or not isinstance(body["input"], dict):
+                    return self._json({"error": "expected verb, target and input"}, HTTPStatus.BAD_REQUEST)
+                command = (body["verb"], body["target"])
+                dispatch = {("look", "account"): ("/api/paper/account", "GET"),
+                            ("look", "bots"): ("/api/paper/bots", "GET"),
+                            ("look", "presence"): ("/api/paper/presence", "GET"),
+                            ("look", "strategies"): ("/api/paper/strategies", "GET"),
+                            ("look", "orders"): ("/api/paper/orders", "GET"),
+                            ("look", "mock_orders"): ("/api/paper/mock/orders", "GET"),
+                            ("look", "mock_ledger"): ("/api/paper/mock/ledger", "GET"),
+                            ("look", "scoreboard"): ("/api/paper/scoreboard", "GET"),
+                            ("look", "map"): ("/api/paper/map", "GET"),
+                            ("examine", "node"): ("/api/paper/map/query", "GET"),
+                            ("make", "strategy"): ("/api/paper/strategies", "POST"),
+                            ("make", "bot"): ("/api/paper/bots", "POST"),
+                            ("make", "order"): ("/api/paper/orders", "POST"),
+                            ("make", "mock_order"): ("/api/paper/mock/orders", "POST"),
+                            ("use", "reconcile"): ("/api/paper/orders/reconcile", "POST")}
+                if command not in dispatch:
+                    return self._json({"error": "unknown paper DM command"}, HTTPStatus.BAD_REQUEST)
+                path, method = dispatch[command]
+                body = body["input"]
+                if command == ("examine", "node"):
+                    if set(body) - {"at", "radius"}:
+                        return self._json({"error": "examine accepts at and radius"}, HTTPStatus.BAD_REQUEST)
+                    dm_query = body
+                elif command == ("look", "mock_ledger"):
+                    if set(body) != {"strategy_id"} or not isinstance(body["strategy_id"], str):
+                        return self._json({"error": "mock ledger requires strategy_id"}, HTTPStatus.BAD_REQUEST)
+                    dm_query = body
+                elif command == ("use", "reconcile"):
+                    if set(body) != {"id"} or not isinstance(body["id"], str):
+                        return self._json({"error": "reconcile requires id"}, HTTPStatus.BAD_REQUEST)
+                    path = f"/api/paper/orders/{body['id']}/reconcile"
+                    body = {}
+                elif method == "GET" and body:
+                    return self._json({"error": "look accepts an empty input"}, HTTPStatus.BAD_REQUEST)
+            db = paper_arena_mod.connect(sessions.state.sql_dir / "paper_arena.sqlite")
+            try:
+                bot_id = self.headers.get("X-Meowdoku-Bot") or None
+                if path != "/api/paper/trainer-events":
+                    paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
+                                                    method.lower() + " " + path,
+                                                    body.get("strategy_id") if isinstance(body, dict) else None)
+                if path == "/api/paper/bots":
+                    if method == "GET":
+                        return self._json(paper_arena_mod.bots(db, account["id"]))
+                    if isinstance(body, dict) and body.get("kind") in ("python", "symbolic", "compiled"):
+                        source = body.get("source")
+                        ref = source.get("ref", "") if isinstance(source, dict) else ""
+                        if not isinstance(ref, str):
+                            raise paper_arena_mod.ArenaError("source.ref required")
+                        owner_key = self._job_identity()[0][0]
+                        if body["kind"] == "python" and (not ref.startswith("divider:") or
+                                divider_intake_mod.get_job(sessions.state, ref.removeprefix("divider:"), owner_key) is None):
+                            raise paper_arena_mod.ArenaError("owned divider job not found", 404)
+                        if body["kind"] == "symbolic":
+                            math_db = math_jobs_mod.connect(sessions.accounts_db)
+                            try:
+                                owned = ref.startswith("mathlab:") and math_jobs_mod.get_job(
+                                    math_db, sessions.state, ref.removeprefix("mathlab:"), owner_key) is not None
+                            finally:
+                                math_db.close()
+                            if not owned:
+                                raise paper_arena_mod.ArenaError("owned math lab job not found", 404)
+                        if body["kind"] == "compiled":
+                            with lowering_mod.connect(sessions.accounts_db) as lowering_db:
+                                exists = ref.startswith("product:") and lowering_db.execute(
+                                    "SELECT 1 FROM lowerings WHERE product_sha256=? LIMIT 1", (ref.removeprefix("product:"),)).fetchone()
+                            if not exists:
+                                raise paper_arena_mod.ArenaError("compiled product not found", 404)
+                    result = paper_arena_mod.register_bot(db, account["id"], body)
+                    paper_arena_mod.record_activity(db, account["id"], result["id"], entry_channel, "register bot")
+                    return self._json(result, HTTPStatus.OK if result["replayed"] else HTTPStatus.CREATED)
+                if path == "/api/paper/presence" and method == "GET":
+                    return self._json(paper_arena_mod.presence(db))
+                if path == "/api/paper/trainer-events" and method == "GET":
+                    if not self._require("paper_train"):
+                        return
+                    from urllib.parse import parse_qs
+                    try:
+                        after = int((parse_qs(self.path.partition("?")[2]).get("after") or ["0"])[0])
+                    except ValueError:
+                        raise paper_arena_mod.ArenaError("invalid trainer cursor")
+                    return self._json(paper_arena_mod.trainer_events(db, after))
+                if path == "/api/paper/shared-account":
+                    if not self._require("account_manage"):
+                        return
+                    if method == "GET":
+                        owner = paper_arena_mod.shared_owner(db)
+                        return self._json({"configured": owner is not None})
+                    if not isinstance(body, dict) or set(body) != {"username"} or not isinstance(body["username"], str):
+                        raise paper_arena_mod.ArenaError("expected username")
+                    authority_db = authz_mod._connect(sessions.accounts_db)
+                    try:
+                        row = authority_db.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (body["username"],)).fetchone()
+                        if row is None:
+                            raise paper_arena_mod.ArenaError("account not found", 404)
+                        target = row[0]
+                        if not alpaca_credentials_mod.configured(sessions.state.secrets_dir, target):
+                            raise paper_arena_mod.ArenaError("paper credentials unavailable for that account", 409)
+                    finally:
+                        authority_db.close()
+                    paper_arena_mod.set_shared_owner(db, target, account["id"])
+                    return self._json({"configured": True})
+                if path == "/api/paper/strategies":
+                    if method == "GET":
+                        return self._json({"strategies": paper_arena_mod.strategies(db, account["id"])})
+                    result = paper_arena_mod.create_strategy(db, account["id"], body)
+                    return self._json(result, HTTPStatus.OK if result["replayed"] else HTTPStatus.CREATED)
+                if path == "/api/paper/orders" and method == "GET":
+                    return self._json({"orders": paper_arena_mod.intents(db, account["id"])})
+                if path == "/api/paper/mock/orders" and method == "GET":
+                    return self._json(paper_mock_mod.orders(db, account["id"]))
+                if path == "/api/paper/mock/ledger" and method == "GET":
+                    from urllib.parse import parse_qs
+                    strategy_id = (dm_query or {}).get("strategy_id") if dm_query is not None else (
+                        parse_qs(self.path.partition("?")[2]).get("strategy_id") or [None])[0]
+                    return self._json(paper_mock_mod.ledger(db, account["id"], strategy_id))
+                if path == "/api/paper/map" and method == "GET":
+                    return self._json(paper_arena_mod.living_map(db, account["id"]))
+                if path == "/api/paper/map/query" and method == "GET":
+                    from urllib.parse import parse_qs
+                    from meowdoku.living_data_query import GraphView, QueryError
+                    args = dm_query if dm_query is not None else parse_qs(self.path.partition("?")[2])
+                    if dm_query is not None:
+                        args = {key: [value] for key, value in dm_query.items()}
+                    at = (args.get("at") or [f"paper:{account['id']}"])[0]
+                    try:
+                        radius = int((args.get("radius") or ["1"])[0])
+                        return self._json(GraphView(paper_arena_mod.living_map(db, account["id"]), "world").query(at, radius=radius))
+                    except (ValueError, QueryError) as error:
+                        return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                if path == "/api/paper/mock/orders" and method == "POST":
+                    prior = paper_mock_mod.replay(db, account["id"], body)
+                    if prior is not None:
+                        return self._json(prior)
+                authority_db = authz_mod._connect(sessions.accounts_db)
+                try:
+                    credential_owner = permission_groups_mod.paper_credential_owner(
+                        authority_db, account["id"], paper_arena_mod.shared_owner(db))
+                finally:
+                    authority_db.close()
+                keys = alpaca_credentials_mod.load_paper(sessions.state.secrets_dir, credential_owner)
+                if path == "/api/paper/account" and method == "GET":
+                    broker = paper_broker_mod.account(keys)
+                    return self._json({k: broker.get(k) for k in
+                                       ("status", "trading_blocked", "buying_power", "equity", "cash", "currency")})
+                if path == "/api/paper/scoreboard" and method == "GET":
+                    prices = market_data_mod.latest_prices(sessions.state.secrets_dir, credential_owner)
+                    return self._json(paper_arena_mod.scoreboard(db, account["id"], prices))
+                if path == "/api/paper/mock/orders" and method == "POST":
+                    prices = market_data_mod.latest_prices(sessions.state.secrets_dir, credential_owner)
+                    if not isinstance(body, dict) or not isinstance(body.get("symbol"), str):
+                        raise paper_arena_mod.ArenaError("mock order object required")
+                    result = paper_mock_mod.place(db, account["id"], body, prices.get(body.get("symbol")))
+                    paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
+                                                    "fill internal mock order", body.get("strategy_id"),
+                                                    json.dumps({"venue": "internal_mock", "order_id": result["id"],
+                                                                "quantity": result["quantity"], "price": result["execution_price"],
+                                                                "fee": result["fee"]}))
+                    return self._json(result, HTTPStatus.CREATED)
+                if path == "/api/paper/orders" and method == "POST":
+                    result = paper_arena_mod.submit(db, account["id"], keys, body)
+                    paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
+                                                    "submit alpaca paper order", body.get("strategy_id"), "alpaca_paper")
+                    if not result.get("replayed") and positive_fill(result.get("filled_qty")):
+                        paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
+                            "alpaca paper fill", result["strategy_id"],
+                            json.dumps({"venue": "alpaca_paper", "order_id": result["id"],
+                                        "quantity": result["filled_qty"], "price": result["filled_avg_price"],
+                                        "symbol": result["symbol"]}))
+                    return self._json(result, HTTPStatus.CREATED)
+                if path.startswith("/api/paper/orders/") and path.endswith("/reconcile") and method == "POST":
+                    if body != {}:
+                        raise paper_arena_mod.ArenaError("reconcile accepts an empty object")
+                    intent_id = path[len("/api/paper/orders/"):-len("/reconcile")]
+                    result = paper_arena_mod.reconcile(db, account["id"], keys, intent_id)
+                    paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
+                                                    "reconcile alpaca paper order", result["strategy_id"],
+                                                    "alpaca_paper:" + str(result.get("broker_status")))
+                    if positive_fill(result.get("fill_delta_qty")):
+                        paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
+                            "alpaca paper fill", result["strategy_id"],
+                            json.dumps({"venue": "alpaca_paper", "order_id": result["id"],
+                                        "quantity": result["fill_delta_qty"], "price": result["filled_avg_price"],
+                                        "symbol": result["symbol"]}))
+                    return self._json(result)
+                return self._json({"error": "paper command not found"}, HTTPStatus.NOT_FOUND)
+            except paper_arena_mod.ArenaError as error:
+                return self._json({"error": str(error)}, error.status)
+            except paper_broker_mod.PaperBrokerError as error:
+                return self._json({"error": str(error)}, error.status)
+            except alpaca_credentials_mod.CredentialError as error:
+                return self._json({"error": str(error)}, error.status)
+            except market_data_mod.MarketError as error:
+                return self._json({"error": str(error)}, error.status)
+            except RuntimeError as error:
+                return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                db.close()
 
         # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
         # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
@@ -2243,6 +2487,8 @@ def make_handler(sessions: Sessions):
                 return self._paper_credentials_route("GET")
             if path in ("/api/markets/history", "/api/markets/now"):
                 return self._markets_route(path)
+            if path.startswith("/api/paper/"):
+                return self._paper_route(path, "GET")
             if path.startswith("/api/profile/"):                  # [PROFILE]
                 return self._profile_route(path, "GET")
             if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
@@ -2762,6 +3008,8 @@ def make_handler(sessions: Sessions):
                 return self._file_keys_route(path0, "POST")
             if path0 == "/api/user-secrets/alpaca-paper":
                 return self._paper_credentials_route("POST")
+            if path0.startswith("/api/paper/"):
+                return self._paper_route(path0, "POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]
                 return self._nodus_post(path0)
             if path0.startswith("/api/profile/"):              # [PROFILE]
