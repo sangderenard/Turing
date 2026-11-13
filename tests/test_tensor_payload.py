@@ -163,3 +163,30 @@ def test_load_into_reports_capacity_and_failure_and_writes_nothing(tmp_path):
                                     strides=(1,)) == tensor_payload.STATUS_FAILED
     assert tensor_payload.load_into(tmp_path / "missing.tp", np.zeros(12, dtype=np.int64),
                                     np.zeros(5, dtype=np.int64)) == tensor_payload.STATUS_FAILED
+
+
+def test_load_into_reshapes_to_the_callers_extents_under_its_strides(tmp_path):
+    import numpy as np
+
+    saved = np.arange(12, dtype=np.float64).reshape(4, 3)
+    target = tmp_path / "triangle_map.tp"
+    tensor_payload.save(target, saved)
+
+    region, handle = np.zeros(12), np.zeros(7, dtype=np.int64)            # reshape to (2, 2, 3), C order
+    assert tensor_payload.load_into(target, region, handle, extents=(2, 2, 3)) == tensor_payload.STATUS_COMPLETE
+    assert (region == saved.ravel()).all() and handle.tolist() == [3, 2, 2, 3, 6, 3, 1]
+
+    extents, strides = (6, 2), (1, 6)                                      # reshape to (6, 2), column-major
+    length = tensor_payload.region_length(extents, strides)
+    region, handle = np.zeros(length), np.zeros(5, dtype=np.int64)
+    assert tensor_payload.load_into(target, region, handle, extents=extents, strides=strides) \
+        == tensor_payload.STATUS_COMPLETE
+    laid = np.lib.stride_tricks.as_strided(region, shape=extents, strides=(8, 48))
+    assert (laid == saved.reshape(extents)).all() and handle.tolist() == [2, 6, 2, 1, 6]
+
+    region, handle = np.zeros(1), np.zeros(1, dtype=np.int64)             # extents () only for one element
+    assert tensor_payload.load_into(target, region, handle, extents=()) == tensor_payload.STATUS_FAILED
+    assert tensor_payload.load_into(target, np.zeros(12), np.zeros(5, dtype=np.int64), extents=(5, 2)) \
+        == tensor_payload.STATUS_FAILED                                   # 10 elements are not the saved 12
+    assert tensor_payload.load_into(target, np.zeros(12), np.zeros(5, dtype=np.int64), extents=(6, 2),
+                                    strides=(2,)) == tensor_payload.STATUS_FAILED

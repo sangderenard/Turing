@@ -214,19 +214,30 @@ def region_length(shape: tuple[int, ...], strides: tuple[int, ...] | None = None
     return 1 + sum((extent - 1) * stride for extent, stride in zip(shape, strides))
 
 
-def load_into(path: Any, region: Any, handle: Any, strides: tuple[int, ...] | None = None) -> int:
+def load_into(
+    path: Any, region: Any, handle: Any,
+    extents: tuple[int, ...] | None = None, strides: tuple[int, ...] | None = None,
+) -> int:
     """Fill the caller's ``region`` with the tensor saved under ``path``; the status.
 
-    ``region`` is the caller's writable one-dimensional buffer of the tensor's dtype, its length the capacity.  The
-    elements are laid out by ``strides`` (in elements, one per axis) when the caller states them, else in the saved
-    C order.  ``handle`` is the caller's writable int64 buffer; it receives ``rank, *shape, *strides`` (the layout
-    the region now holds), so its capacity is ``1 + 2 * rank``.  Nothing is allocated for the caller.  A region or
-    handle too small is :data:`STATUS_OVER_CAPACITY` with nothing written; a payload that is unreadable, of another
-    dtype than the region, or of another rank than the stride tuple is :data:`STATUS_FAILED`.
+    ``region`` is the caller's writable one-dimensional buffer of the tensor's dtype, its length the capacity.
+    ``extents`` reshapes on load: the saved elements, in their C order, are the caller's ``extents`` (same element
+    count as the saved handle); without it the saved shape is kept.  ``strides`` (in elements, one per axis of those
+    extents) lays them out in the region; without it, C order.  The caller sizes the region with
+    :func:`region_length` of the same extents and strides.  ``handle`` is the caller's writable int64 buffer; it
+    receives ``rank, *extents, *strides`` (the layout the region now holds), so its capacity is ``1 + 2 * rank``.
+    Nothing is allocated for the caller.  A region or handle too small is :data:`STATUS_OVER_CAPACITY` with nothing
+    written; a payload that is unreadable or of another dtype than the region, extents of another element count than
+    the saved handle (or negative), or a stride tuple of another rank than the extents is :data:`STATUS_FAILED`.
     """
 
     try:
-        name, shape = read_handle(path)
+        name, saved = read_handle(path)
+        shape = saved if extents is None else tuple(int(extent) for extent in extents)
+        if any(extent < 0 for extent in shape) or int(np.prod(shape, dtype=np.int64)) != int(
+            np.prod(saved, dtype=np.int64)
+        ):
+            return STATUS_FAILED
         layout = c_strides(shape) if strides is None else tuple(int(stride) for stride in strides)
         length = region_length(shape, layout)
         region_array = np.asarray(region)
