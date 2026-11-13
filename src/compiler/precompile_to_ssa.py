@@ -12920,6 +12920,68 @@ class _ControlSSABuilder(TiledObject):
             physical={"arena": True, **_declared_physical_dtype(dtype)},
         )
 
+    def _borrowed_record_span(self, iterable_id, target_id, index, projection):
+        """Select an independently pooled declared span through its record handle."""
+        from ..transmogrifier.ssa import (
+            SSARecordFieldStorage, SSARecordFieldDescriptor,
+        )
+        _, column, row_override, storage_identity, dtype, row_id, record_identity = projection
+        root = self.sequence_descriptors[int(iterable_id)]
+        root_values = {value.id: value for value in self.sequence_storage_values[int(iterable_id)]}
+        handle_arena = root_values[int(root.column_value_ids[int(column)])]
+        parameter = (handle_arena.accounting or {}).get("program_abi_parameter")
+        if parameter is None:
+            raise ValueError("record span pool requires an authored borrowed sequence")
+        pools = getattr(self, "borrowed_record_field_pools", None)
+        if pools is None:
+            pools = self.borrowed_record_field_pools = {}
+            self.borrowed_record_rows = {}
+        key = (int(iterable_id), str(storage_identity))
+        pool = pools.get(key)
+        if pool is None:
+            declaration = self._canonical_cell(int(target_id))
+            causes = (handle_arena, self._sequence_contract_cell(int(iterable_id)), declaration)
+            members = []
+            for name, element_dtype, rank in (("column", dtype, 1), ("lengths", "int64", 1), ("row_stride", "int64", 0), ("capacity", "int64", 0)):
+                value = self.fresh_value(dtype=element_dtype, transform=DESCRIPTOR_CELL,
+                    operands=causes, physical={"physical_dtype": element_dtype,
+                        "storage": "span" if rank else "scalar", "rank": rank,
+                        "arena": bool(rank), "device": None})
+                fact = self._book().page(SSA_VALUE).latest((self._scope(), int(value.id)))
+                value.accounting = {"program_abi_parameter": str(parameter),
+                    "program_abi_field": f"{storage_identity}.{name}",
+                    "program_abi_storage": fact.storage, "program_abi_rank": fact.rank,
+                    "physical_dtype": fact.physical_dtype, "sequence_arena": bool(rank)}
+                self.arguments.append(value)
+                self._bind(value.id, value, BindingKind.SEQUENCE_RESULT, *causes)
+                members.append(value)
+            glyphs, lengths, stride, capacity = members
+            pool = SSAChildTablePoolDescriptor(handle_column=int(column),
+                column_value_ids=(int(glyphs.id),), length_value_id=int(lengths.id),
+                capacity_value_id=int(capacity.id), row_stride_value_id=int(stride.id),
+                column_dtypes=(str(dtype),), key_columns=(), writable=False)
+            pools[key] = pool
+        actual_index = (index if row_override is None else self.external_value(int(row_override), dtype="int64"))
+        handle = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION,
+                                  operands=(handle_arena, actual_index))
+        address = self.fresh_value(dtype="ptr", transform=ADDRESS,
+                                   operands=(handle_arena, actual_index))
+        self.emit(Handler.GetElementPtr, [handle_arena, actual_index], address,
+                  attributes={"binding": "record_span_handle"})
+        self.emit(Handler.Load, [address], handle,
+                  attributes={"binding": "record_span_handle"})
+        self.child_table_selections[int(target_id)] = (pool, handle)
+        descriptor = self._sequence_descriptor(int(target_id), policy="duplicates", writable=False, location="record field span")
+        self._bind(int(target_id), self.ssa_value_objects[descriptor.column_value_ids[0]],
+                   BindingKind.SEQUENCE_RESULT, handle, self._canonical_cell(int(target_id)))
+        row_key = (int(row_id), str(record_identity), int(iterable_id))
+        fields = self.borrowed_record_rows.setdefault(row_key, {})
+        fields.setdefault(str(storage_identity),
+            SSARecordFieldDescriptor(str(storage_identity).removeprefix(str(record_identity) + "."),
+                SSARecordFieldStorage.SEQUENCE, storage_identity=str(storage_identity),
+                sequence_id=int(target_id), dtype=str(dtype), writable=False))
+        return descriptor
+
     def _sequence_descriptor(
         self,
         value_id: int,
@@ -12991,7 +13053,7 @@ class _ControlSSABuilder(TiledObject):
             for column_id, dtype in zip(pool.column_value_ids, pool.column_dtypes):
                 base = self.external_value(column_id)
                 address = self.fresh_value(dtype=str(dtype), transform=ADDRESS, operands=(base, offset),
-                                           physical={"arena": True, "storage": "span", "rank": 1})
+                                           physical={"physical_dtype": str(dtype), "arena": True, "storage": "span", "rank": 1})
                 self.emit(Handler.GetElementPtr, [base, offset], address,
                           attributes={"binding": "selected_child_row_view", "source_value_id": value_id,
                                       **({"child_selection_guard_value_id": int(self.child_selection_validity[value_id].id)} if value_id in self.child_selection_validity else {})})
@@ -21931,6 +21993,9 @@ class _ControlSSABuilder(TiledObject):
                     claim_provisional_definition=True,
                 )
                 continue
+            if isinstance(projection, tuple) and projection[0] == "record_span":
+                self._borrowed_record_span(iterable_id, target_id, induction, projection)
+                continue
             projection_index = induction
             column_projection = projection
             if (
@@ -25173,6 +25238,14 @@ class _ControlSSABuilder(TiledObject):
                 # An alias of another sequence's table registers as that table.
                 continue
             register_sequence(sequence_table, descriptor)
+        from ..transmogrifier.ssa import SSARecordTable, SSARecordDescriptor
+        borrowed_rows = getattr(self, "borrowed_record_rows", {})
+        borrowed_records = SSARecordTable(owner=self.function_name) if borrowed_rows else None
+        for (row_id, identity, source_id), fields in borrowed_rows.items():
+            borrowed_records.register(SSARecordDescriptor(row_id, identity,
+                tuple(fields.values())),
+                sources=self._cells(self._canonical_cell(row_id), self._sequence_contract_cell(source_id)),
+                stage=self._stage())
         function = Function(
                 self.function_name,
                 self.arguments,
@@ -25183,6 +25256,7 @@ class _ControlSSABuilder(TiledObject):
                     # later pass that posts about these values posts under
                     # the scope that holds them.
                     "tensor_shape_concordance_scope": self._scope(),
+                    "borrowed_record_table": borrowed_records,
                     "recursion_table": dict(self.ssa_recursion_table),
                     "named_outputs": page_metadata["named_outputs"],
                     # port id -> the carried phi VALUE standing at that
@@ -33799,6 +33873,9 @@ def lower_control_sections_to_ssa(
     compile_substage(f"SSA section {control_name}: materialize record and reference tables")
     report("materializing record and reference tables")
     record_tables = {}
+    borrowed_records = control_function.metadata.get("borrowed_record_table")
+    if borrowed_records is not None and borrowed_records.records:
+        record_tables[control_function.name] = borrowed_records
     if record_identity is not None and field_names:
         from ..transmogrifier.ssa import (
             SSARecordDescriptor,
@@ -33971,7 +34048,9 @@ def lower_control_sections_to_ssa(
                 cell for cell in (*declaration_cells, *member_cells)
                 if cell is not None
             ))
-            table = SSARecordTable(owner=control_function.name)
+            table = record_tables.get(control_function.name)
+            if table is None:
+                table = SSARecordTable(owner=control_function.name)
             table.register(
                 descriptor,
                 sources=sources,

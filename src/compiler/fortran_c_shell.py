@@ -13657,6 +13657,11 @@ def _graph_control_expression(
     if node_id in resident or node_id in _carried:
         return ControlExpression("value", value_id=node_id, read=read)
     data = graph_obj.nodes[node_id]
+    # Full-content string equality is a structural operation with its own
+    # sequence helper, not a scalar predicate over pointers or truth values.
+    from .glsl_deployment_strategy import _resident_string_comparison_cells
+    if _resident_string_comparison_cells(SimpleNamespace(G=graph_obj), node_id):
+        return ControlExpression("value", value_id=node_id, read=read)
     expression = data.get("expr_obj")
     attributes = data.get("attributes") or {}
     literal = attributes.get("value", data.get("constant"))
@@ -18722,15 +18727,35 @@ def _record_sequence_projection_bindings(
             if attribute not in field_columns:
                 continue
             result_id = int(data.get("value_id", node_id))
+            field_owner = record
+            field_receipt = {}
+            optional_path = False
+            repository_records = dict((graph_obj.graph.get("program_abi") or {}).get("records") or {})
+            for segment in attribute.split("."):
+                field_receipt = dict(dict(field_owner.get("fields") or {}).get(segment) or {})
+                optional_path |= bool(field_receipt.get("optional"))
+                field_owner = repository_records.get(str(field_receipt.get("record")), {})
+            dynamic_span = (
+                field_receipt.get("storage") == "span"
+                and field_receipt.get("shape") is None
+                and field_receipt.get("fixed_length") is None
+            )
+            if dynamic_span and optional_path:
+                raise ValueError(
+                    "optional borrowed record span requires a presence-aware "
+                    f"projection: {record['identity']}.{attribute}"
+                )
+            projection = (
+                ("record_span", int(field_columns[attribute]),
+                 int(target_id) if derived else None,
+                 f"{record['identity']}.{attribute}", str(field_dtypes[attribute]),
+                 int(target_id), str(record["identity"]))
+                if dynamic_span else
+                (("column_at_value", int(field_columns[attribute]), int(target_id))
+                 if derived else int(field_columns[attribute]))
+            )
             bindings.append((
-                int(origin_sequence_id), result_id, str(induction),
-                (
-                    (
-                        "column_at_value", int(field_columns[attribute]),
-                        int(target_id),
-                    )
-                    if derived else int(field_columns[attribute])
-                ),
+                int(origin_sequence_id), result_id, str(induction), projection,
             ))
             fields.append((
                 result_id, attribute, str(field_dtypes[attribute])
@@ -50818,15 +50843,36 @@ def _class_surface_ssa_program(
                                          sequences.by_id(int(field.sequence_id)))
                     member_bindings = {}
                     if _bind_sequence_storage_members(member_bindings, projected, resident_sequence):
+                        # A selected child view has a logical descriptor id
+                        # distinct from its GEP-produced arena. Keep that
+                        # table identity out of the physical SSA alias page.
+                        logical_pair = (int(projected.sequence_id), int(resident_sequence.sequence_id))
+                        defined_values = {int(argument.id) for argument in function.args}
+                        defined_values.update(
+                            int(instruction.res.id)
+                            for block in function.blocks.values()
+                            for instruction in block.instrs
+                            if instruction.res is not None
+                        )
+                        if not (set(logical_pair) & defined_values):
+                            member_bindings.pop(logical_pair[0], None)
                         additions = {old: new for old, new in member_bindings.items()
                                      if old != new and aliases.get(old) != new}
                         if additions:
                             # Clock.clock GetAttr occurrences carry the same
                             # list descriptor as the constructed receiver's
                             # exact record field, including its counters.
+                            from .concordance_declarations import SEQUENCE_DESCRIPTOR
+                            projection_sources = _frame_cells(
+                                _frame_graph_cell(graph, projection_id),
+                                _frame_graph_cell(graph, int(receiver_origin_id)),
+                                _frame_table_cell(sequences, int(projected.sequence_id), SEQUENCE_DESCRIPTOR),
+                                _frame_table_cell(sequences, int(resident_sequence.sequence_id), SEQUENCE_DESCRIPTOR),
+                            )
                             aliases = _publish_concordant_function_aliases(
                                 function, additions,
                                 provenance="linked_call_record_sequence_projection",
+                                sources={identity: projection_sources for identity in additions},
                             )
                             changed = True
                     continue

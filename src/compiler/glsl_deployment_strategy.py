@@ -28190,8 +28190,13 @@ def _tensor_descriptor_rule(
             and str(field.get("storage") or "").casefold() == "scalar"
             and int(field.get("rank", 0)) == 0
         )
+        declared_dynamic_span = bool(
+            isinstance(field, Mapping)
+            and str(field.get("storage") or "").casefold() == "span"
+            and int(field.get("rank", 0)) > 0
+        )
         if isinstance(field, Mapping) and (
-            field.get("shape") is not None or declared_scalar
+            field.get("shape") is not None or declared_scalar or declared_dynamic_span
         ):
             field_shape = tuple(map(int, field.get("shape") or ()))
             field_rank = int(field.get("rank", len(field_shape)))
