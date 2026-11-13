@@ -33,7 +33,7 @@
         "--nodus-ui",
         "nodus-messenger:47614",
         "--nodus-ui",
-        "nodus-training:47617"
+        "nodus-training:47620"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -86,7 +86,7 @@
         "--nodus-ui",
         "nodus-messenger:47614",
         "--nodus-ui",
-        "nodus-training:47617"
+        "nodus-training:47620"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -207,7 +207,7 @@
     {
       "name": "nodus-training-ui-mirror",
       "kind": "command",
-      "port": 47617,
+      "port": 47620,
       "route": "",
       "bind": "127.0.0.1",
       "account": "svc-nodus-training-ui-mirror",
@@ -217,7 +217,7 @@
         "C:/dev/Powershell/nodus/demo_canvas_tables.py",
         "--mode", "server",
         "--host", "127.0.0.1",
-        "--port", "47617",
+        "--port", "47620",
         "--attach-console", "127.0.0.1:47616",
         "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-training.console.secret",
         "--attach-wait", "240"
