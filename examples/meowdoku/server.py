@@ -1398,7 +1398,12 @@ def make_handler(sessions: Sessions):
                     paper_arena_mod.record_activity(db, account["id"], result["id"], entry_channel, "register bot")
                     return self._json(result, HTTPStatus.OK if result["replayed"] else HTTPStatus.CREATED)
                 if path == "/api/paper/presence" and method == "GET":
-                    return self._json(paper_arena_mod.presence(db))
+                    from urllib.parse import parse_qs
+                    try:
+                        offset = int((parse_qs(self.path.partition("?")[2]).get("offset") or ["0"])[0])
+                    except ValueError:
+                        raise paper_arena_mod.ArenaError("invalid presence offset")
+                    return self._json(paper_arena_mod.presence(db, offset=offset))
                 if path == "/api/paper/trainer-events" and method == "GET":
                     if not self._require("paper_train"):
                         return

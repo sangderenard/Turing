@@ -1,5 +1,6 @@
 """Paper-order admission and retry behavior without contacting Alpaca."""
 import sys
+import time
 from pathlib import Path
 from decimal import Decimal
 from urllib.error import HTTPError
@@ -116,6 +117,17 @@ def test_bot_registry_presence_and_trainer_cursor(db):
     assert paper_arena.trainer_events(db, page["next_cursor"])["events"] == []
     with pytest.raises(paper_arena.ArenaError, match="bot not found"):
         paper_arena.record_activity(db, 2, created["id"], "rest", "look")
+
+
+def test_presence_pages_every_active_bot(db):
+    now = time.time()
+    db.executemany("INSERT INTO paper_bots VALUES(?,?,?,?,?,?,?,?)", [
+        (f"{i:032x}", 1, f"Robot {i}", "agent", "{\"registration\":{},\"digest\":\"x\"}",
+         f"bot{i}", now, now) for i in range(501)])
+    first = paper_arena.presence(db)
+    second = paper_arena.presence(db, offset=first["next_offset"])
+    assert len(first["bots"]) == 500 and len(second["bots"]) == 1
+    assert second["next_offset"] is None
 
 
 def test_internal_mock_cash_holdings_fees_and_replay(db):

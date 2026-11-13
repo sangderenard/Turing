@@ -119,7 +119,7 @@ def register_bot(db, owner: int, body: dict) -> dict:
                 raise ArenaError("request_id was already used for a different bot", 409)
             result = {"id": row["id"], "name": row["name"], "kind": row["kind"], "replayed": True}
         else:
-            if db.execute("SELECT COUNT(*) FROM paper_bots WHERE owner_id=?", (owner,)).fetchone()[0] >= 1024:
+            if db.execute("SELECT COUNT(*) FROM paper_bots WHERE owner_id=?", (owner,)).fetchone()[0] >= 3000:
                 raise ArenaError("bot capacity reached", 429)
             identity = uuid.uuid4().hex
             db.execute("INSERT INTO paper_bots VALUES(?,?,?,?,?,?,?,NULL)",
@@ -153,26 +153,28 @@ def record_activity(db, owner: int, bot_id: str | None, channel: str, interactio
     db.execute("DELETE FROM paper_activity WHERE created<?", (now - 30 * 86400,))
 
 
-def presence(db, owner: int | None = None, *, since_seconds: int = 300) -> dict:
+def presence(db, owner: int | None = None, *, since_seconds: int = 300, offset: int = 0) -> dict:
+    if type(offset) is not int or offset < 0:
+        raise ArenaError("invalid presence offset")
     cutoff = time.time() - since_seconds
-    where = "WHERE owner_id=?" if owner is not None else ""
-    args = (owner,) if owner is not None else ()
-    rows = db.execute(f"SELECT id,owner_id,name,kind,last_seen FROM paper_bots {where} ORDER BY COALESCE(last_seen,0) DESC LIMIT 1024", args)
+    where = "AND owner_id=?" if owner is not None else ""
+    args = (cutoff, owner, 501, offset) if owner is not None else (cutoff, 501, offset)
+    rows = list(db.execute(f"SELECT id,owner_id,name,kind,last_seen FROM paper_bots "
+                           f"WHERE last_seen>=? {where} ORDER BY last_seen DESC,id LIMIT ? OFFSET ?", args))
     bots = []
-    for row in rows:
-        if row["last_seen"] is None or row["last_seen"] < cutoff:
-            continue
+    for row in rows[:500]:
         activity = db.execute("SELECT channel,interaction,strategy_id,created FROM paper_activity "
                               "WHERE bot_id=? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         bots.append({"id": row["id"], "owner_id": row["owner_id"], "name": row["name"],
                      "kind": row["kind"], "last_seen": row["last_seen"],
                      "activity": dict(activity) if activity else None})
-    return {"bots": bots, "fade_seconds": since_seconds, "asof": time.time()}
+    return {"bots": bots, "fade_seconds": since_seconds, "asof": time.time(),
+            "next_offset": offset + 500 if len(rows) > 500 else None}
 
 
 def bots(db, owner: int) -> dict:
     rows = db.execute("SELECT id,name,kind,source,created,last_seen FROM paper_bots "
-                      "WHERE owner_id=? ORDER BY created DESC LIMIT 1024", (owner,))
+                      "WHERE owner_id=? ORDER BY created DESC LIMIT 3000", (owner,))
     return {"bots": [{"id": row["id"], "name": row["name"], "kind": row["kind"],
                       "source": json.loads(row["source"])["registration"],
                       "created": row["created"], "last_seen": row["last_seen"]} for row in rows]}
@@ -253,7 +255,7 @@ def create_strategy(db, owner: int, body: dict) -> dict:
                 raise ArenaError("request_id was already used for a different strategy", 409)
             result = {"id": old["id"], "name": old["name"], "risk": old["risk"], "created": old["created"], "replayed": True}
         else:
-            if db.execute("SELECT COUNT(*) FROM paper_strategies WHERE owner_id=?", (owner,)).fetchone()[0] >= 32:
+            if db.execute("SELECT COUNT(*) FROM paper_strategies WHERE owner_id=?", (owner,)).fetchone()[0] >= 3000:
                 raise ArenaError("strategy capacity reached", 429)
             identity = hashlib.sha256(f"strategy:{owner}:{request_id}".encode()).hexdigest()[:32]
             created = time.time()

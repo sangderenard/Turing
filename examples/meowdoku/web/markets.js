@@ -266,7 +266,14 @@ function fadePresence() {
   }
 }
 async function updatePresence() {
-  latestPresence = await api("/api/paper/presence");
+  let offset = 0, combined = [], latest = null;
+  for (let page = 0; page < 20; page++) {
+    latest = await api(`/api/paper/presence?offset=${offset}`);
+    combined.push(...(latest.bots || []));
+    if (latest.next_offset === null || latest.next_offset === undefined) break;
+    offset = latest.next_offset;
+  }
+  latestPresence = { ...latest, bots: combined };
   drawPresence();
 }
 setInterval(fadePresence, 1000);
