@@ -6521,10 +6521,36 @@ def _emit_repository_call_module(
         is_compiler_owned_storage,
         public_sequence_capacity_sources,
         public_sequence_input_ports,
+        public_owned_sequence_returns,
     )
 
     sequence_capacity_relations = public_sequence_capacity_sources(module, function_name)
     sequence_input_ports = public_sequence_input_ports(module, function_name)
+    owned_sequence_ports = public_owned_sequence_returns(module, function_name)
+    output_heap_sequences = tuple(
+        (p.data_id, p.length_id, p.capacity_id, p.owner_id, p.element_dtype)
+        for p in owned_sequence_ports
+    )
+    owned_port_ids = {value_id for ports in output_heap_sequences for value_id in ports[:4]}
+    release_entry_name = f"{entry_name}_release_owned_results" if owned_sequence_ports else None
+    # A returned pointer cell is not a published owned value.  A descriptor
+    # without the exact escape/owner receipt must not masquerade as a one-
+    # element public array (in particular, a selected branch handle).
+    from .ir_sequence_tables import SSASequenceCapacityPolicy
+    root_sequence_table = getattr(module, "sequence_tables", {}).get(function_name)
+    if root_sequence_table is not None:
+        for value in root_outputs:
+            descriptor = root_sequence_table.sequences.get(int(value.id))
+            if (descriptor is not None
+                    and descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC
+                    and descriptor.heap_owner_value_id is not None
+                    and is_compiler_owned_storage(value)
+                    and int(value.id) not in owned_port_ids
+                    and int(value.id) not in {r.output_data_id for r in sequence_capacity_relations}):
+                return LLVMFunctionArtifact(
+                    name=entry_name, llvm_ir="", buffer_order=(), buffer_shapes=(),
+                    extent_order=(), shortfalls=(LLVMEmissionShortfall(
+                        function_name, "Ret", f"owned sequence {value.id} has no validated public ownership escape contract"),))
     output_capacity_sources = tuple(
         (item.output_data_id, item.input_data_id) for item in sequence_capacity_relations
     )
@@ -6553,7 +6579,7 @@ def _emit_repository_call_module(
     root_public_args = tuple(
         value for value in root.args
         if not (
-            int(value.id) not in bounded_public_members
+            int(value.id) not in bounded_public_members | owned_port_ids
             and is_compiler_owned_storage(value)
             and storage_requirements.get(int(value.id)) is not None
             and (
@@ -6565,7 +6591,7 @@ def _emit_repository_call_module(
     root_internal_storage = tuple(
         value for value in root.args
         if (
-            int(value.id) not in bounded_public_members
+            int(value.id) not in bounded_public_members | owned_port_ids
             and is_compiler_owned_storage(value)
             and storage_requirements.get(int(value.id)) is not None
             and (
@@ -6872,6 +6898,40 @@ def _emit_repository_call_module(
     entry_span.take(UnitKind.RETURN)
     entry_recorder.unit(UnitKind.RETURN, "}")
 
+    release_lines = []
+    release_units = []
+    if owned_sequence_ports:
+        from .ssa_heap_allocation import require_heap_owner
+        root_values = {int(v.id): v for v in root.args}
+        release_lines = [f"define void @{release_entry_name}(ptr %buffers) {{", "entry:"]
+        release_units.append(entry_recorder.unit(
+            UnitKind.FUNCTION_HEADER, release_lines[0], spelling=release_entry_name,
+            extra_cells=tuple(p.public_cell for p in owned_sequence_ports)))
+        reset_members = set()
+        for ports in owned_sequence_ports:
+            require_heap_owner(root_values[ports.owner_id])
+            for value_id in dict.fromkeys((ports.owner_id, ports.data_id, ports.length_id, ports.capacity_id)):
+                if value_id in reset_members:
+                    continue
+                reset_members.add(value_id)
+                slot = buffer_order.index(value_id)
+                stem = f"%release.{value_id}"
+                lines = [f"  {stem}.slot = getelementptr ptr, ptr %buffers, i64 {slot}",
+                         f"  {stem} = load ptr, ptr {stem}.slot, align 8"]
+                if value_id == ports.owner_id:
+                    lines.append(f"  call void @turing_heap_release(ptr {stem})")
+                else:
+                    ty, zero = ("ptr", "null") if value_id == ports.data_id else ("i64", "0")
+                    lines.append(f"  store {ty} {zero}, ptr {stem}, align 8")
+                release_lines.extend(lines)
+                release_units.append(entry_recorder.unit(
+                    UnitKind.CALL if value_id == ports.owner_id else UnitKind.STATEMENT,
+                    "\n".join(lines), args=(value_id,),
+                    spelling="turing_heap_release" if value_id == ports.owner_id else stem,
+                    extra_cells=(ports.public_cell, ports.descriptor_cell, ports.owner_cell)))
+        release_lines.extend(("  ret void", "}"))
+        release_units.append(entry_recorder.unit(UnitKind.RETURN, "  ret void\n}", spelling=release_entry_name))
+
     definitions: dict[str, str] = {}
     declarations: dict[str, str] = {}
     unresolved: set[str] = set()
@@ -6893,7 +6953,7 @@ def _emit_repository_call_module(
     # The scalar tables reach target intrinsics from the emitted bodies and the
     # wrapper, not only from authored kernels, so the closure starts at every
     # symbol this module actually references.
-    module_text = "\n".join((*emitted_functions, *wrapper))
+    module_text = "\n".join((*emitted_functions, *wrapper, *release_lines))
     pending_kernels = set(kernels_used) | set(_re.findall(
         r"@([A-Za-z_$.-][\w$.-]*)\s*\(", module_text,
     ))
@@ -6959,6 +7019,7 @@ def _emit_repository_call_module(
             *wrapper,
             "}",
         )),
+        "\n".join(release_lines),
     ) if part)
 
     # Kernel / library text pulled in by symbol: one KERNEL_TEXT unit per
@@ -7019,7 +7080,7 @@ def _emit_repository_call_module(
     )
     wrapper_finished = entry_recorder.finish("\n".join((
         *root_definitions,
-        wrapper_header, *wrapper, "}",
+        wrapper_header, *wrapper, "}", *release_lines,
         *(kernel_texts[symbol] for symbol in sorted(kernel_texts)),
     )))
     publications = function_output_publications(module.functions[function_name])
@@ -7066,11 +7127,21 @@ def _emit_repository_call_module(
         value_id for ports in sequence_input_ports
         for value_id in (ports.length_id, ports.capacity_id)
     }
+    native_written_members |= owned_port_ids
     public_roles = tuple(
         "inout" if value_id in native_written_members else role
         for value_id, role in zip(buffer_order, public_roles, strict=True)
     )
-    if sequence_capacity_relations:
+    release_cell = None
+    if owned_sequence_ports:
+        release_cell = post_artifact_part(
+            emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.OWNED_RESULT_RELEASE,
+            data="\n".join(release_lines),
+            location=(release_entry_name, output_heap_sequences),
+            sources=(*release_units, *(ports.public_cell for ports in owned_sequence_ports)),
+            stage=EMISSION_LLVM,
+        )
+    if sequence_capacity_relations or owned_sequence_ports:
         from .runtime_abi import runtime_abi_description
         from .emission_concordance import post_api_contract
         api_contract_cell = post_api_contract(
@@ -7087,6 +7158,8 @@ def _emit_repository_call_module(
             output_extent_sources=output_extent_sources,
             output_capacity_sources=output_capacity_sources,
             output_length_sources=output_length_sources,
+            output_heap_sequences=output_heap_sequences,
+            release_entry=release_entry_name,
         )
         post_artifact_part(
             emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.RUNTIME_ABI,
@@ -7095,6 +7168,10 @@ def _emit_repository_call_module(
                 cell for item in sequence_capacity_relations
                 for cell in (item.bound_cell, item.output_descriptor_cell,
                              item.input_descriptor_cell)
+            ), *((release_cell,) if release_cell is not None else ()), *(
+                cell for ports in owned_sequence_ports
+                for cell in (ports.public_cell, ports.source_cell, ports.descriptor_cell,
+                             ports.owner_cell, ports.return_slot_cell)
             )),
             stage=EMISSION_LLVM,
         )
@@ -7119,6 +7196,8 @@ def _emit_repository_call_module(
         output_extent_sources=tuple(output_extent_sources),
         output_capacity_sources=output_capacity_sources,
         output_length_sources=output_length_sources,
+        output_heap_sequences=output_heap_sequences,
+        release_entry_name=release_entry_name,
         buffer_ranks=public_ranks,
         buffer_roles=public_roles,
         needs_text_sink=bool(text_sink),
@@ -7185,6 +7264,10 @@ class LLVMFunctionArtifact:
     #: Allocation bounds and written logical lengths are different contracts.
     output_capacity_sources: tuple[tuple[int, int], ...] = ()
     output_length_sources: tuple[tuple[int, int], ...] = ()
+    #: Exact public-owned descriptor ports: data cell, length, capacity,
+    #: owner cell and element dtype. Host copies all results before release.
+    output_heap_sequences: tuple[tuple[int, int, int, int, str], ...] = ()
+    release_entry_name: str | None = None
     #: Per public buffer: its rank (independent of any static shape) and its
     #: role (input / output / inout / other).  Read by ``runtime_abi``.
     buffer_ranks: tuple[int, ...] = ()
@@ -7254,8 +7337,10 @@ class LLVMFunctionArtifact:
             output_extent_sources=self.output_extent_sources,
             output_capacity_sources=self.output_capacity_sources,
             output_length_sources=self.output_length_sources,
+            output_heap_sequences=self.output_heap_sequences,
+            release_entry=self.release_entry_name,
         )
-        if self.output_capacity_sources or self.output_length_sources:
+        if self.output_capacity_sources or self.output_length_sources or self.output_heap_sequences:
             from .concordance_declarations import EMISSION_ARTIFACT, ArtifactPart, Backend
             from .identity_concordance import ConcordanceRefusal
             import hashlib
@@ -7270,6 +7355,15 @@ class LLVMFunctionArtifact:
                     "computed output ABI disagrees with its emission concordance"
                 )
         return description
+
+    def release_owned_results(self, pointers) -> None:
+        if not self.release_entry_name:
+            raise ValueError("owned results have no native release entry")
+        self.entry()
+        release = getattr(self._library, self.release_entry_name)
+        release.argtypes = [_ctypes.POINTER(_ctypes.c_void_p)]
+        release.restype = None
+        release(pointers)
 
     def _uses_validation_runtime(self) -> bool:
         # The prepared object pocket was still scanning its 71,996-byte IR
@@ -7321,30 +7415,41 @@ class LLVMExecution:
     scalar_index: dict = _field(default_factory=dict)
 
     _capacity_buffers: dict[int, _Any] = _field(default_factory=dict, repr=False)
+    _owned_result_cells: dict[int, _Any] = _field(default_factory=dict, repr=False)
 
     def run(self) -> "LLVMExecution":
         self.buffers.update(self._capacity_buffers)
-        self.artifact.reset_validation_error()
-        self.artifact.entry()(self.pointers, self.extents)
-        validation_error = self.artifact.take_validation_error()
-        if validation_error:
-            from .native_faults import validation_fault
+        self.buffers.update(self._owned_result_cells)
+        try:
+            self.artifact.reset_validation_error()
+            self.artifact.entry()(self.pointers, self.extents)
+            validation_error = self.artifact.take_validation_error()
+            if validation_error:
+                from .native_faults import validation_fault
 
-            raise validation_fault(
-                validation_error,
-                f"LLVM runtime validation failed with code {validation_error}",
-            )
-        if self.artifact.external_slots:
-            from .external_functions import check_external_faults
+                raise validation_fault(
+                    validation_error,
+                    f"LLVM runtime validation failed with code {validation_error}",
+                )
+            if self.artifact.external_slots:
+                from .external_functions import check_external_faults
 
-            check_external_faults(self.artifact)
-        if self.artifact.output_length_sources:
-            from .runtime_abi import apply_native_result_extents
-            self.artifact.runtime_abi()
-            apply_native_result_extents(
-                self.buffers, self._capacity_buffers,
-                length_sources=self.artifact.output_length_sources,
-            )
+                check_external_faults(self.artifact)
+            if self.artifact.output_length_sources:
+                from .runtime_abi import apply_native_result_extents
+                self.artifact.runtime_abi()
+                apply_native_result_extents(
+                    self.buffers, self._capacity_buffers,
+                    length_sources=self.artifact.output_length_sources,
+                )
+            if self.artifact.output_heap_sequences:
+                from .runtime_abi import copy_owned_sequence_results
+                self.artifact.runtime_abi()
+                self.buffers.update(copy_owned_sequence_results(
+                    self.buffers, self.artifact.output_heap_sequences))
+        finally:
+            if self.artifact.output_heap_sequences:
+                self.artifact.release_owned_results(self.pointers)
         return self
 
 
@@ -7373,7 +7478,7 @@ def prepare_artifact_execution(
     }
     buffers: dict[int, _Any] = {}
     extent_sources = dict(artifact.output_extent_sources or ())
-    if artifact.output_capacity_sources or artifact.output_length_sources:
+    if artifact.output_capacity_sources or artifact.output_length_sources or artifact.output_heap_sequences:
         artifact.runtime_abi()
     for output_id, source_id in artifact.output_capacity_sources:
         source = feed_values.get(int(source_id))
@@ -7476,6 +7581,8 @@ def prepare_artifact_execution(
         scalar_index=scalar_index,
         _capacity_buffers={int(output_id): buffers[int(output_id)]
                            for output_id, _ in artifact.output_length_sources},
+        _owned_result_cells={int(value_id): buffers[int(value_id)]
+                             for ports in artifact.output_heap_sequences for value_id in ports[:4]},
     )
 
 
@@ -9535,7 +9642,10 @@ def compile_artifact(
         # explicit input to the same link, independent of auto-export policy.
         export_definition = build_dir / f"{artifact.name}.def"
         export_definition.write_text(
-            f"EXPORTS\n    {artifact.name}\n", encoding="utf-8",
+            "EXPORTS\n" + "".join(
+                f"    {symbol}\n" for symbol in (artifact.name, artifact.release_entry_name)
+                if symbol is not None
+            ), encoding="utf-8",
         )
         command.append(str(export_definition))
     if _fma_contract_enabled():
