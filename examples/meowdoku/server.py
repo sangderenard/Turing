@@ -4285,7 +4285,7 @@ def main(argv: list[str] | None = None) -> int:
         spec.loader.exec_module(task_request)
 
         def land_request(ids, _port=args.task_port, _jobs=args.task_jobs_dir, _engine=args.task_engine_id):
-            fields = {"reviews": list(ids)} if ids else {}
+            fields = {"trigger": "request", **({"reviews": list(ids)} if ids else {})}
             try:
                 return task_request.submit(studio_product_nodus.nodus_modules()[0], port=_port, engine_id=_engine, jobs_dir=_jobs,
                                            task="reviews.land", fields=fields, timeout=5.0)

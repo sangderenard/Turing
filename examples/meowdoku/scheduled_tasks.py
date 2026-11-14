@@ -214,7 +214,8 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                     else:                # a one-off request may name the reviews to land (the landing queue's "land now")
                         only = request.get("reviews") if isinstance(request, dict) else None
                         only = [str(r) for r in only] if isinstance(only, list) and only else None
-                        done = gate.land(policy, db, apply=bool(policy["apply"]), only=only)
+                        trigger = "request" if isinstance(request, dict) and request.get("trigger") == "request" else "schedule"
+                        done = gate.land(policy, db, apply=bool(policy["apply"]), only=only, trigger=trigger)
                 finally:
                     db.close()
                 counts = {}

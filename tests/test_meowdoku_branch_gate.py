@@ -829,3 +829,42 @@ def test_revoke_and_threads_over_rest_and_the_notice_they_send(world):
     assert status == 200 and answer["tail"] == 1 and [c["body"] for c in answer["threads"][0]["comments"]] == ["fixed"]
     assert ask("/api/reviews/attention", user=opal, username="opal")[1]["attention"][0]["why"] == "ann wrote in its thread"
     assert ask("/api/reviews/threads?tail=nope", user=ANN, username="ann")[0] == 400
+
+
+def test_each_landing_run_is_recorded_for_the_page_with_its_trigger_and_outcome(world, monkeypatch):
+    import time as clock
+    from types import SimpleNamespace
+    from meowdoku import scheduled_tasks
+    db, policy = world["db"], world["policy"]
+    assert branch_review.lander_status(db)["last"] is None and branch_review.lander_status(db)["running"] is None
+    first = branch(world, "first")
+    submit(world, "first", first, timeout_s=0)
+    branch_gate.land(policy, db, apply=False, log=lambda line: None)
+    assert branch_review.lander_status(db)["last"]["summary"] == "1 would land", "report-only says so"
+    branch_gate.land(policy, db, apply=True, log=lambda line: None)
+    last = branch_review.lander_status(db)["last"]
+    assert last["trigger"] == "cli" and last["landed"] == 1 and last["summary"] == "1 landed" and last["error"] is None
+    table = scheduled_tasks.handlers(SimpleNamespace(DONE=2, UNCHANGED=3), branches={
+        "policy": world["policy_file"], "accounts_db": world["db_file"], "module": branch_gate})
+    table["reviews.land"]({"task": "reviews.land"})
+    assert branch_review.lander_status(db)["last"]["trigger"] == "schedule"
+    table["reviews.land"]({"task": "reviews.land", "trigger": "request"})
+    assert branch_review.lander_status(db)["last"]["trigger"] == "request"
+
+    def broken(*args, **kwargs):
+        raise OSError("git is not on PATH")
+    monkeypatch.setattr(branch_gate, "_land", broken)
+    with pytest.raises(OSError):
+        branch_gate.land(policy, db, apply=True, log=lambda line: None)
+    assert branch_review.lander_status(db)["last"]["error"] == "OSError: git is not on PATH", "a crash is reported, and still raised"
+    run = branch_review.run_started(db, trigger="schedule")
+    db.execute("UPDATE branch_land_runs SET started = ? WHERE id = ?", (clock.time() - branch_review.STUCK_AFTER_S - 60, run))
+    running = branch_review.lander_status(db)["running"]
+    assert running["id"] == run and running["stuck"] is True, "a run that never finishes is reported stuck"
+
+    def ask(path):
+        handler = Handler(path, user=ANN, username="ann")
+        branch_review.http_route(handler, path, "GET", policy=policy, accounts_db=world["db_file"])
+        return handler.sent
+    status, answer = ask("/api/reviews")
+    assert status == 200 and answer["lander"]["running"]["stuck"] is True and answer["lander"]["last"]["error"]

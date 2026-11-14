@@ -142,7 +142,8 @@ async function load({quiet = false} = {}) {
     reviews = result.reviews;
     landing = { queue: result.queue || [], updater: Boolean(result.updater), apply: result.apply !== false,
       schedule: result.automatic_landing || null,
-      clockOffset: Number.isFinite(result.server_now) ? result.server_now - Date.now() / 1000 : 0 };
+      clockOffset: Number.isFinite(result.server_now) ? result.server_now - Date.now() / 1000 : 0, lander: result.lander || null };
+    renderLander();
     renderQueue();
     const open = reviews.filter(r => OPEN.has(r.standing)).length;
     status(`${open} change${open === 1 ? "" : "s"} in play. Lock: ${result.lock}.` +
@@ -193,6 +194,30 @@ function renderQueue() {
     }
     list.append(row);
   }
+}
+
+// The lander's own state: its last run, a run in progress, and a warning when one has run too long or failed.
+function renderLander() {
+  const line = byId("lander"), lander = landing.lander;
+  line.classList.remove("lander-warn");
+  if (!lander) { line.textContent = ""; return; }
+  const parts = [];
+  const { running, last } = lander;
+  if (running) {
+    const minutes = Math.floor(running.seconds / 60);
+    parts.push(running.stuck
+      ? `The lander has been running since ${when(running.started)} (${minutes} min, ${running.trigger}): it is probably stuck, for example on a Git sign-in nobody sees. Check the task worker's log.`
+      : `The lander is running (${running.trigger}, since ${when(running.started)}).`);
+    if (running.stuck) line.classList.add("lander-warn");
+  }
+  if (last) {
+    const took = Math.max(0, Math.round(last.finished - last.started));
+    parts.push(last.error
+      ? `Its last run (${last.trigger}, ${when(last.finished)}) failed: ${last.error}`
+      : `Last landing run: ${when(last.finished)} (${last.trigger}, ${took} s): ${last.summary}.`);
+    if (last.error) line.classList.add("lander-warn");
+  }
+  line.textContent = parts.join(" ") || "The lander has not run since this record began.";
 }
 
 function updateQueueTimer() {

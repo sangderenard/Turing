@@ -518,9 +518,24 @@ def clean(policy, db, *, apply, actor=None, now=None, log=print) -> list:
     return actions
 
 
-def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> list:
+def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None, trigger="cli") -> list:
     """Land each accepted change that is a fast-forward of its base. ``only`` (review ids) limits the run to those changes:
-    the landing queue's "land now". Every change tried and not landed keeps why (branch_review.mark_tried)."""
+    the landing queue's "land now". Every change tried and not landed keeps why (branch_review.mark_tried).
+
+    Each run is recorded for the reviews page (branch_review.run_started / run_finished): when it started and finished,
+    what asked for it (``trigger``: schedule, request or cli), what it did, and the error that stopped it, if one did. A
+    run that never finishes (a Git call waiting on a sign-in nobody sees) stays "running", and the page says so."""
+    run = branch_review.run_started(db, trigger=trigger, asked=only, apply=apply)
+    try:
+        results = _land(policy, db, apply=apply, now=now, log=log, gh=gh, only=only)
+    except BaseException as error:
+        branch_review.run_finished(db, run, [], error=f"{type(error).__name__}: {error}")
+        raise
+    branch_review.run_finished(db, run, results)
+    return results
+
+
+def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> list:
     now = time.time() if now is None else now
     wanted = None if only is None else {str(review_id) for review_id in only}
     results = []

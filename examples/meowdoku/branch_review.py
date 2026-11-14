@@ -66,6 +66,10 @@ DDL = (
     "removed_at REAL NOT NULL, reason TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS worktree_verdicts (path TEXT PRIMARY KEY, verdict TEXT NOT NULL CHECK(verdict IN "
     "('trash','archive','keep')), note TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL, decided_at REAL NOT NULL)",
+    # The lander's runs, for the reviews page: when, why, what came of it (run_started()/run_finished()/lander_status()).
+    "CREATE TABLE IF NOT EXISTS branch_land_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL NOT NULL, finished REAL, "
+    "trigger TEXT NOT NULL, asked TEXT, apply INTEGER NOT NULL, landed INTEGER NOT NULL DEFAULT 0, contained INTEGER NOT NULL "
+    "DEFAULT 0, held INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, summary TEXT, error TEXT)",
     # The Git author identity an account declares for its own commits (identity()/set_identity()).
     "CREATE TABLE IF NOT EXISTS account_git_identity (user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, "
     "declared_at REAL NOT NULL)",
@@ -489,6 +493,47 @@ def attention(db, *, username, now=None) -> list:
     return out
 
 
+STUCK_AFTER_S = 300.0          # a landing run this old and unfinished is reported as probably stuck
+LAND_RUN_KEEP = 200
+
+
+def run_started(db, *, trigger, asked=None, apply=True) -> int:
+    ensure(db)
+    cursor = db.execute("INSERT INTO branch_land_runs (started, trigger, asked, apply) VALUES (?, ?, ?, ?)",
+                        (time.time(), str(trigger), None if not asked else ",".join(str(a) for a in asked), int(bool(apply))))
+    db.execute("DELETE FROM branch_land_runs WHERE id <= ?", (cursor.lastrowid - LAND_RUN_KEEP,))
+    return cursor.lastrowid
+
+
+def run_finished(db, run_id, results, *, error=None) -> None:
+    counts = {"landed": 0, "contained": 0, "held": 0, "other": 0}
+    for entry in results:
+        action = entry.get("action")
+        counts["landed" if action in ("landed", "would land") else "contained" if action in ("contained", "would record contained")
+               else "held" if action == "held" else "other"] += 1
+    applied = (db.execute("SELECT apply FROM branch_land_runs WHERE id = ?", (int(run_id),)).fetchone() or (1,))[0]
+    said = ", ".join(f"{n} {what}" for what, n in (("landed" if applied else "would land", counts["landed"]),
+                                                   ("already in base", counts["contained"]),
+                                                   ("held", counts["held"]), ("other", counts["other"])) if n) or "nothing to land"
+    db.execute("UPDATE branch_land_runs SET finished = ?, landed = ?, contained = ?, held = ?, other = ?, summary = ?, error = ? "
+               "WHERE id = ?", (time.time(), counts["landed"], counts["contained"], counts["held"], counts["other"], said,
+                                None if error is None else str(error)[:500], int(run_id)))
+
+
+def lander_status(db, now=None) -> dict:
+    """The lander as the page shows it: its last finished run, a run in progress (and whether it looks stuck), the last runs."""
+    ensure(db)
+    now = time.time() if now is None else now
+    keys = ("id", "started", "finished", "trigger", "asked", "apply", "landed", "contained", "held", "other", "summary", "error")
+    rows = [dict(zip(keys, r)) for r in db.execute(f"SELECT {', '.join(keys)} FROM branch_land_runs ORDER BY id DESC LIMIT 10")]
+    running = next((r for r in rows if r["finished"] is None), None)
+    if running is not None:
+        running["seconds"] = now - running["started"]
+        running["stuck"] = running["seconds"] > STUCK_AFTER_S
+    return {"last": next((r for r in rows if r["finished"] is not None), None), "running": running, "recent": rows,
+            "stuck_after_s": STUCK_AFTER_S}
+
+
 def kept(db, repository, branch) -> bool:
     """A branch whose author asked for it to be kept after landing."""
     ensure(db)
@@ -680,7 +725,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
                                "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock"),
                                "queue": queue(db), "updater": land_request is not None, "apply": bool(policy.get("apply")),
-                               "server_now": time.time(), "automatic_landing": next_scheduled_landing(landing_schedule_path)})
+                               "server_now": time.time(), "automatic_landing": next_scheduled_landing(landing_schedule_path),
+                               "lander": lander_status(db)})
         if method != "POST":
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
