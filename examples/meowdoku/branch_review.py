@@ -277,13 +277,16 @@ def decide(db, review_id, *, user_id, username, head, decision, note="", now=Non
 
 
 def withdraw(db, review_id, *, user_id, now=None) -> dict:
+    """The author takes a change back while it has not landed: open, or approved and waiting in the landing queue (a change
+    a newer one superseded, such as a rebase, would otherwise wait there for ever). A landed or rejected change stays."""
     _account(user_id)
     now = time.time() if now is None else now
     done = db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = 'withdrawn by its author' "
-                      "WHERE id = ? AND owner_id = ? AND status = 'open' AND landed_at IS NULL", (now, str(review_id), user_id))
+                      "WHERE id = ? AND owner_id = ? AND status IN ('open', 'approved') AND landed_at IS NULL",
+                      (now, str(review_id), user_id))
     if done.rowcount != 1:
         get(db, review_id, now)
-        raise ReviewError("only the author withdraws a change, and only while it is open", 403)
+        raise ReviewError("only the author withdraws a change, and only before it lands", 403)
     return get(db, review_id, now)
 
 

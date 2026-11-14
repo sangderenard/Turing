@@ -536,12 +536,23 @@ def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> lis
             if review["base"] != declared["default"]:
                 raise GateError("the review's base is not the repository's default branch")
             git(path, "fetch", "--quiet", remote)
+            base = f"refs/remotes/{remote}/{review['base']}"
+            if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", review["head"], base],
+                              capture_output=True).returncode == 0:
+                # Already in the base (it came in through another change, a merge or an integration): there is nothing to
+                # push, and holding it as "not a fast-forward" would keep it in the queue for ever. It is recorded as landed.
+                detail = f"already in {review['base']}: nothing to push"
+                if apply:
+                    branch_review.mark_landed(db, review["id"], detail, now)
+                entry.update(action="contained" if apply else "would record contained", reason=detail)
+                log(f"[reviews] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
+                results.append(entry)
+                continue
             if git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{review['branch']}", check=False) != review["head"]:
                 if git(path, "rev-parse", "-q", "--verify", f"refs/heads/{review['branch']}", check=False) != review["head"]:
                     raise GateError("the branch is not at the reviewed commit, here or on the remote; submit the commit it is at")
                 if apply:                        # the author never pushed: this tool does the talking to GitHub
                     git(path, "push", remote, f"{review['head']}:refs/heads/{review['branch']}")
-            base = f"refs/remotes/{remote}/{review['base']}"
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
                               capture_output=True).returncode != 0:
                 raise GateError(f"not a fast-forward of {review['base']}; merge {review['base']} into the branch and submit again")

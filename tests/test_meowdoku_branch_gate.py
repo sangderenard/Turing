@@ -708,3 +708,34 @@ def test_a_one_off_land_request_names_its_reviews_to_the_task_worker(world):
     assert said == "1 would land" and [e["branch"] for e in detail] == ["first"]
     status, said, detail = table["reviews.land"]({"task": "reviews.land"})
     assert said == "2 would land", "a request that names none is the whole queue, as the schedule's"
+
+
+def test_a_change_already_in_its_base_is_recorded_landed_instead_of_held_for_ever(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    head = branch(world, "feature")
+    commit(work, "meanwhile.txt")
+    run(work, "merge", "-q", "--no-ff", "-m", "integrate feature", "feature")     # it reached main through another change
+    run(work, "push", "-q", "origin", "main")
+    made = submit(world, "feature", head, timeout_s=0)
+    preview = branch_gate.land(policy, db, apply=False, now=1000.0, log=lambda line: None)
+    assert preview[0]["action"] == "would record contained" and branch_review.get(db, made["id"], 1000.0)["standing"] == "accepted"
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "contained" and "already in main" in done[0]["reason"]
+    record = branch_review.get(db, made["id"], 1000.0)
+    assert record["standing"] == "landed" and record["landed_detail"].startswith("already in main")
+    assert branch_review.queue(db, now=1000.0) == [] and branch_gate.land(policy, db, apply=True, now=1001.0, log=lambda l: None) == []
+
+
+def test_the_author_withdraws_an_approved_change_before_it_lands_but_not_after(world):
+    db, policy = world["db"], world["policy"]
+    first, second = branch(world, "first"), branch(world, "second")
+    one, two = submit(world, "first", first), submit(world, "second", second)
+    for made in (one, two):
+        branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=made["head"], decision="approved")
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.withdraw(db, one["id"], user_id=BOB)                        # only its author
+    assert branch_review.withdraw(db, one["id"], user_id=ANN)["standing"] == "withdrawn", "superseded while waiting to land"
+    assert [r["id"] for r in branch_review.queue(db)] == [two["id"]]
+    branch_gate.land(policy, db, apply=True, log=lambda line: None)
+    with pytest.raises(branch_review.ReviewError, match="before it lands"):
+        branch_review.withdraw(db, two["id"], user_id=ANN)

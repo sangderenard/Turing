@@ -208,7 +208,7 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                 counts = {}
                 for entry in done:
                     counts[entry["action"]] = counts.get(entry["action"], 0) + 1
-                acted = any(entry["action"] in ("landed", "removed") for entry in done)
+                acted = any(entry["action"] in ("landed", "removed", "contained") for entry in done)
                 said = ", ".join(f"{count} {action}" for action, count in sorted(counts.items())) or "nothing to do"
                 if which == "clean" and any(entry["action"] == "removed" for entry in done):
                     try:                         # the record of what was removed goes into Git's history as well as SQL
