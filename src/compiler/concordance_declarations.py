@@ -676,6 +676,15 @@ SOURCE_EXCEPTION_INGESTION = declare_page("source_exception_ingestion", (
 SOURCE_GRADIENT_TRACKING_MARK = declare_page("source_gradient_tracking_mark", (
     RowField("call", K.PAGE_REF),
 ), tuple)
+#: A source identity wash: an authored construct rewritten into an exactly
+#: equal one the compiler lowers.  Row: the rewritten construct's SOURCE_SPAN
+#: cell.  Fact: (identity name, SOURCE_SPAN cells the identity reads), DERIVED
+#: from those cells.  ``tensor_tuple_data_as_list``: ``AbstractTensor.tensor
+#: ((a, b), ...)`` -> ``AbstractTensor.tensor([a, b], ...)``; fact cells are
+#: (call span, data display span).
+SOURCE_IDENTITY_WASH = declare_page("source_identity_wash", (
+    RowField("site", K.PAGE_REF),
+), tuple)
 SOURCE_EXCEPTION_NORMAL_BINDING = declare_page(
     "source_exception_normal_binding", (
         RowField("read_scope", K.SCOPE),

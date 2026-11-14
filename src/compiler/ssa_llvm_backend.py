@@ -5764,6 +5764,74 @@ def _emit_repository_call_module(
                         and operation in _INTEGER_COMPARISON
                         else "double"
                     )
+                # Program: ``(ep + t).sum()`` with ``ep`` (3, 2) and ``t``
+                # (2,) (scratch lit2r/c2).  Wrong record: every span operand
+                # was loaded at the result's flat index, so the (2,) row was
+                # read at 0..5 -- past its buffer -- and LLVM returned 0 for
+                # 135 with a clean audit.  Rule: an operand whose static
+                # shape differs from the result's is indexed by NumPy's
+                # broadcast law (axes aligned from the right; an extent-1 or
+                # absent axis contributes 0); any other mismatch, or a rank
+                # mismatch whose extents are not static, is refused.
+                result_shape = tuple(map(int, getattr(result, "shape", ()) or ()))
+                broadcast_index: dict[int, str] = {}
+                refused_broadcast = False
+                for position, argument in enumerate(instruction.args):
+                    argument_rank = _declared_span_rank(argument)
+                    if argument_rank <= 0:
+                        continue
+                    argument_shape = tuple(map(int, getattr(argument, "shape", ()) or ()))
+                    if argument_shape == result_shape:
+                        continue
+                    if (
+                        not result_shape or not argument_shape
+                        or len(argument_shape) != argument_rank
+                        or len(result_shape) != _declared_span_rank(result)
+                        or len(argument_shape) > len(result_shape)
+                        or any(
+                            extent not in {1, result_shape[axis + len(result_shape) - len(argument_shape)]}
+                            for axis, extent in enumerate(argument_shape)
+                        )
+                    ):
+                        refused_broadcast = True
+                        break
+                    offset = len(result_shape) - len(argument_shape)
+                    terms = []
+                    operand_stride = 1
+                    for axis in reversed(range(len(argument_shape))):
+                        if argument_shape[axis] != 1:
+                            result_axis = axis + offset
+                            result_stride = 1
+                            for later in result_shape[result_axis + 1:]:
+                                result_stride *= int(later)
+                            register = f"%ew.bc.{tag}.{position}.{axis}"
+                            body.append(
+                                f"  {register}.q = sdiv i32 {index}, {result_stride}"
+                            )
+                            body.append(
+                                f"  {register}.c = srem i32 {register}.q, "
+                                f"{int(result_shape[result_axis])}"
+                            )
+                            body.append(
+                                f"  {register} = mul i32 {register}.c, {operand_stride}"
+                            )
+                            terms.append(register)
+                        operand_stride *= int(argument_shape[axis])
+                    current = "0" if not terms else terms[0]
+                    for term_position, term in enumerate(terms[1:]):
+                        summed = f"%ew.bcidx.{tag}.{position}.{term_position}"
+                        body.append(f"  {summed} = add i32 {current}, {term}")
+                        current = summed
+                    broadcast_index[position] = current
+                if refused_broadcast:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"elementwise {operation} over span %t{result_id} "
+                        "has an operand whose shape does not broadcast to the "
+                        "result by static extents; refusing to read it at the "
+                        "result's flat index",
+                    ))
+                    continue
                 operands = []
                 for position, argument in enumerate(instruction.args):
                     slot = f"%ew.op.{tag}.{position}"
@@ -5771,7 +5839,8 @@ def _emit_repository_call_module(
                     if _declared_span_rank(argument) > 0:
                         body.append(
                             f"  {slot}.addr = getelementptr {source_type}, "
-                            f"ptr {pointer(argument)}, i32 {index}"
+                            f"ptr {pointer(argument)}, i32 "
+                            f"{broadcast_index.get(position, index)}"
                         )
                         body.append(
                             f"  {slot} = load {source_type}, "

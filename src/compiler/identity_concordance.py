@@ -1694,6 +1694,7 @@ class CorrelationTable:
         found.extend(self._source_call_field_state_transfer_findings(module))
         found.extend(self._source_field_transfer_object_step_findings(module))
         found.extend(self._source_gradient_tracking_mark_findings(module))
+        found.extend(self._source_identity_wash_findings(module))
         found.extend(self._returned_aggregate_call_findings(module))
         found.extend(self._source_mapping_get_read_findings(module))
         found.extend(self._source_mapping_get_key_version_demand_findings(module))
@@ -2883,6 +2884,40 @@ class CorrelationTable:
                 found.append(Finding(
                     "returned-aggregate-call", str(row), 0,
                     "returned aggregate call lost its call cell or a tuple return-site row",
+                ))
+        return found
+
+    @staticmethod
+    def _source_identity_wash_findings(module: Any) -> list[Finding]:
+        """Check each recorded source identity wash against the spans it read."""
+        from .concordance_declarations import SOURCE_IDENTITY_WASH, SOURCE_SPAN
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_IDENTITY_WASH)
+        spans = book.page(SOURCE_SPAN)
+        expected_kinds = {"tensor_tuple_data_as_list": ("Call", "Tuple")}
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_IDENTITY_WASH, row)
+            fact = page.cell(receipt.row, receipt.column)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            kinds = expected_kinds.get(fact[0]) if isinstance(fact, tuple) and fact else None
+            cells = tuple(fact[1:]) if kinds is not None else ()
+            valid = (
+                kinds is not None and len(cells) == len(kinds)
+                and row[0] == cells[0]
+                and all(
+                    isinstance(cell, Ref) and cell.page == SOURCE_SPAN and cell in sources
+                    and getattr(spans.cell(cell.row, cell.column), "kind", None) == kind
+                    for cell, kind in zip(cells, kinds)
+                )
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-identity-wash", str(row[0]), 0,
+                    "identity wash lost a span it read, or names no known identity",
                 ))
         return found
 

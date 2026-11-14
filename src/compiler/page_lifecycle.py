@@ -279,6 +279,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "source_resource_control": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "source_exception_ingestion": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "source_gradient_tracking_mark": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
+    "source_identity_wash": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "source_exception_node": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "source_exception_operation": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "c_exception_operation": PageLifecycle(EMISSION, EMISSION, EMISSION),

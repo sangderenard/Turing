@@ -3752,6 +3752,15 @@ def _planned_scalar_dtypes_from_graph(
                     and not tuple(receiver_tensor.get("shape") or ())
                 ):
                     settle(scalar, node_id, receiver_dtype)
+                elif (
+                    len(receivers) == 1
+                    and operation(G.nodes[receivers[0]]) in {"argmax", "argmin"}
+                ):
+                    # Program: ``AbstractTensor.argmax(m.to(...)).item()``
+                    # (scratch nz/c07).  The receiver is an index tensor:
+                    # its element class is int64 by the operator's law,
+                    # whatever its catalogue record holds.
+                    settle(scalar, node_id, "int64")
                 continue
             # Program: ``v = maybe(row, flag); if v is not None: total +=
             # v`` with ``maybe`` returning ``row + 1`` or ``None`` (corpus
@@ -8567,12 +8576,23 @@ def _build_shell_hierarchy_plan(
                     )
                     # So is a call named by its static reference
                     # (``Precision.width_of(x)``): an unlinked callee.
+                    # Program: ``AbstractTensor.argmax(m.to(...)).item()``
+                    # (scratch nz/c07).  Wrong record: the static reference
+                    # names a tensor OPERATION whose result law already
+                    # states its contract (``argmax`` -> int64); no callee
+                    # body will ever attach, so every value computed from it
+                    # stayed deferred and the region's value records had no
+                    # dtype.  Rule: a static-reference call whose own
+                    # descriptor states a tensor contract is not unlinked.
                     or (
                         (graph.G.nodes[source].get("attributes") or {}).get(
                             "source_type"
                         ) == "Call"
                         and (graph.G.nodes[source].get("attributes") or {})
                         .get("static_python_reference") is not None
+                        and not _descriptor_states_tensor_contract(
+                            _tensor_descriptor(graph, int(source))
+                        )
                     )
                 )
                 and source not in call_result_dtypes
@@ -30402,6 +30422,27 @@ def _tensor_descriptor_rule(
                 ).get("identity") == "builtins.sum"
             )
             builtin_sum_start = None
+            # Program: ``AbstractTensor.argmax(m.to(dtype="int64")).item()``
+            # in a loop (scratch nz/c07).  Wrong record: the static form has
+            # no receiver role -- its tensor is ``arg:0`` -- so this law found
+            # no source, the result had no descriptor, and the region's value
+            # records had no dtype for it.  Rule: with no receiver role the
+            # static call's ``arg:0`` is the reduced tensor (and is then not
+            # a positional axis below).
+            static_form = bool(
+                source_id is None and not builtin_sum
+                and any(
+                    str(role).casefold() == "arg:0"
+                    for _parent, role in data.get("parents") or ()
+                )
+            )
+            if static_form:
+                source_id = next((
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role).casefold() == "arg:0"
+                    and int(parent) in graph.G
+                ), None)
             if source_id is None and builtin_sum:
                 # Program: ``sum(i * k for i in range(6))``.  Wrong record:
                 # the builtin's iterable is its ``arg:0`` (not a receiver
@@ -30440,7 +30481,7 @@ def _tensor_descriptor_rule(
             if source is not None:
                 attributes = data.get("attributes") or {}
                 axis = attributes.get("axis", attributes.get("dim"))
-                if axis is None:
+                if axis is None and not static_form:
                     # ``x.sum(0)``: the reduction axis is the first positional
                     # argument (``AbstractTensor.sum(self, dim, keepdim)``),
                     # read as the literal its node carries -- the same
