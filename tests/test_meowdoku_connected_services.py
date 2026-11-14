@@ -17,7 +17,7 @@ class ConnectedServicesTests(unittest.TestCase):
         self.assertIn("MCP services", page)
         self.assertIn('/keys.html#paper-box', page)
         self.assertIn('https://suno.com/mcp', page)
-        self.assertIn('not this site', page)
+        self.assertIn('suno-connect', page)
         self.assertNotIn('<input', page)
         self.assertNotIn('onclick=', page)
 

@@ -14,6 +14,8 @@ h1 { margin-bottom: .4rem; } h3 { margin-top: 0; }
 button { font: inherit; padding: .5rem .9rem; color: inherit; background: #162234; border: 1px solid #647792; border-radius: 6px; cursor: pointer; }
 button:disabled { opacity: .6; cursor: not-allowed; }
 dt { font-weight: 600; margin-top: .8rem; } dd { margin-left: 0; }
+select, textarea { display:block; width:100%; box-sizing:border-box; color:inherit; background:#111823; font:inherit; margin:.6rem 0; }
+pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:28rem; overflow:auto; }
 code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
 </style>
 </head>
@@ -38,12 +40,28 @@ code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
 <h2>MCP services</h2>
 <section class="card" aria-labelledby="suno-heading">
 <h3 id="suno-heading">Suno</h3>
-<p><strong>Site connection not available yet</strong></p>
-<p>The server-side Suno authorization handoff is not implemented. Signing in here does not connect Suno. No Suno account status or permissions have been retrieved.</p>
-<p>You can use Suno's official setup instructions to connect a supported MCP client yourself. When that client opens Suno, sign in and review its permission request there. That authorizes the client you chose, not this site's radio.</p>
-<p>Official MCP endpoint: <code>https://api.suno.com/mcp</code></p>
-<div class="actions"><a href="https://suno.com/mcp" target="_blank" rel="noopener noreferrer">Open official Suno connection instructions</a></div>
-<p class="muted">When the site connection is supported, eligible selections belong in the radio jukebox. It must not share your credentials or automatically publish your library to friends.</p>
+<p id="suno-status" role="status" aria-live="polite">Sign in to manage Suno.</p>
+<p>Connect your own Suno account here. Suno opens for you to sign in and approve access; this site never asks for your Suno password.</p>
+<div class="actions">
+<button id="suno-connect" type="button" disabled>Connect Suno</button>
+<button id="suno-disconnect" type="button" disabled>Disconnect / cancel</button>
+<button id="suno-refresh" type="button" disabled>Refresh Suno status</button>
+<button id="suno-tools-refresh" type="button" disabled>Load available tools</button>
+<a id="suno-authorize" hidden rel="noreferrer">Continue at Suno</a>
+</div>
+<p class="muted">Disconnect removes this site's saved access. To revoke the provider grant itself, use Suno's account controls.</p>
+<div id="suno-tools" hidden>
+<label for="suno-tool">Available tool</label>
+<select id="suno-tool"></select>
+<pre id="suno-schema"></pre>
+<label for="suno-arguments">Arguments (JSON object matching the tool's inputSchema)</label>
+<textarea id="suno-arguments" rows="8" spellcheck="false">{}</textarea>
+<p class="muted">Tools are supplied by Suno. Read the description and arguments before sending. A call can create or change content and may consume your Suno credits. Nothing runs automatically.</p>
+<button id="suno-call" type="button" disabled>Send this tool call</button>
+<pre id="suno-result" role="status" aria-live="polite"></pre>
+</div>
+<p>Official MCP endpoint: <code>https://api.suno.com/mcp</code>. <a href="https://suno.com/mcp" target="_blank" rel="noopener noreferrer">Provider information</a></p>
+<p class="muted">Connecting does not publish your library or share your credentials with friends. Only explicitly selected, permitted media belongs in the radio jukebox.</p>
 </section>
 <p class="muted">Do not paste a Suno password, session cookie, or token into Keys for this connection.</p>
 <noscript><p>JavaScript is needed to check your site account and stored connection status.</p></noscript>
