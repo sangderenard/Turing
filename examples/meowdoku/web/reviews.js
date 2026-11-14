@@ -144,6 +144,7 @@ async function load({quiet = false} = {}) {
       schedule: result.automatic_landing || null,
       clockOffset: Number.isFinite(result.server_now) ? result.server_now - Date.now() / 1000 : 0, lander: result.lander || null };
     renderLander();
+    renderAwaiting();
     renderQueue();
     const open = reviews.filter(r => OPEN.has(r.standing)).length;
     status(`${open} change${open === 1 ? "" : "s"} in play. Lock: ${result.lock}.` +
@@ -156,6 +157,30 @@ async function load({quiet = false} = {}) {
     loadRoom();
     if (selected && reviews.some(r => r.id === selected) && (!quiet || priorStanding !== reviews.find(r => r.id === selected).standing)) show(selected);
   } catch (error) { status(error.message); }
+}
+
+// The approval feed, above the landing queue: every change still waiting for a decision (or held by an objection), newest
+// first, refreshed with the page. Opening one shows its commits and diff, where the decision is made on exactly that commit.
+function renderAwaiting() {
+  const list = byId("awaiting-list");
+  list.replaceChildren();
+  const awaiting = reviews.filter(r => r.standing === "waiting" || r.standing === "objected")
+    .sort((a, b) => b.created_at - a.created_at);
+  byId("awaiting-note").textContent = !awaiting.length ? "No change is waiting for approval." :
+    `${awaiting.length} change${awaiting.length === 1 ? "" : "s"} waiting for a decision. ` +
+    (who.role === "admin" ? "Open one to read its diff and approve or reject it." : "Open one to read its diff, agree or object.");
+  for (const review of awaiting) {
+    const row = el("div", null, "queue-row"), text = el("div");
+    const title = el("button", `${review.repository} · ${review.branch}`, "row"); title.type = "button";
+    title.style.marginTop = "0";
+    title.onclick = async () => { await show(review.id); byId("detail").scrollIntoView({ block: "start" }); };
+    title.append(badge(review.standing));
+    text.append(title, el("small", `${review.head.slice(0, 12)} · by ${review.owner_name} · submitted ${when(review.created_at)}` +
+      (review.standing === "waiting" ? ` · accepted by silence ${until(review.accept_after)}` : "")));
+    if (review.note) text.append(el("small", review.note));
+    row.append(text);
+    list.append(row);
+  }
 }
 
 // The landing queue: what a review accepted and has not landed yet, with the updater's last word on it. "Land now" asks the
