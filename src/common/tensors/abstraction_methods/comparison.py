@@ -182,8 +182,37 @@ def allclose(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
     return self.allclose_(other, rtol=rtol, atol=atol, equal_nan=equal_nan)
 
 def nonzero(self, as_tuple: bool = False):
-    """Return indices of nonzero elements. as_tuple matches numpy/torch API."""
+    """Indices of the nonzero elements, composed only from base operators.
+
+    The flat positions of the nonzero mask (``arange(numel)[mask]``) are
+    unravelled per axis in row-major order (``(position // stride) %
+    extent``), which is the order numpy and torch both report.  ``as_tuple``
+    returns one int64 index tensor per axis; otherwise they are stacked into
+    an ``(N, ndim)`` tensor, as torch and the numpy backend return.  A rank-0
+    tensor is treated as rank 1, as ``numpy.atleast_1d`` does.
+
+    No backend hook: the same definition runs on every backend and is the
+    compiler's source for the operation (``compositional_tensor_source_
+    references``), so YoungMan's ``AbstractTensor.nonzero(match, as_tuple=
+    True)[0].item()`` lowers through ``reshape``, ``!=``, ``arange``, a boolean
+    mask, ``//``, ``%`` and ``stack`` rather than a kernel of its own.
+    """
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    return self.nonzero_(as_tuple=as_tuple)
+    shape = tuple(self.shape)
+    if len(shape) == 0:
+        shape = (1,)
+    count = 1
+    for extent in shape:
+        count = count * extent
+    mask = self.reshape(-1) != 0
+    positions = AbstractTensor.arange(count, dtype="int64", device=self.device)[mask]
+    coordinates = []
+    stride = count
+    for extent in shape:
+        stride = stride // extent
+        coordinates.append((positions // stride) % extent)
+    if as_tuple:
+        return tuple(coordinates)
+    return AbstractTensor.stack(coordinates, dim=1)
