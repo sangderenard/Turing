@@ -493,6 +493,15 @@ class Instance:
                 flags += ["--userlist-port", str(port)]
             else:
                 self.sup.log(f"{self.name}: userlist_prefix {userlist!r}: the host declares no such contract port; searched directly")
+        events = getattr(self.sup, "system_events", None) or {}     # [REVIEWS] this instance may ask the updater for a task
+        if self.spec.get("system_events") is True:                   # (the landing queue's "land now"): instances.json system_events
+            port = getattr(source, "contract_ports", {}).get(events.get("prefix")) if events.get("from") == source_name else None
+            if port:
+                self.sup.log(f"{self.name}: asks tasks of {source_name!r} contract port {port} ({events['prefix']})")
+                flags += ["--task-port", str(port), "--task-jobs-dir", str(events["jobs_dir"])]
+            else:
+                self.sup.log(f"{self.name}: system_events: {source_name!r} declares no {events.get('prefix')!r} port for it; "
+                             "the landing queue cannot land now")
         return flags
 
     def poll(self):

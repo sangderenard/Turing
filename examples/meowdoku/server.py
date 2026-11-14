@@ -401,6 +401,7 @@ class Sessions:
         from meowdoku.living_data_static import StaticWorlds
         self.living_data_static = StaticWorlds()
         self.studio_pictures = None             # [SHOW] set by main() when a Studio Nodus destination is configured
+        self.land_request = None                # [REVIEWS] set by main() when the updater's task table is reachable (--task-port)
         self.fabric_motion = None               # [FABRIC] native row host plus complete UDP frame receiver
         from meowdoku.living_data_query import GraphView
         from meowdoku import rest_api as shared_rest_loader
@@ -1823,7 +1824,8 @@ def make_handler(sessions: Sessions):
                 policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
             except (OSError, ValueError, branch_gate.GateError):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
-            return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+            return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
+                                            land_request=sessions.land_request)
 
         def _orientation_route(self, path: str, method: str) -> None:
             """[ORIENTATION] every markdown file of the core in causal order, with per-account filters (orientation.py)."""
@@ -4112,6 +4114,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="[FEDERATE] the local Nodus host's 127.0.0.1 contract port that /ws/contract/<prefix> bridges to (with --federation-canvas)")
     parser.add_argument("--federation-canvas", default=None,
                         help="[FEDERATE] that Nodus instance's canvas file; its sha256 and web-dir api.yaml module:entry pairs are what a peer must promise")
+    parser.add_argument("--task-port", type=int, default=None,
+                        help="[REVIEWS] the local Nodus host's 127.0.0.1 contract port of the task prefix the updater performs "
+                             "(instances.json system_events); with --task-jobs-dir the landing queue can ask it to land now")
+    parser.add_argument("--task-jobs-dir", default=None, help="[REVIEWS] that prefix's jobs directory (the request files)")
+    parser.add_argument("--task-engine-id", type=int, default=7204, help="[REVIEWS] this server's engine id on that table")
     parser.add_argument("--studio-nodus-port", type=int, default=None,
                         help="[SHOW] the local Nodus host's 127.0.0.1 contract port of the Studio prefix (with --studio-assets)")
     parser.add_argument("--nodus-ui", action="append", default=[], metavar="INSTANCE:PORT",
@@ -4220,6 +4227,22 @@ def main(argv: list[str] | None = None) -> int:
             saved_objects_for=sessions.marble_objects.for_account, registry=sessions.jobs,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
         print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
+    if args.task_port and args.task_jobs_dir:                      # [REVIEWS] the landing queue's "land now": one reviews.land task
+        import importlib.util
+        from meowdoku import studio_product_nodus
+        spec = importlib.util.spec_from_file_location("_server_task_request", studio_product_nodus.DEFAULT_NODUS_TOOLS / "task_request.py")
+        task_request = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(task_request)
+
+        def land_request(ids, _port=args.task_port, _jobs=args.task_jobs_dir, _engine=args.task_engine_id):
+            fields = {"reviews": list(ids)} if ids else {}
+            try:
+                return task_request.submit(studio_product_nodus.nodus_modules()[0], port=_port, engine_id=_engine, jobs_dir=_jobs,
+                                           task="reviews.land", fields=fields, timeout=5.0)
+            except Exception as error:                              # an unreachable table is an answer, never a crash
+                return {"outcome": "failed", "error": f"{type(error).__name__}: {error}"}
+        sessions.land_request = land_request
+        print(f"[reviews] the landing queue asks the updater through Nodus port {args.task_port}", flush=True)
     site_compiler = None
     if args.site_compiler_config:
         from meowdoku.site_compiler import configure as configure_site_compiler
