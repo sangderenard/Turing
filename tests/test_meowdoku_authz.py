@@ -198,3 +198,41 @@ def test_cli_caps_sorted():
     out = subprocess.run([sys.executable, str(AUTHZ), "caps", "--role", "admin", "--tier", "dns"],
                          capture_output=True, text=True, check=True).stdout.split()
     assert out == sorted(ALL - {"lifecycle_admin"})
+
+
+def test_intern_is_a_kiosk_whatever_the_tier():
+    for origin, tier in (("dns", "shader"), ("dns", "play"), ("ip", "dev"), ("lan", "edit")):
+        principal = P("intern", origin, tier)
+        assert authz.kiosk(principal)
+        assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
+    assert not any(authz.kiosk(P(role)) for role in ("guest", "member", "dev", "operator", "service", "admin"))
+
+
+def test_intern_is_off_the_human_ladder_and_takes_no_group(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    authz.grant_role(db, "bob", "intern", "alice")
+    groups = authz._permission_groups
+    with authz._connect(db) as conn:
+        assert groups.authority(conn, 2) == {"highest": "intern", "direct": ["intern"], "groups": ["intern"], "service": False}
+        for group in ("dev", "operator", "nodus"):
+            with pytest.raises(PermissionError):
+                groups.set_grant(conn, 1, 2, group, True)
+    assert authz.role_of(db, 2) == "intern"
+    principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
+    assert principal.role == "intern" and principal.groups == frozenset({"intern"})
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
+
+
+def test_an_older_account_roles_table_is_rebuilt_to_admit_intern(tmp_path):
+    path = tmp_path / "accounts.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(USERS_DDL)
+    conn.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL "
+                 "CHECK(role IN ('admin','member','service','operator')), granted_by TEXT NOT NULL, created_at REAL NOT NULL)")
+    conn.execute("INSERT INTO users (username, password_hash, display_name, created_at) VALUES ('alice','x','alice',0)")
+    conn.execute("INSERT INTO users (username, password_hash, display_name, created_at) VALUES ('bob','x','bob',0)")
+    conn.execute("INSERT INTO account_roles VALUES (1, 'operator', 'operator:abcd', 0)")
+    conn.commit()
+    conn.close()
+    authz.grant_role(path, "bob", "intern", "operator:abcd")
+    assert (authz.role_of(path, 1), authz.role_of(path, 2)) == ("operator", "intern")
