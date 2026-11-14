@@ -18,6 +18,13 @@ function card(page, mine = false) {
   const poster = element("a", ""); poster.className = "poster"; poster.href = href;
   poster.dataset.kind = page.kind;
   poster.setAttribute("aria-label", "Open " + page.title);
+  const contract = page.page_contract;
+  const posterPath = contract?.presentation?.poster;
+  if (posterPath) {
+    poster.style.backgroundImage = `linear-gradient(0deg, #10172288, transparent 60%), url("${href + posterPath.split("/").map(encodeURIComponent).join("/")}")`;
+    poster.style.backgroundSize = "cover";
+    poster.style.backgroundPosition = "center";
+  }
   const mark = element("span", page.title.trim().slice(0, 1).toUpperCase());
   mark.className = "poster-mark"; poster.append(mark);
   const body = element("div", ""); body.className = "card-body";
@@ -26,6 +33,20 @@ function card(page, mine = false) {
   stage.className = "badge " + page.stage;
   const kind = element("span", page.kind === "bundle" ? "Compiled page" : "Uploaded page");
   kind.className = "badge"; badges.append(stage, kind);
+  const badge = (label, title) => {
+    const item = element("span", label); item.className = "badge";
+    if (title) item.title = title;
+    badges.append(item);
+  };
+  if (!contract) badge("Requirements unknown");
+  else {
+    badge(contract.presentation.surface.toUpperCase());
+    const compute = contract.execution.compute;
+    if (compute.length) badge("Compute · " + compute[0] + (compute.length > 1 ? ` +${compute.length - 1}` : ""), compute.join(", "));
+    const caps = contract.access.required_capabilities;
+    if (caps.length) badge("Access · " + caps[0] + (caps.length > 1 ? ` +${caps.length - 1}` : ""), caps.join(", "));
+    badge(contract.execution.standalone === "requires-site" ? "Needs Meowdoku" : "Offline unverified");
+  }
   const title = element("h3", "");
   const link = element("a", page.title); link.href = href; title.append(link);
   if (page.stage === "dev") {
@@ -53,16 +74,21 @@ function card(page, mine = false) {
         location.assign("/p/" + page.id + "/");
       } catch (error) { note(error.message); }
     };
-    const change = element("button", page.stage === "dev" ? "Release" : "Return to dev");
-    change.type = "button";
-    change.onclick = async () => {
-      if (page.stage === "dev" && !confirm("Release this page to the stable server and public feed?")) return;
-      try {
-        await post("/api/pages/" + page.id + "/stage", { stage: page.stage === "dev" ? "release" : "dev" });
-        await refresh();
-      } catch (error) { note(error.message); }
-    };
-    actions.append(preview, change); body.append(actions);
+    actions.append(preview);
+    if (page.stage === "dev") {
+      const bake = element("button", "Bake public release"); bake.type = "button";
+      bake.onclick = async () => {
+        if (!confirm("Create a separate public release of this dev page?")) return;
+        try {
+          const result = await post("/api/pages/" + page.id + "/bake", {});
+          note("Public release baked. Your dev page remains available.");
+          await refresh();
+          $("mine").querySelector(`a[href="/p/${result.id}/"]`)?.focus();
+        } catch (error) { note(error.message); }
+      };
+      actions.append(bake);
+    }
+    body.append(actions);
   }
   box.append(poster, body);
   return box;

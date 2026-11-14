@@ -1266,6 +1266,9 @@ def make_handler(sessions: Sessions):
                     if query.get("mine", ["0"])[0] not in ("0", "1"):
                         raise authored_pages.PageError("invalid feed query")
                     return self._json({"pages": authored_pages.listing(db, site=site, actor=actor, author=author, mine=mine)})
+                match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/contract", path)
+                if method == "GET" and match:
+                    return self._json(authored_pages.descriptor(db, match[1], site=site, actor=actor))
                 if method == "GET" and (path.startswith("/p/") or path.startswith("/site/programs/")):
                     if path.startswith("/p/"):
                         match = re.fullmatch(r"/p/([0-9a-f]{32})(?:/(.*))?", path)
@@ -1297,12 +1300,22 @@ def make_handler(sessions: Sessions):
                         body = self._body_json(limit=750000)
                         if body is None:
                             return
-                        if set(body) != {"title", "description", "content_type", "content_base64", "confirmed_public_copy"} or body["confirmed_public_copy"] is not True:
+                        required = {"title", "description", "content_type", "content_base64", "confirmed_public_copy"}
+                        if not required.issubset(body) or set(body) - (required | {"page_contract"}) or body["confirmed_public_copy"] is not True:
                             raise authored_pages.PageError("explicit public-copy confirmation required")
                         raw = base64.b64decode(body["content_base64"], validate=True)
                         return self._json(authored_pages.upload(db, actor, title=body["title"],
                                                                 description=body["description"], content=raw,
-                                                                content_type=body["content_type"]), HTTPStatus.CREATED)
+                                                                content_type=body["content_type"],
+                                                                page_contract=body.get("page_contract")), HTTPStatus.CREATED)
+                    match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/bake", path)
+                    if match:
+                        body = self._body_json()
+                        if body is None:
+                            return
+                        if body != {}:
+                            raise authored_pages.PageError("expected empty bake request")
+                        return self._json(authored_pages.bake(db, actor, match[1]), HTTPStatus.CREATED)
                     match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/stage", path)
                     if match:
                         body = self._body_json()
@@ -2654,7 +2667,7 @@ def make_handler(sessions: Sessions):
             self._classify()                                      # [ACCESS]
             if self._route_gate(path):                            # [ROUTE]
                 return
-            if path == "/api/pages" or path.startswith("/p/") or path.startswith("/site/programs/"):
+            if path == "/api/pages" or path.startswith("/api/pages/") or path.startswith("/p/") or path.startswith("/site/programs/"):
                 return self._pages_route(path, "GET")
             if path == "/api/route":                              # [ROUTE]
                 return self._route_get()

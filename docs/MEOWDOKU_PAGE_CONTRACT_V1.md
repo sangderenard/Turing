@@ -8,8 +8,9 @@ attributed to an account. `authored_pages.py` currently has two states: `dev`
 (owner-readable on the development host) and `release` (publicly readable on
 stable). Uploaded HTML/text is an explicit public copy. Turing site bundles are
 immutable, inventoried versions registered from an owned, measured workspace.
-The Release button currently changes a stage marker; it does not make an
-independent frozen release while a draft keeps evolving.
+The creator's Bake button makes a separate release record and retains the dev
+page. The older `/stage` route remains for legacy clients, while baked release
+records cannot be returned to dev.
 
 The visual feed card may use a static poster declared by a bundle. It must not
 load a game, shader, script, or iframe merely to create a thumbnail. If no
@@ -35,7 +36,7 @@ authorization system. A missing object on an older page means `unknown`, not
     "surface": "canvas"
   },
   "execution": {
-    "standalone": "verified",
+    "standalone": "unknown",
     "network": "optional",
     "compute": ["browser.webgpu"],
     "site_endpoints": []
@@ -51,9 +52,9 @@ authorization system. A missing object on an older page means `unknown`, not
 ```
 
 `surface` is one of `dom`, `canvas`, `webgl`, `webgpu`, or `mixed` and describes
-the visible page, not its authority. `standalone` is `verified`, `requires-site`,
-or `unknown`; only a build that has actually run without Meowdoku may claim
-`verified`. `network` is `none`, `optional`, or `required`. `compute` names
+the visible page, not its authority. `standalone` is currently `requires-site`
+or `unknown`; a `verified` claim is reserved until the build can attach an
+offline test receipt. `network` is `none`, `optional`, `required`, or `unknown`. `compute` names
 browser mechanisms or registered server operations. `site_endpoints` names
 declared API catalog operations, rather than arbitrary URL strings. Each server
 operation carries its capability from the existing API catalog; the descriptor
@@ -71,6 +72,14 @@ fields and requirement labels; opening the page reads the exact inventoried
 version. Legacy uploads and bundles display requirements as unknown until they
 are rebaked with a contract.
 
+`GET /api/pages/{id}/contract` returns the sealed descriptor through the same
+stable/dev visibility gate as `GET /p/{id}/`. `POST /api/pages/{id}/bake` takes
+`{}` and returns a new release ID; repeating it returns the same release. The
+page upload request may include the descriptor as `page_contract`. A plain
+HTML/text upload has no inventoried poster asset, so its poster must be null.
+These descriptors display requirements; they do not grant access or execute a
+control.
+
 ## Bake and release
 
 1. A creator edits in an owned dev workspace. Each generator uses the existing
@@ -83,8 +92,8 @@ are rebaked with a contract.
    path binds that bundle version to the creator; a browser does not submit a
    server filesystem path. Dev preview uses the normal page route and the dev
    host's owner check.
-3. Bake validates the inventory and contract, checks declared poster and
-   control/compute references, and creates a **new release record** pointing at
+3. Bake validates the inventory and contract, checks the declared poster, and
+   creates a **new release record** pointing at
    that immutable version. The dev record stays available for the next edit.
    A plain upload likewise creates a distinct release copy after the owner
    explicitly confirms public publication. Releasing is not an in-place edit
@@ -106,7 +115,7 @@ file key.
 
 The root uses one responsive card layout for public releases. The development
 host adds an owner-only draft section; the card distinguishes dev/release and
-upload/bundle. A future contract-backed static poster, capability chips,
+upload/bundle. A contract-backed static poster, capability chips,
 compute chip, and standalone indicator occupy the same card positions. Author
 links group the author's published pages. The shared `site-nav.js` remains the
 single account, route, and local-control surface; each page owns its interior.
@@ -115,10 +124,12 @@ to the common publication contract.
 
 ## Remaining implementation gates
 
-- Validate and persist `page_contract` at registration; never read mutable
-  manifest metadata into a released feed without a sealed digest.
-- Add explicit bake and independently retained release records, then migrate
-  the two-axis audience/channel model without exposing existing dev pages.
+- Migrate the two-axis audience/channel model without exposing existing dev
+  pages. Bundle release records still point to the sealed, owned workspace
+  version, whose inventory is checked on reads; durable release storage and
+  workspace lifecycle coupling remain to be completed.
+- Give authors a structured contract editor, and verify declared API operation
+  names and compute requirements against the installed catalogs at bake.
 - Have each generator emit truthful artifact and runtime requirements, with an
   offline verification receipt where it claims standalone operation.
 - Wire the declared Living Data control contract through the existing site
