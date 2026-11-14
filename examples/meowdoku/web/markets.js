@@ -57,8 +57,12 @@ function renderer(canvas) {
 }
 
 const fmt = (number) => Number(number).toLocaleString(undefined, { maximumFractionDigits: 2 });
+let adminTraining = false, trainingInstance = null, trainingPending = null;
+let trainingBusy = false, trainingReading = false, trainingAction = null, clearingRun = null;
+let qualificationPayload = null;
 
 function drawQualification(payload) {
+  qualificationPayload = payload;
   const root = $("qualification-runs"); root.replaceChildren();
   for (const run of payload.runs || []) {
     const card = document.createElement("article"); card.className = "qualification-run";
@@ -96,7 +100,29 @@ function drawQualification(payload) {
       line.textContent = `${position ? position + ": " : ""}validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
       checks.append(line);
     }
-    card.append(title, meta, bar, checks); root.append(card);
+    card.append(title, meta, bar, checks);
+    if (adminTraining) {
+      const controls = document.createElement("div"); controls.className = "row qualification-actions";
+      const managed = trainingInstance?.name === run.worker;
+      const active = managed && ["running", "starting", "backoff"].includes(trainingInstance.state);
+      const stopped = managed && ["stopped", "failed"].includes(trainingInstance.state) && trainingInstance.enabled !== false;
+      for (const [label, action, enabled] of [["Start worker", "start", stopped], ["Stop worker", "shutdown", active]]) {
+        const button = document.createElement("button");
+        button.type = "button"; button.textContent = label;
+        button.disabled = !enabled || !!trainingPending || trainingBusy || trainingReading;
+        button.addEventListener("click", () => requestTrainingControl(false, action, run.worker));
+        controls.append(button);
+      }
+      const clear = document.createElement("button"); clear.type = "button"; clear.textContent = "Clear run";
+      clear.disabled = clearingRun !== null || run.status === "running";
+      clear.addEventListener("click", () => clearQualification(run.id));
+      controls.append(clear);
+      const note = document.createElement("small"); note.className = "muted";
+      note.textContent = managed ? "Start and Stop control the shared worker; Clear removes this run from the watch list."
+                                 : "This worker is not managed here; Clear removes this run from the watch list.";
+      controls.append(note); card.append(controls);
+    }
+    root.append(card);
   }
   $("qualification-state").textContent = root.childElementCount
     ? `${root.childElementCount} recent run(s). Updated ${new Date(payload.asof * 1000).toLocaleTimeString()}.`
@@ -106,13 +132,33 @@ function drawQualification(payload) {
 async function updateQualification() {
   drawQualification(await api("/api/paper/qualification/live"));
 }
+async function clearQualification(id) {
+  if (!adminTraining || clearingRun !== null) return;
+  clearingRun = id;
+  if (qualificationPayload) drawQualification(qualificationPayload);
+  let clearError = null;
+  try {
+    const response = await fetch("/api/paper/qualification/clear", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Clear refused (${response.status})`);
+    await updateQualification();
+  } catch (error) {
+    clearError = `${error.message}. Refresh before retrying; the request may have reached the server.`;
+  } finally {
+    clearingRun = null;
+    if (qualificationPayload) drawQualification(qualificationPayload);
+    if (clearError) $("qualification-state").textContent = clearError;
+  }
+}
 setInterval(() => { if (!document.hidden) updateQualification().catch((error) => { $("qualification-state").textContent = error.message; }); }, 2000);
 updateQualification().catch((error) => { $("qualification-state").textContent = error.message; });
 
 // Use the existing audited supervisor request queue, never a second trainer runner.
 // This page exposes the shortcut to admins only; the control API rechecks authority.
 const TRAINING_INSTANCE = "nodus-training";
-let trainingBusy = false, trainingReading = false, trainingAction = null, trainingPending = null;
 async function refreshTrainingControl() {
   if (trainingReading || trainingBusy) return;
   trainingReading = true;
@@ -122,12 +168,15 @@ async function refreshTrainingControl() {
   try {
     const who = await api("/api/whoami");
     const allowed = who.role === "admin" && (who.capabilities || []).includes("account_manage");
+    adminTraining = allowed;
     $("training-controls").hidden = !allowed;
-    if (!allowed) return;
+    if (!allowed) { trainingInstance = null; if (qualificationPayload) drawQualification(qualificationPayload); return; }
     const data = await api("/api/control/instances");
     const instance = (data.instances || []).find((item) => item.name === TRAINING_INSTANCE);
+    trainingInstance = instance || null;
     const requests = (data.requests || []).filter((item) => item.instance === TRAINING_INSTANCE || item.instance === "*");
     trainingPending = requests.find((item) => item.state === "pending") || null;
+    if (qualificationPayload) drawQualification(qualificationPayload);
     $("training-cancel").hidden = !trainingPending || trainingPending.instance !== TRAINING_INSTANCE;
     $("training-cancel").disabled = !trainingPending || trainingPending.instance !== TRAINING_INSTANCE;
     if (!instance) {
@@ -145,14 +194,22 @@ async function refreshTrainingControl() {
       ? `Request ${trainingPending.id}: ${trainingPending.action} pending. ${trainingPending.detail || "Waiting for the supervisor; this is not yet completed."}`
       : last ? `Last request ${last.id}: ${last.state}. ${last.detail || ""}` : "No recent control request.");
   } catch (error) {
+    adminTraining = false; trainingInstance = null;
+    $("training-controls").hidden = true;
+    if (qualificationPayload) drawQualification(qualificationPayload);
     $("training-control-state").textContent = `Could not verify training state: ${error.message}. Refresh before acting.`;
     $("training-toggle").textContent = "Training status unavailable";
-  } finally { trainingReading = false; }
+  } finally { trainingReading = false; if (qualificationPayload) drawQualification(qualificationPayload); }
 }
-async function requestTrainingControl(cancel = false) {
-  if (trainingBusy || trainingReading || (cancel ? !trainingPending || trainingPending.instance !== TRAINING_INSTANCE : !trainingAction)) return;
-  const action = trainingAction, pending = trainingPending;
+async function requestTrainingControl(cancel = false, requestedAction = null, worker = TRAINING_INSTANCE) {
+  if (trainingBusy || trainingReading || !adminTraining || worker !== TRAINING_INSTANCE ||
+      (cancel ? !trainingPending || trainingPending.instance !== TRAINING_INSTANCE : !(requestedAction || trainingAction))) return;
+  const action = requestedAction || trainingAction, pending = trainingPending;
+  if (!cancel && (trainingPending || !trainingInstance ||
+      (action === "start" && !["stopped", "failed"].includes(trainingInstance.state)) ||
+      (action === "shutdown" && !["running", "starting", "backoff"].includes(trainingInstance.state)))) return;
   trainingBusy = true;
+  if (qualificationPayload) drawQualification(qualificationPayload);
   $("training-toggle").disabled = true; $("training-cancel").disabled = true;
   $("training-refresh").disabled = true;
   try {
@@ -160,7 +217,7 @@ async function requestTrainingControl(cancel = false) {
       method: "POST", credentials: "same-origin", cache: "no-store",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cancel ? { id: pending.id } : {
-        instance: TRAINING_INSTANCE, action, after_jobs: true,
+        instance: TRAINING_INSTANCE, action, after_jobs: action !== "shutdown",
         reason: "Paper market watch admin training control",
       }),
     });
@@ -173,6 +230,7 @@ async function requestTrainingControl(cancel = false) {
   } finally {
     trainingBusy = false; trainingAction = null; trainingPending = null;
     $("training-refresh").disabled = false;
+    await refreshTrainingControl();
   }
 }
 $("training-toggle").addEventListener("click", () => requestTrainingControl());

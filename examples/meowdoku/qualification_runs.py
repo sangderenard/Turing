@@ -39,6 +39,29 @@ def _tables(db) -> None:
                "run_id TEXT PRIMARY KEY, source TEXT NOT NULL, observed_at TEXT, "
                "matured_frames INTEGER NOT NULL, historical_batch INTEGER NOT NULL, "
                "live_batch INTEGER NOT NULL, updated REAL NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS paper_qualification_cleared ("
+               "run_id TEXT PRIMARY KEY, cleared_by TEXT NOT NULL, cleared_at REAL NOT NULL)")
+
+
+def clear(db, run_id: str, *, actor_id: str) -> None:
+    """Remove a finished or stalled receipt from the spectator view, retaining its audit rows."""
+    _tables(db)
+    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id) or not actor_id:
+        raise ValueError("invalid qualification run or actor")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT status,updated FROM paper_qualification_runs WHERE id=?",
+                         (run_id,)).fetchone()
+        if row is None:
+            raise LookupError("qualification run not found")
+        if row["status"] == "running" and time.time() - row["updated"] <= 90:
+            raise RuntimeError("stop the active training before clearing its run")
+        db.execute("INSERT OR IGNORE INTO paper_qualification_cleared VALUES(?,?,?)",
+                   (run_id, actor_id, time.time()))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
 
 
 def live_state(db, run_id: str, *, source: str, observed_at: str | None,
@@ -132,7 +155,9 @@ def public_snapshot(db, *, limit: int = 12) -> dict:
     if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError("invalid qualification page size")
     now = time.time()
-    rows = db.execute("SELECT * FROM paper_qualification_runs ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+    rows = db.execute("SELECT * FROM paper_qualification_runs WHERE id NOT IN "
+                      "(SELECT run_id FROM paper_qualification_cleared) "
+                      "ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
     runs = []
     for row in rows:
         stale = row["status"] == "running" and now - row["updated"] > 90

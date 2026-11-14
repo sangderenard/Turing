@@ -1512,6 +1512,20 @@ def make_handler(sessions: Sessions):
                     return self._nodus_action(body)
             db = paper_arena_mod.connect(sessions.state.sql_dir / "paper_arena.sqlite")
             try:
+                if path == "/api/paper/qualification/clear" and method == "POST":
+                    if not self._require("account_manage"):
+                        return
+                    if not isinstance(body, dict) or set(body) != {"id"}:
+                        return self._json({"error": "expected qualification run id"}, HTTPStatus.BAD_REQUEST)
+                    try:
+                        qualification_runs_mod.clear(db, body["id"], actor_id=account["id"])
+                    except ValueError as error:
+                        return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                    except LookupError as error:
+                        return self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+                    except RuntimeError as error:
+                        return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+                    return self._json({"cleared": body["id"]})
                 bot_id = self.headers.get("X-Meowdoku-Bot") or None
                 if path != "/api/paper/trainer-events":
                     paper_arena_mod.record_activity(db, account["id"], bot_id, entry_channel,
