@@ -169,13 +169,43 @@ function attachForwarding(card, canvas, status, quad, identity) {
   let revision = state.revision, draining = false, lastPoint = null;
   const queue = [];
   const instance = state.instance;
+  // Every button and key the canvas was told is down, with the action that lets it go. A release is never dropped: when
+  // forwarding stops for any reason (switched off, refused, another canvas, another instance, focus lost) whatever is still
+  // held is released, so no drag or key stays down on the canvas.
+  const held = new Map();
+  const releaseOf = (action) => action.op === "mouse" ? { op: "mouse", kind: "up", x: action.x, y: action.y, dx: 0, dy: 0, button: action.button }
+    : { op: "key", key: action.key, scancode: 0, action: 0, mods: action.mods };
+  const heldKey = (action) => action.op === "mouse" ? `b${action.button}` : `k${action.key}`;
+  const isPress = (action) => (action.op === "mouse" && action.kind === "down") || (action.op === "key" && action.action === 1);
+  const isRelease = (action) => (action.op === "mouse" && action.kind === "up") || (action.op === "key" && action.action === 0);
   const active = () => state.forwarding === identity && state.instance === instance && card.isConnected;
+  // Releases go straight to the canvas, outside the queue and whatever the page's state is now; a release refused for a
+  // stale revision is tried once more at the current one.
+  const release = async (actions) => {
+    for (const action of actions) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await send("/api/nodus/action", { instance, action: { ...action, expected_revision: revision } });
+        if (result.status === 200 && !result.body?.error) { revision = result.body.revision; if (state.instance === instance) state.revision = revision; break; }
+        const found = await get("/api/nodus/digest?instance=" + encodeURIComponent(instance || ""));
+        if (found.status !== 200 || found.body.instance !== instance) break;
+        revision = found.body.revision;
+      }
+    }
+  };
+  const releaseAll = () => {
+    const actions = [...held.values()];
+    held.clear();
+    if (actions.length) release(actions);
+  };
   const stop = (message) => {
     if (state.forwarding === identity) state.forwarding = null;
     toggle.checked = false; canvas.classList.remove("forwarding");
+    queue.length = 0;
+    releaseAll();
     if (message) status.textContent = message;
     state.graphKey = null;
   };
+  state.releaseForwarding = () => { if (state.forwarding === identity || held.size) stop(); };
   const drain = async () => {
     if (draining) return;
     draining = true;
@@ -192,13 +222,22 @@ function attachForwarding(card, canvas, status, quad, identity) {
         revision = result.body.revision; state.revision = revision;
         status.textContent = result.body.handled ? "Action applied to running canvas" : "Action reached canvas; no change";
       }
-    } finally { queue.length = 0; draining = false; }
+      if (!active() && held.size) stop();       // forwarding ended while actions waited: let go of what is held
+    } finally { draining = false; }
   };
   const enqueue = (action) => {
-    if (!active()) return;
+    if (!active()) {                            // no longer forwarding: a release of something held still goes through
+      if (isRelease(action) && held.delete(heldKey(action))) release([action]);
+      return;
+    }
+    if (isPress(action)) held.set(heldKey(action), releaseOf(action));
+    else if (isRelease(action)) held.delete(heldKey(action));
     if (action.kind === "move" && queue.at(-1)?.kind === "move") queue[queue.length - 1] = action;
     else if (queue.length < 64) queue.push(action);
-    else { stop("Action queue full; refresh before retrying."); return; }
+    else if (isRelease(action)) {               // full: a release takes the place of the moves, never the other way
+      const kept = queue.filter((queued) => queued.kind !== "move");
+      queue.length = 0; queue.push(...kept, action);
+    } else { stop("Action queue full; refresh before retrying."); return; }
     drain();
   };
   const point = (event) => {
@@ -242,9 +281,15 @@ function attachForwarding(card, canvas, status, quad, identity) {
     if (active() && event.buttons) { event.preventDefault(); enqueue({ op: "mouse", kind: "move", ...point(event), button: event.button < 0 ? 0 : event.button }); }
   });
   canvas.addEventListener("pointerup", (event) => {
-    if (!active()) return;
+    if (!active() && !held.has(`b${event.button}`)) return;
     event.preventDefault(); enqueue({ op: "mouse", kind: "up", ...point(event), button: event.button });
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  });
+  for (const name of ["pointercancel", "lostpointercapture"]) canvas.addEventListener(name, () => {
+    for (const [key, action] of [...held]) if (key.startsWith("b")) enqueue(action);   // the pointer went away mid-press
+  });
+  canvas.addEventListener("blur", () => {
+    for (const [key, action] of [...held]) if (key.startsWith("k")) enqueue(action);   // focus left with a key down
   });
   canvas.addEventListener("click", (event) => {
     if (active()) { event.preventDefault(); enqueue({ op: "mouse", kind: "click", ...point(event), button: event.button }); }
@@ -255,7 +300,7 @@ function attachForwarding(card, canvas, status, quad, identity) {
   }, { passive: false });
   canvas.addEventListener("contextmenu", (event) => { if (active()) event.preventDefault(); });
   for (const [name, action] of [["keydown", 1], ["keyup", 0]]) canvas.addEventListener(name, (event) => {
-    if (!active() || !event.keyCode) return;
+    if (!event.keyCode || (!active() && !(action === 0 && held.has(`k${event.keyCode}`)))) return;
     event.preventDefault();
     const mods = (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
     enqueue({ op: "key", key: event.keyCode, scancode: 0, action, mods });
@@ -378,6 +423,7 @@ async function loadInstances() {
 }
 
 function resetFor(name) {
+  state.releaseForwarding?.();                  // another instance: let the old canvas go of anything still held
   Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, forwarding: null });
   drawMap();
 }
