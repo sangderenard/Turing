@@ -54,3 +54,18 @@ lossless call result, callback clean redirect/refusal, route/method rejection,
 atomic isolated vault storage and source routing/logging integration. SDK lifecycle
 and transport are tested in SpeakToMe. No live Suno login, actual returned menu,
 service restart, live Apache modification or radio library import is claimed.
+
+## Windows candidate receipt
+
+The existing `Provision-ServicePython.ps1` supports a separate `-Root` and
+`-Requirements`. `requirements-mcp-runtime-validation.txt` is the pinned minimal
+SDK-only validation manifest. It was provisioned into
+`srv/candidates/mcp-sdk-20261114/python` with Python 3.11.18; `pip check` and the
+nine SpeakToMe SDK tests passed. The SDK itself supports Python >=3.10; the
+SpeakToMe project's >=3.12 requirement is not an SDK requirement.
+
+Eight host tests now also pass under that candidate, including the real host
+factory, SDK, disk vault, browser-code callback and full tool forwarding with
+only the HTTP transport mocked. No public provider interaction is claimed.
+The minimal candidate is NOT a full service interpreter replacement: scientific
+service dependencies are absent. Never switch the live service to it as-is.

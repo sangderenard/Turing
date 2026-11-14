@@ -10,3 +10,7 @@ Deployment must apply query-free Apache logging before OAuth callbacks; source
 configuration changed only. Original combined logs include secrets in queries.
 Existing default balancer stickiness must retain the authorization worker.
 Full repository suite not run (documented nonterminating suite).
+
+Candidate follow-up: real host factory/SDK/disk-vault integration passes on
+Windows Python3.11.18 under the sanctioned isolated provisioner candidate.
+Eight host tests total, HTTP transport mocked. Provider network never contacted.
