@@ -19,13 +19,13 @@ _lock = threading.Lock()
 def vault_callbacks(root, owner, provider):
     if type(owner) is not int or owner < 1 or provider != 'suno':
         raise PermissionError('invalid connection owner')
-    target = Path(root) / 'user_credentials' / str(owner) / 'mcp-suno.json'
+    target = Path(root) / 'mcp_credentials' / str(owner) / 'suno.json'
     def read():
         if not target.exists():
             return None
         return json.loads(target.read_text(encoding='utf-8'))
     def write(record):
-        # Same restricted StatePaths secrets tree as Alpaca; never user_files.
+        # Dedicated restricted OAuth subtree; never widen access to Alpaca/other credentials.
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_name('.' + secrets.token_hex(16) + '.tmp')
         try:

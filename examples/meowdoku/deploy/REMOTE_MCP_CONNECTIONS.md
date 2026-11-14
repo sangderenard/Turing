@@ -34,7 +34,7 @@ and MCP results retain their full schema and content, not a fabricated menu.
    the same site account, exact single-use state, then redirects to a clean URL.
 
 Tokens/client records use the existing restricted StatePaths secrets tree:
-`user_credentials/<account id>/mcp-suno.json`, atomic replace, no static route,
+`mcp_credentials/<account id>/suno.json`, atomic replace, no static route,
 no account list/download API. Existing Windows secrets-directory ACL inheritance
 must remain restricted. POSIX newly created records are mode 0600. Disconnect
 cancels pending work and erases this site's stored credentials; provider-side

@@ -57,6 +57,8 @@ class HostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r,w,c=mod.vault_callbacks(d,7,'suno'); w({'tokens':{'access_token':'test-only'}})
             self.assertEqual(r()['tokens']['access_token'],'test-only')
+            self.assertTrue((Path(d)/'mcp_credentials'/'7'/'suno.json').is_file())
+            self.assertFalse((Path(d)/'user_credentials').exists())
             self.assertIsNone(mod.vault_callbacks(d,8,'suno')[0]())
             self.assertEqual(list(Path(d).rglob('*.tmp')),[]); c(); self.assertIsNone(r())
             with self.assertRaises(PermissionError): mod.vault_callbacks(d,'../','suno')
