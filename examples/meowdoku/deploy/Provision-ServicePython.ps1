@@ -6,9 +6,10 @@ Download is NOT done here. Asset: cpython-3.11.18+20261026-x86_64-pc-windows-msv
 -WhatIf prints every command and runs none (the hash is still checked). See LAUNCH_2026-11-10.md "Private service interpreter".
 #>
 param(
-    [Parameter(Mandatory = $true)][string]$Archive,
+    [string]$Archive,
     [string]$Root = 'C:/dev/Powershell/srv',
     [string]$Requirements = '',   # default: requirements-service.txt beside this script (Torch build); pass requirements-service-notorch.txt for the Torch-free service
+    [switch]$InstallRequirementsOnly, # additive exact pins; no existing versions may change
     [switch]$WhatIf
 )
 $ErrorActionPreference = 'Stop'
@@ -18,6 +19,19 @@ if (-not $Requirements) { $Requirements = Join-Path $PSScriptRoot 'requirements-
 $PyDir = "$Root/python"
 $Py    = "$PyDir/python.exe"
 
+if ($InstallRequirementsOnly) {
+    if (-not (Test-Path -LiteralPath $Py -PathType Leaf)) { throw "REFUSED: existing private interpreter required: $Py" }
+    if (-not (Test-Path -LiteralPath $Requirements -PathType Leaf)) { throw "REFUSED: requirements missing" }
+    $Helper = Join-Path $PSScriptRoot 'install_service_additions.py'
+    Write-Host "Additive dependency install using $Py; existing versions are constrained and verified."
+    if ($WhatIf) { Write-Host "[WhatIf] $Py $Helper $Requirements (nothing run)"; return }
+    $BeforeHash = (Get-FileHash -LiteralPath $Py -Algorithm SHA256).Hash
+    & $Py $Helper $Requirements
+    $InstallExit = $LASTEXITCODE
+    if ((Get-FileHash -LiteralPath $Py -Algorithm SHA256).Hash -ne $BeforeHash) { throw "REFUSED: interpreter changed during installation" }
+    if ($InstallExit -ne 0) { throw "Additive installation failed; inspect rollback result above." }
+    return
+}
 if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) { throw "REFUSED: archive not found: $Archive" }
 if (-not (Test-Path -LiteralPath $Requirements)) { throw "REFUSED: missing $Requirements" }
 $actual = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
