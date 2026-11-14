@@ -137,6 +137,13 @@ else { Cmd "icacls $landingToken /grant ${Name}:(R)   (no token yet: write it th
 $tlsPublic = "$SecretsBase/tls-public"
 if (Test-Path -LiteralPath $tlsPublic) { Run 'icacls.exe' @($tlsPublic, '/grant', "${Name}:(OI)R") }
 else { Cmd "icacls $tlsPublic /grant ${Name}:(OI)R   (no tls-public folder yet: run Copy-PublicCertificate.ps1, then this script again)" }
+# The secrets folder itself (state layout only; the old build/meowdoku layout inherits Modify). Apache resolves every folder of a
+# configured path by name (FindFirstFile on the parent folder), so without the right to list secrets/ the service is refused
+# tls-public/fullchain.cer although the file grants it read: httpd then exits at startup with "SSLCertificateFile: Invalid file
+# path" (2026-11-13). RX on this folder only, no (OI)(CI): the service sees the names, and opens nothing below that is not granted
+# above. Not (RD): without Synchronize Windows still refuses the listing. operators.py's /grant:r replaces only the operator's
+# entry, so a later restriction of secrets/ keeps this one.
+if ($StateDir) { Run 'icacls.exe' @($SecretsBase, '/grant:r', "${Name}:(RX)") }
 Write-Host 'NOTE: key.pem keeps its existing entries (alber etc.); the service is only ADDED. Tighten by hand if desired.'
 Write-Host "NOTE: other operators' *.secret files under operator_credentials inherit Modify from build/; consider cutting inheritance there."
 
@@ -144,13 +151,33 @@ Write-Host "NOTE: other operators' *.secret files under operator_credentials inh
 Step "(d) Apache service $Svc"
 $svcExists = Get-Service -Name $Svc -ErrorAction SilentlyContinue
 if ($svcExists) { Write-Host "service $Svc already exists: install skipped, configuration re-applied." }
-else { Run "$Apache/bin/httpd.exe" @('-k', 'install', '-n', $Svc) }
+else {
+    # httpd -k install creates the service, then runs a config test. That test exits non-zero while the console-mode Apache still
+    # holds :80/:443, although the service was created (2026-11-13). Judge by the service, not by the exit code.
+    Cmd "$Apache/bin/httpd.exe -k install -n $Svc"
+    if (-not $WhatIf) {
+        & "$Apache/bin/httpd.exe" -k install -n $Svc
+        $installExit = $LASTEXITCODE
+        if (-not (Get-Service -Name $Svc -ErrorAction SilentlyContinue)) { throw "httpd -k install did not create $Svc (exit $installExit)" }
+        if ($installExit -ne 0) { Write-Host "NOTE: httpd -k install exited $installExit, but $Svc exists (its config test fails while the console Apache holds the ports); continuing." }
+    }
+}
 $pwArg = '<from-secret-file>'
 if (-not $WhatIf) { $pwArg = (Get-Content -LiteralPath $SecretFile -Raw).Trim() }
 Run 'sc.exe' @('config', $Svc, 'obj=', ".\$Name", 'password=', $pwArg) $pwArg
 Run 'sc.exe' @('config', $Svc, 'start=', 'auto')
 Run 'sc.exe' @('failure', $Svc, 'reset=', '86400', 'actions=', 'restart/5000')
 $pwArg = $null
+# Startup errors. Until httpd opens logs/error.log it can only write to stderr, and a service has none: a config error then shows
+# only as "service-specific error: Incorrect function" (2026-11-13). httpd -E <file> sends those errors to a file; the service
+# passes ConfigArgs to httpd -k runservice. Apache-Service.ps1 prints the file when a start fails.
+$StartupLog = "$Apache/logs/startup-errors.log"
+$Params = "HKLM:\SYSTEM\CurrentControlSet\Services\$Svc\Parameters"
+Cmd "Set-ItemProperty $Params ConfigArgs = -E $StartupLog  (REG_MULTI_SZ)"
+if (-not $WhatIf) {
+    if (-not (Test-Path -LiteralPath $Params)) { New-Item -Path $Params -Force | Out-Null }
+    Set-ItemProperty -LiteralPath $Params -Name ConfigArgs -Value ([string[]]@('-E', $StartupLog)) -Type MultiString
+}
 
 # ---------------------------------------------------------------- (e) verify
 Step '(e) verification'
@@ -158,10 +185,12 @@ Cmd "sc.exe qc $Svc"
 if (-not $WhatIf) { sc.exe qc $Svc }
 Cmd "groups of ${Name}: Get-LocalGroup | where member"
 if (-not $WhatIf) { Get-LocalGroup | Where-Object { Get-LocalGroupMember -Group $_ -Member $Name -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty Name }
-foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, "$SecretsBase/tls/key.pem", "$SecretsBase/tls-public", "$SecretsBase/tls-public/cert.key", $SecretFile)) {
+foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, $SecretsBase, "$SecretsBase/tls/key.pem", "$SecretsBase/tls-public", "$SecretsBase/tls-public/cert.key", $SecretFile)) {
     Cmd "icacls $d  (lines matching $Name)"
     if (-not $WhatIf -and (Test-Path -LiteralPath $d)) { icacls.exe $d | Select-String -SimpleMatch $Name }
 }
+Cmd "ConfigArgs of $Svc (expect -E $StartupLog)"
+if (-not $WhatIf) { (Get-ItemProperty -LiteralPath $Params -Name ConfigArgs -ErrorAction SilentlyContinue).ConfigArgs -join ' ' }
 Write-Host ''
 if ($WhatIf) { Write-Host '[WhatIf] nothing run.' }
 else { Write-Host 'Done. Next: stop the console-mode Apache (Stop-Apache.ps1), then Apache-Service.ps1 -Start.' }

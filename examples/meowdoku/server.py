@@ -591,7 +591,7 @@ def make_handler(sessions: Sessions):
             self._principal_cache = None
             if self._origin_tier == "shader":                    # [LOGIN] a signed-in account lifts the shader lock; its caps still come from its role
                 account = self._account()
-                lift = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "admin": "edit"}
+                lift = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
                 if account is not None:
                     self._tier = lift.get(authz_mod.role_of(sessions.accounts_db, account["id"]), "shader")
 
@@ -741,6 +741,8 @@ def make_handler(sessions: Sessions):
             # grants no other shader-tier capability or access to other APIs.
             if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/") or path in ("/api/account/authority", "/api/account/authority/grant"):
                 return False
+            if path == "/api/foyer" or path.startswith("/api/foyer/"):
+                return False                                   # [FOYER] the public front face; its route bounds itself
             if method == "GET" and path in ("/reports.html", "/reports.js"):
                 return False
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
@@ -866,6 +868,54 @@ def make_handler(sessions: Sessions):
             self._set_cookie = [c for c in self._set_cookie if not c.startswith(proxy_trust_mod.ROUTE_COOKIE + "=")]
             self._set_cookie.append(proxy_trust_mod.route_cookie(route))
 
+        def _kiosk(self) -> bool:
+            """[KIOSK] True for a kiosk account (authz.KIOSK_ROLES); speaktome_api.routes.index_route reads it too."""
+            return authz_mod.kiosk(self._principal())
+
+        def _guest_gated(self) -> bool:
+            """[GUEST] True for a visitor with no account (authz.guest_gated); speaktome_api.routes.index_route reads it too."""
+            return authz_mod.guest_gated(self._principal())
+
+        def _kiosk_gate(self, path: str, method: str) -> bool:
+            """[KIOSK] True when the request was refused here.  A kiosk role (authz.KIOSK_ROLES, the intern) is answered only on the
+            catalog endpoints declared kiosk (speaktome_api.catalog.kiosk_endpoint).  [GUEST] A visitor with no account is answered
+            on the pages (GET/HEAD outside /api/ and /ws) and on the guest-reachable entries (catalog.guest_endpoint: kiosk, guest,
+            and credential entries such as the loopback admin-token lifecycle, whose handler's own check is the authority) and on
+            the sockets access.GUEST_SOCKETS and access.CREDENTIAL_SOCKETS declare.
+            Every other method and path is refused before any handler runs, including handlers that ask for no capability;
+            without the catalog nothing but the pages is answered."""
+            if self._kiosk():
+                match = getattr(shared_catalog, "kiosk_endpoint", None)
+            elif self._guest_gated():
+                if method in ("GET", "HEAD") and not (path == "/api" or path.startswith("/api/") or path.startswith("/ws")):
+                    return False                                   # the pages; the static handler and its own checks answer them
+                if method == "GET" and (path in access_mod.GUEST_SOCKETS or path.startswith(access_mod.CREDENTIAL_SOCKETS)):
+                    return False                                   # the declared sockets; the grant-checked bridge decides for itself
+                match = getattr(shared_catalog, "guest_endpoint", None)
+            else:
+                return False
+            if method in ("GET", "POST") and match is not None and match(method, path) is not None:
+                return False
+            self.close_connection = True
+            self._set_cookie = []
+            if method == "HEAD":
+                self.send_response(HTTPStatus.FORBIDDEN); self.send_header("Content-Length", "0"); self.end_headers()
+                return True
+            if self._kiosk():
+                self._json({"error": "this account may use only the kiosk endpoints; see /api/index"}, HTTPStatus.FORBIDDEN)
+                return True
+            # [GUEST] answer as the refused entry's handler would first: its capability (403, as authz.require words it), else sign in (401)
+            entry = getattr(shared_catalog, "endpoint_for", lambda m, p: None)(method, path)
+            need = entry.get("capability") if entry else None
+            needs = [need] if isinstance(need, str) else list(need or ())
+            caps = self._caps()
+            if needs and not (all if entry.get("capability_all") else any)(c in caps for c in needs):
+                self._json({"error": "this needs " + (" and " if entry.get("capability_all") else " or ").join(needs)}, HTTPStatus.FORBIDDEN)
+            else:
+                self._json({"error": "sign in for this; without an account only the pages, the game and the kiosk endpoints answer "
+                                     "(see /api/index)"}, HTTPStatus.UNAUTHORIZED)
+            return True
+
         def _route_gate(self, path: str) -> bool:
             """--require-cap: True when the request was refused here (403 + the cookie reset to the Stable server's route).  The route cookie alone never grants access."""
             cap = getattr(sessions, "require_cap", "")
@@ -900,7 +950,7 @@ def make_handler(sessions: Sessions):
         def _route_after_login(self, user_id: int) -> None:
             """Restore a signed-in author's site preference when that route is enabled."""
             role = authz_mod.role_of(sessions.accounts_db, user_id)
-            lift = {"member": "play", "service": "play", "operator": "dev", "admin": "edit"}
+            lift = {"member": "play", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
             tier = lift.get(role, "shader") if self._origin_tier == "shader" else self._origin_tier
             principal = authz_mod.Principal(role, user_id, None, self._origin, tier)
             site = self._route_pref(user_id)
@@ -965,6 +1015,7 @@ def make_handler(sessions: Sessions):
                         "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps),
                         "instance": sessions.instance or None,
                         "signed_in": self._principal().user_id is not None, "username": self._principal().username,
+                        "kiosk": self._kiosk(), "guest": self._guest_gated(),
                         "origin_tier": self._origin_tier})
 
         # ---- [DIVIDER] /api/divider/jobs...: the source divider's intake and status (divider_intake.py; the page is web/divider.html).
@@ -1268,6 +1319,9 @@ def make_handler(sessions: Sessions):
                     if query.get("mine", ["0"])[0] not in ("0", "1"):
                         raise authored_pages.PageError("invalid feed query")
                     return self._json({"pages": authored_pages.listing(db, site=site, actor=actor, author=author, mine=mine)})
+                match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/contract", path)
+                if method == "GET" and match:
+                    return self._json(authored_pages.descriptor(db, match[1], site=site, actor=actor))
                 if method == "GET" and (path.startswith("/p/") or path.startswith("/site/programs/")):
                     if path.startswith("/p/"):
                         match = re.fullmatch(r"/p/([0-9a-f]{32})(?:/(.*))?", path)
@@ -1299,12 +1353,22 @@ def make_handler(sessions: Sessions):
                         body = self._body_json(limit=750000)
                         if body is None:
                             return
-                        if set(body) != {"title", "description", "content_type", "content_base64", "confirmed_public_copy"} or body["confirmed_public_copy"] is not True:
+                        required = {"title", "description", "content_type", "content_base64", "confirmed_public_copy"}
+                        if not required.issubset(body) or set(body) - (required | {"page_contract"}) or body["confirmed_public_copy"] is not True:
                             raise authored_pages.PageError("explicit public-copy confirmation required")
                         raw = base64.b64decode(body["content_base64"], validate=True)
                         return self._json(authored_pages.upload(db, actor, title=body["title"],
                                                                 description=body["description"], content=raw,
-                                                                content_type=body["content_type"]), HTTPStatus.CREATED)
+                                                                content_type=body["content_type"],
+                                                                page_contract=body.get("page_contract")), HTTPStatus.CREATED)
+                    match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/bake", path)
+                    if match:
+                        body = self._body_json()
+                        if body is None:
+                            return
+                        if body != {}:
+                            raise authored_pages.PageError("expected empty bake request")
+                        return self._json(authored_pages.bake(db, actor, match[1]), HTTPStatus.CREATED)
                     match = re.fullmatch(r"/api/pages/([0-9a-f]{32})/stage", path)
                     if match:
                         body = self._body_json()
@@ -1761,6 +1825,16 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
 
+        def _orientation_route(self, path: str, method: str) -> None:
+            """[ORIENTATION] every markdown file of the core in causal order, with per-account filters (orientation.py)."""
+            from meowdoku import branch_gate, orientation
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return orientation.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
         def _git_route(self, path: str, method: str) -> None:
             """[GIT] Git in the core, regulated: declared read operations for accounts holding core_git (core_git.py)."""
             from meowdoku import branch_gate, core_git
@@ -1830,6 +1904,17 @@ def make_handler(sessions: Sessions):
             return shared_rest.living_data_dm_route(
                 self, path, method, service=sessions.living_data_static,
                 CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
+
+        def _foyer(self, path, method):
+            """[FOYER] the one shared demo world (speaktome_api.routes.foyer_route over living_data_static.StaticWorlds).  The
+            visitor is the caller's job identity: its account, or its browser session when it has none."""
+            from meowdoku.living_data_cursor import CursorError
+            from meowdoku.living_data_query import QueryError
+            route = getattr(shared_rest, "foyer_route", None)
+            if route is None:
+                return self._json({"error": "the foyer needs a newer SpeakToMe checkout"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return route(self, path, method, service=sessions.living_data_static, CursorError=CursorError,
+                         QueryError=QueryError, visitor=self._job_identity()[0][0])
 
         def _living_data_cursor(self, path, method):
             from meowdoku.living_data_cursor import CursorError
@@ -2240,6 +2325,8 @@ def make_handler(sessions: Sessions):
 
         def do_HEAD(self):  # noqa: N802
             self._classify()
+            if self._kiosk_gate(self.path.split("?", 1)[0], "HEAD"):   # [KIOSK]
+                return
             if self._route_gate(self.path.split("?", 1)[0]):      # [ROUTE]
                 return
             if self._tier == "shader" or self.path.startswith("/api/") or self.path.startswith("/ws"):
@@ -2654,9 +2741,11 @@ def make_handler(sessions: Sessions):
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             self._classify()                                      # [ACCESS]
+            if self._kiosk_gate(path, "GET"):                     # [KIOSK]
+                return
             if self._route_gate(path):                            # [ROUTE]
                 return
-            if path == "/api/pages" or path.startswith("/p/") or path.startswith("/site/programs/"):
+            if path == "/api/pages" or path.startswith("/api/pages/") or path.startswith("/p/") or path.startswith("/site/programs/"):
                 return self._pages_route(path, "GET")
             if path == "/api/route":                              # [ROUTE]
                 return self._route_get()
@@ -2672,6 +2761,8 @@ def make_handler(sessions: Sessions):
                 return self._log_get()
             if path.startswith("/api/living-data/dm/"):
                 return self._living_data_dm(path, "GET")
+            if path == "/api/foyer" or path.startswith("/api/foyer/"):  # [FOYER]
+                return self._foyer(path, "GET")
             if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path, "GET")
             if path.startswith("/api/compute/requests/"):
@@ -2743,6 +2834,8 @@ def make_handler(sessions: Sessions):
                 return self._reviews_route(path, "GET")
             if path.startswith("/api/git/"):                      # [GIT]
                 return self._git_route(path, "GET")
+            if path == "/api/orientation" or path.startswith("/api/orientation/"):   # [ORIENTATION]
+                return self._orientation_route(path, "GET")
             if path.startswith("/api/relay/"):                    # [RELAY]
                 return self._relay_route(path, "GET")
             if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
@@ -3126,8 +3219,10 @@ def make_handler(sessions: Sessions):
         def _lifecycle_post(self, path: str, length: int) -> None:
             lc = sessions.lifecycle
             if path == "/api/admin/lifecycle":
-                if not self._require("owner_tools"):               # [AUTHZ] edit-tier equivalent; the loopback + admin token below stays the authority
-                    return
+                # [GUEST] the loopback + admin token check below is the authority (catalog credential admin_token): the supervisor and
+                # Stop-Meowdoku.ps1 call it with no account, and a guest no longer holds owner_tools from the LAN edit tier.
+                if lc is None:
+                    return self._json({"error": "operator actions are not available on this server"}, HTTPStatus.SERVICE_UNAVAILABLE)
                 forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
                 ok, status, why = lifecycle_mod.admin_authorize(self.client_address[0], self.headers.get("Host", ""), forwarded,
                                                                 self.headers.get("X-Meowdoku-Admin"), lc.token)
@@ -3191,6 +3286,9 @@ def make_handler(sessions: Sessions):
 
         def _do_post(self):
             path0 = self.path.split("?", 1)[0]
+            self._classify()                                      # [KIOSK] first: no POST route answers an intern unless declared kiosk
+            if self._kiosk_gate(path0, "POST"):
+                return
             if self._route_gate(path0):                           # [ROUTE]
                 return
             if path0 == "/api/pages" or path0.startswith("/api/pages/"):
@@ -3234,6 +3332,8 @@ def make_handler(sessions: Sessions):
                     return
             if path0.startswith("/api/living-data/dm/"):
                 return self._living_data_dm(path0, "POST")
+            if path0 == "/api/foyer" or path0.startswith("/api/foyer/"):  # [FOYER]
+                return self._foyer(path0, "POST")
             if path0 == "/api/living-data/sessions" or path0.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path0, "POST")
             if path0 == "/api/living-data/query":
@@ -3246,6 +3346,8 @@ def make_handler(sessions: Sessions):
                 return self._reviews_route(path0, "POST")
             if path0.startswith("/api/git/"):                     # [GIT]
                 return self._git_route(path0, "POST")
+            if path0 == "/api/orientation" or path0.startswith("/api/orientation/"):   # [ORIENTATION]
+                return self._orientation_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
                 return self._relay_route(path0, "POST")
             if path0 == "/api/control/instances":

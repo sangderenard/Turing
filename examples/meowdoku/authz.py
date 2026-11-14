@@ -7,7 +7,7 @@ content; they cannot change authority. Service is a separate machine role.
 
 ROLES.  ``guest`` is the absence of an account.  ``member`` is any account in ``accounts.db`` ``users`` without a row in
 ``account_roles``.  ``admin`` is an ``account_roles`` row; so is ``service`` (the supervisor's instance accounts: member caps +
-library_manage, see DEFAULT_POLICY).  A request's PRINCIPAL is (role, user_id, username, origin, tier); origin and
+library_manage, see DEFAULT_POLICY); so is ``intern`` (a guest agent's kiosk account, see KIOSK below).  A request's PRINCIPAL is (role, user_id, username, origin, tier); origin and
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
@@ -17,9 +17,11 @@ photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, 
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
     account_manage additionally requires role == 'admin'
     compile_unstable requires a signed-in non-guest account and an explicit role grant; no defaults grant it
-    guest gets tier_caps only
+    guest gets tier_caps capped by role_caps['guest'] (view_site, photo_read, play): no tier lifts a visitor with no account
+    above that (owner, 2026-11-13), so a LAN visit no longer means edit for a guest
+    a KIOSK role (intern) gets role_caps only: no tier caps, so a LAN or edit-tier visit adds nothing
 
-Today's "LAN is edit" behaviour is preserved as POLICY (``tier_caps['edit']``, the default), not as code: a policy file can strip it.
+The LAN "edit" tier is POLICY (``tier_caps['edit']``, the default), not code; it applies to accounts, never above the guest ceiling.
 The policy file ``authz_policy.json`` (beside accounts.db by default; re-read when its mtime changes, like access.py) holds
 ``{"tier_caps": {tier: [caps]}, "role_caps": {role: [caps]}}``; entries merge over the defaults.
 
@@ -67,7 +69,23 @@ service and admin, so a guest never messages.
 
 SCRIPT ACCESS.  ``deploy_scripts`` is granted by no tier, only by role admin/operator.  deploy/*.ps1 run ``script-auth``: the account must
 verify, be in ``script_access`` (explicit allow-list) and hold deploy_scripts; every attempt is a ``script_audit`` row (exit 3 refuses).
-CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude/guest_agent.
+CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude.
+
+KIOSK.  ``intern`` is a read-only guest agent, like a kiosk at an amusement park.  It holds view_site and photo_read whatever
+its origin tier, takes no permission group (permission_groups.authority keeps it off the human ladder, like service), and the
+server answers it only on the catalog endpoints declared ``kiosk`` (speaktome_api.catalog.kiosk_endpoint): every other
+method and path is refused before any handler runs, failing closed when the catalog is not loaded.  An intern therefore
+cannot write, submit, message or touch the lifecycle even where a handler asks for no capability.
+
+GUEST.  A visitor with no account (a cookie guest, or a guest agent: a guest agent has no account, owner 2026-11-13) holds at
+most role_caps['guest'] and is answered only on the server's pages (paths outside /api/ and /ws) and on the catalog entries
+that speaktome_api.catalog.guest_endpoint finds: the kiosk entries, the entries declared guest (the pages' and the game
+table's calls, sign-up) and the entries declared with a credential (admin_token, engine_secret), whose handler's own
+check is the authority.  Sockets are not REST entries: access.GUEST_SOCKETS (the game's) and access.CREDENTIAL_SOCKETS (the
+federation bridge, opened with a peer grant) declare them.  Everything else is refused before any handler runs.
+
+An intern keeps no personal
+storage (owner, 2026-11-13): no user_files folder, no reports, no relay addresses; what it reads is burned on delivery.
 
 CLI: ``python authz.py grant-admin <user> --db accounts.db --granted-by operator:<prefix>``; ``revoke-admin``; ``show``; ``caps``.
 """
@@ -104,7 +122,8 @@ except ImportError:
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
         "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit")
-ROLES = ("admin", "member", "dev", "service", "operator", "guest")
+ROLES = ("admin", "member", "dev", "service", "operator", "intern", "guest")
+KIOSK_ROLES = ("intern",)      # answered only on catalog endpoints declared kiosk (see KIOSK above)
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
 POLICY_FILE = "authz_policy.json"
@@ -128,14 +147,19 @@ DEFAULT_POLICY = {
                      "core_git"],      # core_git: Git in the core through core_git.py; no service account and no tier holds it
         # compile_unstable is granted only explicitly, by a policy file's role list (docs/SITE_UNSTABLE_SOURCE_2026-11-12.md): not even admin holds it by default
         "admin": [c for c in CAPS if c != "compile_unstable"],
-        "guest": [],
+        # intern: a guest agent's kiosk account.  These are its only caps (no tier caps are added); the server's kiosk gate
+        # still limits it to the catalog's kiosk endpoints.
+        "intern": ["view_site", "photo_read"],
+        # guest: a visitor with no account.  Not added to its tier caps but their CEILING (capabilities() intersects), and the
+        # server answers a guest only on its pages and the catalog's guest-reachable entries (GUEST in the docstring).
+        "guest": ["view_site", "photo_read", "play"],
     },
 }
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS account_roles (
     user_id INTEGER PRIMARY KEY,
-    role TEXT NOT NULL CHECK(role IN ('admin','member','service','operator')),
+    role TEXT NOT NULL CHECK(role IN ('admin','member','service','operator','intern')),
     granted_by TEXT NOT NULL,
     created_at REAL NOT NULL
 );
@@ -180,7 +204,7 @@ class AuthzError(Exception):
 
 @dataclass(frozen=True)
 class Principal:
-    role: str                 # admin | member | service | guest
+    role: str                 # admin | member | dev | operator | service | intern | guest
     user_id: int | None
     username: str | None
     origin: str               # lan | ip | dns
@@ -232,8 +256,21 @@ class Policy:
             return self._policy
 
 
+def kiosk(principal: Principal) -> bool:
+    """True for a kiosk role (intern): the server answers it only on the catalog endpoints declared kiosk."""
+    return principal.role in KIOSK_ROLES
+
+
+def guest_gated(principal: Principal) -> bool:
+    """True for a visitor with no account: the server answers it only on its pages and the catalog's guest-reachable entries."""
+    return principal.role == "guest"
+
+
 def capabilities(principal: Principal, policy: dict) -> frozenset:
-    caps = set(policy["tier_caps"].get(principal.tier, ()))
+    caps = set() if kiosk(principal) else set(policy["tier_caps"].get(principal.tier, ()))
+    if guest_gated(principal):
+        return frozenset(c for c in caps & set(policy["role_caps"].get("guest", ())) if c in CAPS and c not in (
+            "lifecycle_admin", "account_manage", "paper_train", "nodus_edit", "compile_unstable"))
     if principal.role in _permission_groups.RANKS:
         for group in _permission_groups.ORDER:
             if _permission_groups.RANKS[group] <= _permission_groups.RANKS[principal.role]:
@@ -268,14 +305,14 @@ def _connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     try:
-        _schema_version.declare(conn, "authz", 3)       # first: a newer database is refused before this module writes anything
+        _schema_version.declare(conn, "authz", 4)       # 4: account_roles admits 'intern'.  First: a newer database is refused before this module writes anything
     except _schema_version.SchemaVersionError:
         conn.close()
         raise
     conn.executescript(_DDL)
     _permission_groups.prepare(conn)
     sql = (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'account_roles'").fetchone() or [""])[0] or ""
-    if "'operator'" not in sql:     # a table created before the service/operator roles: rebuild it with the wider CHECK (rows kept)
+    if "'intern'" not in sql:       # a table created before the service/operator/intern roles: rebuild it with the wider CHECK (rows kept)
         conn.executescript("BEGIN; ALTER TABLE account_roles RENAME TO account_roles_old;" + _DDL +
                            "INSERT INTO account_roles SELECT user_id, role, granted_by, created_at FROM account_roles_old;"
                            "DROP TABLE account_roles_old; COMMIT;")
@@ -383,7 +420,7 @@ def principal_from(account, origin: str, tier: str, db_path) -> Principal:
 
 
 def grant_role(db_path, username: str, role: str, granted_by: str) -> int:
-    """Set a non-admin role row (operator, service, member) for an account; admin goes through grant_admin's grantor check."""
+    """Set a non-admin role row (operator, service, intern, member) for an account; admin goes through grant_admin's grantor check."""
     if role == "admin":
         return grant_admin(db_path, username, granted_by)
     if role not in ROLES or role == "guest":
@@ -638,7 +675,7 @@ def main(argv=None) -> int:
         p.add_argument("--prompt", action="store_true", help="read the password with getpass (twice)")
         p.add_argument("--password-file", default=None)
         if name == "create-user":
-            p.add_argument("--role", choices=("member", "operator", "admin"), required=True)
+            p.add_argument("--role", choices=("member", "operator", "intern", "admin"), required=True)
             p.add_argument("--granted-by", required=True, help="operator:<name>")
     for name in ("grant-admin", "revoke-admin"):
         p = sub.add_parser(name)

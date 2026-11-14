@@ -14,18 +14,58 @@ const element = (tag, text) => { const out = document.createElement(tag); out.te
 
 function card(page, mine = false) {
   const box = element("article", ""); box.className = "card";
-  const title = element("h2", "");
-  const link = element("a", page.title); link.href = "/p/" + page.id + "/";
-  title.append(link);
+  const href = "/p/" + page.id + "/";
+  const poster = element("a", ""); poster.className = "poster"; poster.href = href;
+  poster.dataset.kind = page.kind;
+  poster.setAttribute("aria-label", "Open " + page.title);
+  const contract = page.page_contract;
+  const posterPath = contract?.presentation?.poster;
+  if (posterPath) {
+    poster.style.backgroundImage = `linear-gradient(0deg, #10172288, transparent 60%), url("${href + posterPath.split("/").map(encodeURIComponent).join("/")}")`;
+    poster.style.backgroundSize = "cover";
+    poster.style.backgroundPosition = "center";
+  }
+  const mark = element("span", page.title.trim().slice(0, 1).toUpperCase());
+  mark.className = "poster-mark"; poster.append(mark);
+  const body = element("div", ""); body.className = "card-body";
+  const badges = element("div", ""); badges.className = "badges";
+  const stage = element("span", page.stage === "dev" ? "In development" : "Released");
+  stage.className = "badge " + page.stage;
+  const kind = element("span", page.kind === "bundle" ? "Compiled page" : "Uploaded page");
+  kind.className = "badge"; badges.append(stage, kind);
+  const badge = (label, title) => {
+    const item = element("span", label); item.className = "badge";
+    if (title) item.title = title;
+    badges.append(item);
+  };
+  if (!contract) badge("Requirements unknown");
+  else {
+    badge(contract.presentation.surface.toUpperCase());
+    const compute = contract.execution.compute;
+    if (compute.length) badge("Compute · " + compute[0] + (compute.length > 1 ? ` +${compute.length - 1}` : ""), compute.join(", "));
+    const caps = contract.access.required_capabilities;
+    if (caps.length) badge("Access · " + caps[0] + (caps.length > 1 ? ` +${caps.length - 1}` : ""), caps.join(", "));
+    badge(contract.execution.standalone === "requires-site" ? "Needs Meowdoku" : "Offline unverified");
+  }
+  const title = element("h3", "");
+  const link = element("a", page.title); link.href = href; title.append(link);
+  if (page.stage === "dev") {
+    const openDev = async (event) => {
+      event.preventDefault();
+      try { await post("/api/route", { site: "dev" }); location.assign(href); }
+      catch (error) { note(error.message); }
+    };
+    poster.addEventListener("click", openDev);
+    link.addEventListener("click", openDev);
+  }
   const author = element("a", "@" + page.author);
   author.href = "/?author=" + encodeURIComponent(page.author);
-  const meta = element("p", ""); meta.className = "muted";
-  meta.append(author, document.createTextNode(" · " + page.kind + " · " + new Date(page.updated_at * 1000).toLocaleString()));
-  box.append(title, meta);
-  if (page.description) box.append(element("p", page.description));
+  const meta = element("p", ""); meta.className = "byline";
+  meta.append(author, document.createTextNode(" · " + new Date(page.updated_at * 1000).toLocaleDateString()));
+  body.append(badges, title, meta);
+  if (page.description) { const description = element("p", page.description); description.className = "description"; body.append(description); }
   if (mine) {
     const actions = element("div", ""); actions.className = "row";
-    actions.append(element("span", page.stage));
     const preview = element("button", page.stage === "dev" ? "Preview on dev" : "Open page");
     preview.type = "button";
     preview.onclick = async () => {
@@ -34,17 +74,23 @@ function card(page, mine = false) {
         location.assign("/p/" + page.id + "/");
       } catch (error) { note(error.message); }
     };
-    const change = element("button", page.stage === "dev" ? "Release" : "Return to dev");
-    change.type = "button";
-    change.onclick = async () => {
-      if (page.stage === "dev" && !confirm("Release this page to the stable server and public feed?")) return;
-      try {
-        await post("/api/pages/" + page.id + "/stage", { stage: page.stage === "dev" ? "release" : "dev" });
-        await refresh();
-      } catch (error) { note(error.message); }
-    };
-    actions.append(preview, change); box.append(actions);
+    actions.append(preview);
+    if (page.stage === "dev") {
+      const bake = element("button", "Bake public release"); bake.type = "button";
+      bake.onclick = async () => {
+        if (!confirm("Create a separate public release of this dev page?")) return;
+        try {
+          const result = await post("/api/pages/" + page.id + "/bake", {});
+          note("Public release baked. Your dev page remains available.");
+          await refresh();
+          $("mine").querySelector(`a[href="/p/${result.id}/"]`)?.focus();
+        } catch (error) { note(error.message); }
+      };
+      actions.append(bake);
+    }
+    body.append(actions);
   }
+  box.append(poster, body);
   return box;
 }
 
@@ -56,8 +102,10 @@ async function refresh() {
   }
   const query = author ? "?author=" + encodeURIComponent(author) : "";
   const feed = await request("/api/pages" + query);
-  $("feed").replaceChildren(...feed.pages.map((page) => card(page)));
-  if (!feed.pages.length) $("feed").append(element("p", "No pages here yet."));
+  const released = feed.pages.filter((page) => page.stage === "release");
+  $("feed").replaceChildren(...released.map((page) => card(page)));
+  $("release-count").textContent = released.length + " shown";
+  if (!released.length) { const empty = element("p", "No released pages here yet."); empty.className = "empty"; $("feed").append(empty); }
   const who = await request("/api/whoami");
   $("games-link").hidden = !who.signed_in && who.tier === "shader";
   $("files-link").hidden = !who.signed_in;
@@ -74,6 +122,10 @@ async function refresh() {
   const mine = await request("/api/pages?mine=1");
   $("mine").replaceChildren(...mine.pages.map((page) => card(page, true)));
   if (!mine.pages.length) $("mine").append(element("p", "You have not published a page."));
+  const drafts = mine.pages.filter((page) => page.stage === "dev");
+  $("dev-section").hidden = !drafts.length;
+  $("dev-feed").replaceChildren(...drafts.map((page) => card(page)));
+  $("dev-count").textContent = drafts.length + " shown";
 }
 
 $("publish-form").addEventListener("submit", async (event) => {
