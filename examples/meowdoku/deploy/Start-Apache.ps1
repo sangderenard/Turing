@@ -37,6 +37,8 @@ Write-Host "cmd: $Httpd -t"
 Write-Host "cmd: Start-Process $Httpd -WindowStyle Hidden -WorkingDirectory C:\Apache24\bin"
 Write-Host "then: poll '$Python $Sup --status' until every instance is running/external/skipped/failed (timeout $InstanceTimeout s)"
 Write-Host "cmd: curl.exe -k https://127.0.0.1/api/whoami"
+# The inbound ports the instances declare get their firewall rules here, with the stack they belong to (never fatal).
+try { & (Join-Path $PSScriptRoot 'Set-ServiceFirewall.ps1') -WhatIf:$WhatIf } catch { Write-Warning "firewall: $($_.Exception.Message)" }
 if ($WhatIf) { Write-Host '[WhatIf] nothing run.'; return }
 & $Httpd -t
 if ($LASTEXITCODE -ne 0) { throw 'httpd -t failed' }

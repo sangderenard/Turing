@@ -1,5 +1,9 @@
 {
   "supervisor_python": "C:/dev/Powershell/srv/python/python.exe",
+  "firewall": [
+    {"name": "apache", "protocol": "TCP", "port": 443, "program": "C:/Apache24/bin/httpd.exe"},
+    {"name": "apache", "protocol": "TCP", "port": 80, "program": "C:/Apache24/bin/httpd.exe"}
+  ],
   "restart_account": "svc-pale-horse",
   "restart_account_display_name": "Pale Horse",
   "instances": [
@@ -39,6 +43,9 @@
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
       "studio_prefix": "studio.product",
+      "firewall": [
+        {"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}
+      ],
       "env": {
         "GIT_CONFIG_COUNT": "5",
         "GIT_CONFIG_KEY_0": "safe.directory",
@@ -287,6 +294,9 @@
       "route": "",
       "bind": "0.0.0.0",
       "account": "svc-udp-router",
+      "firewall": [
+        {"protocol": "UDP", "port": "47700-47763", "program": "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe"}
+      ],
       "leases": [],
       "args": [
         "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",

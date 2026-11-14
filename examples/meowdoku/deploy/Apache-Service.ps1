@@ -11,6 +11,9 @@ if (-not $s) {
     Write-Host "Service $Svc is not installed: the console-mode scripts (Start-Apache.ps1 / Stop-Apache.ps1) apply."
     exit 0
 }
+if ($Start -or $Restart) {         # the declared inbound ports' firewall rules come up with the stack (never fatal)
+    try { & (Join-Path $PSScriptRoot 'Set-ServiceFirewall.ps1') } catch { Write-Warning "firewall: $($_.Exception.Message)" }
+}
 if ($Start)   { Start-Service -Name $Svc }
 if ($Stop)    { Stop-Service -Name $Svc }
 if ($Restart) { Restart-Service -Name $Svc }
