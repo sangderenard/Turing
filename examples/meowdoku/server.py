@@ -501,6 +501,8 @@ def make_handler(sessions: Sessions):
             super().__init__(*args, directory=str(web_dir), **kwargs)
 
         def log_message(self, format, *args):  # noqa: A002 - quiet static and polling logs
+            if "/api/connections/" in getattr(self, "path", ""):
+                return  # OAuth codes/state and tool arguments must never enter access logs.
             line = str(args[0]) if args else ""
             if "/api/" in line and "/api/log" not in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
                 sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
@@ -2755,6 +2757,9 @@ def make_handler(sessions: Sessions):
                 return self._user_files_route(path, "GET")
             if path in ("/api/file-keys/me", "/api/file-keys/peer"):
                 return self._file_keys_route(path, "GET")
+            if path.startswith("/api/connections/"):
+                from meowdoku.remote_connections import route
+                return route(self, sessions, path, "GET")
             if path == "/api/user-secrets/alpaca-paper":
                 return self._paper_credentials_route("GET")
             if path in ("/api/markets/history", "/api/markets/now"):
@@ -3284,6 +3289,9 @@ def make_handler(sessions: Sessions):
                 return self._user_files_route(path0, "POST")
             if path0 == "/api/file-keys/me":
                 return self._file_keys_route(path0, "POST")
+            if path0.startswith("/api/connections/"):
+                from meowdoku.remote_connections import route
+                return route(self, sessions, path0, "POST")
             if path0 == "/api/user-secrets/alpaca-paper":
                 return self._paper_credentials_route("POST")
             if path0.startswith("/api/paper/"):
@@ -4160,6 +4168,9 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lc.stopping = True
+        remote_connections = getattr(sessions, "_remote_mcp_connections", None)
+        if remote_connections is not None:
+            remote_connections.close()
         if sessions.radio_jukebox_runner is not None:
             sessions.radio_jukebox_runner.close()
         if sessions.radio_control is not None:
