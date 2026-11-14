@@ -20,14 +20,16 @@ def test_actual_server_http_mailbox(tmp_path):
     from meowdoku import server
     web=tmp_path/'web';web.mkdir();(web/'boards.json').write_text('{"boards":[],"levels":{}}')
     sessions=server.Sessions(web,None);sessions.lifecycle=None;sessions.access.lookup=lambda url:None
-    token,_,_=sessions.get(None);owner='browser:'+hashlib.sha256(token.encode()).hexdigest()
+    token,_,_=sessions.get(None)
+    # a visitor with no account is a guest and never holds share_live (owner, 2026-11-13): this browser is signed in, so the job is the account's
+    uid=sessions.accounts.ensure_user('ray_cat','correcthorse1');account=sessions.accounts.create_session(uid);owner='account:'+str(uid)
     bridge=sessions.client_ray_bridge;secret=bridge.register('job',owner)
     browser=bridge.join('job',owner)['credential']
     httpd=ThreadingHTTPServer(('127.0.0.1',0),server.make_handler(sessions));thread=threading.Thread(target=httpd.serve_forever,daemon=True);thread.start()
     def call(path,body,engine=False,credential=None):
         headers={'Content-Type':'application/json','Authorization':'Bearer '+(credential or (secret if engine else browser))}
         if engine:headers['X-Meowdoku-Engine-Job']='job'
-        else:headers.update({'X-Meowdoku-Rays':'1','Cookie':server.COOKIE+'='+token})
+        else:headers.update({'X-Meowdoku-Rays':'1','Cookie':server.COOKIE+'='+token+'; '+server.ACCOUNT_COOKIE+'='+account})
         c=http.client.HTTPConnection('127.0.0.1',httpd.server_port,timeout=5);c.request('POST','/api/client_rays/'+path,json.dumps(body),headers)
         r=c.getresponse();data=json.loads(r.read());status=r.status;c.close();return status,data
     scene={'revision':'r','geometry_hash':'g','triangles':[{'owner':3,'v0':[0,0,1],'e1':[1,0,0],'e2':[0,1,0]}]}

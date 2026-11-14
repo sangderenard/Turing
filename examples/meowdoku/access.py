@@ -78,6 +78,10 @@ PHOTO_READ_APIS = ("/api/marble_photo/jobs", "/api/marble_photo/lenses", "/api/m
 # /api/reviews/standing answers accepted true/false for one commit id and how to get a review; the review-gate
 # check on GitHub asks it from outside with no account (branch_review.http_route). It reads no identity and no row's text.
 SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim", "/api/reviews/standing") + PHOTO_READ_APIS
+# [GUEST] sockets a visitor with no account may open (server.py _kiosk_gate; the REST entries are declared in speaktome_api.catalog):
+# the game table's input socket and a viewer's push socket, and, by prefix, the federation bridge whose peer grant is the authority.
+GUEST_SOCKETS = ("/ws", "/ws/spectate")
+CREDENTIAL_SOCKETS = ("/ws/contract/",)
 
 # /api/action types that act on the whole process (the shared learner, the Lichess client, the pilot weights), not on the caller's table.
 EDIT_ACTIONS = frozenset({"demo_learning", "arena_save", "arena_stop", "arena_resume", "lichess_pause", "lichess_resume", "pilot_arch"})
