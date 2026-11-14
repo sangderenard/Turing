@@ -30,10 +30,9 @@ Tables in accounts.db (schema module ``chat_rooms`` 2; this module is their one 
 
 Text is stored stripped and only ever returned as a JSON string. Who is asking always comes from the authenticated session.
 
-BETWEEN SERVERS. Rooms are kept relayable over IRC, which already solves server-to-server delivery and resynchronization: a
-room's name is a valid channel name once prefixed with "#" (lowercase letters, digits and dashes, at most 40), and a
-message is text from one account, in order (a relay splits one longer than an IRC line, or of several lines). This module keeps the local truth (ids, removals, entry rules); a relay would
-carry messages between servers and record where each came from. Nothing here speaks IRC yet.
+BETWEEN SERVERS. Rooms are local to this server. There is no relay, and none goes over IRC or any other open chat
+protocol (the owner, 2026-11-14: it would open the site to that protocol's threats). A server-to-server sync, if one is
+wanted, is the site's own, over its authenticated federation; this module keeps the local truth (ids, removals, entry rules).
 
     GET  /api/chat/rooms                                 the rooms this account may enter
     POST /api/chat/rooms             {room, title, about?, stage?, write?}   make a room (dev level and up)
