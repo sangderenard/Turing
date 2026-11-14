@@ -11,9 +11,56 @@ const post = (path, body) => request(path, {
   method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
 });
 const element = (tag, text) => { const out = document.createElement(tag); out.textContent = text; return out; };
+let signedIn = false;
+
+// Two views of the feed: icons (a grid of tiles) or a thread (one column, each page with its comments). A per-viewer
+// convenience kept in this browser; the server keeps nothing of it.
+function viewMode() { try { return localStorage.getItem("feed-view") === "thread" ? "thread" : "icons"; } catch { return "icons"; } }
+function setView(mode) {
+  try { localStorage.setItem("feed-view", mode); } catch { /* private window: the choice lasts this visit */ }
+  $("view-icons").setAttribute("aria-pressed", String(mode === "icons"));
+  $("view-thread").setAttribute("aria-pressed", String(mode === "thread"));
+  for (const id of ["feed", "dev-feed"]) $(id).classList.toggle("thread", mode === "thread");
+  if (mode === "thread") for (const box of document.querySelectorAll("#feed .card, #dev-feed .card")) loadThread(box);
+}
+
+// A page's comment thread (comments.py, kind "page"): its last 20 comments and, signed in, a reply box.
+async function loadThread(box) {
+  const pageId = box.dataset.page;
+  if (!pageId || box.querySelector(".card-thread")) return;
+  const thread = element("section", ""); thread.className = "card-thread"; thread.setAttribute("aria-label", "Comments");
+  box.querySelector(".card-body").append(thread);
+  if (!signedIn) { thread.append(element("p", "Sign in to read and write comments.")); return; }
+  const list = document.createElement("ul");
+  const draw = async () => {
+    try {
+      const { comments } = await request(`/api/comments?kind=page&ref=${encodeURIComponent(pageId)}&tail=20`);
+      list.replaceChildren(...comments.map((c) => {
+        const item = document.createElement("li");
+        item.append(element("span", c.username), document.createTextNode(c.removed ? "(removed by an admin)" : c.body));
+        item.firstChild.className = "who";
+        return item;
+      }));
+      if (!comments.length) list.append(element("li", "No comments yet."));
+    } catch (error) { list.replaceChildren(element("li", error.message)); }
+  };
+  const form = document.createElement("form");
+  const text = document.createElement("textarea"); text.rows = 2; text.maxLength = 4000;
+  text.setAttribute("aria-label", "Comment on this page");
+  const send = element("button", "Comment"); send.type = "submit";
+  form.append(text, send);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!text.value.trim()) return;
+    try { await post("/api/comments", { kind: "page", ref: pageId, body: text.value }); text.value = ""; await draw(); }
+    catch (error) { note(error.message); }
+  });
+  thread.append(list, form);
+  await draw();
+}
 
 function card(page, mine = false) {
-  const box = element("article", ""); box.className = "card";
+  const box = element("article", ""); box.className = "card"; box.dataset.page = page.id;
   const href = "/p/" + page.id + "/";
   const poster = element("a", ""); poster.className = "poster"; poster.href = href;
   poster.dataset.kind = page.kind;
@@ -107,6 +154,8 @@ async function refresh() {
   $("release-count").textContent = released.length + " shown";
   if (!released.length) { const empty = element("p", "No released pages here yet."); empty.className = "empty"; $("feed").append(empty); }
   const who = await request("/api/whoami");
+  signedIn = Boolean(who.signed_in);
+  setView(viewMode());
   $("games-link").hidden = !who.signed_in && who.tier === "shader";
   $("files-link").hidden = !who.signed_in;
   if (!who.signed_in) return;
@@ -126,6 +175,7 @@ async function refresh() {
   $("dev-section").hidden = !drafts.length;
   $("dev-feed").replaceChildren(...drafts.map((page) => card(page)));
   $("dev-count").textContent = drafts.length + " shown";
+  setView(viewMode());
 }
 
 $("publish-form").addEventListener("submit", async (event) => {
@@ -152,4 +202,6 @@ $("publish-form").addEventListener("submit", async (event) => {
   } catch (error) { note(error.message); }
 });
 
+$("view-icons").addEventListener("click", () => setView("icons"));
+$("view-thread").addEventListener("click", () => setView("thread"));
 refresh().catch((error) => note(error.message));

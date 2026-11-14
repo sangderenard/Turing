@@ -100,3 +100,19 @@ def test_the_route_asks_the_kind_and_tells_its_people(tmp_path):
     first = answer["comments"][0]["id"]
     assert ask("/api/comments/remove", "POST", body={"id": first})[0] == 403
     assert ask("/api/comments/remove", "POST", capabilities=("account_manage",), body={"id": first})[0] == 200
+
+
+def test_a_pages_thread_follows_the_pages_own_reading_rule(db):
+    from meowdoku import authored_pages
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+    db.execute("CREATE TABLE authored_pages (id TEXT PRIMARY KEY, owner_id INTEGER, stage TEXT, title TEXT)")
+    db.executemany("INSERT INTO users VALUES (?, ?)", [(1, "ann"), (2, "bo")])
+    db.executemany("INSERT INTO authored_pages VALUES (?, ?, ?, ?)", [("pub", 1, "release", "Shader demo"), ("wip", 1, "dev", "Draft")])
+    kind = authored_pages.comment_kind()
+    bo, ann = {"user_id": 2, "username": "bo", "caps": frozenset()}, {"user_id": 1, "username": "ann", "caps": frozenset()}
+    assert kind.may_write(db, bo, "pub") is True and kind.may_read(db, bo, "pub") is True, "a released page: every signed-in account"
+    assert isinstance(kind.may_read(db, bo, "wip"), str) and kind.may_write(db, ann, "wip") is True, "a dev page: its author alone"
+    with pytest.raises(comments.CommentError):
+        kind.may_read(db, bo, "gone")
+    comments.post(db, "page", "pub", user_id=2, username="bo", body="lovely")
+    assert kind.tell(db, "pub", None) == {"ann", "bo"} and kind.label(db, "pub") == "the page Shader demo"

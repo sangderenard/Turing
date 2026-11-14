@@ -1821,12 +1821,20 @@ def make_handler(sessions: Sessions):
             """[TALK] comments under a post (comments.py) and the chat server's rooms (chat_rooms.py)."""
             self._classify()
             if path == "/api/comments" or path.startswith("/api/comments/"):
-                from meowdoku import branch_review, comments
+                from meowdoku import authored_pages, branch_review, comments
                 return comments.http_route(self, path, method, accounts_db=sessions.accounts_db,
-                                           kinds={branch_review.THREAD_KIND: branch_review.comment_kind()},
+                                           kinds={branch_review.THREAD_KIND: branch_review.comment_kind(),
+                                                  "page": authored_pages.comment_kind()},
                                            notify=sessions.system_notify)
             from meowdoku import chat_rooms
-            return chat_rooms.http_route(self, path, method, accounts_db=sessions.accounts_db)
+            connections = None
+            if "/forward" in path:                  # a lender's connection service, only when forwarding is asked for
+                try:
+                    from meowdoku import remote_connections
+                    connections = remote_connections.service_for(sessions)
+                except Exception:
+                    connections = None              # not configured here: forwarding answers 503, nothing else changes
+            return chat_rooms.http_route(self, path, method, accounts_db=sessions.accounts_db, connections=connections)
 
         def _reviews_route(self, path: str, method: str) -> None:
             """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""

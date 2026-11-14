@@ -381,3 +381,29 @@ def read_bundle_url(db, url, *, site, actor=None):
     if row is None:
         raise PageError("page asset not found", 404)
     return read(db, row["id"], site=site, actor=actor, path=match[3])
+
+
+def comment_kind():
+    """The ``page`` kind of the comments engine (comments.py): a page's thread follows the page's own reading rule. A released
+    page's thread is open to every signed-in account; a page in development, to its author alone (as the page itself is).
+    Its author and earlier writers are told of a new comment."""
+    import sqlite3
+    from meowdoku import comments
+
+    def row(db, ref):
+        try:
+            found = db.execute("SELECT p.owner_id, p.stage, p.title, u.username FROM authored_pages p "
+                               "JOIN users u ON u.id = p.owner_id WHERE p.id = ?", (ref,)).fetchone()
+        except sqlite3.OperationalError:
+            found = None                          # no pages table yet: no such page
+        if found is None:
+            raise comments.CommentError("no such page", 404)
+        return found
+
+    def may(db, who, ref):
+        owner_id, stage, _title, _author = row(db, ref)
+        return True if stage == "release" or owner_id == who["user_id"] else "a page in development is its author's alone"
+    return comments.Kind(may_read=may, may_write=may,
+                         tell=lambda db, ref, made: {row(db, ref)[3]} | comments.writers(db, "page", ref),
+                         label=lambda db, ref: f"the page {row(db, ref)[2]}")
+

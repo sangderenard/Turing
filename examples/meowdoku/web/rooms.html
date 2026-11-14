@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rooms · Meowdoku</title>
+<style>
+body{margin:0;background:#0e1119;color:#e8eaf3;font:15px/1.5 system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:90px 20px 32px}h1,h2,h3{margin:.3em 0}a{color:#acc7ff}button,input,textarea,select{font:inherit;color:inherit;background:#1b2332;border:1px solid #60728c;border-radius:6px;padding:8px}button{cursor:pointer}button:disabled{opacity:.5;cursor:default}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid #a7c7ff;outline-offset:3px}label{display:block;margin:10px 0 4px}textarea,input[type=text]{box-sizing:border-box;width:100%}.muted{color:#b2bed0}.notice{padding:10px;background:#222d40;border-radius:6px}.grid{display:grid;grid-template-columns:minmax(240px,28%) 1fr;gap:20px;margin-top:20px}.panel{border:1px solid #39465c;border-radius:10px;padding:16px;min-width:0}.row{display:block;width:100%;text-align:left;margin-top:8px;overflow-wrap:anywhere}.row[aria-current=true]{border-color:#a7c7ff}.row small{display:block;color:#b2bed0}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:#2a3446;margin-left:6px}.badge.dev{background:#47341f}.badge.release{background:#153d35}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.msgs{list-style:none;padding:0;margin:8px 0}.msgs li{padding:6px 0;border-bottom:1px solid #253045;overflow-wrap:anywhere;white-space:pre-wrap}.msgs .who{color:#acc7ff;font-weight:600;margin-right:8px}.msgs .at{color:#b2bed0;font-size:12px;margin-left:8px}.compose{display:flex;gap:8px;align-items:flex-end}.compose textarea{flex:1}.part{border-top:1px solid #39465c;margin-top:16px;padding-top:8px}code{font:12px ui-monospace,monospace}[hidden]{display:none!important}@media(max-width:760px){.grid{display:block}.panel{margin-bottom:14px}main{padding:100px 12px 24px}}
+</style></head><body>
+<main><h1>Rooms</h1><p class="muted">Chat rooms are site objects. A room made here starts personal, on the development site; its owner shares it, releases it, gives it a set of site objects and bridges, and members may forward tools of their own secured connections into it. A bot in a room has the room's set and whatever its own account brings.</p>
+<p id="message" class="notice" role="status" aria-live="polite">Checking your account…</p>
+<p id="signin" hidden><a href="/login.html">Sign in</a> to see your rooms.</p>
+<section id="content" hidden>
+<div class="actions"><button id="refresh" type="button">Refresh</button><label style="margin:0">History <select id="tail"><option value="20" selected>last 20</option><option value="50">last 50</option><option value="100">last 100</option><option value="all">all</option></select></label><a href="/reviews.html">Change reviews</a></div>
+<div class="grid"><section class="panel"><h2>Your rooms</h2><div id="rooms"></div>
+<form id="make" class="part" hidden><h3>Make a room</h3><label for="make-room">Name (3 to 40 lowercase letters, digits and dashes)</label><input id="make-room" type="text" required pattern="[a-z0-9][a-z0-9-]{2,39}"><label for="make-title">Title</label><input id="make-title" type="text" required maxlength="120"><label for="make-about">About</label><input id="make-about" type="text" maxlength="500"><p><button type="submit">Make it</button></p></form></section>
+<section id="room" class="panel" aria-label="The room"><p>Select a room.</p></section></div>
+</section></main>
+<script type="module" src="/rooms.js"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body></html>

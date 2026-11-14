@@ -18,6 +18,16 @@
   input[type=text], textarea { box-sizing: border-box; width: 100%; }
   textarea { min-height: 5rem; }
   form { display: grid; gap: .8rem; }
+  .views { display: inline-flex; gap: .3rem; }
+  .views button[aria-pressed="true"] { outline: 2px solid #a7c7ff; }
+  .grid.thread { display: block; max-width: 760px; }
+  .grid.thread .card { margin-bottom: 1.2rem; }
+  .card-thread { border-top: 1px solid #39465c; margin-top: .6rem; padding-top: .6rem; }
+  .card-thread ul { list-style: none; padding: 0; margin: .4rem 0; }
+  .card-thread li { padding: .3rem 0; border-bottom: 1px solid #253045; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .card-thread .who { color: #acc7ff; font-weight: 600; margin-right: .5rem; }
+  .card-thread form { display: flex; gap: .5rem; align-items: flex-end; }
+  .card-thread textarea { flex: 1; }
   [hidden] { display: none !important; }
 </style>
 <link rel="stylesheet" href="/pages.css">
@@ -29,7 +39,7 @@
     <nav class="quick-links" aria-label="Pages"><a href="/">Public feed</a><a id="games-link" href="/games.html" hidden>Built-in games</a><a id="files-link" href="/files.html" hidden>My files</a></nav></header>
   <p id="notice" role="status"></p>
   <section id="author-heading" hidden><div class="section-head"><h2 id="author-title"></h2><a href="/">All authors</a></div></section>
-  <section aria-label="Released pages"><div class="section-head"><div><h2>Public feed</h2><p>Released pages anyone can visit.</p></div><span id="release-count" class="count"></span></div>
+  <section aria-label="Released pages"><div class="section-head"><div><h2>Public feed</h2><p>Released pages anyone can visit.</p></div><span class="views" role="group" aria-label="View"><button id="view-icons" type="button" aria-pressed="true">Icons</button><button id="view-thread" type="button" aria-pressed="false">Thread</button></span><span id="release-count" class="count"></span></div>
     <div id="feed" class="grid"></div></section>
   <section id="dev-section" aria-label="Your dev pages" hidden><div class="section-head"><div><h2>In development</h2><p>Only you can preview these pages on the development server.</p></div><span id="dev-count" class="count"></span></div>
     <div id="dev-feed" class="grid"></div></section>
