@@ -1,6 +1,6 @@
-// /nodus.html: Living Data graph picture and read-only UI feeds from Nodus.
+// /nodus.html: Living Data graph picture and opt-in actions on Nodus UI feeds.
 const $ = (id) => document.getElementById(id);
-const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, busy: false };
+const state = { instance: null, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, busy: false, canEdit: false, forwarding: null };
 let feedQuads = [];
 
 function makeFrameQuad(canvas, status) {
@@ -34,9 +34,9 @@ function makeFrameQuad(canvas, status) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.useProgram(program);
   gl.uniform1i(gl.getUniformLocation(program, "frame"), 0);
-  const quad = { url: "", busy: false, etag: null, abort: null, stopped: false,
+  const quad = { url: "", busy: false, etag: null, abort: null, stopped: false, hasFrame: false, fullView: true,
     stop() { this.stopped = true; this.abort?.abort(); },
-    setUrl(url) { this.abort?.abort(); this.url = url; this.etag = null; },
+    setUrl(url, fullView = true) { this.abort?.abort(); this.url = url; this.etag = null; this.hasFrame = false; this.fullView = fullView; },
     async update() {
       if (this.stopped || this.busy || !this.url) return;
       this.busy = true;
@@ -54,8 +54,9 @@ function makeFrameQuad(canvas, status) {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         bitmap.close();
-        this.etag = response.headers.get("ETag"); status.textContent = "Live Nodus frame";
-      } catch (error) { if (!abort.signal.aborted) status.textContent = error.message; }
+        this.etag = response.headers.get("ETag"); this.hasFrame = true;
+        if (!canvas.classList.contains("forwarding")) status.textContent = "Live Nodus frame";
+      } catch (error) { if (!abort.signal.aborted) { this.hasFrame = false; status.textContent = error.message; } }
       finally { this.busy = false; if (this.abort === abort) this.abort = null; }
     },
   };
@@ -158,6 +159,109 @@ function drawGeneric() {
     nodes.reduce((n, x) => n + (x.dependencies || []).length, 0) + " dependencies";
 }
 
+function attachForwarding(card, canvas, status, quad, identity) {
+  if (!state.canEdit) return;
+  const label = el("label", null, "forward-toggle");
+  const toggle = el("input"); toggle.type = "checkbox";
+  toggle.checked = state.forwarding === identity;
+  label.append(toggle, document.createTextNode("Forward my mouse and keyboard actions to this canvas"));
+  card.append(label);
+  let revision = state.revision, draining = false, lastPoint = null;
+  const queue = [];
+  const instance = state.instance;
+  const active = () => state.forwarding === identity && state.instance === instance && card.isConnected;
+  const stop = (message) => {
+    if (state.forwarding === identity) state.forwarding = null;
+    toggle.checked = false; canvas.classList.remove("forwarding");
+    if (message) status.textContent = message;
+    state.graphKey = null;
+  };
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    try {
+      while (queue.length && active()) {
+        const action = queue.shift();
+        const result = await send("/api/nodus/action", {
+          instance, action: { ...action, expected_revision: revision },
+        });
+        if (result.status !== 200 || result.body?.error) {
+          stop((result.body && result.body.error) || `Action refused (${result.status}); refresh before retrying.`);
+          break;
+        }
+        revision = result.body.revision; state.revision = revision;
+        status.textContent = result.body.handled ? "Action applied to running canvas" : "Action reached canvas; no change";
+      }
+    } finally { queue.length = 0; draining = false; }
+  };
+  const enqueue = (action) => {
+    if (!active()) return;
+    if (action.kind === "move" && queue.at(-1)?.kind === "move") queue[queue.length - 1] = action;
+    else if (queue.length < 64) queue.push(action);
+    else { stop("Action queue full; refresh before retrying."); return; }
+    drain();
+  };
+  const point = (event) => {
+    const bounds = canvas.getBoundingClientRect();
+    const x = Math.max(0, Math.min(canvas.width - 1, (event.clientX - bounds.left) * canvas.width / bounds.width));
+    const y = Math.max(0, Math.min(canvas.height - 1, (event.clientY - bounds.top) * canvas.height / bounds.height));
+    const next = { x, y, dx: lastPoint ? x - lastPoint.x : 0, dy: lastPoint ? y - lastPoint.y : 0 };
+    lastPoint = { x, y };
+    return next;
+  };
+  toggle.addEventListener("change", async () => {
+    if (!toggle.checked) { stop("Action forwarding off"); return; }
+    if (!quad || !quad.hasFrame || !quad.fullView) {
+      stop("Show the live whole UI before enabling actions."); return;
+    }
+    const found = await get(q("/api/nodus/digest"));
+    if (!toggle.checked || !card.isConnected || state.instance !== instance || found.status !== 200 || found.body.instance !== instance) {
+      stop("Could not verify the current canvas revision."); return;
+    }
+    revision = found.body.revision;
+    const viewport = await send("/api/nodus/action", { instance,
+      action: { op: "viewport", expected_revision: revision, width: canvas.width, height: canvas.height } });
+    if (!toggle.checked || !card.isConnected || state.instance !== instance || viewport.status !== 200 || viewport.body?.error) {
+      stop((viewport.body && viewport.body.error) || "Could not synchronize the canvas viewport."); return;
+    }
+    revision = viewport.body.revision; state.revision = revision;
+    for (const other of $("console-wall").querySelectorAll(".console-device")) {
+      if (other === card) continue;
+      const previous = other.querySelector(".forward-toggle input");
+      if (previous?.checked) previous.click();
+    }
+    state.forwarding = identity; canvas.classList.add("forwarding"); canvas.tabIndex = 0;
+    status.textContent = "Action forwarding on; focus the frame for keyboard controls.";
+  });
+  canvas.addEventListener("pointerdown", (event) => {
+    if (!active()) return;
+    event.preventDefault(); canvas.focus(); canvas.setPointerCapture(event.pointerId);
+    enqueue({ op: "mouse", kind: "down", ...point(event), button: event.button });
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (active() && event.buttons) { event.preventDefault(); enqueue({ op: "mouse", kind: "move", ...point(event), button: event.button < 0 ? 0 : event.button }); }
+  });
+  canvas.addEventListener("pointerup", (event) => {
+    if (!active()) return;
+    event.preventDefault(); enqueue({ op: "mouse", kind: "up", ...point(event), button: event.button });
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  });
+  canvas.addEventListener("click", (event) => {
+    if (active()) { event.preventDefault(); enqueue({ op: "mouse", kind: "click", ...point(event), button: event.button }); }
+  });
+  canvas.addEventListener("wheel", (event) => {
+    if (!active()) return;
+    event.preventDefault(); enqueue({ op: "mouse", kind: "scroll", ...point(event), scroll: Math.max(-10, Math.min(10, -event.deltaY / 100)) });
+  }, { passive: false });
+  canvas.addEventListener("contextmenu", (event) => { if (active()) event.preventDefault(); });
+  for (const [name, action] of [["keydown", 1], ["keyup", 0]]) canvas.addEventListener(name, (event) => {
+    if (!active() || !event.keyCode) return;
+    event.preventDefault();
+    const mods = (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+    enqueue({ op: "key", key: event.keyCode, scancode: 0, action, mods });
+  });
+}
+
 function drawMap() {
   const map = state.map;
   $("maproot").textContent = map ? `${map.name} [${map.identity}]` : "Map unavailable.";
@@ -187,6 +291,7 @@ function drawMap() {
     const status = el("small", "Connecting to Nodus UI feed…", "mut"); card.append(status);
     const quad = makeFrameQuad(canvas, status);
     if (quad) { quad.setUrl(consoleNode.view.full); feedQuads.push(quad); quad.update(); }
+    attachForwarding(card, canvas, status, quad, consoleNode.identity);
     const full = el("a", "Open full view"); full.href = consoleNode.view.full; full.target = "_blank"; full.rel = "noopener";
     card.append(full);
     const form = el("form");
@@ -206,7 +311,8 @@ function drawMap() {
       const values = Object.fromEntries(Object.entries(fields).map(([key, input]) => [key, Number(input.value)]));
       if (Object.values(values).some((value) => !Number.isInteger(value)) || values.width < 1 || values.height < 1) return;
       if (quad) {
-        quad.setUrl(consoleNode.view.region.replace(/\{(x|y|width|height)\}/g, (_, key) => String(values[key])));
+        if (state.forwarding === consoleNode.identity) card.querySelector(".forward-toggle input").click();
+        quad.setUrl(consoleNode.view.region.replace(/\{(x|y|width|height)\}/g, (_, key) => String(values[key])), false);
         quad.update();
       }
     });
@@ -239,7 +345,7 @@ async function refresh() {
       if (m.status === 200) state.map = m.body.map;
       drawTools();
       drawGeneric();
-      drawMap();
+      if (!state.forwarding) drawMap();
     }
     const bucket = d.body.tick;
     if (bucket !== state.tick || !state.activity) {
@@ -272,7 +378,7 @@ async function loadInstances() {
 }
 
 function resetFor(name) {
-  Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null });
+  Object.assign(state, { instance: name, revision: null, graphKey: null, tick: null, graph: null, map: null, tools: [], activity: null, abstract: null, forwarding: null });
   drawMap();
 }
 
@@ -385,6 +491,7 @@ async function walkLeave() {
 async function setupWalk() {
   const res = await get("/api/whoami");
   const who = res.status === 200 && res.body ? res.body : null;
+  state.canEdit = !!(who && (who.capabilities || []).includes("nodus_edit"));
   if (!who || !(who.capabilities || []).includes("dev_ui")) return;
   $("walk").hidden = false;
   if (!who.signed_in) { $("walknote").hidden = false; return; }
