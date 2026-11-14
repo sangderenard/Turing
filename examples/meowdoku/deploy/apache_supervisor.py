@@ -307,6 +307,14 @@ class Instance:
         # Optional "env" of the instance: variables its child is started with (e.g. the Nodus exec rows' declarations).
         for key, value in (self.spec.get("env") or {}).items():
             env[str(key)] = str(value)
+        # Optional "env_files": a variable whose value is the content of a file, read at each launch and given to this
+        # child only (the landing task's GitHub token). The value is never logged; an unreadable file leaves it unset.
+        for key, path in (self.spec.get("env_files") or {}).items():
+            try:
+                env[str(key)] = Path(path).read_text(encoding="utf-8").strip()
+            except OSError as error:
+                env.pop(str(key), None)
+                self.sup.log(f"{self.name}: env_files {key}: {path} is unreadable ({type(error).__name__}); not set")
         return env
 
     def check(self):
