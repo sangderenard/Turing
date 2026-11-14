@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 from test_meowdoku_remote_connections import Handler
-from meowdoku import remote_connections as host
+from meowdoku import liaison, remote_connections as host
 try:
     import httpx
     from speaktome_api import remote_mcp
@@ -18,6 +19,20 @@ except ImportError:
 
 @unittest.skipIf(remote_mcp is None, 'optional remote MCP SDK not installed')
 class SDKHostTests(unittest.TestCase):
+    def test_interim_factory_remains_active_without_cutover_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            state=SimpleNamespace(run_dir=Path(root)/'run',secrets_dir=Path(root)/'secrets')
+            state.run_dir.mkdir()
+            (state.run_dir/'mcp_connections.json').write_text(json.dumps({'suno':{
+                'callback_url':'https://example.test/api/connections/suno/callback',
+                'allowed_origins':['https://api.suno.com']}}))
+            sessions=SimpleNamespace(state=state,accounts_db=Path(root)/'sql'/'accounts.db')
+            service=host.service_for(sessions)
+            try:
+                self.assertIsInstance(service,remote_mcp.ConnectionService)
+            finally:
+                service.close()
+
     def test_actual_factory_vault_callback_and_tool_forward(self):
         requests=[]
         base='https://api.suno.com'
@@ -49,33 +64,40 @@ class SDKHostTests(unittest.TestCase):
             else: raise AssertionError(method)
             return httpx.Response(200,json={'jsonrpc':'2.0','id':body['id'],'result':result})
         with tempfile.TemporaryDirectory() as root:
-            state=SimpleNamespace(run_dir=Path(root)/'run',secrets_dir=Path(root)/'secrets')
-            state.run_dir.mkdir()
-            (state.run_dir/'mcp_connections.json').write_text(json.dumps({'suno':{'callback_url':callback,'allowed_origins':[base]}}))
-            sessions=SimpleNamespace(state=state)
+            base_dir=Path(root)
+            config=base_dir/'mcp_connections.json'
+            config.write_text(json.dumps({'suno':{'callback_url':callback,'allowed_origins':[base]}}))
+            key_file=base_dir/'liaison-ipc.key'; key_file.write_bytes(b'x'*32)
             def call(action,method='GET',body=None,owner=7,query=''):
                 h=Handler(owner,body); h.path='/api/connections/suno/'+action+query
-                host.route(h,sessions,h.path.partition('?')[0],method); return h
+                host.route(h,object(),h.path.partition('?')[0],method); return h
             with patch.object(remote_mcp,'PublicHTTPTransport',lambda:httpx.MockTransport(respond)):
-                first=call('connect','POST').output
-                self.assertEqual(first[0],200)
-                self.assertEqual(first[1]['status'],'authorization_required')
-                state_token=parse_qs(urlsplit(first[1]['authorization_url']).query)['state'][0]
-                query='?code=fixture-code&state='+state_token
-                self.assertEqual(call('callback',owner=8,query=query).output[0],400)
-                self.assertEqual(call('callback',query=query).code,303)
-                for _ in range(100):
-                    status=call('status').output[1]
-                    if status['status']=='connected': break
-                    time.sleep(.01)
-                self.assertEqual(status,{'status':'connected','configured':True})
-                self.assertEqual(call('tools').output[1]['tools'][0]['inputSchema'],schema)
-                result=call('call','POST',{'name':'fixture_tool','arguments':{'track':'x'}})
-                self.assertEqual(result.output[1]['content'][0]['text'],'fixture-result')
-                self.assertFalse(call('status',owner=8).output[1]['configured'])
-                call('disconnect','POST')
-                self.assertFalse(call('status').output[1]['configured'])
-                sessions._remote_mcp_connections.close()
+                service=liaison.connection_service(config,base_dir/'vault')
+                server=liaison.LiaisonServer(key_file,service,port=0)
+                thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+                client=liaison.LiaisonClient(key_file,port=server.server_address[1])
+                try:
+                    with patch.object(host,'service_for',return_value=client):
+                        first=call('connect','POST').output
+                        self.assertEqual(first[0],200)
+                        self.assertEqual(first[1]['status'],'authorization_required')
+                        state_token=parse_qs(urlsplit(first[1]['authorization_url']).query)['state'][0]
+                        query='?code=fixture-code&state='+state_token
+                        self.assertEqual(call('callback',owner=8,query=query).output[0],400)
+                        self.assertEqual(call('callback',query=query).code,303)
+                        for _ in range(100):
+                            status=call('status').output[1]
+                            if status['status']=='connected': break
+                            time.sleep(.01)
+                        self.assertEqual(status,{'status':'connected','configured':True})
+                        self.assertEqual(call('tools').output[1]['tools'][0]['inputSchema'],schema)
+                        result=call('call','POST',{'name':'fixture_tool','arguments':{'track':'x'}})
+                        self.assertEqual(result.output[1]['content'][0]['text'],'fixture-result')
+                        self.assertFalse(call('status',owner=8).output[1]['configured'])
+                        call('disconnect','POST')
+                        self.assertFalse(call('status').output[1]['configured'])
+                finally:
+                    server.shutdown(); server.server_close(); service.close()
         self.assertTrue(requests)
 
 if __name__=='__main__': unittest.main()

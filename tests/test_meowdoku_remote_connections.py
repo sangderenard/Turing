@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples'))
-from meowdoku import remote_connections as mod
+from meowdoku import liaison, remote_connections as mod
 
 class Handler:
     def __init__(self, owner=7, body=None):

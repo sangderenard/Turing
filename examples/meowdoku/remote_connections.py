@@ -17,28 +17,25 @@ _lock = threading.Lock()
 
 
 def vault_callbacks(root, owner, provider):
+    """Working interim vault, retained until the liaison is explicitly enabled."""
     if type(owner) is not int or owner < 1 or provider != 'suno':
         raise PermissionError('invalid connection owner')
     target = Path(root) / 'mcp_credentials' / str(owner) / 'suno.json'
     def read():
-        if not target.exists():
-            return None
-        return json.loads(target.read_text(encoding='utf-8'))
+        return json.loads(target.read_text(encoding='utf-8')) if target.exists() else None
     def write(record):
-        # Dedicated restricted OAuth subtree; never widen access to Alpaca/other credentials.
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_name('.' + secrets.token_hex(16) + '.tmp')
         try:
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(record, f, separators=(',', ':'))
-                f.flush()
-                os.fsync(f.fileno())
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(record, stream, separators=(',', ':'))
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temp, target)
         finally:
             temp.unlink(missing_ok=True)
-    def clear():
-        target.unlink(missing_ok=True)
+    def clear(): target.unlink(missing_ok=True)
     return read, write, clear
 
 
@@ -47,19 +44,25 @@ def service_for(sessions):
         service = getattr(sessions, '_remote_mcp_connections', None)
         if service is not None:
             return service
-        from speaktome_api.remote_mcp import ConnectionService, JsonVault, Provider, PublicHTTPTransport
-        config = json.loads((sessions.state.run_dir / 'mcp_connections.json').read_text(encoding='utf-8'))
-        c = config['suno']
-        callback = c['callback_url']
-        parsed = urlsplit(callback)
-        if parsed.path != '/api/connections/suno/callback' or parsed.query or parsed.fragment:
-            raise ValueError('invalid callback')
-        provider = Provider('https://api.suno.com/mcp', callback, frozenset(c['allowed_origins']))
-        service = ConnectionService({'suno': provider},
-            lambda owner, name: JsonVault(*vault_callbacks(sessions.state.secrets_dir, owner, name)),
-            lambda name: PublicHTTPTransport())
+        canonical_state = Path(sessions.accounts_db).parent.parent
+        if (canonical_state / 'run' / 'liaison.enabled').is_file():
+            from meowdoku.liaison import LiaisonClient
+            # Both web instances share the canonical accounts DB and IPC key.
+            service = LiaisonClient(canonical_state / 'secrets' / 'liaison-ipc.key')
+        else:
+            from speaktome_api.remote_mcp import ConnectionService, JsonVault, Provider, PublicHTTPTransport
+            config = json.loads((sessions.state.run_dir / 'mcp_connections.json').read_text(encoding='utf-8'))
+            suno = config['suno']
+            callback = suno['callback_url']
+            parsed = urlsplit(callback)
+            if parsed.path != '/api/connections/suno/callback' or parsed.query or parsed.fragment:
+                raise ValueError('invalid callback')
+            service = ConnectionService(
+                {'suno': Provider('https://api.suno.com/mcp', callback, frozenset(suno['allowed_origins']))},
+                lambda owner, provider: JsonVault(*vault_callbacks(sessions.state.secrets_dir, owner, provider)),
+                lambda provider: PublicHTTPTransport())
+            atexit.register(service.close)
         sessions._remote_mcp_connections = service
-        atexit.register(service.close)
         return service
 
 

@@ -33,12 +33,46 @@ and MCP results retain their full schema and content, not a fabricated menu.
 5. Each user clicks Connect and signs in at Suno themselves. The callback requires
    the same site account, exact single-use state, then redirects to a clean URL.
 
-Tokens/client records use the existing restricted StatePaths secrets tree:
-`mcp_credentials/<account id>/suno.json`, atomic replace, no static route,
-no account list/download API. Existing Windows secrets-directory ACL inheritance
-must remain restricted. POSIX newly created records are mode 0600. Disconnect
-cancels pending work and erases this site's stored credentials; provider-side
-revocation remains in Suno's account settings.
+The working interim deployment stores tokens/client records in the restricted
+`mcp_credentials/<account id>/suno.json` subtree. It is retained during the
+liaison cutover below. Disconnect cancels pending work and erases this site's
+stored credentials; provider-side revocation remains in Suno's account settings.
+
+## Dedicated Windows liaison cutover
+
+`MeowdokuLiaison` is a separate Windows service under `svc-liaison`. The web
+route continues to supply the signed-in account ID, and forwards its existing
+status/connect/callback/tools/call/disconnect interface over an authenticated,
+bounded loopback channel. The liaison owns `ConnectionService` and writes only
+`state/secrets/liaison_vault/<account id>/suno.json`. The web process reads the
+IPC key but has no read or write grant on that vault. The channel binds only
+127.0.0.1:48790 and uses a 32-byte operator-generated key, signed requests and
+responses, timestamps, and replay rejection. Never expose that port externally.
+
+The replacement source is staged: without canonical
+`state/run/liaison.enabled`, the web instances continue using the working
+interim vault. Landing the source does not change that runtime mode. The
+liaison must be installed and tested before enabling the marker. In an
+elevated PowerShell, run `Setup-LiaisonService.ps1` from this
+directory; it creates `svc-liaison`, its service logon rights, the restricted
+vault, and the IPC key without printing passwords or token content. Inspect
+the resulting ACLs, then start `MeowdokuLiaison` and verify its local listener.
+While Suno use is paused, run `Migrate-LiaisonVault.ps1` as the operator. It
+copies existing records atomically, verifies equality, and never removes the
+interim files. Check that the source has not changed before the web cutover.
+Run `Set-LiaisonCutover.ps1 -Enable` to verify the service, per-account copy,
+and ACLs, then create the restricted operator-owned
+`state/run/liaison.enabled` marker. Restart only `meowdoku-a` and
+`meowdoku-dev` through the managed lifecycle,
+then verify both HTTPS routes, status for the connected user, and a harmless
+provider catalogue read. Keep the trainer disabled. If the liaison fails,
+run `Set-LiaisonCutover.ps1 -Disable` and restart only those two instances; the interim vault
+remains available.
+
+After the liaison is verified, remove the web service's Modify grant on the
+interim `mcp_credentials` subtree, retaining the operator's copy for rollback.
+Do not delete the interim record during the initial cutover. New liaison vault
+records are atomically replaced; newly created POSIX files are mode 0600.
 
 The transport checks exact configured HTTPS origins, resolves public-only IPs,
 pins its chosen address and keeps original TLS hostname verification. No proxies
