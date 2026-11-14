@@ -130,6 +130,10 @@ foreach ($f in $tokens) { Run 'icacls.exe' @($f.FullName, '/grant', "${Name}:(R)
 Run 'icacls.exe' @("$SecretsBase/tls/key.pem", '/grant', "${Name}:(R)")
 # [MAIL] the mail receiver's public certificate and key (Copy-PublicCertificate.ps1 copies them in): read only, granted on
 # the folder and inherited by its files, so the copy a renewal writes is readable too.
+# [LANDING] the landing task's GitHub token (instances.json task-worker "env_files" GH_TOKEN): read only, that one file.
+$landingToken = "$SecretsBase/github/landing.token"
+if (Test-Path -LiteralPath $landingToken) { Run 'icacls.exe' @($landingToken, '/grant', "${Name}:(R)") }
+else { Cmd "icacls $landingToken /grant ${Name}:(R)   (no token yet: write it there, then run this script again)" }
 $tlsPublic = "$SecretsBase/tls-public"
 if (Test-Path -LiteralPath $tlsPublic) { Run 'icacls.exe' @($tlsPublic, '/grant', "${Name}:(OI)R") }
 else { Cmd "icacls $tlsPublic /grant ${Name}:(OI)R   (no tls-public folder yet: run Copy-PublicCertificate.ps1, then this script again)" }

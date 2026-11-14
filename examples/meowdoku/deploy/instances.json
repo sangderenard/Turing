@@ -275,8 +275,13 @@
         "C:/dev/Powershell/turing/examples/meowdoku/deploy/branch_policy.json"
       ],
       "userlist_prefix": "userlist",
+      "env_files": {
+        "GH_TOKEN": "C:/dev/Powershell/srv/state/secrets/github/landing.token"
+      },
       "env": {
-        "GIT_CONFIG_COUNT": "5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "8",
         "GIT_CONFIG_KEY_0": "safe.directory",
         "GIT_CONFIG_VALUE_0": "C:/dev/Powershell",
         "GIT_CONFIG_KEY_1": "safe.directory",
@@ -286,7 +291,13 @@
         "GIT_CONFIG_KEY_3": "safe.directory",
         "GIT_CONFIG_VALUE_3": "C:/dev/Powershell/speaktome",
         "GIT_CONFIG_KEY_4": "safe.directory",
-        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer"
+        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer",
+        "GIT_CONFIG_KEY_5": "credential.helper",
+        "GIT_CONFIG_VALUE_5": "",
+        "GIT_CONFIG_KEY_6": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_6": "!gh auth git-credential",
+        "GIT_CONFIG_KEY_7": "url.https://github.com/.insteadOf",
+        "GIT_CONFIG_VALUE_7": "git@github.com:"
       }
     },
     {
