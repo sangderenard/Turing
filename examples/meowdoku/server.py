@@ -402,7 +402,7 @@ class Sessions:
         self.living_data_static = StaticWorlds()
         self.studio_pictures = None             # [SHOW] set by main() when a Studio Nodus destination is configured
         self.land_request = None                # [REVIEWS] set by main() when the updater's task table is reachable (--task-port)
-        self.review_notify = None               # [REVIEWS] tells a change's participants of a revoke or comment (same table)
+        self.system_notify = None               # [TALK] system messages to named accounts (system.broadcast, same table)
         self.fabric_motion = None               # [FABRIC] native row host plus complete UDP frame receiver
         from meowdoku.living_data_query import GraphView
         from meowdoku import rest_api as shared_rest_loader
@@ -1817,6 +1817,17 @@ def make_handler(sessions: Sessions):
         # through Nodus); a restart or shutdown then waits for running jobs unless after_jobs is false (instance_control.py).
         # POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
+        def _talk_route(self, path: str, method: str) -> None:
+            """[TALK] comments under a post (comments.py) and the chat server's rooms (chat_rooms.py)."""
+            self._classify()
+            if path == "/api/comments" or path.startswith("/api/comments/"):
+                from meowdoku import branch_review, comments
+                return comments.http_route(self, path, method, accounts_db=sessions.accounts_db,
+                                           kinds={branch_review.THREAD_KIND: branch_review.comment_kind()},
+                                           notify=sessions.system_notify)
+            from meowdoku import chat_rooms
+            return chat_rooms.http_route(self, path, method, accounts_db=sessions.accounts_db)
+
         def _reviews_route(self, path: str, method: str) -> None:
             """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""
             from meowdoku import branch_gate, branch_review
@@ -1825,8 +1836,10 @@ def make_handler(sessions: Sessions):
                 policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
             except (OSError, ValueError, branch_gate.GateError):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            notify = None if sessions.system_notify is None else (
+                lambda names, text, review_id: sessions.system_notify(names, text, "review", review_id))
             return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
-                                            land_request=sessions.land_request, notify=sessions.review_notify,
+                                            land_request=sessions.land_request, notify=notify,
                                             landing_schedule_path=sessions.state.jobs_dir / "cron" / "cron.table")
 
         def _orientation_route(self, path: str, method: str) -> None:
@@ -2845,6 +2858,8 @@ def make_handler(sessions: Sessions):
                 return self._whoami()
             if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
                 return self._reviews_route(path, "GET")
+            if path == "/api/comments" or path.startswith("/api/chat/"):    # [TALK]
+                return self._talk_route(path, "GET")
             if path.startswith("/api/git/"):                      # [GIT]
                 return self._git_route(path, "GET")
             if path == "/api/orientation" or path.startswith("/api/orientation/"):   # [ORIENTATION]
@@ -3357,6 +3372,8 @@ def make_handler(sessions: Sessions):
                 return self._picture_route(path0, "POST")
             if path0 == "/api/reviews" or path0.startswith("/api/reviews/"):   # [REVIEWS]
                 return self._reviews_route(path0, "POST")
+            if path0 == "/api/comments" or path0.startswith("/api/comments/") or path0.startswith("/api/chat/"):   # [TALK]
+                return self._talk_route(path0, "POST")
             if path0.startswith("/api/git/"):                     # [GIT]
                 return self._git_route(path0, "POST")
             if path0 == "/api/orientation" or path0.startswith("/api/orientation/"):   # [ORIENTATION]
@@ -4254,11 +4271,11 @@ def main(argv: list[str] | None = None) -> int:
                 return {"outcome": "failed", "error": f"{type(error).__name__}: {error}"}
         sessions.land_request = land_request
 
-        def review_notify(usernames, text, review_id, _port=args.task_port, _jobs=args.task_jobs_dir, _engine=args.task_engine_id):
-            """A system message to each participant of a change (system.broadcast, by exact name), sent off the request
-            thread: a notice that cannot be delivered is logged, never holds up the change."""
+        def system_notify(usernames, text, kind, ref, _port=args.task_port, _jobs=args.task_jobs_dir, _engine=args.task_engine_id):
+            """A system message to each named account (system.broadcast, by exact name) about one subject, sent off the
+            request thread: a notice that cannot be delivered is logged, never holds up what caused it."""
             fields = {"text": text, "usernames": list(usernames), "msg_type": "question",
-                      "subject": {"kind": "review", "ref": str(review_id)}}
+                      "subject": {"kind": str(kind), "ref": str(ref)}}
 
             def send():
                 try:
@@ -4266,9 +4283,9 @@ def main(argv: list[str] | None = None) -> int:
                                                   jobs_dir=_jobs, task="system.broadcast", fields=fields, timeout=10.0)
                 except Exception as error:
                     outcome = {"outcome": "failed", "error": f"{type(error).__name__}: {error}"}
-                print(f"[reviews] notice of review {review_id} to {', '.join(usernames)}: {outcome.get('outcome')}", flush=True)
-            threading.Thread(target=send, name="review-notice", daemon=True).start()
-        sessions.review_notify = review_notify
+                print(f"[talk] notice of {kind} {str(ref)[:12]} to {', '.join(usernames)}: {outcome.get('outcome')}", flush=True)
+            threading.Thread(target=send, name="system-notice", daemon=True).start()
+        sessions.system_notify = system_notify
         print(f"[reviews] the landing queue asks the updater through Nodus port {args.task_port}", flush=True)
     site_compiler = None
     if args.site_compiler_config:

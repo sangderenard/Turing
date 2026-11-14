@@ -31,12 +31,13 @@ function badge(standing) { return el("span", standing, "badge " + standing); }
 const moderator = () => who && (who.role === "admin" || who.role === "operator");
 const tail = () => byId("tail").value;
 const drafts = new Map();          // unsent text per box, kept across the periodic refresh
+let roomOpen = null;               // may this account enter the reviewers' room (asked once)
 
 function messageList(messages) {
   const list = el("ul", null, "msgs");
   for (const m of messages) {
     const item = el("li");
-    item.append(el("span", m.username, "who"), document.createTextNode(m.body), el("span", when(m.at), "at"));
+    item.append(el("span", m.username, "who"), document.createTextNode(m.removed ? "(removed by an admin)" : m.body), el("span", when(m.at), "at"));
     list.append(item);
   }
   return list;
@@ -78,7 +79,7 @@ async function loadThreads() {
         box.append(el("p", `Approval revoked by ${review.revoked_by} ${when(review.revoked_at)}: ${review.revoke_reason}`, "revoked"));
       box.append(messageList(review.comments));
       box.append(composer(`thread:${review.id}`, `Reply in the thread of ${review.branch}`, async body => {
-        await request("/api/reviews/comment", { id: review.id, body }); await loadThreads(); }));
+        await request("/api/comments", { kind: "review", ref: review.id, body }); await loadThreads(); }));
       holder.append(box);
     }
   } catch (error) { holder.replaceChildren(el("p", `Threads could not be read: ${error.message}`, "muted")); }
@@ -87,11 +88,14 @@ async function loadThreads() {
 // The reviewers' chat: one persistent room of the operators and admins.
 async function loadRoom() {
   const chat = byId("chat");
-  byId("chat-compose").hidden = !moderator();
-  if (!moderator()) { byId("chat-note").textContent = "The reviewers' chat is for operators and admins."; chat.replaceChildren(); return; }
+  if (roomOpen === null) {                  // the chat server says which rooms this account may enter
+    try { roomOpen = (await request("/api/chat/rooms")).rooms.some(r => r.room === "reviewers"); } catch (error) { roomOpen = false; }
+  }
+  byId("chat-compose").hidden = !roomOpen;
+  if (!roomOpen) { byId("chat-note").textContent = "The reviewers' chat is for operators and admins; a change's thread is open to its author."; chat.replaceChildren(); return; }
   if (document.activeElement === byId("chat-text") && byId("chat-text").value) return;
   try {
-    const { room } = await request(`/api/reviews/room?tail=${encodeURIComponent(tail())}`);
+    const { messages: room } = await request(`/api/chat/rooms/reviewers?tail=${encodeURIComponent(tail())}`);
     chat.replaceChildren(...messageList(room).children);
     if (!room.length) chat.append(el("li", "No message yet.", "muted"));
   } catch (error) { chat.replaceChildren(el("li", `The chat could not be read: ${error.message}`, "muted")); }
@@ -100,7 +104,7 @@ async function loadRoom() {
 async function sendRoom() {
   const text = byId("chat-text");
   if (!text.value.trim()) return;
-  try { await request("/api/reviews/room", { body: text.value }); text.value = ""; await loadRoom(); }
+  try { await request("/api/chat/rooms/reviewers", { body: text.value }); text.value = ""; await loadRoom(); }
   catch (error) { status(`Not sent: ${error.message}`); }
 }
 
@@ -349,7 +353,7 @@ async function show(id) {
   thread.append(el("h3", "Thread"), el("p", "Write to this change's author, approver and revoker; they are told, and the " +
     "thread is listed under Threads.", "muted"),
     composer(`thread:${review.id}`, `Write in the thread of ${review.branch}`, async body => {
-      await request("/api/reviews/comment", { id: review.id, body }); status(`Written in the thread of ${review.branch}.`);
+      await request("/api/comments", { kind: "review", ref: review.id, body }); status(`Written in the thread of ${review.branch}.`);
       await loadThreads(); }));
   detail.append(thread);
   const change = el("section");

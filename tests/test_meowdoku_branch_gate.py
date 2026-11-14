@@ -768,7 +768,8 @@ def test_an_operator_revokes_an_approval_and_the_change_stops_until_approved_aga
     assert branch_review.get(db, made["id"])["standing"] == "approved", "an admin approves it again"
 
 
-def test_threads_and_attention_follow_who_wrote_last(world):
+def test_a_changes_thread_is_a_comments_post_and_attention_follows_who_wrote_last(world):
+    from meowdoku import comments
     db = world["db"]
     opal = _with_operator(world)
     head = branch(world, "feature")
@@ -776,37 +777,29 @@ def test_threads_and_attention_follow_who_wrote_last(world):
     branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
     branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="conflicts with the gate", now=2000.0)
     waiting = branch_review.attention(db, username="ann", now=2001.0)
-    assert [w["id"] for w in waiting] == [made["id"]] and "opal revoked its approval: conflicts with the gate" == waiting[0]["why"]
+    assert [w["id"] for w in waiting] == [made["id"]] and waiting[0]["why"] == "opal revoked its approval: conflicts with the gate"
     assert branch_review.attention(db, username="admin", now=2001.0)[0]["why"].startswith("opal revoked"), "the approver too"
-    assert branch_review.attention(db, username="opal", now=2001.0) == [], "the last word is the revoker's own"
-    assert branch_review.attention(db, username="bob", now=2001.0) == [], "bob takes no part"
-    told = branch_review.comment(db, made["id"], user_id=ANN, username="ann", body="merged main; please look", now=2002.0)
-    assert told["tell"] == ["admin", "opal"]
+    assert branch_review.attention(db, username="opal", now=2001.0) == [] and branch_review.attention(db, username="bob") == []
+    comments.post(db, "review", made["id"], user_id=ANN, username="ann", body="merged main; please look", now=2002.0)
     assert branch_review.attention(db, username="ann", now=2003.0) == []
     assert [w["why"] for w in branch_review.attention(db, username="opal", now=2003.0)] == ["ann wrote in its thread"]
+    kind = branch_review.comment_kind()
+    bob = {"user_id": BOB, "username": "bob", "caps": frozenset()}
+    ann = {"user_id": ANN, "username": "ann", "caps": frozenset()}
+    assert kind.may_write(db, ann, made["id"]) is True, "the author keeps the board without dev_ui"
+    assert isinstance(kind.may_write(db, bob, made["id"]), str), "a stranger without dev_ui does not"
+    assert kind.may_read(db, {**bob, "caps": frozenset({"dev_ui"})}, made["id"]) is True
+    assert sorted(kind.tell(db, made["id"], None)) == ["admin", "ann", "opal"]
+    with pytest.raises(comments.CommentError):
+        kind.may_read(db, ann, "no-such-review")
     for n in range(25):
-        branch_review.comment(db, made["id"], user_id=BOB, username="bob", body=f"note {n}", now=2010.0 + n)
+        comments.post(db, "review", made["id"], user_id=BOB, username="bob", body=f"note {n}", now=2010.0 + n)
     (thread,) = branch_review.threads(db, 20)
     assert len(thread["comments"]) == 20 and thread["comments"][-1]["body"] == "note 24", "the tail, oldest first"
-    assert len(branch_review.threads(db, branch_review.tail_of("all"))[0]["comments"]) == 27
-    with pytest.raises(branch_review.ReviewError):
-        branch_review.tail_of("0")
 
 
-def test_the_reviewers_room_is_for_operators_and_admins(world):
-    db = world["db"]
-    opal = _with_operator(world)
-    with pytest.raises(branch_review.ReviewError, match="operators and admins"):
-        branch_review.room_post(db, user_id=ANN, username="ann", body="hi")
-    for n in range(23):
-        branch_review.room_post(db, user_id=opal if n % 2 else ADMIN, username="opal" if n % 2 else "admin", body=f"m{n}")
-    said = branch_review.room(db, user_id=opal, tail=20)
-    assert [m["body"] for m in said][0] == "m3" and said[-1]["body"] == "m22"
-    with pytest.raises(branch_review.ReviewError):
-        branch_review.room(db, user_id=ANN)
-
-
-def test_revoke_comment_and_room_over_rest_and_the_notices_they_send(world):
+def test_revoke_and_threads_over_rest_and_the_notice_they_send(world):
+    from meowdoku import comments
     policy, db_file = world["policy"], world["db_file"]
     opal = _with_operator(world)
     head = branch(world, "feature")
@@ -814,22 +807,25 @@ def test_revoke_comment_and_room_over_rest_and_the_notices_they_send(world):
     branch_review.decide(world["db"], made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
     told = []
 
-    def ask(path, method="GET", **kw):
+    def ask(path, method="GET", route="reviews", **kw):
         handler = Handler(path, **kw)
-        branch_review.http_route(handler, path.split("?")[0], method, policy=policy, accounts_db=db_file,
-                                 notify=lambda names, text, review_id: told.append((names, text, review_id)))
+        if route == "reviews":
+            branch_review.http_route(handler, path.split("?")[0], method, policy=policy, accounts_db=db_file,
+                                     notify=lambda names, text, review_id: told.append((names, text, review_id)))
+        else:
+            comments.http_route(handler, path.split("?")[0], method, accounts_db=db_file,
+                                kinds={"review": branch_review.comment_kind()},
+                                notify=lambda names, text, kind, ref: told.append((names, text, (kind, ref))))
         return handler.sent
 
     status, answer = ask("/api/reviews/revoke", "POST", user=opal, username="opal", body={"id": made["id"], "reason": "wait"})
     assert status == 200 and answer["review"]["standing"] == "revoked"
     assert told[-1][0] == ["admin", "ann"] and "opal revoked the approval of work feature" in told[-1][1] and told[-1][2] == made["id"]
-    status, answer = ask("/api/reviews/comment", "POST", user=ANN, username="ann", body={"id": made["id"], "body": "fixed"})
-    assert status == 200 and told[-1][0] == ["admin", "opal"] and "ann wrote in the thread" in told[-1][1]
+    status, answer = ask("/api/comments", "POST", route="comments", user=ANN, username="ann", capabilities=(),
+                         body={"kind": "review", "ref": made["id"], "body": "fixed"})
+    assert status == 200 and answer["told"] == ["admin", "opal"] and told[-1][2] == ("review", made["id"])
+    assert "ann wrote in the thread of work feature" in told[-1][1]
     status, answer = ask("/api/reviews/threads?tail=1", user=ANN, username="ann")
     assert status == 200 and answer["tail"] == 1 and [c["body"] for c in answer["threads"][0]["comments"]] == ["fixed"]
     assert ask("/api/reviews/attention", user=opal, username="opal")[1]["attention"][0]["why"] == "ann wrote in its thread"
-    assert ask("/api/reviews/room", "POST", user=ANN, username="ann", body={"body": "hi"})[0] == 403
-    assert ask("/api/reviews/room", "POST", user=opal, username="opal", body={"body": "hi"})[0] == 200
-    status, answer = ask("/api/reviews/room", user=opal, username="opal")
-    assert status == 200 and answer["tail"] == 20 and answer["room"][0]["body"] == "hi"
     assert ask("/api/reviews/threads?tail=nope", user=ANN, username="ann")[0] == 400

@@ -66,13 +66,6 @@ DDL = (
     "removed_at REAL NOT NULL, reason TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS worktree_verdicts (path TEXT PRIMARY KEY, verdict TEXT NOT NULL CHECK(verdict IN "
     "('trash','archive','keep')), note TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL, decided_at REAL NOT NULL)",
-    # A change's thread: anyone who reads reviews writes in it (comment()); the author, approver and revoker are told.
-    "CREATE TABLE IF NOT EXISTS branch_review_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id TEXT NOT NULL, "
-    "user_id INTEGER NOT NULL, username TEXT, body TEXT NOT NULL, at REAL NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS branch_review_comments_by_review ON branch_review_comments(review_id, id)",
-    # The reviewers' room: one persistent chat of the operators and admins, beside the changes (room_post()/room()).
-    "CREATE TABLE IF NOT EXISTS review_room_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
-    "username TEXT, body TEXT NOT NULL, at REAL NOT NULL)",
     # The Git author identity an account declares for its own commits (identity()/set_identity()).
     "CREATE TABLE IF NOT EXISTS account_git_identity (user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, "
     "declared_at REAL NOT NULL)",
@@ -386,71 +379,60 @@ def land_now(db, body, *, user_id, username, land_request) -> dict:
     return {"asked": ids, "outcome": outcome}
 
 
-MAX_COMMENT = 4000
-MAX_TAIL = 1000
-
-
 def may_moderate(db, user_id) -> bool:
-    """An operator or an admin: may revoke an approval and talk in the reviewers' room."""
+    """An operator or an admin: may revoke an approval."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'account_roles'").fetchone():
         return False
     return db.execute("SELECT 1 FROM account_roles WHERE user_id = ? AND role IN ('admin', 'operator')",
                       (user_id,)).fetchone() is not None
 
 
-def _text(value, what, limit=MAX_COMMENT) -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > limit:
-        raise ReviewError(f"{what} must be text of 1 to {limit} characters")
-    return value.strip()
-
-
-def tail_of(value):
-    """A history length: a positive count up to MAX_TAIL, or "all" (MAX_TAIL). Default 20."""
-    if value in (None, ""):
-        return 20
-    if value == "all":
-        return MAX_TAIL
-    try:
-        count = int(value)
-    except (TypeError, ValueError):
-        raise ReviewError("tail must be a count or all") from None
-    if not 1 <= count <= MAX_TAIL:
-        raise ReviewError(f"tail must be 1 to {MAX_TAIL}, or all")
-    return count
-
-
-def _comment_rows(db, review_id, tail) -> list:
-    rows = db.execute("SELECT id, username, body, at FROM branch_review_comments WHERE review_id = ? ORDER BY id DESC LIMIT ?",
-                      (str(review_id), int(tail))).fetchall()
-    return [{"id": r[0], "username": r[1], "body": r[2], "at": r[3]} for r in reversed(rows)]
+# A change's thread is a post of the comments engine (comments.py), kind "review", ref the review id. Its participants (the
+# author, whoever approved or revoked it, everyone who wrote in it) may read and write it even without dev_ui: an author with
+# less privilege has the change's message board, not the reviewers' room (chat_rooms.py).
+THREAD_KIND = "review"
 
 
 def participants(db, record) -> set:
     """Who a change concerns: its author, whoever approved or revoked it, and everyone who wrote in its thread."""
+    from meowdoku import comments
     names = {record.get("owner_name"), record.get("reviewer_name"), record.get("revoked_by")}
-    names |= {r[0] for r in db.execute("SELECT DISTINCT username FROM branch_review_comments WHERE review_id = ?",
-                                       (record["id"],))}
+    names |= comments.writers(db, THREAD_KIND, record["id"])
     return {name for name in names if name}
 
 
-def comment(db, review_id, *, user_id, username, body, now=None) -> dict:
-    """One message in a change's thread. Answers the change and who should be told (its participants but the writer)."""
-    _account(user_id)
-    body = _text(body, "a comment")
-    now = time.time() if now is None else now
-    record = get(db, review_id, now)
-    db.execute("INSERT INTO branch_review_comments (review_id, user_id, username, body, at) VALUES (?, ?, ?, ?, ?)",
-               (record["id"], user_id, username, body, now))
-    record = get(db, review_id, now)
-    return {"review": record, "tell": sorted(participants(db, record) - {username})}
+def _label(record) -> str:
+    return f"{record['repository']} {record['branch']} ({record['head'][:12]})"
+
+
+def comment_kind():
+    """The ``review`` kind of the comments engine: who reads and writes a change's thread, and who is told."""
+    from meowdoku import comments
+
+    def record_of(db, ref):
+        try:
+            return get(db, ref)
+        except ReviewError as error:
+            raise comments.CommentError(error.message, error.status) from None
+
+    def may(db, who, ref):
+        record = record_of(db, ref)
+        return True if "dev_ui" in who["caps"] or who["username"] in participants(db, record) else \
+            "a change's thread is for its participants and the accounts that read reviews"
+    return comments.Kind(may_read=may, may_write=may,
+                         tell=lambda db, ref, made: participants(db, record_of(db, ref)),
+                         label=lambda db, ref: _label(record_of(db, ref)))
 
 
 def revoke(db, review_id, *, user_id, username, reason, now=None) -> dict:
     """An operator or admin takes back an approval that has not landed: the change is open again, standing "revoked"
     (never accepted by silence, never landed) until an admin approves it again or its author withdraws it. The reason
-    opens the change's thread; the author and the approver are told."""
+    opens the change's thread. Answers the change and who should be told (its participants but the revoker)."""
+    from meowdoku import comments
     _account(user_id)
-    reason = _text(reason, "a reason", 500)
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+        raise ReviewError("a reason must be text of 1 to 500 characters")
+    reason = reason.strip()
     ensure(db)
     if not may_moderate(db, user_id):
         raise ReviewError("an operator or admin revokes an approval", 403)
@@ -460,22 +442,28 @@ def revoke(db, review_id, *, user_id, username, reason, now=None) -> dict:
     if done.rowcount != 1:
         get(db, review_id, now)
         raise ReviewError("only an approved change that has not landed can have its approval revoked", 409)
-    return comment(db, review_id, user_id=user_id, username=username, body=f"Revoked the approval: {reason}", now=now)
+    comments.post(db, THREAD_KIND, str(review_id), user_id=user_id, username=username, body=f"Revoked the approval: {reason}",
+                  now=now)
+    record = get(db, review_id, now)
+    return {"review": record, "tell": sorted(participants(db, record) - {username})}
 
 
 def threads(db, tail=20, now=None, *, limit=50) -> list:
     """The changes that have a thread or a revoked approval, the most recently active first, each with its last ``tail``
     comments."""
+    from meowdoku import comments
     ensure(db)
     now = time.time() if now is None else now
-    ids = [r[0] for r in db.execute(
-        "SELECT r.id FROM branch_reviews r LEFT JOIN branch_review_comments c ON c.review_id = r.id "
-        "WHERE c.id IS NOT NULL OR r.revoked_at IS NOT NULL GROUP BY r.id "
-        "ORDER BY MAX(COALESCE(MAX(c.at), 0), COALESCE(r.revoked_at, 0)) DESC LIMIT ?", (int(limit),))]
+    activity = dict(comments.active(db, THREAD_KIND, limit=limit))
+    for review_id, at in db.execute("SELECT id, revoked_at FROM branch_reviews WHERE revoked_at IS NOT NULL"):
+        activity[review_id] = max(activity.get(review_id, 0.0), at)
     out = []
-    for review_id in ids:
-        record = get(db, review_id, now)
-        record["comments"] = _comment_rows(db, review_id, tail)
+    for review_id in sorted(activity, key=activity.get, reverse=True)[:limit]:
+        try:
+            record = get(db, review_id, now)
+        except ReviewError:
+            continue                              # a thread of a review that is gone
+        record["comments"] = comments.thread(db, THREAD_KIND, review_id, tail=tail)
         out.append(record)
     return out
 
@@ -499,28 +487,6 @@ def attention(db, *, username, now=None) -> list:
         out.append({"id": record["id"], "repository": record["repository"], "branch": record["branch"],
                     "standing": record["standing"], "why": why, "last": last})
     return out
-
-
-def room_post(db, *, user_id, username, body, now=None) -> dict:
-    """One message in the reviewers' room (operators and admins)."""
-    _account(user_id)
-    body = _text(body, "a message")
-    ensure(db)
-    if not may_moderate(db, user_id):
-        raise ReviewError("the reviewers' room is for operators and admins", 403)
-    now = time.time() if now is None else now
-    cursor = db.execute("INSERT INTO review_room_messages (user_id, username, body, at) VALUES (?, ?, ?, ?)",
-                        (user_id, username, body, now))
-    return {"id": cursor.lastrowid, "username": username, "body": body, "at": now}
-
-
-def room(db, *, user_id, tail=20) -> list:
-    """The last ``tail`` messages of the reviewers' room, oldest first."""
-    ensure(db)
-    if not may_moderate(db, user_id):
-        raise ReviewError("the reviewers' room is for operators and admins", 403)
-    rows = db.execute("SELECT id, username, body, at FROM review_room_messages ORDER BY id DESC LIMIT ?", (int(tail),)).fetchall()
-    return [{"id": r[0], "username": r[1], "body": r[2], "at": r[3]} for r in reversed(rows)]
 
 
 def kept(db, repository, branch) -> bool:
@@ -654,14 +620,13 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
                                           landing queue: accepted changes not yet landed, with the last attempt's result
         POST /api/reviews/land            {ids: [...]} or {all: true}   an admin asks the updater to land them now
         POST /api/reviews/revoke          {id, reason}              an operator or admin takes back an approval
-        POST /api/reviews/comment         {id, body}                one message in a change's thread
         GET  /api/reviews/threads?tail=N  the changes with a thread or a revoked approval, each with its last N messages
         GET  /api/reviews/attention       the threads waiting for this account's answer (what the MCP shows first)
-        GET  /api/reviews/room?tail=N     the reviewers' room: the last N messages (operators and admins)
-        POST /api/reviews/room            {body}                    one message in it
+    A change's thread is written through the comments engine (POST /api/comments, kind "review"); the reviewers' room is
+    the chat server's room "reviewers" (/api/chat/rooms/reviewers).
 
-    ``notify(usernames, text, review_id)`` tells the other participants of a change about a revoke or a comment (a
-    system message, subject review:<id>); None leaves them to find it on the page.
+    ``notify(usernames, text, review_id)`` tells the other participants of a change about a revoke (a system message,
+    subject review:<id>); None leaves them to find it on the page.
         POST /api/reviews                 {repository, branch, head, timeout_hours?, keep?}   submit
         POST /api/reviews/remark          {id, verdict, note?}                                a peer
         POST /api/reviews/decide          {id, head, decision, note?}                         an admin
@@ -701,11 +666,13 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             return self._json({"removed": removed(db), "cleaner": policy.get("cleaner")})
         if method == "GET" and path == "/api/reviews/identity":
             return self._json({"identity": identity(db, principal.user_id)})
-        if method == "GET" and path in ("/api/reviews/threads", "/api/reviews/room"):
+        if method == "GET" and path == "/api/reviews/threads":
+            from meowdoku import comments
             query = parse_qs(self.path.partition("?")[2])
-            tail = tail_of((query.get("tail") or [None])[0])
-            if path == "/api/reviews/room":
-                return self._json({"room": room(db, user_id=principal.user_id, tail=tail), "tail": tail})
+            try:
+                tail = comments.tail_of((query.get("tail") or [None])[0])
+            except comments.CommentError as error:
+                return self._json({"error": error.message}, error.status)
             return self._json({"threads": threads(db, tail), "tail": tail})
         if method == "GET" and path == "/api/reviews/attention":
             return self._json({"attention": attention(db, username=principal.username)})
@@ -748,21 +715,12 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             made = decide(db, body.get("id"), **who, head=body.get("head"), decision=body.get("decision"), note=body.get("note", ""))
         elif path == "/api/reviews/withdraw":
             made = withdraw(db, body.get("id"), user_id=principal.user_id)
-        elif path in ("/api/reviews/revoke", "/api/reviews/comment"):
-            if path == "/api/reviews/revoke":
-                told = revoke(db, body.get("id"), **who, reason=body.get("reason"))
-                said = f"{principal.username} revoked the approval of"
-                text = f"{said} {{change}}: {body.get('reason', '').strip()}"
-            else:
-                told = comment(db, body.get("id"), **who, body=body.get("body"))
-                text = f"{principal.username} wrote in the thread of {{change}}: {body.get('body', '').strip()[:300]}"
+        elif path == "/api/reviews/revoke":
+            told = revoke(db, body.get("id"), **who, reason=body.get("reason"))
             made = told["review"]
             if notify is not None and told["tell"]:
-                change = f"{made['repository']} {made['branch']} ({made['head'][:12]})"
-                notify(told["tell"], text.format(change=change) + " Answer in its thread: /reviews.html, or reviews_comment.",
-                       made["id"])
-        elif path == "/api/reviews/room":
-            return self._json({"message": room_post(db, **who, body=body.get("body"))})
+                notify(told["tell"], f"{principal.username} revoked the approval of {_label(made)}: {made['revoke_reason']}"
+                       " Answer in its thread: /reviews.html, or comments_post with kind review.", made["id"])
         elif path == "/api/reviews/land":
             return self._json(land_now(db, body, user_id=principal.user_id, username=principal.username,
                                        land_request=land_request))
