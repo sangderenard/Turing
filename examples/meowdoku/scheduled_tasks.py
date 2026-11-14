@@ -91,13 +91,19 @@ def befriend_everyone(accounts_db, system_username, *, messaging) -> str:
 
 def broadcast(accounts_db, system_username, request, *, messaging, userlist=None) -> str:
     """One system event to an audience, as messages from the system account.  The request carries ``text``, and
-    either ``audience`` (admin | everyone) or ``terms`` (search terms of the user list), and optionally ``msg_type``
-    and ``subject`` ({kind, ref}).  The audience is found by searching the user list (``find_identities``); each
+    either ``audience`` (admin | everyone), ``terms`` (search terms of the user list) or ``usernames`` (exactly those
+    accounts, each found by identity_tools.represent: a search term matches parts of names), and optionally
+    ``msg_type`` and ``subject`` ({kind, ref}).  The audience is found by searching the user list (``find_identities``); each
     identity found is made a contact of the system (one that blocked it is skipped) and told.  Returns the sentence."""
     text, audience = request.get("text"), request.get("audience", "admin")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("a broadcast needs text")
-    if "terms" in request:
+    if "usernames" in request:
+        names = request["usernames"]
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) and n for n in names):
+            raise ValueError("usernames must be a list of account names")
+        terms, audience = None, "named"
+    elif "terms" in request:
         terms, audience = request["terms"], "matching"
     elif audience in AUDIENCE_TERMS:
         terms = AUDIENCE_TERMS[audience]
@@ -107,7 +113,13 @@ def broadcast(accounts_db, system_username, request, *, messaging, userlist=None
     sent, skipped = 0, 0
     try:
         system_id = _system(db, system_username)
-        identities, how = find_identities(db, terms, userlist)
+        if terms is None:                        # named accounts: each one exactly, never a partial match
+            from meowdoku import identity_tools
+            found = [identity_tools.represent(db, name) for name in request["usernames"]]
+            identities, how = [i for i in found if i is not None], "by name"
+            skipped += len(found) - len(identities)
+        else:
+            identities, how = find_identities(db, terms, userlist)
         for identity in identities:
             user_id = int(identity["identity"].split(":", 1)[1])
             if user_id == system_id:

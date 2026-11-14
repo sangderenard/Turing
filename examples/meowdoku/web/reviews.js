@@ -3,7 +3,7 @@
 // HAND-AUTHORED. createElement/textContent only. The server enforces every capability; this only decides what to show.
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
-const OPEN = new Set(["waiting", "objected", "accepted"]);
+const OPEN = new Set(["waiting", "objected", "accepted", "revoked"]);
 const DIFF_LINES = 6000;
 let who = null, caps = new Set(), reviews = [], selected = null, detailGeneration = 0;
 let landing = { queue: [], updater: false, apply: true, schedule: null, clockOffset: 0 };
@@ -28,6 +28,92 @@ function until(seconds) {
   return `in ${hours} h ${minutes} min`;
 }
 function badge(standing) { return el("span", standing, "badge " + standing); }
+const moderator = () => who && (who.role === "admin" || who.role === "operator");
+const tail = () => byId("tail").value;
+const drafts = new Map();          // unsent text per box, kept across the periodic refresh
+
+function messageList(messages) {
+  const list = el("ul", null, "msgs");
+  for (const m of messages) {
+    const item = el("li");
+    item.append(el("span", m.username, "who"), document.createTextNode(m.body), el("span", when(m.at), "at"));
+    list.append(item);
+  }
+  return list;
+}
+
+function composer(key, label, send) {
+  const box = el("div", null, "compose"), text = document.createElement("textarea"), button = el("button", "Send");
+  text.rows = 2; text.maxLength = 4000; text.setAttribute("aria-label", label); text.value = drafts.get(key) || "";
+  text.oninput = () => drafts.set(key, text.value);
+  button.type = "button";
+  button.onclick = async () => {
+    if (!text.value.trim()) return;
+    button.disabled = true;
+    try { await send(text.value); drafts.delete(key); text.value = ""; }
+    catch (error) { status(`Not sent: ${error.message}`); }
+    button.disabled = false;
+  };
+  box.append(text, button);
+  return box;
+}
+
+// Threads: one per change, read top to bottom; a reply tells the change's author, approver and revoker.
+async function loadThreads() {
+  const holder = byId("threads");
+  if (holder.contains(document.activeElement) && document.activeElement.tagName === "TEXTAREA") return;
+  try {
+    const { threads } = await request(`/api/reviews/threads?tail=${encodeURIComponent(tail())}`);
+    holder.replaceChildren();
+    if (!threads.length) holder.append(el("p", "No thread yet. Open a change and write in its thread, or revoke an approval.", "muted"));
+    for (const review of threads) {
+      const box = el("article", null, "thread"), title = el("h3");
+      const open = el("button", `${review.repository} · ${review.branch}`, "row"); open.type = "button"; open.style.marginTop = "0";
+      open.onclick = () => show(review.id);
+      open.append(badge(review.standing));
+      title.append(open);
+      box.append(title, el("small", `${review.head.slice(0, 12)} · by ${review.owner_name}` +
+        (review.reviewer_name ? ` · decided by ${review.reviewer_name}` : "")));
+      if (review.standing === "revoked")
+        box.append(el("p", `Approval revoked by ${review.revoked_by} ${when(review.revoked_at)}: ${review.revoke_reason}`, "revoked"));
+      box.append(messageList(review.comments));
+      box.append(composer(`thread:${review.id}`, `Reply in the thread of ${review.branch}`, async body => {
+        await request("/api/reviews/comment", { id: review.id, body }); await loadThreads(); }));
+      holder.append(box);
+    }
+  } catch (error) { holder.replaceChildren(el("p", `Threads could not be read: ${error.message}`, "muted")); }
+}
+
+// The reviewers' chat: one persistent room of the operators and admins.
+async function loadRoom() {
+  const chat = byId("chat");
+  byId("chat-compose").hidden = !moderator();
+  if (!moderator()) { byId("chat-note").textContent = "The reviewers' chat is for operators and admins."; chat.replaceChildren(); return; }
+  if (document.activeElement === byId("chat-text") && byId("chat-text").value) return;
+  try {
+    const { room } = await request(`/api/reviews/room?tail=${encodeURIComponent(tail())}`);
+    chat.replaceChildren(...messageList(room).children);
+    if (!room.length) chat.append(el("li", "No message yet.", "muted"));
+  } catch (error) { chat.replaceChildren(el("li", `The chat could not be read: ${error.message}`, "muted")); }
+}
+
+async function sendRoom() {
+  const text = byId("chat-text");
+  if (!text.value.trim()) return;
+  try { await request("/api/reviews/room", { body: text.value }); text.value = ""; await loadRoom(); }
+  catch (error) { status(`Not sent: ${error.message}`); }
+}
+
+async function revokeApproval(review, button) {
+  const reason = prompt(`Revoke the approval of ${review.repository} ${review.branch}? It stops landing and opens its thread; ` +
+    "its author and approver are told. Why?");
+  if (!reason || !reason.trim()) return;
+  button.disabled = true;
+  try { await request("/api/reviews/revoke", { id: review.id, reason }); status(`Approval of ${review.branch} revoked.`); }
+  catch (error) { status(`Not revoked: ${error.message}`); }
+  button.disabled = false;
+  await load();
+}
 
 function render() {
   const list = byId("list");
@@ -61,6 +147,8 @@ async function load({quiet = false} = {}) {
     byId("approve-all").hidden = who.role !== "admin" || !approvable.length;
     byId("approve-all").textContent = `Approve all ${approvable.length} waiting`;
     render();
+    loadThreads();
+    loadRoom();
     if (selected && reviews.some(r => r.id === selected) && (!quiet || priorStanding !== reviews.find(r => r.id === selected).standing)) show(selected);
   } catch (error) { status(error.message); }
 }
@@ -89,6 +177,11 @@ function renderQueue() {
     text.append(review.land_tried_at == null ? el("small", "Not tried yet.")
       : el("small", `Last tried ${when(review.land_tried_at)}: ${review.land_result}`, "held"));
     row.append(text);
+    if (moderator() && review.standing === "approved") {
+      const revoke = el("button", "Revoke approval", "reject"); revoke.type = "button";
+      revoke.onclick = () => revokeApproval(review, revoke);
+      row.append(revoke);
+    }
     if (admin && updater) {
       const button = el("button", "Land now", "approve"); button.type = "button";
       button.onclick = () => landNow({ ids: [review.id] }, `${review.repository} ${review.branch}`, button);
@@ -243,6 +336,7 @@ async function show(id) {
     ["Branch after landing", review.delete_branch ? "deleted" : "kept"],
     ...(review.reviewer_name ? [["Decided by", `${review.reviewer_name}, ${when(review.reviewed_at)}`]] : []),
     ...(review.note ? [["Note", review.note]] : []),
+    ...(review.revoked_at ? [["Approval revoked", `by ${review.revoked_by}, ${when(review.revoked_at)}: ${review.revoke_reason}`]] : []),
     ...(review.landed_at ? [["Landed", `${when(review.landed_at)} ${review.landed_detail || ""}`]] : []),
   ]) { facts.append(el("dt", term)); const dd = el("dd"); dd.append(el(term === "Commit" ? "code" : "span", value)); facts.append(dd); }
   detail.replaceChildren(heading, facts);
@@ -251,6 +345,13 @@ async function show(id) {
     for (const r of review.remarks) detail.append(el("p", `${r.username}: ${r.verdict}${r.note ? " — " + r.note : ""} (${when(r.at)})`));
   }
   controls(review, detail);
+  const thread = el("section", null, "decide");
+  thread.append(el("h3", "Thread"), el("p", "Write to this change's author, approver and revoker; they are told, and the " +
+    "thread is listed under Threads.", "muted"),
+    composer(`thread:${review.id}`, `Write in the thread of ${review.branch}`, async body => {
+      await request("/api/reviews/comment", { id: review.id, body }); status(`Written in the thread of ${review.branch}.`);
+      await loadThreads(); }));
+  detail.append(thread);
   const change = el("section");
   detail.append(change);
   if (!caps.has("core_git")) {
@@ -287,6 +388,8 @@ async function main() {
   byId("approve-all").onclick = approveAll;
   byId("land-all").onclick = () => landNow({ all: true }, `all ${landing.queue.length} queued changes`, byId("land-all"));
   byId("settled").onchange = render;
+  byId("tail").onchange = () => { loadThreads(); loadRoom(); };
+  byId("chat-send").onclick = sendRoom;
   await load();
   setInterval(updateQueueTimer, 1000);
   setInterval(() => { if (!document.hidden) load({quiet: true}); }, 20000);

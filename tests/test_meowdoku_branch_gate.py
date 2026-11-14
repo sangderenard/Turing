@@ -739,3 +739,97 @@ def test_the_author_withdraws_an_approved_change_before_it_lands_but_not_after(w
     branch_gate.land(policy, db, apply=True, log=lambda line: None)
     with pytest.raises(branch_review.ReviewError, match="before it lands"):
         branch_review.withdraw(db, two["id"], user_id=ANN)
+
+
+def _with_operator(world):
+    world["db"].execute("INSERT INTO users VALUES (4, 'opal')")
+    world["db"].execute("INSERT INTO account_roles VALUES (4, 'operator')")
+    return 4
+
+
+def test_an_operator_revokes_an_approval_and_the_change_stops_until_approved_again(world):
+    db, policy = world["db"], world["policy"]
+    opal = _with_operator(world)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head, timeout_s=0)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    with pytest.raises(branch_review.ReviewError, match="operator or admin"):
+        branch_review.revoke(db, made["id"], user_id=BOB, username="bob", reason="no")
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason=" ")
+    told = branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="it breaks the paper tests")
+    record = told["review"]
+    assert record["standing"] == "revoked" and record["revoked_by"] == "opal" and told["tell"] == ["admin", "ann"]
+    assert branch_review.queue(db) == [] and branch_gate.land(policy, db, apply=True, log=lambda line: None) == []
+    assert not branch_review.accepted_head(db, "work", "main", head), "the push check refuses a revoked change too"
+    with pytest.raises(branch_review.ReviewError, match="approved change"):
+        branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="again")
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    assert branch_review.get(db, made["id"])["standing"] == "approved", "an admin approves it again"
+
+
+def test_threads_and_attention_follow_who_wrote_last(world):
+    db = world["db"]
+    opal = _with_operator(world)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="conflicts with the gate", now=2000.0)
+    waiting = branch_review.attention(db, username="ann", now=2001.0)
+    assert [w["id"] for w in waiting] == [made["id"]] and "opal revoked its approval: conflicts with the gate" == waiting[0]["why"]
+    assert branch_review.attention(db, username="admin", now=2001.0)[0]["why"].startswith("opal revoked"), "the approver too"
+    assert branch_review.attention(db, username="opal", now=2001.0) == [], "the last word is the revoker's own"
+    assert branch_review.attention(db, username="bob", now=2001.0) == [], "bob takes no part"
+    told = branch_review.comment(db, made["id"], user_id=ANN, username="ann", body="merged main; please look", now=2002.0)
+    assert told["tell"] == ["admin", "opal"]
+    assert branch_review.attention(db, username="ann", now=2003.0) == []
+    assert [w["why"] for w in branch_review.attention(db, username="opal", now=2003.0)] == ["ann wrote in its thread"]
+    for n in range(25):
+        branch_review.comment(db, made["id"], user_id=BOB, username="bob", body=f"note {n}", now=2010.0 + n)
+    (thread,) = branch_review.threads(db, 20)
+    assert len(thread["comments"]) == 20 and thread["comments"][-1]["body"] == "note 24", "the tail, oldest first"
+    assert len(branch_review.threads(db, branch_review.tail_of("all"))[0]["comments"]) == 27
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.tail_of("0")
+
+
+def test_the_reviewers_room_is_for_operators_and_admins(world):
+    db = world["db"]
+    opal = _with_operator(world)
+    with pytest.raises(branch_review.ReviewError, match="operators and admins"):
+        branch_review.room_post(db, user_id=ANN, username="ann", body="hi")
+    for n in range(23):
+        branch_review.room_post(db, user_id=opal if n % 2 else ADMIN, username="opal" if n % 2 else "admin", body=f"m{n}")
+    said = branch_review.room(db, user_id=opal, tail=20)
+    assert [m["body"] for m in said][0] == "m3" and said[-1]["body"] == "m22"
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.room(db, user_id=ANN)
+
+
+def test_revoke_comment_and_room_over_rest_and_the_notices_they_send(world):
+    policy, db_file = world["policy"], world["db_file"]
+    opal = _with_operator(world)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head)
+    branch_review.decide(world["db"], made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    told = []
+
+    def ask(path, method="GET", **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path.split("?")[0], method, policy=policy, accounts_db=db_file,
+                                 notify=lambda names, text, review_id: told.append((names, text, review_id)))
+        return handler.sent
+
+    status, answer = ask("/api/reviews/revoke", "POST", user=opal, username="opal", body={"id": made["id"], "reason": "wait"})
+    assert status == 200 and answer["review"]["standing"] == "revoked"
+    assert told[-1][0] == ["admin", "ann"] and "opal revoked the approval of work feature" in told[-1][1] and told[-1][2] == made["id"]
+    status, answer = ask("/api/reviews/comment", "POST", user=ANN, username="ann", body={"id": made["id"], "body": "fixed"})
+    assert status == 200 and told[-1][0] == ["admin", "opal"] and "ann wrote in the thread" in told[-1][1]
+    status, answer = ask("/api/reviews/threads?tail=1", user=ANN, username="ann")
+    assert status == 200 and answer["tail"] == 1 and [c["body"] for c in answer["threads"][0]["comments"]] == ["fixed"]
+    assert ask("/api/reviews/attention", user=opal, username="opal")[1]["attention"][0]["why"] == "ann wrote in its thread"
+    assert ask("/api/reviews/room", "POST", user=ANN, username="ann", body={"body": "hi"})[0] == 403
+    assert ask("/api/reviews/room", "POST", user=opal, username="opal", body={"body": "hi"})[0] == 200
+    status, answer = ask("/api/reviews/room", user=opal, username="opal")
+    assert status == 200 and answer["tail"] == 20 and answer["room"][0]["body"] == "hi"
+    assert ask("/api/reviews/threads?tail=nope", user=ANN, username="ann")[0] == 400

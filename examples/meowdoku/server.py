@@ -402,6 +402,7 @@ class Sessions:
         self.living_data_static = StaticWorlds()
         self.studio_pictures = None             # [SHOW] set by main() when a Studio Nodus destination is configured
         self.land_request = None                # [REVIEWS] set by main() when the updater's task table is reachable (--task-port)
+        self.review_notify = None               # [REVIEWS] tells a change's participants of a revoke or comment (same table)
         self.fabric_motion = None               # [FABRIC] native row host plus complete UDP frame receiver
         from meowdoku.living_data_query import GraphView
         from meowdoku import rest_api as shared_rest_loader
@@ -1825,7 +1826,7 @@ def make_handler(sessions: Sessions):
             except (OSError, ValueError, branch_gate.GateError):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
-                                            land_request=sessions.land_request,
+                                            land_request=sessions.land_request, notify=sessions.review_notify,
                                             landing_schedule_path=sessions.state.jobs_dir / "cron" / "cron.table")
 
         def _orientation_route(self, path: str, method: str) -> None:
@@ -4252,6 +4253,22 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as error:                              # an unreachable table is an answer, never a crash
                 return {"outcome": "failed", "error": f"{type(error).__name__}: {error}"}
         sessions.land_request = land_request
+
+        def review_notify(usernames, text, review_id, _port=args.task_port, _jobs=args.task_jobs_dir, _engine=args.task_engine_id):
+            """A system message to each participant of a change (system.broadcast, by exact name), sent off the request
+            thread: a notice that cannot be delivered is logged, never holds up the change."""
+            fields = {"text": text, "usernames": list(usernames), "msg_type": "question",
+                      "subject": {"kind": "review", "ref": str(review_id)}}
+
+            def send():
+                try:
+                    outcome = task_request.submit(studio_product_nodus.nodus_modules()[0], port=_port, engine_id=_engine,
+                                                  jobs_dir=_jobs, task="system.broadcast", fields=fields, timeout=10.0)
+                except Exception as error:
+                    outcome = {"outcome": "failed", "error": f"{type(error).__name__}: {error}"}
+                print(f"[reviews] notice of review {review_id} to {', '.join(usernames)}: {outcome.get('outcome')}", flush=True)
+            threading.Thread(target=send, name="review-notice", daemon=True).start()
+        sessions.review_notify = review_notify
         print(f"[reviews] the landing queue asks the updater through Nodus port {args.task_port}", flush=True)
     site_compiler = None
     if args.site_compiler_config:
