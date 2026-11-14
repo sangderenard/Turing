@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>You've been invited</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --ok:#17743a; --bad:#b3261e; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --ok:#5fcf86; --bad:#ff8a80; --card:#202024; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:24rem; margin:0 auto; padding:2rem 16px 4rem; }
+  h1 { font-size:1.3rem; margin:0 0 1rem; }
+  label { display:block; margin:.7rem 0 .2rem; color:var(--mut); }
+  input { width:100%; box-sizing:border-box; font:inherit; padding:.5rem .6rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  button { font:inherit; padding:.45rem 1.1rem; margin-top:1rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .bad { color:var(--bad); } .ok { color:var(--ok); } .mut { color:var(--mut); }
+  ul { padding-left:1.2rem; }
+  button[aria-pressed="true"] { border-color:var(--ok); color:var(--ok); font-weight:600; }
+  [hidden] { display:none !important; }
+</style>
+<style>
+  main.wide { max-width:30rem; }
+  .mock { border:1px dashed var(--line); border-radius:6px; padding:.5rem .7rem; color:var(--mut); font-size:.9rem; margin:0 0 1rem; }
+  fieldset { border:0; padding:0; margin:0; }
+  fieldset:disabled input { opacity:.6; }
+  .row { display:flex; gap:.5rem; align-items:end; } .row button { margin-top:0; }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; margin-top:.5rem; }
+  th, td { text-align:left; padding:.35rem .3rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:500; }
+  code { font-size:.85rem; word-break:break-all; }
+  h2 { font-size:1.05rem; margin:1.6rem 0 .3rem; }
+</style>
+</head>
+<body>
+<main>
+  <p class="mock">Mockup. Nothing on this page is sent or saved yet.</p>
+  <h1>You've been invited</h1>
+  <p id="lead">Checking your invitation...</p>
+  <section id="finish" hidden>
+    <p class="mut" id="chain"></p>
+    <form id="form" autocomplete="on">
+      <label for="username">Choose a username</label>
+      <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="email">Email <span class="mut">(for recovering your account)</span></label>
+      <input id="email" type="email" autocomplete="email">
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="new-password" required>
+      <label for="password2">Password again</label>
+      <input id="password2" type="password" autocomplete="new-password" required>
+      <button id="submit" type="submit">Finish registration</button>
+    </form>
+  </section>
+  <p id="status" class="mut" role="status"></p>
+  <p class="mut">Already have an account? <a href="/login.html">Sign in</a>.</p>
+</main>
+<script src="invited.js"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body>
+</html>

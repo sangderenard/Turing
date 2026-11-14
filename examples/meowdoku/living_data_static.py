@@ -26,6 +26,14 @@ MAX_PNG = 2 * 1024 * 1024
 TTL = 900
 RENDER_TIMEOUT = 60
 RID = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+# [FOYER] the one shared demo world (owner, 2026-11-13): registered by a resident host holding library_manage, walked and
+# photographed by anyone in the foyer (guests, guest agents, interns).  Nothing in it is a visitor's: no world of their own,
+# no edits, no scene export; a picture is one queued render-phong on the shared host, at most one per visitor.
+FOYER_PENDING = 8                  # renders queued or in flight across all visitors
+FOYER_RECEIPTS = 64                # visitor receipts kept; the oldest finished ones go first
+FOYER_MAX_SIDE = 640               # a visitor's picture is at most 640 px a side
+FOYER_GREETING = ("This is a demo: one shared world anyone in the foyer may walk and photograph. Nothing here is yours; "
+                  "an admin makes intern accounts (man foyer).")
 SHA = re.compile(r'^[0-9a-f]{64}$')
 
 
@@ -199,7 +207,11 @@ class StaticWorlds:
                 'ray_available': False}
 
     def register(self, owner, body):
-        _fields(body, {'map', 'source_sha256', 'renderer_identity', 'request_id'})
+        _fields(body, {'map', 'source_sha256', 'renderer_identity', 'request_id', 'foyer'})
+        foyer = body.get('foyer')
+        if foyer is not None:              # the caller's route already required library_manage for this
+            _fields(foyer, {'start_position', 'start_facing'})
+            foyer = {'start_position': _vector(foyer.get('start_position')), 'start_facing': _vector(foyer.get('start_facing'), True)}
         request_id = _rid(body.get('request_id')); digest = _digest(body)
         source = body.get('source_sha256')
         if not isinstance(source, str) or not SHA.fullmatch(source):
@@ -212,6 +224,8 @@ class StaticWorlds:
                     if world['request_id'] == request_id and world['digest'] == digest:
                         return dict(self._public(world), host_token=world['token'], replayed=True)
                     raise CursorError('close your registered static world before replacing it', 409)
+            if foyer is not None and self._foyer() is not None:
+                raise CursorError('the foyer already has a resident host; close it first', 409)
             if len(self.worlds) >= MAX_WORLDS:
                 raise CursorError('static world capacity reached', 503)
             # Only data graph views; do not instantiate uploaded worker or WASM.
@@ -235,6 +249,8 @@ class StaticWorlds:
                      'renderer': renderer, 'map_digest': _digest(body['map']), 'commands': {}, 'touched': self.clock(),
                      'request_id': request_id, 'digest': digest,
                      'world_registry_digest': _digest(body['map'].get('world', {}))}
+            if foyer is not None:
+                world.update(foyer=foyer, visitors={})
             self.worlds[world['id']] = world
             return dict(self._public(world), host_token=world['token'])
 
@@ -265,43 +281,50 @@ class StaticWorlds:
                 return dict(self._receipt(world, old), replayed=True)
             if len(world['commands']) >= MAX_COMMANDS:
                 raise CursorError('command receipt capacity reached; close and reattach world', 429)
-            entry = {'id': request_id, 'digest': digest, 'operation': operation,
-                     'state': 'complete', 'deadline': self.clock() + RENDER_TIMEOUT}
-            if operation == 'export-scene':
-                _fields(body, {'request_id', 'operation'})
-                if 'scene' not in world:
-                    raise CursorError('host has not admitted its realized scene snapshot', 409)
-                entry['result'] = world['scene']
-            elif operation == 'inspect':
-                _fields(body, {'request_id', 'operation', 'at', 'layer', 'radius', 'limit', 'offset', 'edge_offset'})
-                layer = body.get('layer', 'world')
-                if layer not in ('world', 'layout'):
-                    raise CursorError('layer must be world or layout')
-                graph = world['graph'] if layer == 'world' else world['layout']
-                at = body.get('at', world['root'])
-                result = graph.query(at, radius=body.get('radius', 1), limit=body.get('limit', 64),
-                                     offset=body.get('offset', 0), edge_offset=body.get('edge_offset', 0))
-                # Analytic data comes from the exact registered object record.
-                result['object'] = deepcopy(graph.nodes[at])
-                result['text'] = f"{result['at'].get('name') or at}: {result['total']} declared graph references within {result['radius']} hops."
-                if len(json.dumps(result).encode()) > MAX_PNG:
-                    raise CursorError('analytic object response exceeds 2 MiB', 413)
-                entry['result'] = result
-            else:
-                _fields(body, {'request_id', 'operation', 'position', 'facing', 'width', 'height', 'optics'})
-                camera = {'position': _vector(body.get('position')), 'facing': _vector(body.get('facing'), True),
-                          'width': _integer(body.get('width', 512), 64, 1024, 'width'),
-                          'height': _integer(body.get('height', 384), 64, 1024, 'height')}
-                if 'optics' in body:
-                    camera['optics'] = _optics(body['optics'])
+            entry = self._enter(world, body)
+            world['touched'] = self.clock()
+            return self._receipt(world, entry)
+
+    def _enter(self, world, body, queue=False):
+        """Build, record and return one command entry of ``world`` (caller holds the lock and has checked replay/capacity)."""
+        request_id, digest, operation = body['request_id'], _digest(body), body.get('operation')
+        entry = {'id': request_id, 'digest': digest, 'operation': operation,
+                 'state': 'complete', 'deadline': self.clock() + RENDER_TIMEOUT}
+        if operation == 'export-scene':
+            _fields(body, {'request_id', 'operation'})
+            if 'scene' not in world:
+                raise CursorError('host has not admitted its realized scene snapshot', 409)
+            entry['result'] = world['scene']
+        elif operation == 'inspect':
+            _fields(body, {'request_id', 'operation', 'at', 'layer', 'radius', 'limit', 'offset', 'edge_offset'})
+            layer = body.get('layer', 'world')
+            if layer not in ('world', 'layout'):
+                raise CursorError('layer must be world or layout')
+            graph = world['graph'] if layer == 'world' else world['layout']
+            at = body.get('at', world['root'])
+            result = graph.query(at, radius=body.get('radius', 1), limit=body.get('limit', 64),
+                                 offset=body.get('offset', 0), edge_offset=body.get('edge_offset', 0))
+            # Analytic data comes from the exact registered object record.
+            result['object'] = deepcopy(graph.nodes[at])
+            result['text'] = f"{result['at'].get('name') or at}: {result['total']} declared graph references within {result['radius']} hops."
+            if len(json.dumps(result).encode()) > MAX_PNG:
+                raise CursorError('analytic object response exceeds 2 MiB', 413)
+            entry['result'] = result
+        else:
+            _fields(body, {'request_id', 'operation', 'position', 'facing', 'width', 'height', 'optics'})
+            camera = {'position': _vector(body.get('position')), 'facing': _vector(body.get('facing'), True),
+                      'width': _integer(body.get('width', 512), 64, 1024, 'width'),
+                      'height': _integer(body.get('height', 384), 64, 1024, 'height')}
+            if 'optics' in body:
+                camera['optics'] = _optics(body['optics'])
+            if not queue:                      # [FOYER] the shared world queues instead, bounded by foyer_command
                 for pending in world['commands'].values():
                     self._receipt(world, pending)
                     if pending['state'] in ('queued', 'rendering'):
                         raise CursorError('a render is already pending for this world', 409)
-                entry.update(state='queued', camera=camera)
-            world['commands'][request_id] = entry
-            world['touched'] = self.clock()
-            return self._receipt(world, entry)
+            entry.update(state='queued', camera=camera)
+        world['commands'][request_id] = entry
+        return entry
 
     def receipt(self, owner, identity, request_id):
         _rid(request_id)
@@ -330,6 +353,8 @@ class StaticWorlds:
                 return {**self._public(world), **{k: v for k, v in admitted.items() if k != 'snapshot'}}
             if body.get('action') == 'poll':
                 _fields(body, {'host_token', 'action'})
+                if 'foyer' in world:           # [FOYER] a resident host's polling keeps the shared world open
+                    world['touched'] = self.clock()
                 for entry in world['commands'].values():
                     self._receipt(world, entry)
                     if entry['state'] in ('queued', 'rendering'):
@@ -429,6 +454,91 @@ class StaticWorlds:
                          'png_sha256': hashlib.sha256(png).hexdigest(), 'simulation': False})
             world['touched'] = self.clock()
             return self._receipt(world, entry)
+
+    # ---- [FOYER] the shared demo world, for anyone in the foyer --------------------------------------------------
+    def _foyer(self):
+        self._prune()
+        return next((w for w in self.worlds.values() if 'foyer' in w), None)
+
+    def _foyer_world(self):
+        world = self._foyer()
+        if world is None:
+            raise CursorError('the foyer is closed: no resident host is attached', 503)
+        return world
+
+    def _foyer_public(self, world):
+        return {'foyer': True, 'demo': True, 'greeting': FOYER_GREETING, 'root': world['graph'].nodes[world['root']]['identity'],
+                'source_sha256': world['source'], 'renderer_identity': world['renderer'], 'map_sha256': world['map_digest'],
+                'start': {'position': list(world['foyer']['start_position']), 'facing': list(world['foyer']['start_facing'])},
+                'capabilities': ['inspect', 'render-phong'], 'max_side': FOYER_MAX_SIDE, 'simulation': False}
+
+    def foyer_status(self):
+        with self.lock:
+            return self._foyer_public(self._foyer_world())
+
+    def _foyer_receipt(self, world, entry, request_id):
+        receipt = self._receipt(world, entry)
+        for private in ('world_id',):
+            receipt.pop(private, None)
+        return {**receipt, 'request_id': request_id, 'demo': True}
+
+    def foyer_command(self, visitor, body):
+        """One visitor's inspect or picture on the shared world.  ``visitor`` is the server's identity key for the caller."""
+        _fields(body, {'request_id', 'operation', 'at', 'layer', 'radius', 'limit', 'offset', 'edge_offset',
+                       'position', 'facing', 'width', 'height'})
+        request_id = _rid(body.get('request_id'))
+        if body.get('operation') not in ('inspect', 'render-phong'):
+            raise CursorError('the foyer offers inspect and render-phong')
+        if body.get('operation') == 'render-phong':
+            for side in ('width', 'height'):
+                if side in body:
+                    _integer(body[side], 64, FOYER_MAX_SIDE, side)
+        with self.lock:
+            world = self._foyer_world()
+            mine = world['visitors'].setdefault(visitor, {})
+            if request_id in mine:
+                entry = world['commands'].get(mine[request_id])
+                if entry is None:
+                    raise CursorError('that receipt has been forgotten', 410)
+                if entry['visitor_digest'] != _digest(body):
+                    raise CursorError('request_id reused with different command', 409)
+                return dict(self._foyer_receipt(world, entry, request_id), replayed=True)
+            if body.get('operation') == 'render-phong':
+                pending = [e for e in world['commands'].values() if e['operation'] == 'render-phong'
+                           and self._receipt(world, e)['state'] in ('queued', 'rendering')]
+                if any(e.get('visitor') == visitor for e in pending):
+                    raise CursorError('your last picture is still being taken; ask for its receipt', 409)
+                if len(pending) >= FOYER_PENDING:
+                    raise CursorError('the foyer camera is busy; try again in a moment', 429)
+            self._foyer_evict(world)
+            internal = secrets.token_hex(16)                   # the host sees only this, never a visitor's request id
+            command = dict(body, request_id=internal)
+            # The shared world's own command path: one render in flight is relaxed to the foyer queue above.
+            entry = self._enter(world, command, queue=True)
+            entry.update(visitor=visitor, visitor_digest=_digest(body))
+            mine[request_id] = internal
+            world['touched'] = self.clock()
+            return self._foyer_receipt(world, entry, request_id)
+
+    def foyer_receipt(self, visitor, request_id):
+        _rid(request_id)
+        with self.lock:
+            world = self._foyer_world()
+            internal = world['visitors'].get(visitor, {}).get(request_id)
+            entry = world['commands'].get(internal) if internal else None
+            if entry is None:
+                raise CursorError('receipt not found', 404)
+            return self._foyer_receipt(world, entry, request_id)
+
+    def _foyer_evict(self, world):
+        finished = [k for k, e in world['commands'].items() if self._receipt(world, e)['state'] in ('complete', 'failed')]
+        while len(world['commands']) >= FOYER_RECEIPTS and finished:
+            gone = world['commands'].pop(finished.pop(0))
+            mine = world['visitors'].get(gone.get('visitor'), {})
+            for key in [k for k, v in mine.items() if v == gone['id']]:
+                del mine[key]
+        if len(world['commands']) >= FOYER_RECEIPTS:
+            raise CursorError('the foyer camera is busy; try again in a moment', 429)
 
     def close(self, owner, identity):
         with self.lock:

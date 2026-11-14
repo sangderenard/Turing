@@ -66,7 +66,7 @@ def test_karate_club_real_rest_walk(server):
 def test_http_ownership_admission_and_conflict(server):
     payload = {'map': model(), 'at': 'r', 'request_id': 'new'}
     assert _call(server.port, BASE, 'POST', OUTSIDE, payload)[0] == 403
-    assert _call(server.port, BASE, 'POST', {}, payload)[0] == 401
+    assert _call(server.port, BASE, 'POST', {}, payload)[0] == 403          # a guest never holds dev_ui (owner, 2026-11-13)
     h = _cookie(server, 'cursorowner', 'operator')
     other = _cookie(server, 'cursorother', 'operator')
     status, _, item = _call(server.port, BASE, 'POST', h, payload)

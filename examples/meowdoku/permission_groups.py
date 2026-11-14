@@ -10,6 +10,8 @@ import time
 
 RANKS = {"member": 10, "dev": 20, "operator": 30, "admin": 40}
 ORDER = tuple(RANKS)
+# intern (a guest agent's kiosk account, authz.KIOSK_ROLES) is not a rung: it does not imply member, and no group is granted to it.
+KIOSK = "intern"
 DDL = """CREATE TABLE IF NOT EXISTS account_permission_grants (
     user_id INTEGER NOT NULL REFERENCES users(id),
     group_name TEXT NOT NULL CHECK(group_name IN ('dev','operator')),
@@ -39,12 +41,16 @@ def authority(db, user_id):
 
     A service account keeps its separate service capability role and uses the
     server paper credential; it is not a rung in human account authority.
+    An intern account is not a rung either: its highest group is intern, with
+    no implied member group and no dev/operator/nodus grants.
     """
     if user_id is None:
         return {"highest": None, "direct": [], "groups": [], "service": False}
     prepare(db)
     role_row = db.execute("SELECT role FROM account_roles WHERE user_id=?", (user_id,)).fetchone()
     role = role_row[0] if role_row else "member"
+    if role == KIOSK:
+        return {"highest": KIOSK, "direct": [KIOSK], "groups": [KIOSK], "service": False}
     direct = {"member"}
     if role in RANKS:
         direct.add(role)
@@ -66,6 +72,8 @@ def set_grant(db, actor_id, user_id, group_name, enabled):
         raise PermissionError("admin permission group required")
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         raise LookupError("account not found")
+    if enabled and authority(db, user_id)["highest"] == KIOSK:
+        raise PermissionError("an intern account takes no permission group; change its role instead")
     if group_name == "nodus":
         if enabled:
             db.execute("INSERT INTO account_nodus_grants(user_id,granted_by,created_at) VALUES(?,?,?) "
