@@ -49,7 +49,8 @@ def server(tmp_path):
     web.mkdir(parents=True)
     (web / "boards.json").write_text(json.dumps({"boards": [], "levels": {}}), encoding="utf-8")
     (web / "shader.html").write_text("<html>SHADER-PAGE</html>", encoding="utf-8")
-    (web / "index.html").write_text("<html>GAME-PAGE</html>", encoding="utf-8")
+    (web / "index.html").write_text("<html>FEED-PAGE</html>", encoding="utf-8")
+    (web / "play.html").write_text("<html>GAME-PAGE</html>", encoding="utf-8")
     (web / "login.html").write_text("<html>LOGIN-PAGE</html>", encoding="utf-8")
     (web / "login.js").write_text("// login", encoding="utf-8")
     sessions = srv.Sessions(web, None)
@@ -76,7 +77,8 @@ def _login(server, name, password=PASSWORD):
 
 
 def test_anonymous_outside_visitor_keeps_the_shader_lock(server):
-    assert "SHADER-PAGE" in _call(server.port, "/", headers=OUTSIDE)[3]
+    assert "FEED-PAGE" in _call(server.port, "/", headers=OUTSIDE)[3]
+    assert "SHADER-PAGE" in _call(server.port, "/play.html", headers=OUTSIDE)[3]
     assert _call(server.port, "/api/mathlab/jobs", headers=OUTSIDE)[0] == 403
     who = _call(server.port, "/api/whoami", headers=OUTSIDE)[3]
     assert who["origin_tier"] == "shader" and who["tier"] == "shader" and who["signed_in"] is False and who["username"] is None
@@ -111,9 +113,11 @@ def test_member_login_lifts_the_tier_and_logout_restores_the_lock(server):
     who = _call(server.port, "/api/whoami", headers={**OUTSIDE, "Cookie": cookie})[3]
     assert who["signed_in"] is True and who["username"] == "cat_two" and who["origin_tier"] == "shader"
     assert who["tier"] == "play" and who["origin"] == "dns" and "compile_submit" in who["capabilities"]
-    assert "GAME-PAGE" in _call(server.port, "/", headers={**OUTSIDE, "Cookie": cookie})[3]
+    assert "FEED-PAGE" in _call(server.port, "/", headers={**OUTSIDE, "Cookie": cookie})[3]
+    assert "GAME-PAGE" in _call(server.port, "/play.html", headers={**OUTSIDE, "Cookie": cookie})[3]
     assert _call(server.port, "/api/account/logout", "POST", {**OUTSIDE, "Cookie": cookie}, {})[0] == 200
-    assert "SHADER-PAGE" in _call(server.port, "/", headers={**OUTSIDE, "Cookie": cookie})[3]
+    assert "FEED-PAGE" in _call(server.port, "/", headers={**OUTSIDE, "Cookie": cookie})[3]
+    assert "SHADER-PAGE" in _call(server.port, "/play.html", headers={**OUTSIDE, "Cookie": cookie})[3]
     assert _call(server.port, "/api/mathlab/jobs", headers={**OUTSIDE, "Cookie": cookie})[0] == 403
 
 
