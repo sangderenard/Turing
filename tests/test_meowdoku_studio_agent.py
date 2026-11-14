@@ -7,7 +7,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
@@ -20,6 +20,27 @@ def product(raw=b"MRP1existing-payload", content_type="application/octet-stream"
 
 
 class StudioAgentTests(unittest.TestCase):
+    def test_missing_node_does_not_stop_server_startup(self):
+        with tempfile.TemporaryDirectory(prefix="studio-agent-no-node-") as directory:
+            assets = Path(directory) / "assets.json"
+            assets.write_text("{}")
+            with patch("meowdoku.studio_agent.shutil.which", return_value=None):
+                worker = StudioAgentProducts(assets)
+                with self.assertRaisesRegex(StudioAgentError, "Node is required"):
+                    worker.build({"operation": "ray-payload"})
+
+    def test_explicit_node_path_is_used_for_studio_request(self):
+        with tempfile.TemporaryDirectory(prefix="studio-agent-node-path-") as directory:
+            assets = Path(directory) / "assets.json"
+            assets.write_text("{}")
+            worker = StudioAgentProducts(assets, node="C:/nvm4w/nodejs/node.exe")
+            result = Mock(returncode=0, stdout=json.dumps(product()).encode())
+            with patch("meowdoku.studio_agent.shutil.which", return_value=worker.node) as which:
+                with patch("meowdoku.studio_agent.subprocess.run", return_value=result) as run:
+                    self.assertEqual(worker.build({"operation": "ray-payload"}), product())
+            which.assert_called_once_with(worker.node)
+            self.assertEqual(run.call_args.args[0][0], worker.node)
+
     def test_checked_blob(self):
         value = product()
         self.assertEqual(product_bytes(value), b"MRP1existing-payload")

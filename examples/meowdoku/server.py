@@ -4010,6 +4010,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
     parser.add_argument("--studio-defaults", default=None,
                         help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
+    parser.add_argument("--studio-node", default=None,
+                        help="[SHOW] Node executable for Studio scene requests; resolved when a request runs")
     parser.add_argument("--fabric-row-host", default=None, help="persistent native Nodus spring-row host executable")
     parser.add_argument("--fabric-row-plugin", default=None, help="native Nodus spring-row plugin DLL")
     parser.add_argument("--fabric-core-dir", default=None, help="directory containing the Nodus tensor-core DLL")
@@ -4102,7 +4104,8 @@ def main(argv: list[str] | None = None) -> int:
         sessions.studio_pictures = studio_pictures.StudioPictures(
             port=args.studio_nodus_port, prefix=args.studio_nodus_prefix,
             products=studio_agent.StudioAgentProducts(Path(args.studio_assets),
-                                                      defaults=Path(args.studio_defaults) if args.studio_defaults else None),
+                                                      defaults=Path(args.studio_defaults) if args.studio_defaults else None,
+                                                      node=args.studio_node),
             store_dir=sessions.state.jobs_dir / "studio-product", photo_jobs=sessions.marble_photos,
             saved_objects_for=sessions.marble_objects.for_account, registry=sessions.jobs,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
