@@ -1823,6 +1823,16 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
 
+        def _orientation_route(self, path: str, method: str) -> None:
+            """[ORIENTATION] every markdown file of the core in causal order, with per-account filters (orientation.py)."""
+            from meowdoku import branch_gate, orientation
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return orientation.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
         def _git_route(self, path: str, method: str) -> None:
             """[GIT] Git in the core, regulated: declared read operations for accounts holding core_git (core_git.py)."""
             from meowdoku import branch_gate, core_git
@@ -2822,6 +2832,8 @@ def make_handler(sessions: Sessions):
                 return self._reviews_route(path, "GET")
             if path.startswith("/api/git/"):                      # [GIT]
                 return self._git_route(path, "GET")
+            if path == "/api/orientation" or path.startswith("/api/orientation/"):   # [ORIENTATION]
+                return self._orientation_route(path, "GET")
             if path.startswith("/api/relay/"):                    # [RELAY]
                 return self._relay_route(path, "GET")
             if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
@@ -3329,6 +3341,8 @@ def make_handler(sessions: Sessions):
                 return self._reviews_route(path0, "POST")
             if path0.startswith("/api/git/"):                     # [GIT]
                 return self._git_route(path0, "POST")
+            if path0 == "/api/orientation" or path0.startswith("/api/orientation/"):   # [ORIENTATION]
+                return self._orientation_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
                 return self._relay_route(path0, "POST")
             if path0 == "/api/control/instances":
