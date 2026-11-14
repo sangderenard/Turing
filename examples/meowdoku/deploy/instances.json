@@ -159,7 +159,7 @@
         "--host", "127.0.0.1",
         "--port", "47614",
         "--attach-console", "127.0.0.1:47612",
-        "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-messenger.console.secret"
+        "--console-token-file", "C:/dev/Powershell/srv/state/run/console/nodus-messenger.console.secret"
       ],
       "nodus": {
         "path_prepend": [
@@ -223,7 +223,7 @@
         "--host", "127.0.0.1",
         "--port", "47620",
         "--attach-console", "127.0.0.1:47616",
-        "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-training.console.secret",
+        "--console-token-file", "C:/dev/Powershell/srv/state/run/console/nodus-training.console.secret",
         "--attach-wait", "240"
       ],
       "nodus": {"path_prepend": ["C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release"]},

@@ -153,8 +153,10 @@ def listening(port, host="127.0.0.1") -> bool:
 
 
 def console_secret_path(state_dir, name) -> Path:
-    """Per-run read-only-console token file: <operator_credentials>/<instance>.console.secret (the operators.py secrets dir)."""
-    return StatePaths.coerce(state_dir).operator_credentials_dir / f"{name}.console.secret"
+    """Per-run read-only-console token file: <run>/console/<instance>.console.secret. Not under secrets/operator_credentials:
+    the supervisor runs as the service account, which writes this file at every launch and must not hold write access to
+    the operators' credentials (2026-11-13: that write was refused and the Nodus host did not start)."""
+    return StatePaths.coerce(state_dir).console_dir / f"{name}.console.secret"
 
 
 def _abs(path):
@@ -190,14 +192,15 @@ class Instance:
         return console_secret_path(self.sup.paths, self.name)
 
     def write_console_token(self):
-        """A fresh token for this run (overwritten on every launch), in the restricted secrets dir."""
+        """A fresh token for this run (overwritten on every launch), in the restricted console dir: the account the stack runs
+        as has full control, Administrators may read (an elevated Open-Console.ps1)."""
         path = self.console_token_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if not self.sup.secrets_restricted:
             self.sup.secrets_restricted = True
             sys.path[:0] = [p for p in (str(HERE),) if p not in sys.path]
             import operators as operators_mod            # noqa: E402  (the same icacls restriction operators.py applies)
-            self.sup.log(operators_mod._restrict(path.parent))
+            self.sup.log(operators_mod._restrict(path.parent, readers=("*S-1-5-32-544",)))
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(secrets.token_urlsafe(32))
