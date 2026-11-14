@@ -265,8 +265,29 @@ def remove_branch(path, branch, head, *, remote, delete_remote, local, skipped=N
     return "; ".join(done)
 
 
+def folder_state(path) -> str:
+    """present, gone, or unreadable. A folder this account may not open (another account's profile) is unreadable, never
+    gone: to the service account, a worktree in the operator's profile can look missing, and a missing worktree is
+    pruned (2026-11-14: 91 worktrees under C:/Users/alber, which the cleanup account cannot read)."""
+    import os
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "gone"
+    except OSError:
+        return "unreadable"
+    try:
+        os.listdir(path)
+    except NotADirectoryError:
+        return "gone"
+    except OSError:
+        return "unreadable"
+    return "present" if Path(path).is_dir() else "gone"
+
+
 def side_worktrees(path, remote="origin") -> list:
-    """Every worktree of a repository except its own checkout, with what removing it would lose."""
+    """Every worktree of a repository except its own checkout, with what removing it would lose. ``state`` is the
+    folder's (folder_state); an unreadable one is not looked into."""
     entries, current = [], None
     for line in git(path, "worktree", "list", "--porcelain").splitlines():
         if line.startswith("worktree "):
@@ -280,23 +301,27 @@ def side_worktrees(path, remote="origin") -> list:
             current["locked"] = True
     out = []
     for entry in entries[1:]:
-        entry["exists"] = Path(entry["path"]).is_dir()
+        entry["state"] = folder_state(entry["path"])
+        entry["exists"] = entry["state"] != "gone"
         entry["on_remote"] = bool(entry["head"]) and bool(git(path, "branch", "-r", "--contains", entry["head"], check=False))
         entry["same_on_remote"] = bool(entry["branch"]) and git(
             path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{entry['branch']}", check=False) == entry["head"]
         entry["dirty"], entry["touched"] = 0, None
-        if entry["exists"]:
-            # Looking must not count as use: no optional locks, so this status never rewrites the index.
-            entry["dirty"] = len(git(entry["path"], "--no-optional-locks", "status", "--porcelain", check=False).splitlines())
-            # When HEAD last really moved (a checkout, a commit, a reset), from the reflog entry itself. File times
-            # are not evidence: Git's housekeeping rewrites every worktree's reflog and made 49 idle worktrees look
-            # used within the day (2026-11-12).
-            moved = re.search(r"\{(\d+)\}", git(entry["path"], "log", "-g", "-1", "--date=unix", "--format=%gd", "HEAD", check=False))
-            if moved:
-                entry["touched"] = float(moved[1])
-            else:                                # no reflog: the commit's own time
-                stamp = git(entry["path"], "log", "-1", "--format=%ct", "HEAD", check=False)
-                entry["touched"] = float(stamp) if stamp.isdigit() else None
+        if entry["state"] == "present":
+            try:
+                # Looking must not count as use: no optional locks, so this status never rewrites the index.
+                entry["dirty"] = len(git(entry["path"], "--no-optional-locks", "status", "--porcelain", check=False).splitlines())
+                # When HEAD last really moved (a checkout, a commit, a reset), from the reflog entry itself. File times
+                # are not evidence: Git's housekeeping rewrites every worktree's reflog and made 49 idle worktrees look
+                # used within the day (2026-11-12).
+                moved = re.search(r"\{(\d+)\}", git(entry["path"], "log", "-g", "-1", "--date=unix", "--format=%gd", "HEAD", check=False))
+                if moved:
+                    entry["touched"] = float(moved[1])
+                else:                                # no reflog: the commit's own time
+                    stamp = git(entry["path"], "log", "-1", "--format=%ct", "HEAD", check=False)
+                    entry["touched"] = float(stamp) if stamp.isdigit() else None
+            except OSError:                      # listed, but git may not run in it as this account
+                entry["state"], entry["dirty"], entry["touched"] = "unreadable", 0, None
         out.append(entry)
     return out
 
@@ -413,13 +438,27 @@ def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> li
         path = declared["path"]
         if not Path(path, ".git").exists():
             continue
-        for tree in side_worktrees(path, policy["remote"]):
+        try:
+            trees = side_worktrees(path, policy["remote"])
+        except OSError as error:                 # one repository this account cannot look into never stops the others
+            actions.append({"repository": name, "branch": "(worktrees)", "head": None, "worktree": path, "action": "keep",
+                            "reason": f"its worktrees could not be listed: {type(error).__name__}"})
+            continue
+        unreadable = [tree for tree in trees if tree["state"] == "unreadable"]
+        for tree in trees:
             label = tree["branch"] or f"(detached at {(tree['head'] or '')[:12]})"
             entry = {"repository": name, "branch": label, "head": tree["head"], "worktree": tree["path"]}
-            if not tree["exists"]:
-                if apply:
-                    git(path, "worktree", "prune", check=False)
-                entry.update(action="pruned" if apply else "would prune", reason="its folder is gone; only the record was left")
+            if tree["state"] == "unreadable":
+                entry.update(action="keep", reason="the cleanup account cannot read this folder (another account's, such as "
+                                                   "the operator's profile); the operator removes it")
+            elif not tree["exists"]:
+                if unreadable:                   # git prune would drop every worktree it cannot see, the unreadable ones too
+                    entry.update(action="keep", reason=f"its folder is gone, but {len(unreadable)} worktree(s) here cannot be "
+                                                       "read, and git worktree prune would drop them as well")
+                else:
+                    if apply:
+                        git(path, "worktree", "prune", check=False)
+                    entry.update(action="pruned" if apply else "would prune", reason="its folder is gone; only the record was left")
             elif tree["locked"]:
                 entry.update(action="keep", reason="locked")
             elif tree["touched"] is None or now - tree["touched"] < idle:

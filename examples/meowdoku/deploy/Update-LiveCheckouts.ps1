@@ -7,9 +7,14 @@ has no tracked changes, and its commit is part of the remote's default branch. A
   blocked   untracked files there would be overwritten. With -MoveIdenticalUntracked, files whose content equals what landed
             (line endings aside) are moved to <state>/backups/untracked-<repo>-<time>/ and the fast-forward is tried again.
 Nothing is pushed, reset, merged or deleted. A restart (Apache-Service.ps1 -Restart) is what loads the moved code.
+The site's pages are a published copy (web_export.py), not the source tree: a restart does not refresh them. When turing or
+spectral-analyzer moved, or with -ExportWeb, the pages are exported again from the live turing checkout (web_export.py
+--skip-boards, so the board database is kept) into each web folder the servers serve: build\meowdoku\web and every --web-dir
+in instances.json. -ExportWeb republishes what the live checkout holds now, even what is not on the remote.
 .EXAMPLE   $env:MEOWDOKU_OPERATOR='<operator>'; $env:MEOWDOKU_STATE_DIR='C:\dev\Powershell\srv\state'; .\Update-LiveCheckouts.ps1 -WhatIf
+.EXAMPLE   .\Update-LiveCheckouts.ps1 -ExportWeb      # move what landed, and publish the pages even if nothing moved
 #>
-param([switch]$WhatIf, [switch]$MoveIdenticalUntracked, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile,
+param([switch]$WhatIf, [switch]$MoveIdenticalUntracked, [switch]$ExportWeb, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile,
       [string]$AccountsDb, [string]$StateDir)
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
@@ -95,3 +100,43 @@ foreach ($property in $policy.repositories.PSObject.Properties) {
 }
 $rows | ForEach-Object { [pscustomobject]$_ } | Format-Table -AutoSize -Wrap
 if ($rows | Where-Object { $_.State -eq 'moved' }) { Write-Host 'Moved checkouts take effect at the next restart (Apache-Service.ps1 -Restart).' }
+
+# The published pages. web_export.py copies the pages from turing and the shaders and wave arena from spectral-analyzer, so a
+# move of either makes the served copy stale until it is exported again.
+$pagesMoved = @($rows | Where-Object { $_.State -in @('moved', 'would move') -and $_.Repository -in @('turing', 'spectral-analyzer') })
+if ($ExportWeb -or $pagesMoved.Count) {
+    # Pages are published only from reviewed code: both source checkouts must be on their default branch.
+    $offBase = @(foreach ($source in @('turing', 'spectral-analyzer')) {
+        $entry = $policy.repositories.$source
+        $on = (G ([string]$entry.path) @('rev-parse', '--abbrev-ref', 'HEAD'))[0]
+        if ($on -ne [string]$entry.default) { "$source is on $on, not $($entry.default)" }
+    })
+    if ($offBase.Count) { throw "REFUSED to publish the pages: $($offBase -join '; '). Put the checkout back on its default branch first." }
+    $turing = [string]$policy.repositories.turing.path
+    $exporter = Join-Path $turing 'examples\meowdoku\web_export.py'
+    $instances = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'instances.json') -Raw | ConvertFrom-Json
+    $webDirs = @((Join-Path $turing 'build\meowdoku\web'))      # web_export.py's default, which a server without --web-dir serves
+    foreach ($instance in $instances.instances) {
+        $arguments = @($instance.args)
+        $at = [array]::IndexOf($arguments, '--web-dir')
+        if ($at -ge 0 -and $at + 1 -lt $arguments.Count) { $webDirs += [string]$arguments[$at + 1] }
+    }
+    $webDirs = @($webDirs | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Sort-Object -Unique)
+    $why = if ($pagesMoved.Count) { "$(($pagesMoved | ForEach-Object { $_.Repository }) -join ' and ') moved" } else { '-ExportWeb' }
+    Write-Host ''
+    Write-Host "Publishing the pages ($why) into $($webDirs.Count) web folder(s)."
+    $python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'   # the compiler's Python (web_export compiles a shader)
+    $failed = @()
+    foreach ($dir in $webDirs) {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir 'boards.json'))) {
+            Write-Host "skipped $dir : no boards.json there (not a published web folder; export it once by hand)"; continue
+        }
+        Write-Host "cmd: $python $exporter --skip-boards --out $dir"
+        if ($WhatIf) { continue }
+        $env:PYTHONUTF8 = '1'
+        & $python $exporter --skip-boards --out $dir
+        if ($LASTEXITCODE -ne 0) { $failed += $dir; Write-Warning "web_export.py exited $LASTEXITCODE for $dir" }
+    }
+    if ($failed.Count) { throw "The pages were not published into: $($failed -join ', ')" }
+    if (-not $WhatIf) { Write-Host 'Pages published; a page reload shows them (no restart needed for pages).' }
+}
