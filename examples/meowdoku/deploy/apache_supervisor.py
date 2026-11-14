@@ -437,6 +437,11 @@ class Instance:
         self.uid = ensure_service_user(self.spec["account"], self.sup.db_path)
         with connect(self.sup.db_path) as db:
             db.execute("INSERT OR REPLACE INTO account_instances VALUES (?, ?)", (self.uid, self.name))
+        if self.spec.get("autostart", True) is False:   # [CONTROL] off at start: managed, launched only by a start request
+            self.state = "stopped"
+            self.sup.log(f"{self.name}: autostart false: not started with the stack; a start request starts it")
+            self.record(started=None)
+            return
         if self.kind == "meowdoku" and listening(self.port):
             self.state = "external"
             self.sup.log(f"{self.name}: port {self.port} already has a listener; not launching over it (state external)")
@@ -790,13 +795,18 @@ class Supervisor:
                 state, detail = "refused", "no such instance under this supervisor"
             else:
                 done = []
+                # [CONTROL] the whole stack ("*") brings back only what runs with it: an instance off at start
+                # ("autostart": false) that is not running now stays stopped; asked for by name, it starts.
+                left = set() if item["instance"] != instance_control.ALL else {
+                    i.name for i in targets if i.spec.get("autostart", True) is False and not (i.proc and i.proc.poll() is None)}
                 try:
                     if item["action"] in ("restart", "shutdown"):
                         for inst in reversed(targets):
                             done.append(f"{inst.name}: {inst.force_stop()}")
                     if item["action"] in ("restart", "start"):
                         for inst in targets:
-                            done.append(f"{inst.name}: {inst.force_start()}")
+                            done.append(f"{inst.name}: " + ("left stopped (autostart: false)" if inst.name in left
+                                                            else inst.force_start()))
                     if authorized is not None:
                         done.insert(0, f"authorized by {self.restart_display}: no running jobs")
                     state, detail = "done", "; ".join(done)

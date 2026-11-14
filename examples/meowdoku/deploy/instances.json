@@ -184,6 +184,7 @@
     },
     {
       "name": "nodus-training",
+      "autostart": false,
       "kind": "nodus",
       "port": null,
       "route": "",
@@ -220,6 +221,7 @@
     },
     {
       "name": "nodus-training-ui-mirror",
+      "autostart": false,
       "kind": "command",
       "port": 47620,
       "route": "",
