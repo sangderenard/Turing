@@ -33,6 +33,7 @@ class StatePaths:
             self.job_library_db = r / "marble_photos" / "job-library.sqlite"
             self.log_ring = r / "log_ring.jsonl"
             self.operator_credentials_dir = r / "operator_credentials"
+            self.service_tokens_dir = self.operator_credentials_dir   # unchanged: the legacy layout keeps the old path
         else:
             self.sql_dir, self.content_dir, self.products_dir = r / "sql", r / "content", r / "products"
             self.canvas_dir, self.logs_dir = r / "canvas", r / "logs"
@@ -40,6 +41,10 @@ class StatePaths:
             self.job_library_db = r / "sql" / "job-library.sqlite"
             self.log_ring = r / "logs" / "log_ring.jsonl"
             self.operator_credentials_dir = r / "secrets" / "operator_credentials"
+            # Per-run tokens the running stack writes itself (apache_supervisor's Nodus console tokens). Apart from
+            # operator_credentials, which holds the operators' passwords: the service account (Apache2.4 as svc-meowdoku) may
+            # write here, and nowhere else under secrets/. Setup-ServiceAccount.ps1 gives this folder its own ACL (2026-11-13).
+            self.service_tokens_dir = r / "secrets" / "service_tokens"
 
     # ---- constructors
     @classmethod
@@ -120,13 +125,14 @@ class StatePaths:
         return self.run_dir / f"launch{'' if port in (None, DEFAULT_PORT) else f'_{port}'}.json"
 
     def ensure(self, restrict: bool = True) -> list[str]:
-        """Create the directories (the new layout's seven plus tls/ and operator_credentials/ under secrets/) and restrict secrets/ to
-        the current user with the same icacls step operators.py uses.  The legacy layout only gets its base directory."""
+        """Create the directories (the new layout's seven plus tls/, operator_credentials/ and service_tokens/ under secrets/) and
+        restrict secrets/ to the current user with the same icacls step operators.py uses.  The legacy layout only gets its base
+        directory."""
         if self.is_legacy:
             self.root.mkdir(parents=True, exist_ok=True)
             return []
         for d in (self.sql_dir, self.content_dir, self.products_dir, self.canvas_dir, self.logs_dir, self.secrets_dir, self.run_dir,
-                  self.tls_dir, self.operator_credentials_dir):
+                  self.tls_dir, self.operator_credentials_dir, self.service_tokens_dir):
             d.mkdir(parents=True, exist_ok=True)
         if not restrict:
             return []

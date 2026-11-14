@@ -153,8 +153,11 @@ def listening(port, host="127.0.0.1") -> bool:
 
 
 def console_secret_path(state_dir, name) -> Path:
-    """Per-run read-only-console token file: <operator_credentials>/<instance>.console.secret (the operators.py secrets dir)."""
-    return StatePaths.coerce(state_dir).operator_credentials_dir / f"{name}.console.secret"
+    """Per-run read-only-console token file: <service_tokens>/<instance>.console.secret.  The state layout keeps it apart from
+    operator_credentials (operators' passwords), because under the Apache2.4 service the supervisor runs as svc-meowdoku, which may
+    write service_tokens and must not write operator_credentials; there the write failed with PermissionError (2026-11-13).  The
+    legacy layout's service_tokens_dir is operator_credentials, as before."""
+    return StatePaths.coerce(state_dir).service_tokens_dir / f"{name}.console.secret"
 
 
 def _abs(path):
@@ -193,7 +196,11 @@ class Instance:
         """A fresh token for this run (overwritten on every launch), in the restricted secrets dir."""
         path = self.console_token_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.sup.secrets_restricted:
+        # Legacy layout only: there the folder sits under build/, which grants the service Modify, so it is cut to the operator. In
+        # the state layout service_tokens/ is created under secrets/ (already cut to the operator) and given its ACL by
+        # Setup-ServiceAccount.ps1; restricting it here would fail as the service (exit 5, not the owner) and, run as the operator,
+        # is a no-op.
+        if StatePaths.coerce(self.sup.paths).is_legacy and not self.sup.secrets_restricted:
             self.sup.secrets_restricted = True
             sys.path[:0] = [p for p in (str(HERE),) if p not in sys.path]
             import operators as operators_mod            # noqa: E402  (the same icacls restriction operators.py applies)

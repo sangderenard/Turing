@@ -63,7 +63,7 @@ def test_ensure_creates_dirs_and_restricts_secrets(tmp_path, monkeypatch):
     monkeypatch.setattr(operators, "_restrict", lambda d: seen.append(Path(d)) or f"{d}: restricted")
     p = StatePaths(tmp_path / "state")
     report = p.ensure()
-    for d in (p.sql_dir, p.content_dir, p.products_dir, p.canvas_dir, p.logs_dir, p.secrets_dir, p.run_dir, p.tls_dir, p.operator_credentials_dir):
+    for d in (p.sql_dir, p.content_dir, p.products_dir, p.canvas_dir, p.logs_dir, p.secrets_dir, p.run_dir, p.tls_dir, p.operator_credentials_dir, p.service_tokens_dir):
         assert d.is_dir(), d
     assert seen == [p.secrets_dir] and len(report) == 1
     legacy = StatePaths.legacy(tmp_path / "repo")
@@ -128,7 +128,7 @@ def test_supervisor_state_dir_in_instances_json(tmp_path):
             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
     inst = tmp_path / "instances.json"
     inst.write_text(json.dumps({"state_dir": str(root), "instances": [spec]}), encoding="utf-8")
-    token = root / "secrets" / "operator_credentials" / "nodus-stub.console.secret"
+    token = root / "secrets" / "service_tokens" / "nodus-stub.console.secret"
     cmd = [sys.executable, str(SUP), "--instances", str(inst)]                         # no --db, no --state-dir: both come from the file
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:

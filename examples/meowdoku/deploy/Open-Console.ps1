@@ -36,7 +36,7 @@ $row = @($json | ConvertFrom-Json) | Where-Object { $_.name -eq $Instance } | Se
 if (-not $row) { throw "REFUSED no such instance: $Instance" }
 if ($row.state -ne 'running') { throw "REFUSED instance $Instance is not running (state $($row.state))." }
 if (-not $row.console_port) { throw "REFUSED instance $Instance has no console port." }
-$Token = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$Instance.console.secret" } else { Join-Path $State "operator_credentials\$Instance.console.secret" }
+$Token = if ($StateDir) { Join-Path $StateDir "secrets\service_tokens\$Instance.console.secret" }   # state_paths.py service_tokens_dir else { Join-Path $State "operator_credentials\$Instance.console.secret" }
 if (-not (Test-Path -LiteralPath $Token)) { throw "REFUSED console token file missing: $Token" }
 if (Test-Path -LiteralPath $PidFile) {
     $old = (Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)

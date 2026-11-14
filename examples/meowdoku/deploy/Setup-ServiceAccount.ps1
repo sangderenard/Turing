@@ -140,6 +140,15 @@ else { Cmd "icacls $tlsPublic /grant ${Name}:(OI)R   (no tls-public folder yet: 
 # above. Not (RD): without Synchronize Windows still refuses the listing. operators.py's /grant:r replaces only the operator's
 # entry, so a later restriction of secrets/ keeps this one.
 if ($StateDir) { Run 'icacls.exe' @($SecretsBase, '/grant:r', "${Name}:(RX)") }
+# service_tokens/ (state_paths.py service_tokens_dir): the per-run tokens the stack writes itself (the supervisor's Nodus console
+# tokens). The service writes them, so it needs Modify; operator_credentials/ beside it holds the operators' passwords and stays
+# closed to it. Inheritance cut so nothing from secrets/ applies; the operator keeps Full (Open-Console.ps1 reads the tokens).
+if ($StateDir) {
+    $ServiceTokens = "$SecretsBase/service_tokens"
+    Cmd "New-Item -ItemType Directory -Force $ServiceTokens"
+    if (-not $WhatIf) { New-Item -ItemType Directory -Force -Path $ServiceTokens | Out-Null }
+    Run 'icacls.exe' @($ServiceTokens, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)', 'alber:(OI)(CI)(F)', "${Name}:(OI)(CI)(M)")
+}
 Write-Host 'NOTE: key.pem keeps its existing entries (alber etc.); the service is only ADDED. Tighten by hand if desired.'
 Write-Host "NOTE: other operators' *.secret files under operator_credentials inherit Modify from build/; consider cutting inheritance there."
 
@@ -181,7 +190,7 @@ Cmd "sc.exe qc $Svc"
 if (-not $WhatIf) { sc.exe qc $Svc }
 Cmd "groups of ${Name}: Get-LocalGroup | where member"
 if (-not $WhatIf) { Get-LocalGroup | Where-Object { Get-LocalGroupMember -Group $_ -Member $Name -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty Name }
-foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, $SecretsBase, "$SecretsBase/tls/key.pem", "$SecretsBase/tls-public", "$SecretsBase/tls-public/cert.key", $SecretFile)) {
+foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, $SecretsBase, "$SecretsBase/service_tokens", "$SecretsBase/tls/key.pem", "$SecretsBase/tls-public", "$SecretsBase/tls-public/cert.key", $SecretFile)) {
     Cmd "icacls $d  (lines matching $Name)"
     if (-not $WhatIf -and (Test-Path -LiteralPath $d)) { icacls.exe $d | Select-String -SimpleMatch $Name }
 }

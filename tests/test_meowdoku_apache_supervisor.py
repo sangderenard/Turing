@@ -177,7 +177,7 @@ def test_nodus_console_token_port_and_cleanup(tmp_path):
             "args": [], "leases": [], "python": sys.executable,
             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
     db, state, inst = _setup(tmp_path, spec)
-    token = state / "secrets" / "operator_credentials" / "nodus-stub.console.secret"      # --state-dir is the state root
+    token = state / "secrets" / "service_tokens" / "nodus-stub.console.secret"      # --state-dir is the state root
     plan = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
     command = json.loads(plan.stdout)["instances"][0]["command"]
     assert command[command.index("--console-port") + 1] == "0" and command[command.index("--console-token-file") + 1] == str(token)
