@@ -1,6 +1,12 @@
-"""Retire exact positional call occurrences at the signature-pruning seam."""
+"""Retire exact positional call occurrences at the seams that own them.
+
+Signature pruning shifts a call's argument positions.  A physical-call
+adaptation round's census is that round's view of block indices; it closes
+with the round, because later block rewrites move the calls it named.
+"""
 from .concordance_declarations import (
     FORMAL_ACTUAL_OCCURRENCE as OCC, FORMAL_OCCURRENCE_PRUNED,
+    FORMAL_OCCURRENCE_ROUND_CLOSED, PHYSICAL_CALL_INPUT_ADAPTATION_ROUND,
     PRUNED_CALLEE_FORMAL, SSA_VALUE, FRAME_BINDING,
 )
 
@@ -11,6 +17,46 @@ def _scope(function):
 
 def _fact(book, cell):
     return book.page(cell.page).cell(cell.row, cell.column)
+
+
+def _round_closed(fact):
+    from .identity_concordance import Unresolved
+    return isinstance(fact, Unresolved) and fact.reason == FORMAL_OCCURRENCE_ROUND_CLOSED
+
+
+def close_round_occurrences(book, rows, round_cell):
+    """Close one adaptation round's census rows at that round's ledger cell."""
+    from .identity_concordance import ConcordanceRefusal, Derived, Mode, Unresolved
+    if not rows:
+        return
+    if round_cell is None or round_cell.page != PHYSICAL_CALL_INPUT_ADAPTATION_ROUND:
+        raise ConcordanceRefusal("adaptation round occurrence view lacks its round ledger cell")
+    for row in dict.fromkeys(rows):
+        current = book.latest_ref(OCC, row)
+        if current is None or not isinstance(_fact(book, current), int):
+            continue
+        read = (current, round_cell)
+        book.post(OCC, row, Unresolved(FORMAL_OCCURRENCE_ROUND_CLOSED, read=read),
+                  stage=FRAME_BINDING, provenance=Derived(read), mode=Mode.REVISE)
+
+
+def _round_closure_sources(book, cell):
+    """The closed row's own prior statement and the round that closed it."""
+    from .identity_concordance import Ref
+    fact = _fact(book, cell)
+    causes = tuple(parent for parent, _ in book.edges_into(cell))
+    if set(causes) != set(fact.read) or len(causes) != 2:
+        return None
+    columns = [column for column, _ in book.page(OCC).history(cell.row)]
+    at = columns.index(cell.column)
+    if at == 0:
+        return None
+    previous = Ref(OCC, cell.row, columns[at - 1])
+    rounds = [ref for ref in causes if ref.page == PHYSICAL_CALL_INPUT_ADAPTATION_ROUND]
+    if (previous not in causes or not isinstance(_fact(book, previous), int)
+            or len(rounds) != 1 or book.stamp_of(rounds[0]) < book.stamp_of(previous)):
+        return None
+    return (cell, *causes)
 
 
 def capture_pruned_occurrences(functions, callee, keep_indices, book):
@@ -29,6 +75,9 @@ def capture_pruned_occurrences(functions, callee, keep_indices, book):
                 refs = tuple(book.latest_ref(OCC, (callee.name, int(formal.id), caller.name,
                     str(label), index, position, _scope(caller)))
                     for position, formal in enumerate(callee.args))
+                # A closed adaptation-round view is no current statement.
+                refs = tuple(None if ref is not None and _round_closed(_fact(book, ref)) else ref
+                             for ref in refs)
                 if not any(ref is not None for ref in refs):
                     continue
                 if (None in refs or len(call.args) != len(callee.args)
@@ -71,7 +120,8 @@ def _current_occurrence(book, ref, seen):
     if proof is None:
         raise ValueError("unproven later occurrence transition")
     fact = _fact(book, current)
-    if any(r.page == PRUNED_CALLEE_FORMAL and r.row == ref.row[:2] for r in fact.read):
+    if _round_closed(fact) or any(
+            r.page == PRUNED_CALLEE_FORMAL and r.row == ref.row[:2] for r in fact.read):
         return None, proof
     replacements = [r for r in fact.read if r.page == OCC and r.row[:2] == ref.row[:2]
                     and r.row[2:5] == ref.row[2:5] and r.row[6] == ref.row[6]
@@ -89,6 +139,8 @@ def occurrence_retirement_sources(book, cell, functions=None, _seen=frozenset())
         return None
     try:
         fact = _fact(book, cell)
+        if cell.page == OCC and _round_closed(fact):
+            return _round_closure_sources(book, cell)
         if (cell.page != OCC or book.latest_ref(OCC, cell.row) != cell
                 or not isinstance(fact, Unresolved) or fact.reason != FORMAL_OCCURRENCE_PRUNED):
             return None

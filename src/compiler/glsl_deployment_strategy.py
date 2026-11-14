@@ -15710,15 +15710,35 @@ def _control_partition_keys(
                 branch_frontiers_by_node.setdefault(
                     int(node_id), []
                 ).append(int(control_id))
-    callsites = tuple(
+    # Program: ``for i in range(len(xs)): zs.append(xs[(i + 1) % len(xs)]);
+    # zs.append(ys[(i + 1) % len(xs)])`` (scratch modix3/c8).  Wrong record:
+    # the two ``len(xs)`` calls are host-evaluated at their own statements,
+    # but both index computations shared one region; it was emitted after
+    # the second ``len`` (ordered after the first append), while the first
+    # read's bounds check had already consumed its index ("Lt reads a value
+    # defined at sequence_index_in_range.2").  Rule: a host-evaluated call
+    # that a region captures is a frontier exactly as a user call is -- its
+    # descendants are keyed apart from work that does not depend on it.
+    eligible = frozenset(node_ids)
+    host_calls = tuple(
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
-        for attributes in ((data.get("attributes") or {}),)
-        if (
-            attributes.get("callee_ref") is not None
-            or attributes.get("method_ref") is not None
-        )
+        if str(data.get("type") or "") == "Call"
+        and int(node_id) not in eligible
+        and any(int(child) in eligible for child in graph.G.successors(node_id))
     )
+    callsites = tuple(dict.fromkeys((
+        *(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            for attributes in ((data.get("attributes") or {}),)
+            if (
+                attributes.get("callee_ref") is not None
+                or attributes.get("method_ref") is not None
+            )
+        ),
+        *host_calls,
+    )))
     call_descendants = {
         callsite: nx.descendants(graph.G, callsite)
         for callsite in callsites

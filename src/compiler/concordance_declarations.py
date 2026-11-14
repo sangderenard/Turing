@@ -3120,6 +3120,10 @@ PHI_EDGE_PROJECTION_PLACEMENT = declare_page("phi_edge_projection_placement_conc
     RowField("value_id", K.VALUE_ID),
 ), tuple)                              # CONCORD
 FORMAL_OCCURRENCE_PRUNED = declare_reason("formal_occurrence_pruned")
+#: A positional occurrence published for one physical-call adaptation round
+#: is that round's view of call positions; later passes add and remove
+#: instructions.  read = (the occurrence, the round's ledger cell).
+FORMAL_OCCURRENCE_ROUND_CLOSED = declare_reason("formal_occurrence_round_closed")
 PRUNED_CALLEE_FORMAL = declare_page("pruned_callee_formal_concordance", (
     RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), str)                                # CONCORD
