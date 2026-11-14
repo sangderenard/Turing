@@ -134,14 +134,19 @@ def test_restart_on_crash_once(tmp_path):
 
 def test_instance_env_reaches_only_its_child(tmp_path):
     seen = (tmp_path / "seen.json").as_posix()
-    code = (f"import json,os,time\njson.dump({{k: os.environ.get(k) for k in ('NODUS_EXEC_ROWS', 'OTHER')}}, open({seen!r}, 'w'))\n"
+    code = (f"import json,os,time\njson.dump({{k: os.environ.get(k) for k in ('NODUS_EXEC_ROWS', 'OTHER', 'FROM_FILE', 'MISSING')}}, open({seen!r}, 'w'))\n"
             "time.sleep(120)")
-    spec = dict(_spec(code), env={"NODUS_EXEC_ROWS": "C:/declared/rows.txt", "OTHER": 7})
+    secret = tmp_path / "token.txt"
+    secret.write_text("value-from-a-file\n", encoding="utf-8")
+    spec = dict(_spec(code), env={"NODUS_EXEC_ROWS": "C:/declared/rows.txt", "OTHER": 7},
+                env_files={"FROM_FILE": str(secret), "MISSING": str(tmp_path / "absent.txt")})
     db, state, inst = _setup(tmp_path, spec)
     proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         got = _wait(lambda: json.loads(Path(seen).read_text(encoding="utf-8")) if Path(seen).exists() else None)
-        assert got == {"NODUS_EXEC_ROWS": "C:/declared/rows.txt", "OTHER": "7"}
+        assert got == {"NODUS_EXEC_ROWS": "C:/declared/rows.txt", "OTHER": "7", "FROM_FILE": "value-from-a-file", "MISSING": None}
+        log = (state / "logs" / "apache-supervisor.log").read_text(encoding="utf-8")
+        assert "env_files MISSING" in log and "value-from-a-file" not in log      # the value itself is never logged
         proc.stdin.close()
         assert proc.wait(timeout=45) == 0
     finally:
