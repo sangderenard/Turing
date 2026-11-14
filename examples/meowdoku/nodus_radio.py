@@ -74,3 +74,54 @@ def snapshot(config_path, accounts_db, *, now=None, station=None):
         except (ValueError, IndexError, struct.error, OSError):
             continue
     return state
+
+
+def history(config_path, accounts_db, *, now=None, station=None):
+    """Recent source-indexed FFT frames for the currently playing file station.
+
+    The NRAD captured-frame index shares the file source's 48 kHz timeline
+    with the PCM sent to FFmpeg. Relay arrival time is diagnostic only; it
+    does not define the playback position after HLS buffering.
+    """
+    now = time.time() if now is None else now
+    empty = {'frames': [], 'sample_rate': None, 'title': 'Nodus Radio'}
+    if station is None:
+        return empty
+    try:
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return empty
+    try:
+        if (config.get('enabled') is not True or config.get('source') != 'file' or
+                config['jukebox']['native']['hls']['enabled'] is not True):
+            return empty
+    except (KeyError, TypeError):
+        return empty
+    address, owner, peer = config.get('address'), config.get('owner_id'), station['peer']
+    if type(address) is not int or type(owner) is not int or not isinstance(peer, str) or not peer:
+        raise ValueError('invalid Radio station configuration')
+    uri = accounts_db.resolve().as_uri() + '?mode=ro'
+    with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+        relay._owned(db, address, owner)
+        rows = db.execute("SELECT peer, kind, body, created_at FROM relay_packages "
+                          "WHERE address=? AND direction='in' ORDER BY id DESC LIMIT 512", (address,)).fetchall()
+    frames = []
+    # Keep a bounded ten-second window. A new native process has a new peer,
+    # so frames from the previous song cannot share the HLS media timeline.
+    for sender, kind, body, created in reversed(rows):
+        if created < now - 10 or created > now + 1:
+            continue
+        try:
+            packets = relay.unpack_record(body) if kind == relay.CONGLOMERATE else [(sender, body)]
+            for packet_peer, data in packets:
+                if packet_peer != peer:
+                    continue
+                try:
+                    frame = decode_packet(data)
+                except ValueError:
+                    continue
+                frames.append({**frame, 'received_at': round(created, 3)})
+        except (ValueError, IndexError, struct.error, OSError):
+            continue
+    return {'frames': frames[-512:], 'sample_rate': frames[-1]['sample_rate'] if frames else None,
+            'title': str(station['title'])[:160]}

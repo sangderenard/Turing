@@ -33,6 +33,7 @@ def prepare(state, hls):
     arguments = ["-hide_banner", "-loglevel", "error", "-probesize", "32",
                  "-analyzeduration", "0", "-f", "s16le", "-ar", "48000", "-ac", "2",
                  "-i", "pipe:0", "-c:a", "aac", "-b:a", "96k", "-f", "hls",
+                 "-muxdelay", "0", "-muxpreload", "0",
                  "-hls_time", "1", "-hls_list_size", "3", "-hls_flags", "delete_segments",
                  "-hls_segment_filename", str(directory / "radio_%03d.ts"), "-y",
                  str(directory / "radio.m3u8")]
