@@ -39,6 +39,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from pathlib import Path
 
 STATUSES = ("open", "approved", "rejected", "withdrawn")
 VERDICTS = ("agree", "object")
@@ -319,6 +320,29 @@ def queue(db, now=None) -> list:
     return sorted(landable(db, now), key=lambda record: record["created_at"])
 
 
+def next_scheduled_landing(table_path, now=None) -> dict | None:
+    """Read the installed cron table; report only schedules we can time exactly."""
+    if table_path is None:
+        return None
+    try:
+        lines = Path(table_path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    matches = [line.split() for line in lines if line.strip() and not line.lstrip().startswith("#")
+               and line.split()[0] == "reviews.land"]
+    if len(matches) != 1 or len(matches[0]) < 6:
+        return None
+    fields = matches[0]
+    minute = re.fullmatch(r"\*/([1-9][0-9]*)", fields[1])
+    if (minute is None or fields[2:6] != ["*", "*", "*", "*"] or
+            60 % int(minute.group(1)) != 0):
+        return None
+    interval = int(minute.group(1)) * 60
+    current = time.time() if now is None else now
+    return {"next_at": (int(current // interval) + 1) * interval,
+            "interval_seconds": interval}
+
+
 def land_now(db, body, *, user_id, username, land_request) -> dict:
     """An admin asks the updater (the task worker's reviews.land) to land changes of the queue now, instead of at its next
     scheduled run: ``{"ids": [...]}`` for those, ``{"all": true}`` for the whole queue. The request is one task asked of the
@@ -471,7 +495,7 @@ def advice(policy, repository, head=None) -> str:
     ])
 
 
-def http_route(self, path, method, *, policy, accounts_db, land_request=None):
+def http_route(self, path, method, *, policy, accounts_db, land_request=None, landing_schedule_path=None):
     """The reviews over REST. ``self`` is the host's request handler; ``policy`` the loaded branch policy.
 
         GET  /api/reviews                 the changes in play and the recent settled ones (dev_ui, signed in), and the
@@ -519,7 +543,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None):
         if method == "GET" and path == "/api/reviews":
             return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
                                "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock"),
-                               "queue": queue(db), "updater": land_request is not None, "apply": bool(policy.get("apply"))})
+                               "queue": queue(db), "updater": land_request is not None, "apply": bool(policy.get("apply")),
+                               "server_now": time.time(), "automatic_landing": next_scheduled_landing(landing_schedule_path)})
         if method != "POST":
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):

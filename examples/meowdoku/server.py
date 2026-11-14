@@ -1825,7 +1825,8 @@ def make_handler(sessions: Sessions):
             except (OSError, ValueError, branch_gate.GateError):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
-                                            land_request=sessions.land_request)
+                                            land_request=sessions.land_request,
+                                            landing_schedule_path=sessions.state.jobs_dir / "cron" / "cron.table")
 
         def _orientation_route(self, path: str, method: str) -> None:
             """[ORIENTATION] every markdown file of the core in causal order, with per-account filters (orientation.py)."""

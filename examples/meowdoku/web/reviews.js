@@ -6,7 +6,7 @@ const el = (tag, text, cls) => { const n = document.createElement(tag); if (text
 const OPEN = new Set(["waiting", "objected", "accepted"]);
 const DIFF_LINES = 6000;
 let who = null, caps = new Set(), reviews = [], selected = null, detailGeneration = 0;
-let landing = { queue: [], updater: false, apply: true };
+let landing = { queue: [], updater: false, apply: true, schedule: null, clockOffset: 0 };
 
 async function request(path, body) {
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store",
@@ -45,11 +45,14 @@ function render() {
   if (!shown.length) list.append(el("p", byId("settled").checked ? "No changes yet." : "No change is waiting.", "muted"));
 }
 
-async function load() {
+async function load({quiet = false} = {}) {
   try {
     const result = await request("/api/reviews");
+    const priorStanding = reviews.find(r => r.id === selected)?.standing;
     reviews = result.reviews;
-    landing = { queue: result.queue || [], updater: Boolean(result.updater), apply: result.apply !== false };
+    landing = { queue: result.queue || [], updater: Boolean(result.updater), apply: result.apply !== false,
+      schedule: result.automatic_landing || null,
+      clockOffset: Number.isFinite(result.server_now) ? result.server_now - Date.now() / 1000 : 0 };
     renderQueue();
     const open = reviews.filter(r => OPEN.has(r.standing)).length;
     status(`${open} change${open === 1 ? "" : "s"} in play. Lock: ${result.lock}.` +
@@ -58,7 +61,7 @@ async function load() {
     byId("approve-all").hidden = who.role !== "admin" || !approvable.length;
     byId("approve-all").textContent = `Approve all ${approvable.length} waiting`;
     render();
-    if (selected && reviews.some(r => r.id === selected)) show(selected);
+    if (selected && reviews.some(r => r.id === selected) && (!quiet || priorStanding !== reviews.find(r => r.id === selected).standing)) show(selected);
   } catch (error) { status(error.message); }
 }
 
@@ -68,6 +71,7 @@ function renderQueue() {
   const list = byId("queue-list"), admin = who.role === "admin";
   list.replaceChildren();
   const { queue, updater } = landing;
+  updateQueueTimer();
   byId("queue-note").textContent = !queue.length ? "Nothing is waiting to land." :
     `${queue.length} accepted change${queue.length === 1 ? "" : "s"} not landed yet. A change that is not a fast-forward of its base stays held until its branch takes the base again.` +
     (!landing.apply ? " The policy's apply is off: the updater only says what it would do." : "") +
@@ -92,6 +96,20 @@ function renderQueue() {
     }
     list.append(row);
   }
+}
+
+function updateQueueTimer() {
+  const timer = byId("queue-timer");
+  if (!landing.queue.length) { timer.textContent = "No accepted review is waiting to land."; return; }
+  if (!landing.apply) { timer.textContent = "Automatic landing is in report-only mode."; return; }
+  if (!landing.schedule || !landing.updater) {
+    timer.textContent = "The automatic landing time is unavailable; refresh for the updater's latest result.";
+    return;
+  }
+  const seconds = Math.max(0, Math.ceil(landing.schedule.next_at - Date.now() / 1000 - landing.clockOffset));
+  const minutes = Math.floor(seconds / 60), remainder = seconds % 60;
+  timer.textContent = seconds ? `Next automatic landing attempt in ${minutes}:${String(remainder).padStart(2, "0")} ` +
+    `(${when(landing.schedule.next_at)}).` : "Scheduled landing time reached; waiting for the updater's result.";
 }
 
 async function landNow(body, what, button) {
@@ -270,5 +288,7 @@ async function main() {
   byId("land-all").onclick = () => landNow({ all: true }, `all ${landing.queue.length} queued changes`, byId("land-all"));
   byId("settled").onchange = render;
   await load();
+  setInterval(updateQueueTimer, 1000);
+  setInterval(() => { if (!document.hidden) load({quiet: true}); }, 20000);
 }
 main();

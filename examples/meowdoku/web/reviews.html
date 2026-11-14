@@ -9,7 +9,7 @@ body{margin:0;background:#0e1119;color:#e8eaf3;font:15px/1.5 system-ui,sans-seri
 <p id="signin" hidden><a href="/login.html">Sign in</a> to read the reviews.</p>
 <section id="content" hidden>
 <div class="actions"><button id="refresh" type="button">Refresh</button><button id="approve-all" class="approve" type="button" hidden>Approve all waiting</button><label style="margin:0"><input id="settled" type="checkbox"> Show settled changes</label><a href="/issues.html">Issue tickets</a></div>
-<section id="queue" class="panel" aria-label="Landing queue" style="margin-top:24px"><div class="actions"><h2 style="margin-right:auto">Landing queue</h2><button id="land-all" class="approve" type="button" hidden>Land all</button></div><p id="queue-note" class="muted"></p><div id="queue-list"></div></section>
+<section id="queue" class="panel" aria-label="Landing queue" style="margin-top:24px"><div class="actions"><h2 style="margin-right:auto">Accepted review queue</h2><button id="land-all" class="approve" type="button" hidden>Land all</button></div><p id="queue-timer" class="notice" role="timer" aria-live="off">Checking the automatic landing schedule…</p><p id="queue-note" class="muted"></p><div id="queue-list"></div></section>
 <div class="grid"><section class="panel"><h2>Changes</h2><div id="list"></div></section>
 <section id="detail" class="panel" aria-label="Change details"><p>Select a change.</p></section></div>
 </section></main>

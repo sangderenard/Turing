@@ -655,6 +655,16 @@ def test_the_queue_columns_are_added_to_a_database_made_before_them(tmp_path):
     branch_review.ensure(db)                     # idempotent
 
 
+def test_accepted_queue_timer_reads_the_installed_cron_table(tmp_path):
+    table = tmp_path / "cron.table"
+    assert branch_review.next_scheduled_landing(table, now=600) is None
+    table.write_text("# UTC\nreviews.land */10 * * * * missed=once\n", encoding="utf-8")
+    assert branch_review.next_scheduled_landing(table, now=600) == {
+        "next_at": 1200, "interval_seconds": 600}
+    table.write_text("reviews.land 3 * * * * missed=once\n", encoding="utf-8")
+    assert branch_review.next_scheduled_landing(table, now=600) is None
+
+
 def test_land_now_over_rest_is_an_admins_and_asks_the_updater_for_exactly_the_queue(world):
     policy, db_file = world["policy"], world["db_file"]
     head = branch(world, "feature")
