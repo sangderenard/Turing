@@ -33,6 +33,7 @@ class RadioHlsTests(unittest.TestCase):
         self.assertIn('row exec.radio.hls\n', declaration)
         self.assertIn('mode stream\n', declaration)
         self.assertIn('argument -probesize\nargument 32\n', declaration)
+        self.assertIn('argument -muxdelay\nargument 0\nargument -muxpreload\nargument 0\n', declaration)
         self.assertIn('argument pipe:0\n', declaration)
         directory = nodus_radio_hls.output_dir(self.state)
         (directory / 'radio.m3u8').write_bytes(b'#EXTM3U\n')

@@ -2728,6 +2728,15 @@ def make_handler(sessions: Sessions):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if path == "/api/radio/history":
+                if not self._require("view_site"):
+                    return
+                from meowdoku import nodus_radio
+                try:
+                    return self._json(nodus_radio.history(sessions.state.radio_json, sessions.accounts_db,
+                        station=sessions.radio_jukebox_runner.station() if sessions.radio_jukebox_runner else None))
+                except (OSError, ValueError, KeyError, nodus_radio.sqlite3.Error, nodus_radio.relay.RelayError):
+                    return self._json({"frames": [], "sample_rate": None, "title": "Nodus Radio"}, 503)
             if path == "/api/radio":
                 if not self._require("view_site"):
                     return
