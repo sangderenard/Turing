@@ -178,3 +178,28 @@ def test_continuous_qualification_progress_and_stop(server):
         qualification_runs.finish(db, run_id, status="stopped", result={})
         stopped = qualification_runs.public_snapshot(db)["runs"][0]
         assert stopped["status"] == "stopped" and stopped["finished"] is not None
+
+
+def test_only_admin_can_clear_inactive_qualification_receipt(server):
+    path = server.sessions.state.sql_dir / "paper_arena.sqlite"
+    with paper_arena.connect(path) as db:
+        run_id = qualification_runs.begin(db, market="AAPL", model="test", worker="nodus-training",
+                                          planned_epochs=0)
+    viewer = helpers._signup(server.port, "qualification_clear_viewer")
+    admin = helpers._signup(server.port, "qualification_clear_admin")
+    admin_headers = {**helpers.PUBLIC_XFF, "Cookie": admin}
+    assert helpers._call(server.port, "/api/admin/account/grant", "POST",
+                         {"Host": "127.0.0.1", "X-Meowdoku-Admin": helpers.TOKEN},
+                         {"username": "qualification_clear_admin"})[0] == 200
+    endpoint = "/api/paper/qualification/clear"
+    assert helpers._call(server.port, endpoint, "POST", {**helpers.PUBLIC_XFF, "Cookie": viewer},
+                         {"id": run_id})[0] == 403
+    assert helpers._call(server.port, endpoint, "POST", admin_headers, {"id": run_id})[0] == 409
+    with paper_arena.connect(path) as db:
+        qualification_runs.finish(db, run_id, status="stopped", result={})
+    assert helpers._call(server.port, endpoint, "POST", admin_headers, {"id": "invalid"})[0] == 400
+    assert helpers._call(server.port, endpoint, "POST", admin_headers, {"id": run_id})[0] == 200
+    assert helpers._call(server.port, endpoint, "POST", admin_headers, {"id": run_id})[0] == 200
+    assert helpers._call(server.port, "/api/paper/qualification/live", headers=helpers.PUBLIC_XFF)[1]["runs"] == []
+    with paper_arena.connect(path) as db:
+        assert db.execute("SELECT 1 FROM paper_qualification_runs WHERE id=?", (run_id,)).fetchone()

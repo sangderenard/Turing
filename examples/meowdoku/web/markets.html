@@ -42,6 +42,8 @@
   .qualification-run progress { width: 100%; height: .8rem; accent-color: #67c5a3; }
   .qualification-run .metrics { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-variant-numeric: tabular-nums; }
   .qualification-run .checks { margin: .5rem 0 0; padding-left: 1.3rem; max-height: 9rem; overflow: auto; font-variant-numeric: tabular-nums; }
+  .qualification-actions { margin-top: .7rem; }
+  .qualification-actions small { flex-basis: 100%; }
   #training-canvas { display:block; width:100%; height: min(68vh, 40rem); border:1px solid #425d77; border-radius:8px; background:#17171a; }
 </style>
 </head>
@@ -72,7 +74,7 @@
     <p id="qualification-state" class="muted">Checking training runs…</p>
     <div id="training-controls" hidden>
       <h3>Training service · admin</h3>
-      <p class="muted">Controls only the shared Nodus trainer, not trading or the rest of the site. Stop asks the worker to save and exit; the supervisor may force it after its shutdown timeout. Start resumes its saved checkpoint.</p>
+      <p class="muted">Controls only the shared Nodus trainer, not trading or the rest of the site. Stop requests immediate shutdown; the supervisor may force it after its shutdown timeout. Start resumes its saved checkpoint.</p>
       <div class="row">
         <button id="training-toggle" type="button" disabled>Checking training…</button>
         <button id="training-cancel" type="button" hidden>Cancel pending request</button>
