@@ -262,6 +262,40 @@ def test_federation_from_hands_contract_port_and_canvas_to_dependent(tmp_path):
     assert _rows(db, "SELECT contract_port FROM service_instances WHERE name = 'nodus-stub'")[0]["contract_port"] is None
 
 
+def test_an_instance_declaring_system_events_is_handed_the_updaters_task_port(tmp_path):
+    """[REVIEWS] the landing queue's "land now": the web server asks the declared system_events prefix for a task."""
+    tool = tmp_path / "stub_contract_canvas.py"
+    tool.write_text(_NODUS_CONTRACT_STUB, encoding="utf-8")
+    canvas = tmp_path / "x.canvas"
+    canvas.write_text("canvas", encoding="utf-8")
+    recorder, record, quiet, record_quiet = tmp_path / "recorder.py", tmp_path / "argv.json", tmp_path / "quiet.py", tmp_path / "quiet.json"
+    recorder.write_text(_ARGV_RECORDER, encoding="utf-8")
+    quiet.write_text(_ARGV_RECORDER, encoding="utf-8")
+    nodus = {"name": "nodus-stub", "kind": "nodus", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-nodus-stub",
+             "args": [], "leases": [], "python": sys.executable,
+             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1}}
+    asking = {"name": "meow-stub", "kind": "command", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-meow-stub",
+              "args": [sys.executable, str(recorder), str(record)], "leases": [], "federation_from": "nodus-stub", "system_events": True}
+    other = {**asking, "name": "meow-other", "account": "svc-meow-other", "args": [sys.executable, str(quiet), str(record_quiet)]}
+    del other["system_events"]
+    jobs = tmp_path / "jobs"
+    db, state, inst = tmp_path / "accounts.db", tmp_path / "state", tmp_path / "instances.json"
+    inst.write_text(json.dumps({"instances": [asking, other, nodus], "system_events": {
+        "from": "nodus-stub", "prefix": "py.stub", "jobs_dir": str(jobs), "engine_id": 7202}}), encoding="utf-8")
+    proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        _wait(lambda: len([r for r in _rows(db, "SELECT * FROM service_instances") if r["state"] == "running"]) == 3, timeout=60)
+        argv = json.loads(record.read_text(encoding="utf-8"))
+        assert argv[argv.index("--task-port") + 1] == "47777" and argv[argv.index("--task-jobs-dir") + 1] == str(jobs)
+        assert "--task-port" not in json.loads(record_quiet.read_text(encoding="utf-8")), "only a declaring instance asks"
+        proc.stdin.close()
+        assert proc.wait(timeout=45) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close(); proc.stderr.close()
+
+
 def _dev_pair(tmp_path, dev_enabled=True):
     def spec(name, route, site, **extra):
         return {"name": name, "kind": "meowdoku", "port": 59001 if site == "stable" else 59002, "route": route, "site": site, "bind": "127.0.0.1",

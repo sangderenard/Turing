@@ -52,7 +52,7 @@ DDL = (
     "accept_after REAL NOT NULL, delete_branch INTEGER NOT NULL CHECK(delete_branch IN (0,1)), "
     "status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','approved','rejected','withdrawn')), "
     "reviewed_at REAL, reviewer_id INTEGER, reviewer_name TEXT, note TEXT NOT NULL DEFAULT '', "
-    "landed_at REAL, landed_detail TEXT, UNIQUE(repository, branch, head))",
+    "landed_at REAL, landed_detail TEXT, land_tried_at REAL, land_result TEXT, UNIQUE(repository, branch, head))",
     "CREATE TABLE IF NOT EXISTS branch_review_remarks (review_id TEXT NOT NULL, user_id INTEGER NOT NULL, username TEXT, "
     "verdict TEXT NOT NULL CHECK(verdict IN ('agree','object')), note TEXT NOT NULL DEFAULT '', at REAL NOT NULL, "
     "PRIMARY KEY(review_id, user_id))",
@@ -69,7 +69,8 @@ DDL = (
     "declared_at REAL NOT NULL)",
 )
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
-            "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail")
+            "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail",
+            "land_tried_at", "land_result")
 
 
 class ReviewError(Exception):
@@ -83,6 +84,10 @@ def ensure(db) -> None:
         db.execute(statement)
     if "removed_by" not in {row[1] for row in db.execute("PRAGMA table_info(branch_removed)")}:
         db.execute("ALTER TABLE branch_removed ADD COLUMN removed_by TEXT")      # notices made before the cleanup account
+    columns = {row[1] for row in db.execute("PRAGMA table_info(branch_reviews)")}
+    for column, kind in (("land_tried_at", "REAL"), ("land_result", "TEXT")):   # the landing queue: reviews made before it
+        if column not in columns:
+            db.execute(f"ALTER TABLE branch_reviews ADD COLUMN {column} {kind}")
 
 
 _EMAIL = re.compile(r"^[^@\s<>]+@[^@\s<>]+$")
@@ -302,6 +307,47 @@ def mark_landed(db, review_id, detail, now=None) -> dict:
     return get(db, review_id, now)
 
 
+def mark_tried(db, review_id, result, now=None) -> None:
+    """The landing task's last attempt at a change it did not land: when, and why it held (the landing queue shows it)."""
+    now = time.time() if now is None else now
+    db.execute("UPDATE branch_reviews SET land_tried_at = ?, land_result = ? WHERE id = ? AND landed_at IS NULL",
+               (now, str(result)[:500], str(review_id)))
+
+
+def queue(db, now=None) -> list:
+    """The landing queue: every change a review accepted that has not landed, oldest first, with its last attempt."""
+    return sorted(landable(db, now), key=lambda record: record["created_at"])
+
+
+def land_now(db, body, *, user_id, username, land_request) -> dict:
+    """An admin asks the updater (the task worker's reviews.land) to land changes of the queue now, instead of at its next
+    scheduled run: ``{"ids": [...]}`` for those, ``{"all": true}`` for the whole queue. The request is one task asked of the
+    cron table (nodus tools/task_request.py); the updater lands what is a fast-forward and records why it held the rest,
+    which the queue then shows. Answers the ids asked for and the updater's outcome (``done``, or ``timeout`` when it is
+    still working: the result arrives in the queue either way)."""
+    _account(user_id)
+    ensure(db)
+    if not is_admin(db, user_id):
+        raise ReviewError("an admin lands changes", 403)
+    if land_request is None:
+        raise ReviewError("this server cannot reach the updater: its instance declares no system_events", 503)
+    waiting = {record["id"]: record for record in queue(db)}
+    if body.get("all") is True:
+        ids = list(waiting)
+    else:
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+            raise ReviewError("ids must be a list of review ids, or all must be true")
+        missing = [i for i in ids if i not in waiting]
+        if missing:
+            raise ReviewError(f"not in the landing queue (not accepted, or already landed): {', '.join(missing)}", 409)
+    if not ids:
+        return {"asked": [], "outcome": {"outcome": "nothing to land"}}
+    outcome = land_request(None if body.get("all") is True else ids)
+    print(f"[reviews] {username} land now: {len(ids)} change(s) -> {outcome.get('outcome')}", flush=True)
+    return {"asked": ids, "outcome": outcome}
+
+
 def kept(db, repository, branch) -> bool:
     """A branch whose author asked for it to be kept after landing."""
     ensure(db)
@@ -425,10 +471,12 @@ def advice(policy, repository, head=None) -> str:
     ])
 
 
-def http_route(self, path, method, *, policy, accounts_db):
+def http_route(self, path, method, *, policy, accounts_db, land_request=None):
     """The reviews over REST. ``self`` is the host's request handler; ``policy`` the loaded branch policy.
 
-        GET  /api/reviews                 the changes in play and the recent settled ones (dev_ui, signed in)
+        GET  /api/reviews                 the changes in play and the recent settled ones (dev_ui, signed in), and the
+                                          landing queue: accepted changes not yet landed, with the last attempt's result
+        POST /api/reviews/land            {ids: [...]} or {all: true}   an admin asks the updater to land them now
         POST /api/reviews                 {repository, branch, head, timeout_hours?, keep?}   submit
         POST /api/reviews/remark          {id, verdict, note?}                                a peer
         POST /api/reviews/decide          {id, head, decision, note?}                         an admin
@@ -470,7 +518,8 @@ def http_route(self, path, method, *, policy, accounts_db):
             return self._json({"identity": identity(db, principal.user_id)})
         if method == "GET" and path == "/api/reviews":
             return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
-                               "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock")})
+                               "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock"),
+                               "queue": queue(db), "updater": land_request is not None, "apply": bool(policy.get("apply"))})
         if method != "POST":
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
@@ -505,6 +554,9 @@ def http_route(self, path, method, *, policy, accounts_db):
             made = decide(db, body.get("id"), **who, head=body.get("head"), decision=body.get("decision"), note=body.get("note", ""))
         elif path == "/api/reviews/withdraw":
             made = withdraw(db, body.get("id"), user_id=principal.user_id)
+        elif path == "/api/reviews/land":
+            return self._json(land_now(db, body, user_id=principal.user_id, username=principal.username,
+                                       land_request=land_request))
         else:
             return self._json({"error": "not found"}, 404)
         print(f"[reviews] {principal.username} {path.rsplit('/', 1)[1]} {made['repository']} {made['branch']} -> {made['standing']}", flush=True)

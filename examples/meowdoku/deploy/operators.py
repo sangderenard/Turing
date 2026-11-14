@@ -1,6 +1,6 @@
 """Operator accounts for the deploy scripts: bootstrap and rotate.  Prints only usernames and file paths, never a secret.
 
-  python operators.py bootstrap --db build/meowdoku/accounts.db --users admin,codex,claude,guest_agent \\
+  python operators.py bootstrap --db build/meowdoku/accounts.db --users admin,codex,claude \\
                                 --secrets-dir build/meowdoku/operator_credentials
   python operators.py rotate <username> --db ... --secrets-dir ...
   python operators.py bootstrap --state-dir C:/dev/Powershell/srv/state     (db = <state>/sql/accounts.db, secrets = <state>/secrets/operator_credentials)
@@ -8,7 +8,7 @@
 bootstrap: each missing account is created with a fresh ``secrets.token_urlsafe(32)`` password written ONLY to
 ``<secrets-dir>/<username>.secret`` (an existing secret file is never overwritten; the account is then left as it is).
 ``admin`` gets role admin (authz.grant_admin, granted_by ``operator:bootstrap``); every other name gets role ``operator``; all are
-added to ``script_access``.  The secrets dir is restricted to the current user with icacls (best effort, reported).
+added to ``script_access``.  A guest agent has no account (owner, 2026-11-13): it is never bootstrapped here.  The secrets dir is restricted to the current user with icacls (best effort, reported).
 """
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("bootstrap")
     p.add_argument("--db")
-    p.add_argument("--users", default="admin,codex,claude,guest_agent")
+    p.add_argument("--users", default="admin,codex,claude")
     p.add_argument("--secrets-dir")
     p.add_argument("--state-dir", help="the state root: replaces --db and --secrets-dir")
     p = sub.add_parser("rotate")

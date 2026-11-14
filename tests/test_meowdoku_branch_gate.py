@@ -628,3 +628,73 @@ def test_an_account_declares_its_own_git_identity_and_mismatches_are_named(world
     assert branch_review.authorship(db, review, ["Ann <ann@example.invalid>"]) == "every commit is by ann's declared identity"
     assert branch_review.authorship(db, review, ["Albert <albert@example.invalid>"]) == \
         "commits not by ann's declared identity: Albert <albert@example.invalid>"
+
+
+def test_the_landing_queue_lands_only_what_is_asked_and_keeps_why_the_rest_held(world):
+    db, policy = world["db"], world["policy"]
+    first, second = branch(world, "first"), branch(world, "second")
+    one, two = submit(world, "first", first, timeout_s=0), submit(world, "second", second, timeout_s=0)
+    assert [r["id"] for r in branch_review.queue(db, now=1000.0)] == [one["id"], two["id"]]
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[two["id"]])
+    assert actions(done) == {"second": "landed"} and remote_has(world, "main") == second
+    queued = branch_review.queue(db, now=1000.0)
+    assert [r["id"] for r in queued] == [one["id"]] and queued[0]["land_tried_at"] is None, "only the asked change was tried"
+    done = branch_gate.land(policy, db, apply=True, now=1001.0, log=lambda line: None, only=[one["id"]])
+    assert actions(done) == {"first": "held"}
+    held = branch_review.queue(db, now=1001.0)[0]
+    assert held["land_tried_at"] == 1001.0 and held["land_result"].startswith("held: not a fast-forward of main")
+    assert branch_review.get(db, two["id"])["land_result"] is None, "a landed change keeps its landing record, not a hold"
+
+
+def test_the_queue_columns_are_added_to_a_database_made_before_them(tmp_path):
+    db = sqlite3.connect(tmp_path / "old.db", isolation_level=None)
+    db.execute(branch_review.DDL[0].replace(", land_tried_at REAL, land_result TEXT", ""))
+    branch_review.ensure(db)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(branch_reviews)")}
+    assert {"land_tried_at", "land_result"} <= columns
+    branch_review.ensure(db)                     # idempotent
+
+
+def test_land_now_over_rest_is_an_admins_and_asks_the_updater_for_exactly_the_queue(world):
+    policy, db_file = world["policy"], world["db_file"]
+    head = branch(world, "feature")
+    made = submit(world, "feature", head, timeout_s=0)
+    asked = []
+
+    def updater(ids):
+        asked.append(ids)
+        return {"outcome": "done", "status": 2}
+
+    def ask(path, land_request=updater, **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path, "POST" if "body" in kw else "GET", policy=policy, accounts_db=db_file,
+                                 land_request=land_request)
+        return handler.sent
+
+    status, listing = ask("/api/reviews", user=ANN, username="ann")
+    assert status == 200 and listing["updater"] is True and [r["id"] for r in listing["queue"]] == [made["id"]]
+    assert ask("/api/reviews", user=ANN, username="ann", land_request=None)[1]["updater"] is False
+    assert ask("/api/reviews/land", user=ANN, username="ann", body={"all": True})[0] == 403, "only an admin lands"
+    assert ask("/api/reviews/land", user=ADMIN, username="admin", body={"all": True}, land_request=None)[0] == 503
+    assert ask("/api/reviews/land", user=ADMIN, username="admin", body={"ids": ["nope"]})[0] == 409
+    assert ask("/api/reviews/land", user=ADMIN, username="admin", body={"ids": []})[0] == 400
+    assert asked == [], "nothing refused reached the updater"
+    status, answer = ask("/api/reviews/land", user=ADMIN, username="admin", body={"ids": [made["id"]]})
+    assert status == 200 and answer == {"asked": [made["id"]], "outcome": {"outcome": "done", "status": 2}}
+    status, answer = ask("/api/reviews/land", user=ADMIN, username="admin", body={"all": True})
+    assert status == 200 and answer["asked"] == [made["id"]]
+    assert asked == [[made["id"]], None], "ids for those, none (the whole queue) for all"
+
+
+def test_a_one_off_land_request_names_its_reviews_to_the_task_worker(world):
+    from types import SimpleNamespace
+    from meowdoku import scheduled_tasks
+    first, second = branch(world, "first"), branch(world, "second")
+    one = submit(world, "first", first, timeout_s=0)
+    submit(world, "second", second, timeout_s=0)
+    table = scheduled_tasks.handlers(SimpleNamespace(DONE=2, UNCHANGED=3), branches={
+        "policy": world["policy_file"], "accounts_db": world["db_file"], "module": branch_gate})
+    status, said, detail = table["reviews.land"]({"task": "reviews.land", "reviews": [one["id"]]})
+    assert said == "1 would land" and [e["branch"] for e in detail] == ["first"]
+    status, said, detail = table["reviews.land"]({"task": "reviews.land"})
+    assert said == "2 would land", "a request that names none is the whole queue, as the schedule's"

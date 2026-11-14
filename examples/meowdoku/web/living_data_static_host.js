@@ -102,6 +102,37 @@ globalThis.livingDataStaticHost = Object.freeze({
     livingDataStaticCheckPinned();
     return result;
   },
+  async reside({start_position,start_facing,interval_ms=500,signal}={}) {
+    // [FOYER] Become the resident host of the one shared demo world (owner, 2026-11-13): register this static map as the
+    // foyer (the signed-in account needs library_manage), then render every queued visitor picture through render() below,
+    // until the signal aborts or the service refuses.  Explicit operator action; it never starts on its own.
+    await livingDataStaticReady;
+    const call=async(path,body)=>{
+      const response=await fetch(path,{method:'POST',credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const value=await response.json();
+      if(!response.ok)throw Error(path+' '+response.status+' '+(value.error||''));
+      return value;};
+    const snapshot=this.snapshot(), base='/api/living-data/dm/worlds';
+    const attached=await call(base,{map:snapshot.map,source_sha256:snapshot.source_sha256,
+      renderer_identity:snapshot.renderer_identity,request_id:'foyer-resident',
+      foyer:{start_position,start_facing}});
+    const host=base+'/'+attached.world_id+'/host', token=attached.host_token;
+    while(!signal?.aborted){
+      const work=await call(host,{host_token:token,action:'poll'});
+      if(!work.request_id){await new Promise(done=>setTimeout(done,interval_ms));continue;}
+      let result;
+      try{
+        const rendered=await this.render(work.camera);
+        result={png_base64:rendered.data_url.split(',')[1],width:rendered.width,height:rendered.height,
+          source_sha256:rendered.source_sha256,renderer_identity:rendered.renderer_identity,
+          position:work.camera.position,facing:work.camera.facing,actual_camera:rendered.camera};
+      }catch(error){result={error:String(error.message||error).slice(0,500)};}
+      await call(host,{host_token:token,action:'complete',request_id:work.request_id,result});
+    }
+    await call(base+'/'+attached.world_id+'/close',{});
+    return {closed:true,world_id:attached.world_id};
+  },
   async render(request={}) {
     await livingDataStaticReady;
     if(stateLoopRuntime.worker) throw Error('Static host refuses a physics worker');

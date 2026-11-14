@@ -6,6 +6,7 @@ const el = (tag, text, cls) => { const n = document.createElement(tag); if (text
 const OPEN = new Set(["waiting", "objected", "accepted"]);
 const DIFF_LINES = 6000;
 let who = null, caps = new Set(), reviews = [], selected = null, detailGeneration = 0;
+let landing = { queue: [], updater: false, apply: true };
 
 async function request(path, body) {
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store",
@@ -48,6 +49,8 @@ async function load() {
   try {
     const result = await request("/api/reviews");
     reviews = result.reviews;
+    landing = { queue: result.queue || [], updater: Boolean(result.updater), apply: result.apply !== false };
+    renderQueue();
     const open = reviews.filter(r => OPEN.has(r.standing)).length;
     status(`${open} change${open === 1 ? "" : "s"} in play. Lock: ${result.lock}.` +
       (who.role === "admin" ? "" : " Only an admin account can approve or reject; you can agree or object."));
@@ -57,6 +60,53 @@ async function load() {
     render();
     if (selected && reviews.some(r => r.id === selected)) show(selected);
   } catch (error) { status(error.message); }
+}
+
+// The landing queue: what a review accepted and has not landed yet, with the updater's last word on it. "Land now" asks the
+// updater for one reviews.land task at once instead of waiting for its schedule; the result shows here on the next refresh.
+function renderQueue() {
+  const list = byId("queue-list"), admin = who.role === "admin";
+  list.replaceChildren();
+  const { queue, updater } = landing;
+  byId("queue-note").textContent = !queue.length ? "Nothing is waiting to land." :
+    `${queue.length} accepted change${queue.length === 1 ? "" : "s"} not landed yet. A change that is not a fast-forward of its base stays held until its branch takes the base again.` +
+    (!landing.apply ? " The policy's apply is off: the updater only says what it would do." : "") +
+    (admin && !updater ? " This server cannot reach the updater, so landing now is not offered (they land on the updater's schedule)." : "");
+  const landAll = byId("land-all");
+  landAll.hidden = !admin || !updater || !queue.length;
+  landAll.textContent = `Land all ${queue.length}`;
+  for (const review of queue) {
+    const row = el("div", null, "queue-row"), text = el("div");
+    const title = el("button", `${review.repository} · ${review.branch}`, "row"); title.type = "button";
+    title.style.marginTop = "0"; title.onclick = () => show(review.id);
+    title.append(badge(review.standing));
+    text.append(title, el("small", `${review.head.slice(0, 12)} · by ${review.owner_name}` +
+      (review.reviewer_name ? ` · approved by ${review.reviewer_name} ${when(review.reviewed_at)}` : " · accepted by its time-out")));
+    text.append(review.land_tried_at == null ? el("small", "Not tried yet.")
+      : el("small", `Last tried ${when(review.land_tried_at)}: ${review.land_result}`, "held"));
+    row.append(text);
+    if (admin && updater) {
+      const button = el("button", "Land now", "approve"); button.type = "button";
+      button.onclick = () => landNow({ ids: [review.id] }, `${review.repository} ${review.branch}`, button);
+      row.append(button);
+    }
+    list.append(row);
+  }
+}
+
+async function landNow(body, what, button) {
+  if (!confirm(`Ask the updater to land ${what} now? It lands only a fast-forward of the base and says why it holds anything else.`)) return;
+  button.disabled = true;
+  let message;
+  try {
+    const result = await request("/api/reviews/land", body);
+    const said = result.outcome.outcome === "done" ? "the updater has run" :
+      result.outcome.outcome === "timeout" ? "the updater is still working; refresh in a minute" : `the updater answered: ${result.outcome.outcome}`;
+    message = `Asked to land ${result.asked.length} change${result.asked.length === 1 ? "" : "s"}: ${said}.`;
+  } catch (error) { message = `Not asked: ${error.message}`; }
+  button.disabled = false;
+  await load();
+  status(message);
 }
 
 // Approve every change that is waiting or already accepted by its time-out, each at exactly the commit listed. A change
@@ -217,6 +267,7 @@ async function main() {
   byId("content").hidden = false;
   byId("refresh").onclick = load;
   byId("approve-all").onclick = approveAll;
+  byId("land-all").onclick = () => landNow({ all: true }, `all ${landing.queue.length} queued changes`, byId("land-all"));
   byId("settled").onchange = render;
   await load();
 }

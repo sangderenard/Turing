@@ -177,14 +177,24 @@ def tiered(tmp_path):
     httpd.server_close()
 
 
+def _member(sessions, name="tier_cat"):
+    """A signed-in account's cookie: a visitor with no account is a guest, held to view_site/photo_read/play on every tier (owner, 2026-11-13)."""
+    return {"Cookie": f"{srv.ACCOUNT_COOKIE}={sessions.accounts.create_session(sessions.accounts.ensure_user(name, 'correcthorse1'))}"}
+
+
 def test_whoami_reports_the_tier_and_nothing_else(tiered):
-    port, set_tier, _ = tiered
+    port, set_tier, sessions = tiered
+    member = _member(sessions)
     for tier in ("edit", "dev", "play", "shader"):
         set_tier(tier)
         status, who = _get(port, "/api/whoami", {"X-Secret": "abc"})
         assert status == 200 and who["tier"] == tier and who["origin"] == "lan"
-        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities", "instance", "signed_in", "username", "origin_tier"}
-        assert who["edit"] == (tier == "edit") and who["dev"] == (tier in ("edit", "dev")) and who["shader"] == (tier == "shader")
+        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities", "instance", "signed_in", "username", "origin_tier",
+                            "kiosk", "guest"}
+        assert who["edit"] is False and who["dev"] is False and who["shader"] == (tier == "shader")      # a guest, on any tier
+        if tier != "shader":                                                                     # an account on shader is lifted to play
+            who = _get(port, "/api/whoami", member)[1]
+            assert who["tier"] == tier and who["edit"] == (tier == "edit") and who["dev"] == (tier in ("edit", "dev"))
 
 
 def test_shader_tier_gets_the_shader_page_or_403(tiered):
@@ -223,7 +233,10 @@ def test_edit_endpoints_are_refused_below_edit(tiered):
     port, set_tier, sessions = tiered
     for tier in ("play", "dev", "shader"):
         set_tier(tier)
-        assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"X-Meowdoku-Admin": "x"})[0] == 403
+        # the lifecycle is answered by its own loopback + admin token check (catalog credential admin_token), here with no lifecycle
+        # configured (503); the shader tier refuses every POST before it
+        assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"X-Meowdoku-Admin": "x"})[0] == (
+            403 if tier == "shader" else 503)
         assert _get(port, "/api/loading_anim", method="POST", body=b"xx", headers={"X-Meowdoku-Loading": "1"})[0] == 403
         if tier != "shader":
             for kind in OWNER_ACTIONS:
@@ -235,13 +248,16 @@ def test_edit_endpoints_are_refused_below_edit(tiered):
 def test_edit_tier_keeps_the_token_checks(tiered):
     port, set_tier, sessions = tiered
     set_tier("edit")
+    member = _member(sessions)
     # the tier gate passes, then the old checks still apply: the lifecycle admin token, the loading header
     sessions.lifecycle = type("L", (), {"token": "t" * 40})()
     assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"Host": f"127.0.0.1:{port}"})[0] == 401
     assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"Host": "evil.example", "X-Meowdoku-Admin": "t" * 40})[0] == 403
-    assert _get(port, "/api/loading_anim", method="POST", body=b"xx", headers={"X-Meowdoku-Loading": "0"})[0] == 403
+    assert _get(port, "/api/loading_anim", method="POST", body=b"xx", headers={**member, "X-Meowdoku-Loading": "0"})[0] == 403
+    status, body = _get(port, "/api/action", method="POST", body=json.dumps({"type": "arena_save"}).encode(), headers=member)
+    assert status == 400 and "no game" in body["error"]
     status, body = _get(port, "/api/action", method="POST", body=json.dumps({"type": "arena_save"}).encode())
-    assert status == 400 and "no game" in body["error"]                                   # past the tier gate: the action's own refusal
+    assert status == 403 and body["error"] == "this needs owner_tools"                       # a guest on the edit tier is not an owner                                   # past the tier gate: the action's own refusal
 
 
 def test_require_tier_is_generic():
