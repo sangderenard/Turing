@@ -82,15 +82,15 @@ function showSunoStatus(data) {
   const messages = {
     disconnected:"Suno is not connected.",
     authorized:"Saved Suno authorization. Load tools to verify access.",
-    connecting:"Connecting to Suno…",
+    connecting:"Connecting to Sunoâ€¦",
     authorization_required:"Waiting for your approval at Suno.",
-    finishing:"Completing Suno authorization…",
+    finishing:"Completing Suno authorizationâ€¦",
     connected:"Connected to Suno.",
     failed:"Suno connection failed. You can retry connecting."
   };
   if (!data || !Object.hasOwn(messages, data.status)) throw Error("Invalid Suno connection status.");
   sunoState = data.status;
-  $("suno-status").textContent = messages[sunoState] + (data.error ? " " + String(data.error) : "");
+  $("suno-status").textContent = messages[sunoState] + (data.error ? " " + String(data.error) : "") + (data.required_origin ? " Required provider origin: " + String(data.required_origin) : "");
   $("suno-authorize").hidden = true; $("suno-authorize").removeAttribute("href");
   if (data.authorization_url && sunoState === "authorization_required") {
     const url = new URL(data.authorization_url);
