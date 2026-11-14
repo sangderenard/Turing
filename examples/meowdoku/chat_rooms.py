@@ -347,7 +347,10 @@ def revoke_grant(db, room, grant, *, user_id, now=None) -> dict:
 
 def forwarded_call(db, room, grant, *, user_id, username, name, arguments, call, caps=frozenset(), now=None):
     """One forwarded tool, under its lender's connection. ``call(owner_id, provider, name, arguments)`` is the host's
-    connection service. Answers what the tool answered; every attempt that reaches the provider is audited."""
+    connection service. Answers what the tool answered; every attempt that reaches the provider is audited.
+
+    The hourly limit holds for calls that overlap (several threads or server processes): the slot is counted and taken in
+    one write transaction BEFORE the provider is asked, and the outcome is written to that same row afterwards."""
     _enter(db, room, user_id, caps, write=True)
     now = time.time() if now is None else now
     row = db.execute("SELECT owner_id, provider, tools FROM chat_room_grants WHERE id = ? AND room = ? AND revoked_at IS NULL "
@@ -359,18 +362,23 @@ def forwarded_call(db, room, grant, *, user_id, username, name, arguments, call,
         raise ChatError(f"this grant lends only: {', '.join(lent)}", 403)
     if not isinstance(arguments, dict):
         raise ChatError("arguments must be an object")
-    recent = db.execute("SELECT count(*) FROM chat_grant_calls WHERE grant_id = ? AND caller_id = ? AND at > ?",
-                        (str(grant), int(user_id), now - 3600.0)).fetchone()[0]
-    if recent >= CALLS_PER_HOUR:
-        raise ChatError(f"at most {CALLS_PER_HOUR} forwarded calls an hour per member and grant", 429)
-    ok = False
+    if db.in_transaction:
+        db.commit()
+    db.execute("BEGIN IMMEDIATE")              # the database's write lock: one counter at a time, in every process
     try:
-        answer = call(owner_id, provider, name, arguments)
-        ok = True
-        return answer
-    finally:
-        db.execute("INSERT INTO chat_grant_calls (at, grant_id, caller_id, caller, tool, ok) VALUES (?,?,?,?,?,?)",
-                   (now, str(grant), int(user_id), str(username), name, int(ok)))
+        recent = db.execute("SELECT count(*) FROM chat_grant_calls WHERE grant_id = ? AND caller_id = ? AND at > ?",
+                            (str(grant), int(user_id), now - 3600.0)).fetchone()[0]
+        if recent >= CALLS_PER_HOUR:
+            raise ChatError(f"at most {CALLS_PER_HOUR} forwarded calls an hour per member and grant", 429)
+        slot = db.execute("INSERT INTO chat_grant_calls (at, grant_id, caller_id, caller, tool, ok) VALUES (?,?,?,?,?,0)",
+                          (now, str(grant), int(user_id), str(username), name)).lastrowid
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    answer = call(owner_id, provider, name, arguments)     # a failure leaves the slot taken and its ok 0: audited, counted
+    db.execute("UPDATE chat_grant_calls SET ok = 1 WHERE rowid = ?", (slot,))
+    return answer
 
 
 def _row(r) -> dict:

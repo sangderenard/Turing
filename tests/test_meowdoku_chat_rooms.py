@@ -227,3 +227,49 @@ def test_every_agent_from_guest_agents_up_shares_the_agents_room_and_services_do
     with pytest.raises(chat_rooms.ChatError, match="for intern"):
         chat_rooms.post(db, "agents", user_id=7, username="svc", body="beep")
     assert [r["room"] for r in chat_rooms.rooms_for(db, 6)] == ["agents"], "a guest agent sees the agents room, not the reviewers"
+
+
+def test_overlapping_forwarded_calls_never_pass_the_hourly_limit(tmp_path):
+    """Calls that overlap (several server threads or processes) are counted before the provider is asked, so no burst can
+    exceed CALLS_PER_HOUR (the review of 2026-11-14 measured 31 provider calls against a limit of 30)."""
+    import threading
+    import time as clock
+    path = tmp_path / "accounts.db"
+    setup = sqlite3.connect(path, isolation_level=None)
+    setup.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL)")
+    setup.executemany("INSERT INTO account_roles VALUES (?, ?)", [(3, "dev"), (5, "member")])
+    chat_rooms.create(setup, user_id=3, username="devi", caps=DEV, room="burst", title="Burst")
+    _public(setup, "burst", 3)
+    chat_rooms.configure(setup, "burst", user_id=3, caps=DEV, changes={"stage": "release"})
+    grant = chat_rooms.forward(setup, "burst", user_id=3, username="devi", caps=DEV, provider="suno", tool_names=["generate"],
+                               offered=["generate"])["grant"]
+    setup.close()
+    reached, lock = [], threading.Lock()
+
+    def provider(owner, name_of_provider, name, arguments):
+        with lock:
+            reached.append(name)
+        clock.sleep(0.05)                       # slow enough that every caller overlaps the others
+        return {"ok": True}
+
+    refused = []
+
+    def member():
+        db = sqlite3.connect(path, timeout=30, isolation_level=None)
+        try:
+            chat_rooms.forwarded_call(db, "burst", grant, user_id=5, username="mem", name="generate", arguments={},
+                                      call=provider)
+        except chat_rooms.ChatError as error:
+            refused.append(error.status)
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=member) for _ in range(chat_rooms.CALLS_PER_HOUR + 10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(reached) == chat_rooms.CALLS_PER_HOUR and refused == [429] * 10
+    check = sqlite3.connect(path)
+    assert check.execute("SELECT count(*), sum(ok) FROM chat_grant_calls").fetchone() == (30, 30)
+    check.close()
