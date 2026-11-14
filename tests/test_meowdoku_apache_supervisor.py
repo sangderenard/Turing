@@ -75,7 +75,7 @@ def test_shipped_instances_dry_run_lists_all():
     out = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     names = [i["name"] for i in json.loads(out.stdout)["instances"]]
-    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "nodus-ui-mirror", "task-worker", "udp-router", "relay"]
+    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "nodus-ui-mirror", "nodus-training", "nodus-training-ui-mirror", "task-worker", "udp-router", "relay"]
 
 
 def test_lifecycle_account_lease_stdin_eof(tmp_path):
@@ -177,7 +177,7 @@ def test_nodus_console_token_port_and_cleanup(tmp_path):
             "args": [], "leases": [], "python": sys.executable,
             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
     db, state, inst = _setup(tmp_path, spec)
-    token = state / "secrets" / "operator_credentials" / "nodus-stub.console.secret"      # --state-dir is the state root
+    token = state / "run" / "console" / "nodus-stub.console.secret"      # --state-dir is the state root
     plan = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
     command = json.loads(plan.stdout)["instances"][0]["command"]
     assert command[command.index("--console-port") + 1] == "0" and command[command.index("--console-token-file") + 1] == str(token)

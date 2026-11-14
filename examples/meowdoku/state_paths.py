@@ -33,6 +33,7 @@ class StatePaths:
             self.job_library_db = r / "marble_photos" / "job-library.sqlite"
             self.log_ring = r / "log_ring.jsonl"
             self.operator_credentials_dir = r / "operator_credentials"
+            self.console_dir = r / "console"
         else:
             self.sql_dir, self.content_dir, self.products_dir = r / "sql", r / "content", r / "products"
             self.canvas_dir, self.logs_dir = r / "canvas", r / "logs"
@@ -40,6 +41,9 @@ class StatePaths:
             self.job_library_db = r / "sql" / "job-library.sqlite"
             self.log_ring = r / "logs" / "log_ring.jsonl"
             self.operator_credentials_dir = r / "secrets" / "operator_credentials"
+            # Per-run console tokens live under run/, which the service account owns: it writes one at every launch, and it
+            # must not need write access to operator_credentials/ (the operators' and the service's own passwords).
+            self.console_dir = r / "run" / "console"
 
     # ---- constructors
     @classmethod

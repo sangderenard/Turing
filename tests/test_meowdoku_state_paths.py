@@ -128,7 +128,7 @@ def test_supervisor_state_dir_in_instances_json(tmp_path):
             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
     inst = tmp_path / "instances.json"
     inst.write_text(json.dumps({"state_dir": str(root), "instances": [spec]}), encoding="utf-8")
-    token = root / "secrets" / "operator_credentials" / "nodus-stub.console.secret"
+    token = root / "run" / "console" / "nodus-stub.console.secret"
     cmd = [sys.executable, str(SUP), "--instances", str(inst)]                         # no --db, no --state-dir: both come from the file
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:

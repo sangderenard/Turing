@@ -1,5 +1,9 @@
 {
   "supervisor_python": "C:/dev/Powershell/srv/python/python.exe",
+  "firewall": [
+    {"name": "apache", "protocol": "TCP", "port": 443, "program": "C:/Apache24/bin/httpd.exe"},
+    {"name": "apache", "protocol": "TCP", "port": 80, "program": "C:/Apache24/bin/httpd.exe"}
+  ],
   "restart_account": "svc-pale-horse",
   "restart_account_display_name": "Pale Horse",
   "instances": [
@@ -22,6 +26,8 @@
         "C:/dev/Powershell/srv/state/content/studio_agent/assets.json",
         "--studio-defaults",
         "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json",
+        "--studio-node",
+        "C:/nvm4w/nodejs/node.exe",
         "--fabric-row-host",
         "C:/dev/Powershell/srv/state/products/fabric-row/spring_network_nodus_host.exe",
         "--fabric-row-plugin",
@@ -39,6 +45,9 @@
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
       "studio_prefix": "studio.product",
+      "firewall": [
+        {"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}
+      ],
       "env": {
         "GIT_CONFIG_COUNT": "5",
         "GIT_CONFIG_KEY_0": "safe.directory",
@@ -159,7 +168,7 @@
         "--host", "127.0.0.1",
         "--port", "47614",
         "--attach-console", "127.0.0.1:47612",
-        "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-messenger.console.secret"
+        "--console-token-file", "C:/dev/Powershell/srv/state/run/console/nodus-messenger.console.secret"
       ],
       "nodus": {
         "path_prepend": [
@@ -223,7 +232,7 @@
         "--host", "127.0.0.1",
         "--port", "47620",
         "--attach-console", "127.0.0.1:47616",
-        "--console-token-file", "C:/dev/Powershell/srv/state/secrets/operator_credentials/nodus-training.console.secret",
+        "--console-token-file", "C:/dev/Powershell/srv/state/run/console/nodus-training.console.secret",
         "--attach-wait", "240"
       ],
       "nodus": {"path_prepend": ["C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release"]},
@@ -287,6 +296,9 @@
       "route": "",
       "bind": "0.0.0.0",
       "account": "svc-udp-router",
+      "firewall": [
+        {"protocol": "UDP", "port": "47700-47763", "program": "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe"}
+      ],
       "leases": [],
       "args": [
         "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",

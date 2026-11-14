@@ -31,12 +31,14 @@ from meowdoku.state_paths import StatePaths          # noqa: E402
 BOOTSTRAP = "operator:bootstrap"
 
 
-def _restrict(directory: Path) -> str:
+def _restrict(directory: Path, readers: tuple = ()) -> str:
+    """Cut inheritance and leave the current user full control; ``readers`` (account names or *SIDs) may also read."""
     if os.name != "nt":
         os.chmod(directory, 0o700)
         return f"{directory}: chmod 700"
     try:
-        r = subprocess.run(["icacls", str(directory), "/inheritance:r", "/grant:r", f"{getpass.getuser()}:(OI)(CI)F"],
+        grants = [f"{getpass.getuser()}:(OI)(CI)F"] + [f"{reader}:(OI)(CI)R" for reader in readers]
+        r = subprocess.run(["icacls", str(directory), "/inheritance:r", "/grant:r", *grants],
                            capture_output=True, text=True, timeout=30)
         return f"{directory}: icacls " + ("restricted to the current user" if r.returncode == 0 else f"failed (exit {r.returncode})")
     except (OSError, subprocess.SubprocessError) as error:
