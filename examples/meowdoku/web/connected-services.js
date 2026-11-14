@@ -46,12 +46,15 @@ async function refreshAccount() {
 // Suno is a real session-owned backend connection, not a browser token store.
 let sunoSignedIn = false, sunoBusy = false, sunoEpoch = 0, sunoState = "disconnected";
 let sunoTools = [], sunoTimer;
+let radioBusy = false, radioSongs = [];
 const sunoBase = "/api/connections/suno/";
 const workingStates = ["connecting", "authorization_required", "finishing"];
 function resetSuno() {
   sunoEpoch++; sunoSignedIn = false; sunoBusy = false;
   clearTimeout(sunoTimer);
   sunoTools = []; $("suno-tools").hidden = true;
+  radioSongs = []; $("suno-radio").hidden = true; $("suno-radio-song").replaceChildren();
+  $("suno-radio-credit").hidden = true; $("suno-radio-status").textContent = "";
   $("suno-authorize").hidden = true; $("suno-authorize").removeAttribute("href");
   $("suno-schema").textContent = ""; $("suno-result").textContent = "";
   $("suno-arguments").value = "{}";
@@ -65,6 +68,9 @@ function updateSunoButtons() {
   $("suno-refresh").disabled = locked;
   $("suno-tools-refresh").disabled = locked || !["connected", "authorized"].includes(sunoState);
   $("suno-call").disabled = locked || !sunoTools.length || !["connected", "authorized"].includes(sunoState);
+  $("suno-radio-load").disabled = locked || radioBusy;
+  $("suno-radio-import").disabled = locked || radioBusy || !radioSongs.length;
+  $("suno-radio-credit").disabled = locked || radioBusy;
 }
 async function sunoRequest(action, body) {
   const options = {credentials:"same-origin", cache:"no-store", redirect:"error"};
@@ -103,6 +109,7 @@ function showSunoStatus(data) {
     sunoTools = []; $("suno-tools").hidden = true;
     $("suno-schema").textContent = ""; $("suno-result").textContent = "";
   }
+  $("suno-radio").hidden = !["connected", "authorized"].includes(sunoState);
   clearTimeout(sunoTimer);
   if (workingStates.includes(sunoState)) sunoTimer = setTimeout(refreshSuno, 2000);
 }
@@ -156,5 +163,56 @@ $("suno-call").addEventListener("click", () => {
     $("suno-result").textContent = JSON.stringify(data, null, 2);
   });
 });
+function sunoTextResult(result) {
+  if (!result || result.isError || !Array.isArray(result.content)) throw Error("Suno returned no song list.");
+  const part = result.content.find(item => item?.type === "text");
+  if (!part) throw Error("Suno returned no song list.");
+  return JSON.parse(part.text);
+}
+$("suno-radio-load").addEventListener("click", async () => {
+  if (radioBusy || !sunoSignedIn) return;
+  radioBusy = true; updateSunoButtons(); $("suno-radio-credit").hidden = true;
+  try {
+    const answer = sunoTextResult(await sunoRequest("call", {name:"library-list", arguments:{limit:50}}));
+    if (!Array.isArray(answer.items)) throw Error("Suno did not return a song list.");
+    radioSongs = answer.items.filter(song => song?.status === "complete" &&
+      /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(song.id));
+    $("suno-radio-song").replaceChildren();
+    for (const song of radioSongs) {
+      const option = document.createElement("option");
+      option.value = song.id; option.textContent = song.title || song.id;
+      $("suno-radio-song").appendChild(option);
+    }
+    $("suno-radio-status").textContent = radioSongs.length ?
+      `Choose one of ${radioSongs.length} finished songs to offer to Radio.` : "No finished songs on this page.";
+  } catch (error) { $("suno-radio-status").textContent = error.message; }
+  finally { radioBusy = false; updateSunoButtons(); }
+});
+async function importSunoRadio(confirmCredit) {
+  if (radioBusy || !radioSongs.some(song => song.id === $("suno-radio-song").value)) return;
+  radioBusy = true; updateSunoButtons(); $("suno-radio-credit").hidden = true;
+  const songId = $("suno-radio-song").value;
+  const storage = $("suno-radio-storage").value;
+  try {
+    const response = await fetch("/api/radio/suno/import", {method:"POST", credentials:"same-origin",
+      cache:"no-store", redirect:"error", headers:{"Content-Type":"application/json", "X-Meowdoku-Radio":"1"},
+      body:JSON.stringify({song_id:songId, storage, confirm_credit:confirmCredit})});
+    const data = await response.json();
+    if (!response.ok) throw Error(data.error || `Import failed (HTTP ${response.status}).`);
+    if (data.status === "requires_credit") {
+      $("suno-radio-status").textContent = `Suno requires one download credit (${data.credits_remaining} remain). The song has not been imported.`;
+      $("suno-radio-credit").hidden = false;
+    } else if (data.status === "processing") {
+      $("suno-radio-status").textContent = "Suno is preparing the audio. Retry the check shortly.";
+    } else if (data.status === "ready") {
+      $("suno-radio-status").textContent = `${data.title || "Song"} is saved in your server assets and offered to Radio.`;
+    } else throw Error("Unexpected import response.");
+  } catch (error) { $("suno-radio-status").textContent = error.message; }
+  finally { radioBusy = false; updateSunoButtons(); }
+}
+$("suno-radio-import").addEventListener("click", () => importSunoRadio(false));
+$("suno-radio-credit").addEventListener("click", () => importSunoRadio(true));
+$("suno-radio-song").addEventListener("change", () => { $("suno-radio-credit").hidden = true; });
+$("suno-radio-storage").addEventListener("change", () => { $("suno-radio-credit").hidden = true; });
 $("refresh").addEventListener("click", refreshAccount);
 void refreshAccount();

@@ -1137,7 +1137,8 @@ def make_handler(sessions: Sessions):
             from meowdoku.nodus_radio_jukebox import Jukebox
             from meowdoku.nodus_radio_jukebox_runner import Runner
             if sessions.radio_jukebox is None:
-                sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json)
+                sessions.radio_jukebox = Jukebox(sessions.accounts_db, sessions.state.radio_json,
+                                                 state=sessions.state)
                 sessions.radio_jukebox_runner = Runner(sessions.radio_jukebox, sessions.state.radio_json, sessions.jobs,
                                                        state=sessions.state)
             return sessions.radio_jukebox, sessions.radio_jukebox_runner
@@ -2840,6 +2841,9 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/radio/jukebox":
                 return self._radio_jukebox("GET")
+            if path == "/api/radio/suno/assets":
+                from meowdoku.suno_radio_assets import route
+                return route(self, sessions, path, "GET")
             if path == "/api/radio/playback":
                 return self._radio_playback("GET")
             if path.startswith("/api/radio/hls/"):
@@ -3345,6 +3349,9 @@ def make_handler(sessions: Sessions):
                 return self._pages_route(path0, "POST")
             if path0 == "/api/radio/jukebox":
                 return self._radio_jukebox("POST")
+            if path0 == "/api/radio/suno/import":
+                from meowdoku.suno_radio_assets import route
+                return route(self, sessions, path0, "POST")
             if path0 == "/api/radio/playback":
                 return self._radio_playback("POST")
             if path0 == "/api/route":                             # [ROUTE]

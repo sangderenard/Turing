@@ -26,8 +26,9 @@ CREATE VIEW IF NOT EXISTS radio_billboard AS SELECT song_id, COUNT(*) AS votes, 
 '''
 
 class Jukebox:
-    def __init__(self, db_path, config_path):
+    def __init__(self, db_path, config_path, *, state=None):
         self.db_path, self.config_path = str(db_path), Path(config_path)
+        self.state = state
 
     @contextmanager
     def connect(self):
@@ -46,7 +47,7 @@ class Jukebox:
 
     def catalogue(self):
         try:
-            config = json.loads(self.config_path.read_text(encoding='utf-8'))
+            config = json.loads(self.config_path.read_text(encoding='utf-8')) if self.config_path.is_file() else {}
             songs = config.get('jukebox', {}).get('songs', [])
             if not isinstance(songs, list) or len(songs) > 10000:
                 raise ValueError()
@@ -56,6 +57,9 @@ class Jukebox:
                 if not isinstance(key, str) or not 1 <= len(key) <= 128 or not isinstance(title, str) or not 1 <= len(title) <= 200 or key in result:
                     raise ValueError()
                 result[key] = dict(song)
+            if self.state is not None:
+                from meowdoku.suno_radio_assets import station_catalogue
+                result.update(station_catalogue(self.state, self.db_path))
             return result
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             raise ControlError('Radio song catalogue is not configured', 503)

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -220,7 +221,7 @@ class Runner:
 
     def _run(self, config):
         while not self.stop.is_set():
-            owned = None; claim = None; registered = False
+            owned = None; claim = None; registered = False; playback_wav = None
             try:
                 with self.lock:
                     if self.stop.is_set(): break
@@ -231,9 +232,15 @@ class Runner:
                 if not self.jobs.begin('radio_jukebox', claim['token'], owner=f"account:{claim['user_id']}", label='Radio requested track'):
                     raise RuntimeError('Could not register source ownership')
                 registered = True
-                song = self.store.catalogue()[claim['song_id']]
+                song = dict(self.store.catalogue()[claim['song_id']])
                 path = Path(song['path'])
                 if not path.is_absolute() or not path.is_file(): raise RuntimeError('Catalogue source unavailable')
+                if song.get('storage') in ('mp3', 'flac'):
+                    if self.state is None: raise RuntimeError('Account-owned audio state is unavailable')
+                    from meowdoku.suno_radio_assets import run_codec
+                    playback_wav = path.parent / ('.playback-' + secrets.token_hex(12) + '.wav')
+                    run_codec(self.state, path, playback_wav, song['storage'] + '_decode')
+                    song['path'] = str(playback_wav)
                 owned = self.track(config, song)
                 owned.on_pcm = self._publish_pcm
                 with self.lock:
@@ -254,6 +261,11 @@ class Runner:
                 if owned is not None:
                     try: owned.close()
                     except Exception as exc: self.error = str(exc); status = 'failed'; self.stop.set()
+                if playback_wav is not None:
+                    try:
+                        playback_wav.unlink(missing_ok=True)
+                    except OSError as exc:
+                        self.error = str(exc); status = 'failed'; self.stop.set()
                 if claim is not None:
                     try:
                         if registered and not self.jobs.end('radio_jukebox', claim['token']):

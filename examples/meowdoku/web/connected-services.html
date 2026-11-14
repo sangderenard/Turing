@@ -60,6 +60,16 @@ code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
 <button id="suno-call" type="button" disabled>Send this tool call</button>
 <pre id="suno-result" role="status" aria-live="polite"></pre>
 </div>
+<div id="suno-radio" hidden>
+<h4>Put one of my songs on the server Radio</h4>
+<p class="muted">Importing offers the selected song to the shared jukebox. The file belongs to your site account. MP3 saves space; FLAC keeps the WAV download losslessly compressed. Radio decodes either through Nodus when it plays.</p>
+<button id="suno-radio-load" type="button">Load my finished songs</button>
+<label for="suno-radio-song">Song</label><select id="suno-radio-song"></select>
+<label for="suno-radio-storage">Stored audio</label><select id="suno-radio-storage"><option value="mp3" selected>MP3 (default)</option><option value="flac">Lossless FLAC</option></select>
+<button id="suno-radio-import" type="button" disabled>Check and import to Radio</button>
+<button id="suno-radio-credit" type="button" hidden>Spend one Suno download credit and import</button>
+<p id="suno-radio-status" role="status" aria-live="polite"></p>
+</div>
 <p>Official MCP endpoint: <code>https://api.suno.com/mcp</code>. <a href="https://suno.com/mcp" target="_blank" rel="noopener noreferrer">Provider information</a></p>
 <p class="muted">Connecting does not publish your library or share your credentials with friends. Only explicitly selected, permitted media belongs in the radio jukebox.</p>
 </section>
