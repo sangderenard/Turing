@@ -682,6 +682,9 @@ SOURCE_GRADIENT_TRACKING_MARK = declare_page("source_gradient_tracking_mark", (
 #: from those cells.  ``tensor_tuple_data_as_list``: ``AbstractTensor.tensor
 #: ((a, b), ...)`` -> ``AbstractTensor.tensor([a, b], ...)``; fact cells are
 #: (call span, data display span).
+#: ``tensor_rect_literal_as_flat_reshape``: ``AbstractTensor.tensor(<R x C
+#: constant literal>, ...)`` -> ``AbstractTensor.tensor(<flat>, ...).reshape(R, C)``;
+#: fact cells are (call span, nested literal span).
 SOURCE_IDENTITY_WASH = declare_page("source_identity_wash", (
     RowField("site", K.PAGE_REF),
 ), tuple)

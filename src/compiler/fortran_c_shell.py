@@ -98,6 +98,7 @@ from .ast_control_normalization import (
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _filter_torch_device_placement as _filter_torch_device_placement,
     _filter_gradient_tracking_marks as _filter_gradient_tracking_marks,
+    _wash_tensor_rectangular_literal as _wash_tensor_rectangular_literal,
     _wash_tensor_tuple_data as _wash_tensor_tuple_data,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
     _single_exit_tuple_arity as _single_exit_tuple_arity,
@@ -65856,11 +65857,14 @@ def _lower_ast_source_to_ssa_impl(
             f"{len(device_placement_receipts)} device placement(s)"
         )
     gradient_mark_receipts = list(_filter_gradient_tracking_marks(tree))
-    identity_wash_receipts = list(_wash_tensor_tuple_data(tree))
+    identity_wash_receipts = [
+        *_wash_tensor_rectangular_literal(tree),
+        *_wash_tensor_tuple_data(tree),
+    ]
     if identity_wash_receipts:
         report(
             "ssa-source: identity wash rewrote "
-            f"{len(identity_wash_receipts)} tensor tuple-data display(s)"
+            f"{len(identity_wash_receipts)} tensor data display(s)"
         )
     if gradient_mark_receipts:
         report(
@@ -66442,9 +66446,10 @@ def _lower_ast_source_to_ssa_impl(
                 _filter_gradient_tracking_marks(discovered)
             ),
             # Pursued definitions get the same source identity washes.
-            lambda discovered: identity_wash_receipts.extend(
-                _wash_tensor_tuple_data(discovered)
-            ),
+            lambda discovered: identity_wash_receipts.extend((
+                *_wash_tensor_rectangular_literal(discovered),
+                *_wash_tensor_tuple_data(discovered),
+            )),
             _normalize_direct_tail_recursion,
             normalize_discovered_destructuring,
         ),

@@ -5269,7 +5269,19 @@ def _emit_repository_call_module(
                     continue
 
             if (
-                operation in {"Cast", "CastLike", "cast_like"}
+                (
+                    operation in {"Cast", "CastLike", "cast_like"}
+                    # Program: ``AbstractTensor.all(ep == t, dim=1).to(dtype=
+                    # "int64")`` (scratch lit2w/c5).  Wrong record: the
+                    # tensor-op cast spellings (``_CAST_OPERATIONS``: ``to``,
+                    # ``to_dtype``, ``astype``) reached LLVM under their own
+                    # names with no emission.  Rule: with one source they are
+                    # the span cast to the result's declared dtype.
+                    or (
+                        operation in {"to", "to_dtype", "astype"}
+                        and len(instruction.args) == 1
+                    )
+                )
                 and result is not None
                 and instruction.args
                 and _declared_span_rank(result) > 0
@@ -5919,6 +5931,171 @@ def _emit_repository_call_module(
                 body.append(f"{done}:")
                 if active_block is not None:
                     block_exit_label[active_block] = done
+                continue
+
+            reduction_axis = instruction.attributes.get(
+                "dim", instruction.attributes.get("axis"),
+            )
+            if (
+                operation in {"all", "any", "sum"}
+                and result is not None
+                and instruction.args
+                and type(reduction_axis) is int
+                and tuple(result.shape or ())
+                and tuple(instruction.args[0].shape or ())
+                and all(
+                    type(extent) is int and extent > 0
+                    for extent in tuple(instruction.args[0].shape)
+                )
+            ):
+                # Program: ``AbstractTensor.all(ep == t, dim=1)`` over a static
+                # (6, 2) bool span (scratch lit2w/c5; YoungMan ``_edge_lookup``'s
+                # ``all(edge_pairs == edge_tensor, dim=1)``).  Wrong record: only
+                # the flat reduction to a scalar had LLVM emission; an axis
+                # reduction whose result keeps a shape was refused ("operation
+                # has no repository LLVM emission").  Rule: over static extents,
+                # each result element o * inner + i reduces source elements
+                # o * extent * inner + k * inner + i for k over the axis, with
+                # the flat reduction's accumulators (and/or truth, add).
+                source = instruction.args[0]
+                source_shape = tuple(map(int, source.shape))
+                rank = len(source_shape)
+                axis_index = int(reduction_axis) % rank if rank else 0
+                extent = source_shape[axis_index]
+                inner = _math.prod(source_shape[axis_index + 1:]) or 1
+                outer = _math.prod(source_shape[:axis_index]) or 1
+                result_count = outer * inner
+                if _math.prod(tuple(map(int, result.shape))) != result_count:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"axis {operation} over %t{int(source.id)}: result shape "
+                        f"{tuple(result.shape)} is not the source {source_shape} "
+                        f"reduced on axis {axis_index}",
+                    ))
+                    continue
+                element_type = _value_llvm_type(source)
+                result_type = _value_llvm_type(result)
+                accumulator_type = (
+                    "i1" if operation in {"any", "all"} else result_type
+                )
+                if accumulator_type not in {*_INTEGER_LLVM_TYPES, "double"}:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"axis {operation} reduction into {accumulator_type}",
+                    ))
+                    continue
+                floating = accumulator_type == "double"
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                ohead, obody, odone = (
+                    f"axr.ohead.{tag}", f"axr.obody.{tag}", f"axr.odone.{tag}",
+                )
+                ihead, ibody, idone = (
+                    f"axr.ihead.{tag}", f"axr.ibody.{tag}", f"axr.idone.{tag}",
+                )
+                j, jn = f"%axr.j.{tag}", f"%axr.jn.{tag}"
+                k, kn = f"%axr.k.{tag}", f"%axr.kn.{tag}"
+                acc, acc_next = f"%axr.acc.{tag}", f"%axr.accn.{tag}"
+                if operation == "all":
+                    initial = "true"
+                elif operation == "any":
+                    initial = "false"
+                else:
+                    initial = literal(0, accumulator_type)
+                body.append(f"  br label %{ohead}")
+                body.append(f"{ohead}:")
+                body.append(
+                    f"  {j} = phi i64 [ 0, %{entry_label} ], [ {jn}, %{idone} ]"
+                )
+                body.append(f"  %axr.more.{tag} = icmp slt i64 {j}, {result_count}")
+                body.append(
+                    f"  br i1 %axr.more.{tag}, label %{obody}, label %{odone}"
+                )
+                body.append(f"{obody}:")
+                body.append(f"  %axr.o.{tag} = sdiv i64 {j}, {inner}")
+                body.append(f"  %axr.i.{tag} = srem i64 {j}, {inner}")
+                body.append(
+                    f"  %axr.base.{tag} = mul i64 %axr.o.{tag}, {extent * inner}"
+                )
+                body.append(
+                    f"  %axr.base2.{tag} = add i64 %axr.base.{tag}, %axr.i.{tag}"
+                )
+                body.append(f"  br label %{ihead}")
+                body.append(f"{ihead}:")
+                body.append(
+                    f"  {k} = phi i64 [ 0, %{obody} ], [ {kn}, %{ibody} ]"
+                )
+                body.append(
+                    f"  {acc} = phi {accumulator_type} [ {initial}, %{obody} ], "
+                    f"[ {acc_next}, %{ibody} ]"
+                )
+                body.append(f"  %axr.kmore.{tag} = icmp slt i64 {k}, {extent}")
+                body.append(
+                    f"  br i1 %axr.kmore.{tag}, label %{ibody}, label %{idone}"
+                )
+                body.append(f"{ibody}:")
+                body.append(f"  %axr.koff.{tag} = mul i64 {k}, {inner}")
+                body.append(
+                    f"  %axr.src.{tag} = add i64 %axr.base2.{tag}, %axr.koff.{tag}"
+                )
+                body.append(
+                    f"  %axr.addr.{tag} = getelementptr {element_type}, "
+                    f"ptr {pointer(source)}, i64 %axr.src.{tag}"
+                )
+                body.append(
+                    f"  %axr.v.{tag} = load {element_type}, ptr %axr.addr.{tag}, "
+                    f"align {_align(element_type)}"
+                )
+                if operation in {"any", "all"}:
+                    if element_type in {"double", "float"}:
+                        body.append(
+                            f"  %axr.t.{tag} = fcmp une {element_type} %axr.v.{tag}, 0.0"
+                        )
+                    else:
+                        body.append(
+                            f"  %axr.t.{tag} = icmp ne {element_type} %axr.v.{tag}, 0"
+                        )
+                    joiner = "and" if operation == "all" else "or"
+                    body.append(f"  {acc_next} = {joiner} i1 {acc}, %axr.t.{tag}")
+                else:
+                    item = convert_loaded(
+                        f"%axr.v.{tag}", element_type, accumulator_type,
+                        f"axr.cv.{tag}", source_unsigned=_unsigned_value(source),
+                        target_unsigned=_unsigned_value(result),
+                    )
+                    if accumulator_type == "i64" and not _unsigned_value(result) and (
+                        python_int_overflow_checked(instruction)
+                    ):
+                        body.extend(
+                            f"  {line}" for line in integer_scalar_lines(
+                                "Add", "i64", [acc, item], acc_next, checked=True,
+                            )[0]
+                        )
+                    else:
+                        body.append(
+                            f"  {acc_next} = {'fadd' if floating else 'add'} "
+                            f"{accumulator_type} {acc}, {item}"
+                        )
+                body.append(f"  {kn} = add i64 {k}, 1")
+                body.append(f"  br label %{ihead}")
+                body.append(f"{idone}:")
+                stored = convert_loaded(
+                    acc, accumulator_type, result_type, f"axr.store.{tag}",
+                )
+                body.append(
+                    f"  %axr.dst.{tag} = getelementptr {result_type}, "
+                    f"ptr {pointer(result)}, i64 {j}"
+                )
+                body.append(
+                    f"  store {result_type} {stored}, ptr %axr.dst.{tag}, "
+                    f"align {_align(result_type)}"
+                )
+                body.append(f"  {jn} = add i64 {j}, 1")
+                body.append(f"  br label %{ohead}")
+                body.append(f"{odone}:")
+                if active_block is not None:
+                    block_exit_label[active_block] = odone
                 continue
 
             if (

@@ -2898,7 +2898,10 @@ class CorrelationTable:
         found = []
         page = book.page(SOURCE_IDENTITY_WASH)
         spans = book.page(SOURCE_SPAN)
-        expected_kinds = {"tensor_tuple_data_as_list": ("Call", "Tuple")}
+        expected_kinds = {
+            "tensor_tuple_data_as_list": ({"Call"}, {"Tuple"}),
+            "tensor_rect_literal_as_flat_reshape": ({"Call"}, {"List", "Tuple"}),
+        }
         for row in page.rows():
             receipt = book.latest_ref(SOURCE_IDENTITY_WASH, row)
             fact = page.cell(receipt.row, receipt.column)
@@ -2910,7 +2913,7 @@ class CorrelationTable:
                 and row[0] == cells[0]
                 and all(
                     isinstance(cell, Ref) and cell.page == SOURCE_SPAN and cell in sources
-                    and getattr(spans.cell(cell.row, cell.column), "kind", None) == kind
+                    and getattr(spans.cell(cell.row, cell.column), "kind", None) in kind
                     for cell, kind in zip(cells, kinds)
                 )
             )

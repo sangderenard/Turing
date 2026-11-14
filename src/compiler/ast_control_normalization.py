@@ -667,6 +667,136 @@ def _declared_abstract_tensor_names(tree: ast.Module) -> frozenset[str]:
     return frozenset(imported - rebound)
 
 
+def _rectangular_constant_literal(node: ast.AST):
+    """``(dims, flat leaves)`` of a rectangular nested list/tuple display whose
+    leaves are numeric constants (int, float, bool), with depth >= 2; else None."""
+
+    def shape_of(item):
+        if isinstance(item, (ast.List, ast.Tuple)):
+            if not item.elts or any(isinstance(e, ast.Starred) for e in item.elts):
+                return None
+            inner = [shape_of(e) for e in item.elts]
+            if any(s is None for s in inner) or len(set(inner)) != 1:
+                return None
+            return (len(item.elts), *inner[0])
+        if isinstance(item, ast.Constant) and type(item.value) in {int, float, bool}:
+            return ()
+        if (
+            isinstance(item, ast.UnaryOp) and isinstance(item.op, ast.USub)
+            and isinstance(item.operand, ast.Constant)
+            and type(item.operand.value) in {int, float}
+        ):
+            return ()
+        return None
+
+    def leaves(item):
+        if isinstance(item, (ast.List, ast.Tuple)):
+            for element in item.elts:
+                yield from leaves(element)
+        else:
+            yield item
+
+    dims = shape_of(node)
+    if dims is None or len(dims) < 2:
+        return None
+    return dims, list(leaves(node))
+
+
+def _wash_tensor_rectangular_literal(tree: ast.Module) -> tuple[dict[str, Any], ...]:
+    """Source identity: ``AbstractTensor.tensor(<R x C nested literal>, ...)`` is
+    ``AbstractTensor.tensor(<flat literal>, ...).reshape(R, C)`` (any depth).
+
+    Both are row-major: ``ensure_tensor`` packs the nested display to shape
+    (R, C) and ``reshape`` of the flat data gives the same elements, shape and
+    dtype (checked: ``[(0, 1), (0, 2), (1, 2)]`` int64 against
+    ``[0, 1, 0, 2, 1, 2]`` int64 ``.reshape(3, 2)``).  Leaves must be numeric
+    constants, so no leaf can be a runtime sequence that would change the
+    packing.  Program: YoungMan ``configure_geometry``'s ``edge_pairs =
+    AbstractTensor.tensor([(0, 1), (0, 2), ...], dtype="int64")`` (scratch
+    lit2d/c1, c2).  Wrong record: the nested display lowered as a resident
+    arena of rows ("private sequence N has no proven capacity") and the tensor
+    reached regions as a shapeless handle; the flat literal plus ``reshape``
+    lowers.  Recorded on SOURCE_IDENTITY_WASH by the call's span with the
+    literal's span.
+    """
+
+    from ..transmogrifier.graph.graph_express2 import (
+        _annotate_visual_source_owners, _source_module_identity,
+        post_source_span,
+    )
+    from .concordance_declarations import INGESTION, SOURCE_IDENTITY_WASH
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    names = _declared_abstract_tensor_names(tree)
+
+    def washable(call: ast.AST):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "tensor"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in names
+            and len(call.args) >= 1
+        ):
+            return None
+        return _rectangular_constant_literal(call.args[0])
+
+    if not names or not any(washable(node) for node in ast.walk(tree)):
+        return ()
+    module_name = _source_module_identity(tree, None)
+    tree._turing_source_module = module_name
+    _annotate_visual_source_owners(tree, module_name=module_name)
+    receipts: list[dict[str, Any]] = []
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Call(self, call):  # noqa: N802
+            call = self.generic_visit(call)
+            found = washable(call)
+            if found is None:
+                return call
+            dims, flat = found
+            data = call.args[0]
+            call_cell = post_source_span(None, call)
+            data_cell = post_source_span(None, data)
+            if call_cell is None or data_cell is None:
+                return call
+            current_identity_book().post(
+                SOURCE_IDENTITY_WASH, (call_cell,),
+                ("tensor_rect_literal_as_flat_reshape", call_cell, data_cell),
+                stage=INGESTION,
+                provenance=Derived((call_cell, data_cell)),
+                mode=Mode.CONCORD,
+            )
+            flat_call = ast.copy_location(ast.Call(
+                func=call.func,
+                args=[ast.copy_location(
+                    ast.List(elts=list(flat), ctx=ast.Load()), data,
+                ), *call.args[1:]],
+                keywords=list(call.keywords),
+            ), call)
+            reshaped = ast.copy_location(ast.Call(
+                func=ast.copy_location(ast.Attribute(
+                    value=flat_call, attr="reshape", ctx=ast.Load(),
+                ), call),
+                args=[ast.copy_location(ast.Constant(value=int(extent)), call)
+                      for extent in dims],
+                keywords=[],
+            ), call)
+            receipts.append({
+                "identity": "tensor_rect_literal_as_flat_reshape",
+                "line": int(getattr(call, "lineno", -1)),
+                "column": int(getattr(call, "col_offset", -1)),
+                "shape": tuple(dims),
+                "wash_cell": (call_cell,),
+            })
+            return reshaped
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _wash_tensor_tuple_data(tree: ast.Module) -> tuple[dict[str, Any], ...]:
     """Source identity: ``AbstractTensor.tensor((a, b), ...)`` is
     ``AbstractTensor.tensor([a, b], ...)``.
