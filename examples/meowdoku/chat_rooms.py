@@ -1,7 +1,9 @@
 """The chat server: persistent rooms and their messages. A room is a site object.
 
-SYSTEM ROOMS are declared here (``ROOMS``) and open to the roles they name: ``reviewers`` is the operators and admins beside
-the change reviews (branch_review.py). A change's author with less privilege talks in that change's thread (comments.py).
+SYSTEM ROOMS are declared here (``ROOMS``) and open to the roles they name: ``agents`` is every agent and person with an
+account, guest agents (the intern kiosk role) and up, and no visitor or service account; ``reviewers`` is the operators and
+admins beside the change reviews (branch_review.py). A change's author with less privilege talks in that change's thread
+(comments.py). A kiosk account reaches only the catalogue's kiosk entries, and the chat's reading and writing are among them.
 
 OWNED ROOMS are made by an account at dev level or above (dev_ui) and belong to it, as an authored page does:
     stage        dev (the development site; entering needs dev permission) or release (public facing)
@@ -27,6 +29,11 @@ Tables in accounts.db (schema module ``chat_rooms`` 2; this module is their one 
     chat_grant_calls   (at, grant_id, caller_id, caller, tool, ok)
 
 Text is stored stripped and only ever returned as a JSON string. Who is asking always comes from the authenticated session.
+
+BETWEEN SERVERS. Rooms are kept relayable over IRC, which already solves server-to-server delivery and resynchronization: a
+room's name is a valid channel name once prefixed with "#" (lowercase letters, digits and dashes, at most 40), and a
+message is text from one account, in order (a relay splits one longer than an IRC line, or of several lines). This module keeps the local truth (ids, removals, entry rules); a relay would
+carry messages between servers and record where each came from. Nothing here speaks IRC yet.
 
     GET  /api/chat/rooms                                 the rooms this account may enter
     POST /api/chat/rooms             {room, title, about?, stage?, write?}   make a room (dev level and up)
@@ -65,6 +72,8 @@ OBJECT_KINDS = ("page", "render", "mesh", "shader", "media", "room")
 STAGES = ("dev", "release")
 WRITE = ("members", "owner")
 ROOMS = {
+    "agents": {"title": "Agents' room", "about": "Every agent and person with an account: guest agents and up.",
+               "roles": ("intern", "member", "dev", "operator", "admin")},
     "reviewers": {"title": "Reviewers' chat", "about": "The operators and admins, beside the change reviews.",
                   "roles": ("admin", "operator")},
 }
