@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connected services</title>
+<style>
+:root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
+body { margin: 0; background: #111823; color: #eef2fa; }
+main { max-width: 52rem; margin: auto; padding: 1.5rem 1rem 5rem; }
+a { color: #a9ceff; } .muted { color: #bac7d8; }
+.card { background: #1c2939; border: 1px solid #44536a; border-radius: 12px; padding: 1.25rem; margin: 1rem 0 2rem; }
+h1 { margin-bottom: .4rem; } h3 { margin-top: 0; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+button { font: inherit; padding: .5rem .9rem; color: inherit; background: #162234; border: 1px solid #647792; border-radius: 6px; cursor: pointer; }
+button:disabled { opacity: .6; cursor: not-allowed; }
+dt { font-weight: 600; margin-top: .8rem; } dd { margin-left: 0; }
+code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
+</style>
+</head>
+<body><main>
+<p><a href="/">Home</a> / <a href="/keys.html">Keys and credentials</a></p>
+<h1>Connected services</h1>
+<p class="muted">Manage external connections for your site account. Provider authorization is separate from your site login.</p>
+<p id="identity" role="status" aria-live="polite">Checking your site account.</p>
+<p id="sign-in" hidden><a href="/login.html">Sign in to this site</a> to manage your own connections.</p>
+<button id="refresh" type="button">Refresh status</button>
+<h2>Key-based connections</h2>
+<section class="card" aria-labelledby="paper-heading">
+<h3 id="paper-heading">Alpaca paper market</h3>
+<p id="paper-status" role="status">Sign in to check the credential stored for your account.</p>
+<p class="muted">This is the same connection managed in Keys, not a second copy. A stored credential is not proof that Alpaca currently accepts it.</p>
+<div id="paper-actions" class="actions" hidden>
+<a href="/keys.html#paper-box">Connect or replace in Keys</a>
+<a href="/markets.html">Open paper market</a>
+</div>
+<p class="muted">To revoke an issued key, use the provider's account controls. This site does not currently offer a disconnect control.</p>
+</section>
+<h2>MCP services</h2>
+<section class="card" aria-labelledby="suno-heading">
+<h3 id="suno-heading">Suno</h3>
+<p><strong>Site connection not available yet</strong></p>
+<p>The server-side Suno authorization handoff is not implemented. Signing in here does not connect Suno. No Suno account status or permissions have been retrieved.</p>
+<p>You can use Suno's official setup instructions to connect a supported MCP client yourself. When that client opens Suno, sign in and review its permission request there. That authorizes the client you chose, not this site's radio.</p>
+<p>Official MCP endpoint: <code>https://api.suno.com/mcp</code></p>
+<div class="actions"><a href="https://suno.com/mcp" target="_blank" rel="noopener noreferrer">Open official Suno connection instructions</a></div>
+<p class="muted">When the site connection is supported, eligible selections belong in the radio jukebox. It must not share your credentials or automatically publish your library to friends.</p>
+</section>
+<p class="muted">Do not paste a Suno password, session cookie, or token into Keys for this connection.</p>
+<noscript><p>JavaScript is needed to check your site account and stored connection status.</p></noscript>
+</main>
+<script type="module" src="/connected-services.js"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body></html>

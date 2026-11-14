@@ -447,6 +447,7 @@ async function main() {
     link("Games", "/games.html", !onDev || caps.has("dev_ui")),
     link("Profile and servers", "/profile.html"),
     link("Keys", "/keys.html", caps.has("message")),
+    link("Connected services", "/connected-services.html"),
     link("My files", "/files.html", caps.has("message")),
     link("Paper markets", "/markets.html", caps.has("message")),
     link("Browse the site", "/browse"),
