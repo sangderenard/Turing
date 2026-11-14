@@ -1885,6 +1885,18 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             return core_git.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
 
+        def _checkout_route(self, path: str, method: str) -> None:
+            """[CHECKOUT] the central checkout: the service makes an account's branch and working folder and does its Git
+            (central_checkout.py); the account reads, writes and commits there through declared operations."""
+            from meowdoku import branch_gate, central_checkout
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return central_checkout.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
+                                               root=sessions.state.content_dir / "checkouts")
+
         def _relay_route(self, path: str, method: str) -> None:
             """[RELAY] datagrams and packages, address to address, for any signed-in account (relay.py)."""
             from meowdoku import relay
@@ -2888,6 +2900,8 @@ def make_handler(sessions: Sessions):
                 return self._talk_route(path, "GET")
             if path.startswith("/api/git/"):                      # [GIT]
                 return self._git_route(path, "GET")
+            if path == "/api/checkouts" or path.startswith("/api/checkouts/"):   # [CHECKOUT]
+                return self._checkout_route(path, "GET")
             if path == "/api/orientation" or path.startswith("/api/orientation/"):   # [ORIENTATION]
                 return self._orientation_route(path, "GET")
             if path.startswith("/api/relay/"):                    # [RELAY]
@@ -3405,6 +3419,8 @@ def make_handler(sessions: Sessions):
                 return self._talk_route(path0, "POST")
             if path0.startswith("/api/git/"):                     # [GIT]
                 return self._git_route(path0, "POST")
+            if path0 == "/api/checkouts" or path0.startswith("/api/checkouts/"):   # [CHECKOUT]
+                return self._checkout_route(path0, "POST")
             if path0 == "/api/orientation" or path0.startswith("/api/orientation/"):   # [ORIENTATION]
                 return self._orientation_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
