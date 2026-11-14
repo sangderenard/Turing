@@ -8,7 +8,9 @@ What -Apply does, in this order:
   (a) reports who besides named accounts may touch C:\dev, C:\dev\Powershell and C:\Apache24
   (b) SAVES every folder permission of those trees to -BackupDir, with a manifest; Restore-AgentBoxAcls.ps1 puts them back
   (c) grants the service account Modify, explicitly, on the folders the stack writes that today it can only write through
-      the broad "Authenticated Users: Modify" (every state_dir in instances.json, srv\backups, turing\build)
+      the broad "Authenticated Users: Modify" (every state_dir in instances.json, srv\backups, turing\build), the .git
+      folder of every repository in branch_policy.json (the lander fetches, pushes and updates refs there) and the
+      removal notices file the cleaner commits
   (d) locks the trees: C:\dev and C:\Apache24 lose "Authenticated Users: Modify" (they keep "Users: Read", which the
       service needs to list the parents of every path it opens); C:\dev\Powershell loses both "Authenticated Users" and
       "Users". The operator keeps Full control; every explicit grant (the service's, codex's sandbox group) is kept.
@@ -107,6 +109,17 @@ foreach ($w in ($writes | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') } |
     if (Test-Path -LiteralPath $w) { Run 'icacls.exe' @($w, '/grant', "${ServiceAccount}:(OI)(CI)M") }
     else { Write-Host "skip (missing): $w" }
 }
+# The lander and the cleaner run inside the service's task worker: fetch, push, update-ref and branch in every repository of
+# branch_policy.json (the live checkouts' .git), and the removal notices file is rewritten and committed in the workspace.
+$policy = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'branch_policy.json') | ConvertFrom-Json
+foreach ($r in $policy.repositories.PSObject.Properties) {
+    $gitDir = Join-Path ([string]$r.Value.path).Replace('/', '\') '.git'
+    if (Test-Path -LiteralPath $gitDir -PathType Container) { Run 'icacls.exe' @($gitDir, '/grant', "${ServiceAccount}:(OI)(CI)M") }
+    else { Write-Host "skip (no .git folder): $gitDir" }
+}
+$notices = if ($policy.notices_file) { ([string]$policy.notices_file).Replace('/', '\') } else { Join-Path $Workspace 'REMOVAL_NOTICES.csv' }   # branch_gate.py's default
+if (Test-Path -LiteralPath $notices -PathType Leaf) { Run 'icacls.exe' @($notices, '/grant', "${ServiceAccount}:M") }
+else { Write-Host "skip (missing): $notices" }
 
 # ---------------------------------------------------------------- (d)
 Step '(d) lock the trees (inherited entries are copied first, so every explicit grant stays)'
@@ -122,7 +135,6 @@ Run 'icacls.exe' @($Apache, '/grant', "${Operator}:(OI)(CI)F")
 
 # ---------------------------------------------------------------- (e)
 Step "(e) the standard account $AgentAccount"
-$policy = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'branch_policy.json') | ConvertFrom-Json
 $codeRepos = @($policy.repositories.PSObject.Properties | ForEach-Object { ([string]$_.Value.path).Replace('/', '\').TrimEnd('\') } |
     Where-Object { $_ -ne $Workspace })
 if ($CreateAgentAccount) {
