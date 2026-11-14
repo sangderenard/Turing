@@ -891,3 +891,39 @@ def test_a_landing_run_fetches_each_repository_once_and_still_lands_a_chain(worl
     assert len(fetches) == 1, "one fetch for the one repository, not one per change"
     assert done["first"] == "landed" and done["second"] == "landed", "a chain lands in one run: the push moved the tracked base"
     assert done["third"] == "held" and remote_has(world, "main") == second
+
+
+def test_a_worktree_the_cleaner_cannot_read_is_kept_and_never_lets_a_prune_drop_it(world, monkeypatch, tmp_path):
+    import shutil
+    work, db, policy = world["work"], world["db"], world["policy"]
+    branch(world, "theirs")
+    branch(world, "gone")
+    theirs, gone = tmp_path / "wt-theirs", tmp_path / "wt-gone"
+    run(work, "worktree", "add", "-q", str(theirs), "theirs")
+    run(work, "worktree", "add", "-q", str(gone), "gone")
+    shutil.rmtree(gone)
+    assert branch_gate.folder_state(str(theirs)) == "present" and branch_gate.folder_state(str(gone)) == "gone"
+    real = branch_gate.folder_state
+    monkeypatch.setattr(branch_gate, "folder_state",
+                        lambda path: "unreadable" if Path(path).resolve() == theirs.resolve() else real(path))
+    done = {Path(e["worktree"]).name: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, log=lambda l: None)}
+    assert done["wt-theirs"]["action"] == "keep" and "cannot read" in done["wt-theirs"]["reason"]
+    assert done["wt-gone"]["action"] == "keep" and "git worktree prune would drop them" in done["wt-gone"]["reason"]
+    listed = run(work, "worktree", "list")
+    assert "wt-theirs" in listed and "wt-gone" in listed, "nothing was pruned while a worktree could not be read"
+    monkeypatch.setattr(branch_gate, "folder_state", real)
+    done = {Path(e["worktree"]).name: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, log=lambda l: None)}
+    assert done["wt-gone"]["action"] == "pruned" and "wt-gone" not in run(work, "worktree", "list")
+    assert "wt-theirs" in run(work, "worktree", "list")
+
+
+def test_an_unreadable_folder_is_never_reported_gone(monkeypatch, tmp_path):
+    import os
+    folder = tmp_path / "locked"
+    folder.mkdir()
+
+    def denied(path, *args, **kwargs):
+        raise PermissionError(5, "Access is denied", str(path))
+    monkeypatch.setattr(os, "listdir", denied)
+    assert branch_gate.folder_state(str(folder)) == "unreadable"
+    assert branch_gate.folder_state(str(tmp_path / "nothing")) == "gone"
