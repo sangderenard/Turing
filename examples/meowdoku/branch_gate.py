@@ -518,10 +518,15 @@ def clean(policy, db, *, apply, actor=None, now=None, log=print) -> list:
     return actions
 
 
-def land(policy, db, *, apply, now=None, log=print, gh=run_gh) -> list:
+def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> list:
+    """Land each accepted change that is a fast-forward of its base. ``only`` (review ids) limits the run to those changes:
+    the landing queue's "land now". Every change tried and not landed keeps why (branch_review.mark_tried)."""
     now = time.time() if now is None else now
+    wanted = None if only is None else {str(review_id) for review_id in only}
     results = []
     for review in branch_review.landable(db, now):
+        if wanted is not None and review["id"] not in wanted:
+            continue
         entry = {"review": review["id"], "repository": review["repository"], "branch": review["branch"], "head": review["head"]}
         declared = policy["repositories"].get(review["repository"])
         try:
@@ -571,6 +576,8 @@ def land(policy, db, *, apply, now=None, log=print, gh=run_gh) -> list:
                 entry.update(action="landed", reason=detail)
         except GateError as error:
             entry.update(action="held", reason=str(error))
+        if entry["action"] != "landed":
+            branch_review.mark_tried(db, review["id"], f"{entry['action']}: {entry['reason']}", now)
         log(f"[reviews] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
         results.append(entry)
     return results

@@ -676,6 +676,18 @@ SOURCE_EXCEPTION_INGESTION = declare_page("source_exception_ingestion", (
 SOURCE_GRADIENT_TRACKING_MARK = declare_page("source_gradient_tracking_mark", (
     RowField("call", K.PAGE_REF),
 ), tuple)
+#: A source identity wash: an authored construct rewritten into an exactly
+#: equal one the compiler lowers.  Row: the rewritten construct's SOURCE_SPAN
+#: cell.  Fact: (identity name, SOURCE_SPAN cells the identity reads), DERIVED
+#: from those cells.  ``tensor_tuple_data_as_list``: ``AbstractTensor.tensor
+#: ((a, b), ...)`` -> ``AbstractTensor.tensor([a, b], ...)``; fact cells are
+#: (call span, data display span).
+#: ``tensor_rect_literal_as_flat_reshape``: ``AbstractTensor.tensor(<R x C
+#: constant literal>, ...)`` -> ``AbstractTensor.tensor(<flat>, ...).reshape(R, C)``;
+#: fact cells are (call span, nested literal span).
+SOURCE_IDENTITY_WASH = declare_page("source_identity_wash", (
+    RowField("site", K.PAGE_REF),
+), tuple)
 SOURCE_EXCEPTION_NORMAL_BINDING = declare_page(
     "source_exception_normal_binding", (
         RowField("read_scope", K.SCOPE),
@@ -3120,6 +3132,10 @@ PHI_EDGE_PROJECTION_PLACEMENT = declare_page("phi_edge_projection_placement_conc
     RowField("value_id", K.VALUE_ID),
 ), tuple)                              # CONCORD
 FORMAL_OCCURRENCE_PRUNED = declare_reason("formal_occurrence_pruned")
+#: A positional occurrence published for one physical-call adaptation round
+#: is that round's view of call positions; later passes add and remove
+#: instructions.  read = (the occurrence, the round's ledger cell).
+FORMAL_OCCURRENCE_ROUND_CLOSED = declare_reason("formal_occurrence_round_closed")
 PRUNED_CALLEE_FORMAL = declare_page("pruned_callee_formal_concordance", (
     RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), str)                                # CONCORD

@@ -1694,6 +1694,7 @@ class CorrelationTable:
         found.extend(self._source_call_field_state_transfer_findings(module))
         found.extend(self._source_field_transfer_object_step_findings(module))
         found.extend(self._source_gradient_tracking_mark_findings(module))
+        found.extend(self._source_identity_wash_findings(module))
         found.extend(self._returned_aggregate_call_findings(module))
         found.extend(self._source_mapping_get_read_findings(module))
         found.extend(self._source_mapping_get_key_version_demand_findings(module))
@@ -2883,6 +2884,43 @@ class CorrelationTable:
                 found.append(Finding(
                     "returned-aggregate-call", str(row), 0,
                     "returned aggregate call lost its call cell or a tuple return-site row",
+                ))
+        return found
+
+    @staticmethod
+    def _source_identity_wash_findings(module: Any) -> list[Finding]:
+        """Check each recorded source identity wash against the spans it read."""
+        from .concordance_declarations import SOURCE_IDENTITY_WASH, SOURCE_SPAN
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_IDENTITY_WASH)
+        spans = book.page(SOURCE_SPAN)
+        expected_kinds = {
+            "tensor_tuple_data_as_list": ({"Call"}, {"Tuple"}),
+            "tensor_rect_literal_as_flat_reshape": ({"Call"}, {"List", "Tuple"}),
+        }
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_IDENTITY_WASH, row)
+            fact = page.cell(receipt.row, receipt.column)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            kinds = expected_kinds.get(fact[0]) if isinstance(fact, tuple) and fact else None
+            cells = tuple(fact[1:]) if kinds is not None else ()
+            valid = (
+                kinds is not None and len(cells) == len(kinds)
+                and row[0] == cells[0]
+                and all(
+                    isinstance(cell, Ref) and cell.page == SOURCE_SPAN and cell in sources
+                    and getattr(spans.cell(cell.row, cell.column), "kind", None) in kind
+                    for cell, kind in zip(cells, kinds)
+                )
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-identity-wash", str(row[0]), 0,
+                    "identity wash lost a span it read, or names no known identity",
                 ))
         return found
 
@@ -10518,6 +10556,16 @@ class CorrelationTable:
                     if occurrence_retirement_sources(book, cell, module.functions) is None:
                         found.append(Finding("formal-actual-retirement-disagreement", str(caller), int(formal),
                                              "positional occurrence retirement lacks exact pruning/replacement proof"))
+                    continue
+                if isinstance(old, Unresolved):
+                    # A later census restates a position whose adaptation-
+                    # round view closed; it derives from that closed cell.
+                    from .concordance_declarations import FORMAL_OCCURRENCE_ROUND_CLOSED
+                    if old.reason != FORMAL_OCCURRENCE_ROUND_CLOSED or previous not in causes:
+                        found.append(Finding(
+                            "formal-actual-transition-disagreement", str(caller), int(formal),
+                            f"occurrence {(block, index, position)!r} restated {current!r} "
+                            "without the closed round view it follows"))
                     continue
                 transition_key = (scope, block, index, position)
                 transitions = tuple(parent for parent in causes
@@ -23007,18 +23055,19 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
 
 def publish_formal_actual_occurrences(
     functions: Mapping[str, Any], *, book: Any, call_table: Any = None,
-) -> None:
+) -> tuple:
     """Publish exact incoming call positions without classifying hidden formals.
 
     Program: the structural full-content string equality helper borrows its
     caller's descriptor storage. Its early physical-layout demand needs the
     real call occurrence before late hidden-formal classification. This is
     the existing occurrence census, with the same source and rebind checks;
-    it does not create storage or classify any formal.
+    it does not create storage or classify any formal.  Returns the rows it
+    stated, so a physical-call adaptation round can close its own view.
     """
 
     from .concordance_declarations import (
-        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE,
+        CALL_RECORD, FORMAL_ACTUAL_OCCURRENCE, FORMAL_OCCURRENCE_ROUND_CLOSED,
         FRAME_BINDING, FRAME_SOURCE_CELL_ABSENT, REGION_SIGNATURE, SSA_VALUE,
     )
     # Persisted books own their vocabulary. Add this scoped relation through
@@ -23035,6 +23084,7 @@ def publish_formal_actual_occurrences(
         )
 
     incoming_page = book.page(occurrence_page)
+    stated: list[tuple] = []
     for caller_name, caller in functions.items():
         # Repository-SSA composition retains imported functions beside the
         # current unit, but their identity rows remain owned by the book that
@@ -23122,7 +23172,14 @@ def publish_formal_actual_occurrences(
                     occurrence_sources = () if actual_cell is None else (actual_cell,)
                     occurrence_mode = Mode.CONCORD
                     previous = book.latest_ref(occurrence_page, occurrence_row)
-                    if previous is not None and incoming_page.latest(occurrence_row) != int(actual.id):
+                    prior_fact = incoming_page.latest(occurrence_row)
+                    if (previous is not None and isinstance(prior_fact, Unresolved)
+                            and prior_fact.reason == FORMAL_OCCURRENCE_ROUND_CLOSED):
+                        # A closed adaptation-round view: this census states
+                        # the position again from the current program.
+                        occurrence_mode = Mode.REVISE
+                        occurrence_sources = (previous, *occurrence_sources)
+                    elif previous is not None and prior_fact != int(actual.id):
                         # The storage-effects bootstrap's targets span is
                         # rebound to its control-owned loop header Phi after
                         # the first formal/actual census. The transition is
@@ -23145,6 +23202,8 @@ def publish_formal_actual_occurrences(
                                     else Unsourced(FRAME_SOURCE_CELL_ABSENT)),
                         mode=occurrence_mode,
                     )
+                    stated.append(occurrence_row)
+    return tuple(stated)
 
 
 def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:

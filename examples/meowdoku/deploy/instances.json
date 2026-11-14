@@ -45,6 +45,7 @@
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
       "studio_prefix": "studio.product",
+      "system_events": true,
       "firewall": [
         {"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}
       ],
@@ -183,6 +184,7 @@
     },
     {
       "name": "nodus-training",
+      "autostart": false,
       "kind": "nodus",
       "port": null,
       "route": "",
@@ -219,6 +221,7 @@
     },
     {
       "name": "nodus-training-ui-mirror",
+      "autostart": false,
       "kind": "command",
       "port": 47620,
       "route": "",
