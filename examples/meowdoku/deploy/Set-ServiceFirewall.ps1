@@ -2,9 +2,12 @@
 .SYNOPSIS  Bring the Windows Firewall in line with the inbound ports instances.json declares. Run by the scripts that bring
 the stack up (Start-Apache.ps1, Apache-Service.ps1 -Start/-Restart), so a port and its rule arrive together.
 An instance declares what it listens on from outside:
-    "firewall": [{"protocol": "TCP", "port": 47625, "program": "C:/dev/Powershell/srv/python/python.exe"}]
-Each declaration of an enabled instance becomes one inbound Allow rule, named "SpeakToMe <instance> <protocol> <port>",
-in the rule group "SpeakToMe", limited to that program and that port. A rule of that group that no enabled instance
+    "firewall": [{"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}]
+A program that is not an instance (Apache) is declared at the top of instances.json, with a name:
+    "firewall": [{"name": "apache", "protocol": "TCP", "port": 443, "program": "C:/Apache24/bin/httpd.exe"}]
+A port is a number or a range "first-last". Each declaration (of an enabled instance, or at the top) becomes one inbound
+Allow rule, named "SpeakToMe <name> <protocol> <port>", in the rule group "SpeakToMe", limited to that program and that
+port, on every network profile: the rule does not depend on whether Windows calls the network Public or Private. A rule of that group that no enabled instance
 declares any more is removed. Rules made by hand (8766, 443, the old python.exe prompts) are never touched.
 Changing rules needs an elevated shell. Without one this only reports what is missing and goes on: it never stops a
 bring-up. -WhatIf reports only.
@@ -22,17 +25,29 @@ try {
 }
 $list = if ($spec.PSObject.Properties.Name -contains 'instances') { $spec.instances } else { $spec }
 
-$wanted = @{}
+$owners = @()
+if ($spec.PSObject.Properties.Name -contains 'firewall') {
+    foreach ($entry in $spec.firewall) { $owners += [pscustomobject]@{ name = [string]$entry.name; entries = @($entry) } }
+}
 foreach ($instance in $list) {
     if ($instance.enabled -eq $false -or -not $instance.firewall) { continue }
-    foreach ($entry in $instance.firewall) {
+    $owners += [pscustomobject]@{ name = [string]$instance.name; entries = @($instance.firewall) }
+}
+$wanted = @{}
+foreach ($owner in $owners) {
+    foreach ($entry in $owner.entries) {
         $protocol = ([string]$entry.protocol).ToUpperInvariant()
-        if ($protocol -notin @('TCP', 'UDP') -or -not ([int]$entry.port -gt 0) -or -not $entry.program) {
-            Write-Warning "firewall: $($instance.name) declares an unusable entry (protocol, port and program are required)"
+        $port = ([string]$entry.port).Trim()
+        $ports = @($port -split '-' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+        $valid = $ports.Count -eq ($port -split '-').Count -and $ports.Count -in @(1, 2) -and ($ports | Where-Object { $_ -lt 1 -or $_ -gt 65535 }).Count -eq 0 -and
+                 ($ports.Count -eq 1 -or $ports[0] -le $ports[1])
+        if (-not $owner.name -or $protocol -notin @('TCP', 'UDP') -or -not $valid -or -not $entry.program) {
+            Write-Warning "firewall: '$($owner.name)' declares an unusable entry (name, protocol, port or range, and program are required)"
             continue
         }
-        $name = "$Group $($instance.name) $protocol $([int]$entry.port)"
-        $wanted[$name] = @{ Protocol = $protocol; Port = [string][int]$entry.port; Program = [IO.Path]::GetFullPath([string]$entry.program) }
+        $port = ($ports -join '-')
+        $name = "$Group $($owner.name) $protocol $port"
+        $wanted[$name] = @{ Protocol = $protocol; Port = $port; Program = [IO.Path]::GetFullPath([string]$entry.program) }
     }
 }
 
@@ -48,10 +63,10 @@ foreach ($name in $wanted.Keys) {
     $want = $wanted[$name]
     $rule = $held | Where-Object { $_.Name -eq $name }
     if ($rule) {
-        $port = $rule | Get-NetFirewallPortFilter
+        $portFilter = $rule | Get-NetFirewallPortFilter
         $app = $rule | Get-NetFirewallApplicationFilter
-        $same = $port.Protocol -eq $want.Protocol -and [string]$port.LocalPort -eq $want.Port -and $app.Program -eq $want.Program -and
-                $rule.Enabled -eq 'True' -and $rule.Action -eq 'Allow'
+        $same = $portFilter.Protocol -eq $want.Protocol -and (@($portFilter.LocalPort) -join ',') -eq $want.Port -and $app.Program -eq $want.Program -and
+                $rule.Enabled -eq 'True' -and $rule.Action -eq 'Allow' -and $rule.Profile -eq 'Any'
         if ($same) { Write-Host "firewall: $name is in place"; continue }
         if ($change) { Remove-NetFirewallRule -Name $name } else { $missing++; Write-Host "firewall: $name differs from its declaration"; continue }
     } elseif (-not $change) {

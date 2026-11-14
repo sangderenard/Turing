@@ -152,9 +152,68 @@ def listening(port, host="127.0.0.1") -> bool:
         return False
 
 
+_JOB = None      # [JOB] the kill-on-close job this supervisor put itself in; held for the life of the process
+
+
+def tie_children_to_this_process() -> str:
+    """Put this process in a Windows job object that ends every process in it when its last handle closes.
+
+    The supervisor holds the only handle, so when the supervisor ends, however it ends, every instance it started
+    ends with it. Children join the job when they are created, so none can start outside it. Without this, a service
+    stop ended the supervisor without its shutdown and left the instances running on their ports (2026-11-13: the next
+    supervisor found 8766, 47611-47617 and 47699 taken and could start nothing). Returns a sentence for the log."""
+    global _JOB
+    if os.name != "nt":
+        return "children follow the supervisor by process group only (not Windows)"
+    if _JOB is not None:
+        return "children are already tied to this supervisor"
+    import ctypes
+    from ctypes import wintypes
+
+    class BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class IO(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                                         "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class EXTENDED(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IO), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return f"children are NOT tied to the supervisor: CreateJobObject failed ({ctypes.get_last_error()})"
+    info = EXTENDED()
+    info.BasicLimitInformation.LimitFlags = 0x2000                # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):   # JobObjectExtendedLimitInformation
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        return f"children are NOT tied to the supervisor: SetInformationJobObject failed ({error})"
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        return f"children are NOT tied to the supervisor: AssignProcessToJobObject failed ({error})"
+    _JOB = job
+    return "children are tied to this supervisor: a kill-on-close job ends them when it ends"
+
+
 def console_secret_path(state_dir, name) -> Path:
-    """Per-run read-only-console token file: <operator_credentials>/<instance>.console.secret (the operators.py secrets dir)."""
-    return StatePaths.coerce(state_dir).operator_credentials_dir / f"{name}.console.secret"
+    """Per-run read-only-console token file: <run>/console/<instance>.console.secret. Not under secrets/operator_credentials:
+    the supervisor runs as the service account, which writes this file at every launch and must not hold write access to
+    the operators' credentials (2026-11-13: that write was refused and the Nodus host did not start)."""
+    return StatePaths.coerce(state_dir).console_dir / f"{name}.console.secret"
 
 
 def _abs(path):
@@ -190,14 +249,15 @@ class Instance:
         return console_secret_path(self.sup.paths, self.name)
 
     def write_console_token(self):
-        """A fresh token for this run (overwritten on every launch), in the restricted secrets dir."""
+        """A fresh token for this run (overwritten on every launch), in the restricted console dir: the account the stack runs
+        as has full control, Administrators may read (an elevated Open-Console.ps1)."""
         path = self.console_token_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if not self.sup.secrets_restricted:
             self.sup.secrets_restricted = True
             sys.path[:0] = [p for p in (str(HERE),) if p not in sys.path]
             import operators as operators_mod            # noqa: E402  (the same icacls restriction operators.py applies)
-            self.sup.log(operators_mod._restrict(path.parent))
+            self.sup.log(operators_mod._restrict(path.parent, readers=("*S-1-5-32-544",)))
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(secrets.token_urlsafe(32))
@@ -649,6 +709,7 @@ class Supervisor:
             if hasattr(signal, sig):
                 signal.signal(getattr(signal, sig), lambda *_: self.stop.set())
         if manage:
+            self.log(tie_children_to_this_process())       # [JOB] before the first instance starts
             specs = load_instances(self.instances_path)
             self.system_events = instances_system_events(self.instances_path)
             account, display = instances_restart_account(self.instances_path)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -177,7 +178,7 @@ def test_nodus_console_token_port_and_cleanup(tmp_path):
             "args": [], "leases": [], "python": sys.executable,
             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
     db, state, inst = _setup(tmp_path, spec)
-    token = state / "secrets" / "operator_credentials" / "nodus-stub.console.secret"      # --state-dir is the state root
+    token = state / "run" / "console" / "nodus-stub.console.secret"      # --state-dir is the state root
     plan = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
     command = json.loads(plan.stdout)["instances"][0]["command"]
     assert command[command.index("--console-port") + 1] == "0" and command[command.index("--console-token-file") + 1] == str(token)
@@ -291,3 +292,35 @@ def test_disabled_instance_is_skipped_and_contributes_no_route(tmp_path):
     assert plan["m-dev"]["skipped"] == "disabled (enabled: false)" and plan["m-dev"]["command"] is None
     a = plan["m-a"]["command"]
     assert a[a.index("--routes") + 1] == "a" and "--dev-route" not in a
+
+
+def _alive(pid) -> bool:
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=30).stdout
+        return str(pid) in out.split()
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_instances_end_when_the_supervisor_is_killed(tmp_path):
+    """A supervisor ended abruptly (no shutdown, as a service stop does) takes its instances with it: they are in its
+    kill-on-close job, so nothing is left holding their ports for the next supervisor."""
+    spec = {"name": "sleeper", "kind": "command", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-sleeper",
+            "args": [sys.executable, "-c", "import time\nprint('up', flush=True)\ntime.sleep(120)"], "leases": []}
+    db, state, inst = _setup(tmp_path, spec)
+    proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        row = _wait(lambda: next((r for r in _rows(db, "SELECT * FROM service_instances") if r["state"] == "running" and r["pid"]), None))
+        child = int(row["pid"])
+        assert _alive(child)
+        proc.kill()                                   # TerminateProcess: the supervisor's shutdown never runs
+        proc.wait(timeout=30)
+        if os.name == "nt":
+            assert _wait(lambda: not _alive(child), timeout=20), "the instance outlived its supervisor"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close(); proc.stderr.close()
