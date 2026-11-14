@@ -178,6 +178,37 @@ if (-not $WhatIf) {
     if (-not (Test-Path -LiteralPath $Params)) { New-Item -Path $Params -Force | Out-Null }
     Set-ItemProperty -LiteralPath $Params -Name ConfigArgs -Value ([string[]]@('-E', $StartupLog)) -Type MultiString
 }
+# The front's configuration is the repository's file itself (APACHE_FRONT_2026-11-10.md step 2), never a copy under conf/: a copy
+# drifts (2026-11-14: conf/meowdoku-proxy.conf lacked the site-nav filter and held a hand edit the repository had since taken).
+# Any other Include of a meowdoku-proxy.conf is replaced by this one; httpd.conf is backed up first and checked after (httpd -t).
+$ProxyConf = "$Repo/examples/meowdoku/deploy/apache/meowdoku-proxy.conf"
+$HttpdConf = "$Apache/conf/httpd.conf"
+$wantInclude = "Include `"$ProxyConf`""
+Cmd "httpd.conf: $wantInclude  (replacing any other Include of meowdoku-proxy.conf)"
+if (-not $WhatIf) {
+    $lines = Get-Content -LiteralPath $HttpdConf
+    $found = @($lines | Where-Object { $_ -match '^\s*Include\s+"?[^"]*meowdoku-proxy\.conf"?\s*$' })
+    if ($found.Count -eq 1 -and $found[0].Trim() -eq $wantInclude) { Write-Host 'httpd.conf already includes the repository conf.' }
+    else {
+        $backup = "$HttpdConf.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+        Copy-Item -LiteralPath $HttpdConf -Destination $backup
+        $kept = @($lines | Where-Object { $_ -notmatch '^\s*Include\s+"?[^"]*meowdoku-proxy\.conf"?\s*$' }) + $wantInclude
+        Set-Content -LiteralPath $HttpdConf -Value $kept -Encoding ascii
+        Write-Host "httpd.conf now includes the repository conf (was: $($found -join ' | ')); backup $backup"
+    }
+    & "$Apache/bin/httpd.exe" -t
+    if ($LASTEXITCODE -ne 0) { throw "httpd -t refused the configuration (exit $LASTEXITCODE); httpd.conf backup is beside it" }
+}
+
+# ---------------------------------------------------------------- (d2) pre-push hooks
+# The gate's pre-push hook runs the interpreter that installed it (branch_gate.py hook_text: sys.executable). Installed from the
+# operator's own Python it points into C:/Users/alber, which the service cannot run, and every push the landing task makes fails
+# ("cannot execute: Is a directory", 2026-11-14). Installed from the private interpreter, the operator and the service both run it.
+Step '(d2) pre-push hooks, installed from the private interpreter'
+$Gate = "$Repo/examples/meowdoku/branch_gate.py"
+$Policy = "$Repo/examples/meowdoku/deploy/branch_policy.json"
+$AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql/accounts.db' } else { "$StateBase/accounts.db" }
+Run "$Srv/python/python.exe" @($Gate, '--policy', $Policy, '--db', $AccountsDb, 'install-hook')
 
 # ---------------------------------------------------------------- (e) verify
 Step '(e) verification'
