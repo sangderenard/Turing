@@ -47,7 +47,7 @@ class AdditionsTests(unittest.TestCase):
             self.assertIn("-I", args)
             calls.append(args)
             if '--dry-run' in args:
-                Path(args[args.index('--report')+1]).write_text(json.dumps({'install':[{'metadata':{'name':'new','version':'1'}, 'download_info':{'url':'https://files.pythonhosted.org/new.whl', 'archive_info':{'hashes':{'sha256':'a'*64}}}}]}))
+                Path(args[args.index('--report')+1]).write_text(json.dumps({'unicode_note':'\u65e5\u672c\u8a9e \U0001f3b5', 'install':[{'metadata':{'name':'new','version':'1'}, 'download_info':{'url':'https://files.pythonhosted.org/new.whl', 'archive_info':{'hashes':{'sha256':'a'*64}}}}]}, ensure_ascii=False), encoding='utf-8')
             elif 'install' in args:
                 self.assertIn('--no-deps', args)
                 self.assertIn('--require-hashes', args)

@@ -76,7 +76,7 @@ def run(requirements):
         invoke(['install', '--dry-run', '--no-cache-dir', '--only-binary=:all:',
                 '--index-url', 'https://pypi.org/simple', '--constraint', str(constraints),
                 '--report', str(report), *requested])
-        additions = check_plan(json.loads(report.read_text()), before)
+        additions = check_plan(json.loads(report.read_text(encoding="utf-8")), before)
         if installed() != before:
             raise RuntimeError('Runtime changed concurrently; refusing install')
         if not additions:
