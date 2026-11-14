@@ -868,3 +868,26 @@ def test_each_landing_run_is_recorded_for_the_page_with_its_trigger_and_outcome(
         return handler.sent
     status, answer = ask("/api/reviews")
     assert status == 200 and answer["lander"]["running"]["stuck"] is True and answer["lander"]["last"]["error"]
+
+
+def test_a_landing_run_fetches_each_repository_once_and_still_lands_a_chain(world, monkeypatch):
+    db, policy, work = world["db"], world["policy"], world["work"]
+    first = branch(world, "first")
+    run(work, "checkout", "-q", "-b", "second", "first")
+    second = commit(work, "second.txt")
+    run(work, "push", "-q", "origin", "second")
+    run(work, "checkout", "-q", "main")
+    for name, head in (("first", first), ("second", second), ("third", branch(world, "third"))):
+        submit(world, name, head, timeout_s=0)
+    fetches = []
+    real = branch_gate.git
+
+    def counting(path, *args, **kwargs):
+        if args[:1] == ("fetch",):
+            fetches.append(path)
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(branch_gate, "git", counting)
+    done = actions(branch_gate.land(policy, db, apply=True, log=lambda line: None))
+    assert len(fetches) == 1, "one fetch for the one repository, not one per change"
+    assert done["first"] == "landed" and done["second"] == "landed", "a chain lands in one run: the push moved the tracked base"
+    assert done["third"] == "held" and remote_has(world, "main") == second

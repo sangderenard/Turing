@@ -539,6 +539,7 @@ def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> li
     now = time.time() if now is None else now
     wanted = None if only is None else {str(review_id) for review_id in only}
     results = []
+    fetched = set()                                # one fetch per repository per run, not one per change
     for review in branch_review.landable(db, now):
         if wanted is not None and review["id"] not in wanted:
             continue
@@ -550,7 +551,9 @@ def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> li
             path, remote = declared["path"], policy["remote"]
             if review["base"] != declared["default"]:
                 raise GateError("the review's base is not the repository's default branch")
-            git(path, "fetch", "--quiet", remote)
+            if (path, remote) not in fetched:
+                git(path, "fetch", "--quiet", remote)
+                fetched.add((path, remote))
             base = f"refs/remotes/{remote}/{review['base']}"
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", review["head"], base],
                               capture_output=True).returncode == 0:
