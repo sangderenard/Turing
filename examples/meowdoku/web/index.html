@@ -20,16 +20,21 @@
   form { display: grid; gap: .8rem; }
   [hidden] { display: none !important; }
 </style>
+<link rel="stylesheet" href="/pages.css">
 </head>
 <body>
 <main>
-  <h1>Pages</h1>
-  <p class="muted">Pages people have chosen to publish. Open an author to see their pages.</p>
-  <nav class="row" aria-label="Pages"><a href="/">Feed</a><a id="games-link" href="/games.html" hidden>Games</a><a id="files-link" href="/files.html" hidden>My files</a></nav>
+  <header class="mast"><div class="mast-copy"><div class="eyebrow">Meowdoku · made here</div><h1>Pages from people</h1>
+    <p class="muted">Games, experiments, and places their authors chose to publish. Open a creator to explore more.</p></div>
+    <nav class="quick-links" aria-label="Pages"><a href="/">Public feed</a><a id="games-link" href="/games.html" hidden>Built-in games</a><a id="files-link" href="/files.html" hidden>My files</a></nav></header>
   <p id="notice" role="status"></p>
-  <section id="author-heading" hidden><h2 id="author-title"></h2><p><a href="/">All authors</a></p></section>
-  <section id="feed" aria-label="Published pages"></section>
-  <section id="publish" class="card" hidden>
+  <section id="author-heading" hidden><div class="section-head"><h2 id="author-title"></h2><a href="/">All authors</a></div></section>
+  <section aria-label="Released pages"><div class="section-head"><div><h2>Public feed</h2><p>Released pages anyone can visit.</p></div><span id="release-count" class="count"></span></div>
+    <div id="feed" class="grid"></div></section>
+  <section id="dev-section" aria-label="Your dev pages" hidden><div class="section-head"><div><h2>In development</h2><p>Only you can preview these pages on the development server.</p></div><span id="dev-count" class="count"></span></div>
+    <div id="dev-feed" class="grid"></div></section>
+  <section id="publish" class="publish" hidden>
+    <div class="eyebrow">Creator space</div>
     <h2>Publish a page</h2>
     <p class="muted">Choose a UTF-8 HTML or text file. A private encrypted file must first be decrypted on your device. Publishing sends a separate readable copy. New pages begin in dev.</p>
     <form id="publish-form">
@@ -40,7 +45,7 @@
       <button type="submit">Create dev page</button>
     </form>
     <h3>My pages</h3>
-    <div id="mine"></div>
+    <div id="mine" class="grid"></div>
   </section>
 </main>
 <script type="module" src="/pages.js"></script>

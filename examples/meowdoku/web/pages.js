@@ -14,18 +14,37 @@ const element = (tag, text) => { const out = document.createElement(tag); out.te
 
 function card(page, mine = false) {
   const box = element("article", ""); box.className = "card";
-  const title = element("h2", "");
-  const link = element("a", page.title); link.href = "/p/" + page.id + "/";
-  title.append(link);
+  const href = "/p/" + page.id + "/";
+  const poster = element("a", ""); poster.className = "poster"; poster.href = href;
+  poster.dataset.kind = page.kind;
+  poster.setAttribute("aria-label", "Open " + page.title);
+  const mark = element("span", page.title.trim().slice(0, 1).toUpperCase());
+  mark.className = "poster-mark"; poster.append(mark);
+  const body = element("div", ""); body.className = "card-body";
+  const badges = element("div", ""); badges.className = "badges";
+  const stage = element("span", page.stage === "dev" ? "In development" : "Released");
+  stage.className = "badge " + page.stage;
+  const kind = element("span", page.kind === "bundle" ? "Compiled page" : "Uploaded page");
+  kind.className = "badge"; badges.append(stage, kind);
+  const title = element("h3", "");
+  const link = element("a", page.title); link.href = href; title.append(link);
+  if (page.stage === "dev") {
+    const openDev = async (event) => {
+      event.preventDefault();
+      try { await post("/api/route", { site: "dev" }); location.assign(href); }
+      catch (error) { note(error.message); }
+    };
+    poster.addEventListener("click", openDev);
+    link.addEventListener("click", openDev);
+  }
   const author = element("a", "@" + page.author);
   author.href = "/?author=" + encodeURIComponent(page.author);
-  const meta = element("p", ""); meta.className = "muted";
-  meta.append(author, document.createTextNode(" · " + page.kind + " · " + new Date(page.updated_at * 1000).toLocaleString()));
-  box.append(title, meta);
-  if (page.description) box.append(element("p", page.description));
+  const meta = element("p", ""); meta.className = "byline";
+  meta.append(author, document.createTextNode(" · " + new Date(page.updated_at * 1000).toLocaleDateString()));
+  body.append(badges, title, meta);
+  if (page.description) { const description = element("p", page.description); description.className = "description"; body.append(description); }
   if (mine) {
     const actions = element("div", ""); actions.className = "row";
-    actions.append(element("span", page.stage));
     const preview = element("button", page.stage === "dev" ? "Preview on dev" : "Open page");
     preview.type = "button";
     preview.onclick = async () => {
@@ -43,8 +62,9 @@ function card(page, mine = false) {
         await refresh();
       } catch (error) { note(error.message); }
     };
-    actions.append(preview, change); box.append(actions);
+    actions.append(preview, change); body.append(actions);
   }
+  box.append(poster, body);
   return box;
 }
 
@@ -56,8 +76,10 @@ async function refresh() {
   }
   const query = author ? "?author=" + encodeURIComponent(author) : "";
   const feed = await request("/api/pages" + query);
-  $("feed").replaceChildren(...feed.pages.map((page) => card(page)));
-  if (!feed.pages.length) $("feed").append(element("p", "No pages here yet."));
+  const released = feed.pages.filter((page) => page.stage === "release");
+  $("feed").replaceChildren(...released.map((page) => card(page)));
+  $("release-count").textContent = released.length + " shown";
+  if (!released.length) { const empty = element("p", "No released pages here yet."); empty.className = "empty"; $("feed").append(empty); }
   const who = await request("/api/whoami");
   $("games-link").hidden = !who.signed_in && who.tier === "shader";
   $("files-link").hidden = !who.signed_in;
@@ -74,6 +96,10 @@ async function refresh() {
   const mine = await request("/api/pages?mine=1");
   $("mine").replaceChildren(...mine.pages.map((page) => card(page, true)));
   if (!mine.pages.length) $("mine").append(element("p", "You have not published a page."));
+  const drafts = mine.pages.filter((page) => page.stage === "dev");
+  $("dev-section").hidden = !drafts.length;
+  $("dev-feed").replaceChildren(...drafts.map((page) => card(page)));
+  $("dev-count").textContent = drafts.length + " shown";
 }
 
 $("publish-form").addEventListener("submit", async (event) => {
