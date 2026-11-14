@@ -25,15 +25,34 @@ class AdditionsTests(unittest.TestCase):
                      {'metadata':{'name':'new','version':'1'},'is_direct':True}):
             with self.assertRaises(ValueError): m.check_plan({'install':[item]}, {'old':'1'})
 
+    def test_plan_requires_approved_wheel_and_hash(self):
+        good = {'metadata':{'name':'new','version':'1'}, 'download_info':{
+            'url':'https://files.pythonhosted.org/new.whl',
+            'archive_info':{'hashes':{'sha256':'a'*64}}}}
+        self.assertEqual(m.check_plan({'install':[good]}, {})[0][0], 'new')
+        for url in ('https://evil.test/new.whl', 'http://files.pythonhosted.org/new.whl',
+                    'https://files.pythonhosted.org/new.tar.gz',
+                    'https://user@files.pythonhosted.org/new.whl'):
+            good['download_info']['url'] = url
+            with self.assertRaises(ValueError): m.check_plan({'install':[good]}, {})
+        good['download_info']['url'] = 'https://files.pythonhosted.org/new.whl'
+        good['download_info']['archive_info']['hashes']['sha256'] = ''
+        with self.assertRaises(ValueError): m.check_plan({'install':[good]}, {})
+
     def exercise(self, fail=False):
         state = {'old':'1'}
         calls = []
-        def invoke(args, check):
+        def invoke(args, check, env):
+            self.assertEqual(env["PIP_CONFIG_FILE"], m.os.devnull)
+            self.assertIn("-I", args)
             calls.append(args)
             if '--dry-run' in args:
-                Path(args[args.index('--report')+1]).write_text(json.dumps({'install':[{'metadata':{'name':'new','version':'1'}}]}))
+                Path(args[args.index('--report')+1]).write_text(json.dumps({'install':[{'metadata':{'name':'new','version':'1'}, 'download_info':{'url':'https://files.pythonhosted.org/new.whl', 'archive_info':{'hashes':{'sha256':'a'*64}}}}]}))
             elif 'install' in args:
                 self.assertIn('--no-deps', args)
+                self.assertIn('--require-hashes', args)
+                self.assertIn('--no-index', args)
+                self.assertIn('--hash=sha256:' + 'a'*64, Path(args[args.index('-r')+1]).read_text())
                 state['new'] = '1'
                 if fail: raise RuntimeError('partial failure')
             elif 'uninstall' in args:

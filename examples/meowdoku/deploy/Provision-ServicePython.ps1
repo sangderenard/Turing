@@ -26,7 +26,7 @@ if ($InstallRequirementsOnly) {
     Write-Host "Additive dependency install using $Py; existing versions are constrained and verified."
     if ($WhatIf) { Write-Host "[WhatIf] $Py $Helper $Requirements (nothing run)"; return }
     $BeforeHash = (Get-FileHash -LiteralPath $Py -Algorithm SHA256).Hash
-    & $Py $Helper $Requirements
+    & $Py -I $Helper $Requirements
     $InstallExit = $LASTEXITCODE
     if ((Get-FileHash -LiteralPath $Py -Algorithm SHA256).Hash -ne $BeforeHash) { throw "REFUSED: interpreter changed during installation" }
     if ($InstallExit -ne 0) { throw "Additive installation failed; inspect rollback result above." }
