@@ -108,7 +108,10 @@ function New-AgentPassword {
     $secure.MakeReadOnly()
     $secure
 }
-function Credential-File([string]$name) { Join-Path $StoreDir "$name.xml" }
+# Reading the saved passwords and starting a program as an agent account live in AgentAccounts.psm1, shared with
+# Start-AgentDay.ps1; saving one is here, where the passwords are made.
+Import-Module (Join-Path $PSScriptRoot 'AgentAccounts.psm1') -Force
+function Credential-File([string]$name) { Get-AgentCredentialFile $name }
 # Export-Clixml encrypts the password with the current user's DPAPI key: only the operator, signed in as themself, can read it.
 function Save-AgentCredential([pscredential]$cred) {
     if (-not (Test-Path -LiteralPath $StoreDir)) {
@@ -117,27 +120,6 @@ function Save-AgentCredential([pscredential]$cred) {
     }
     $cred | Export-Clixml -LiteralPath (Credential-File $cred.UserName)
     Write-Host "  password saved encrypted for $Operator only: $(Credential-File $cred.UserName) (not shown)"
-}
-function Read-AgentCredential([string]$name) {
-    $file = Credential-File $name
-    if (Test-Path -LiteralPath $file) { Import-Clixml -LiteralPath $file } else { $null }
-}
-# Start a program as an agent account with that account's own environment. Start-Process -Credential copies the caller's
-# environment (HOME, TEMP, APPDATA and PATH pointed at the operator's profile: the first -OpenConsole on 2026-11-14 tried
-# to write its history and $HOME\gemini.key into C:\Users\alber and was refused), and -UseNewEnvironment gives only the
-# machine scope (USERNAME reads SYSTEM). A ProcessStartInfo whose Environment is never touched passes no environment
-# block, so CreateProcessWithLogonW builds one from the account's own profile; it also opens a new console by default.
-function Start-AsAgent([pscredential]$cred, [string]$file, [string[]]$arguments, [string]$directory, [switch]$Hidden) {
-    $info = [System.Diagnostics.ProcessStartInfo]::new($file)
-    foreach ($a in $arguments) { $info.ArgumentList.Add($a) }
-    $info.UserName = $cred.UserName
-    $info.Domain = $env:COMPUTERNAME
-    $info.Password = $cred.Password
-    $info.LoadUserProfile = $true
-    $info.UseShellExecute = $false
-    $info.WorkingDirectory = $directory
-    $info.CreateNoWindow = [bool]$Hidden
-    [System.Diagnostics.Process]::Start($info)
 }
 
 # ---------------------------------------------------------------- console
