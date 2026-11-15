@@ -766,6 +766,10 @@ def make_handler(sessions: Sessions):
                 return False                                   # [NEWSLETTER] published articles are public; the route bounds itself
             if method == "GET" and path in ("/newsletter.html", "/newsletter.js"):
                 return False
+            if method == "POST" and path in ("/api/invitations/check", "/api/invitations/redeem"):
+                return False                                   # [INVITE] registration by invitation; the route bounds itself
+            if method == "GET" and path in ("/invited.html", "/invited.js", "/register.html", "/register.js"):
+                return False
             if method == "GET" and path in ("/reports.html", "/reports.js"):
                 return False
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
@@ -1144,6 +1148,20 @@ def make_handler(sessions: Sessions):
                 service_type=account_content.Groups, accounts=sessions.accounts,
                 account_cookie=ACCOUNT_COOKIE, AccessError=account_content.AccessError,
                 SchemaVersionError=account_content.schema_version.SchemaVersionError)
+
+        def _invitations_route(self, path: str, method: str) -> None:
+            """[INVITE] registration by invitation (invitations.py): a one-time code in a link registers and signs in; the
+            route bounds itself (checking and redeeming need no account, and wrong codes count against the login guard)."""
+            from meowdoku import invitations
+
+            def sign_in(user):
+                self._bind_instance(user["id"])
+                self._set_account_cookie(sessions.accounts.create_session(user["id"]))
+
+            self._classify()
+            self._set_cookie = []
+            return invitations.http_route(self, path, method, accounts_db=sessions.accounts_db, signup=sessions.accounts.signup,
+                                          sign_in=sign_in, account_error=accounts_mod.AccountError, guard=login_guard_mod)
 
         def _newsletter_route(self, path: str, method: str) -> None:
             """[NEWSLETTER] the server's articles (newsletter.py): anyone reads what is published; the route bounds itself."""
@@ -2877,6 +2895,8 @@ def make_handler(sessions: Sessions):
                     conn.close()
             if path == "/api/newsletter" or path.startswith("/api/newsletter/"):
                 return self._newsletter_route(path, "GET")
+            if path == "/api/invitations" or path.startswith("/api/invitations/"):
+                return self._invitations_route(path, "GET")
             if path == "/api/reports" or path.startswith("/api/reports/"):
                 return self._reports_route(path, "GET")
             if path == "/api/tickets":
@@ -3505,6 +3525,8 @@ def make_handler(sessions: Sessions):
                     conn.close()
             if path0 == "/api/newsletter" or path0.startswith("/api/newsletter/"):
                 return self._newsletter_route(path0, "POST")
+            if path0 == "/api/invitations" or path0.startswith("/api/invitations/"):
+                return self._invitations_route(path0, "POST")
             if path0 == "/api/reports" or path0.startswith("/api/reports/"):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]

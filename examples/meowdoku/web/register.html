@@ -34,32 +34,18 @@
 </head>
 <body>
 <main>
-  <p class="mock">Mockup. Nothing on this page is sent or saved yet.</p>
   <h1>Register</h1>
   <p>Registration is by invitation. Anyone who has an account can invite you: ask someone you know who is on
      here, or someone they know.</p>
   <h2>I have an invitation</h2>
   <form id="code-form" class="row">
-    <div style="flex:1"><label for="code">Invitation code or link</label>
-    <input id="code" autocapitalize="none" spellcheck="false" required></div>
+    <div style="flex:1"><label for="code">Invitation link or code</label>
+    <input id="code" autocapitalize="none" spellcheck="false" autocomplete="off" required></div>
     <button type="submit">Open</button>
-  </form>
-  <h2>Open registration</h2>
-  <p class="mut">Closed for now. This is the form it will use.</p>
-  <form>
-    <fieldset disabled>
-      <label for="r-username">Username</label>
-      <input id="r-username" autocomplete="username">
-      <label for="r-email">Email</label>
-      <input id="r-email" type="email" autocomplete="email">
-      <label for="r-password">Password</label>
-      <input id="r-password" type="password" autocomplete="new-password">
-      <button type="submit">Register</button>
-    </fieldset>
   </form>
   <p class="mut">Already registered? <a href="/login.html">Sign in</a>.</p>
 </main>
-<script src="register.js"></script>
+<script src="/register.js"></script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>
 </body>
 </html>

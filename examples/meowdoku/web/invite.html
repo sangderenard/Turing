@@ -30,37 +30,55 @@
   th { color:var(--mut); font-weight:500; }
   code { font-size:.85rem; word-break:break-all; }
   h2 { font-size:1.05rem; margin:1.6rem 0 .3rem; }
+  select { width:100%; box-sizing:border-box; font:inherit; padding:.5rem .6rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:.8rem 1rem; margin-top:1.2rem; background:var(--card); }
+  #qr { display:block; margin:.4rem auto; max-width:100%; height:auto; image-rendering:pixelated; background:#fff; }
+  .actions { flex-wrap:wrap; } .actions > * { margin-top:.5rem; }
+  a.button { display:inline-block; padding:.45rem 1.1rem; border-radius:6px; border:1px solid var(--line); color:var(--fg); text-decoration:none; }
+  button.small { margin-top:0; padding:.2rem .6rem; font-size:.85rem; }
+  @media print { body * { visibility:hidden; } #made, #made * { visibility:visible; } #made { position:absolute; inset:0; border:0; } .actions { display:none; } }
 </style>
 </head>
 <body>
 <main class="wide">
-  <p class="mock">Mockup. Nothing on this page is sent or saved yet.</p>
   <h1>Invite someone</h1>
-  <p>Anyone with an account can invite people they know. The people you invite can invite people too. Each
-     invitation records who invited whom.</p>
+  <p>Registration here is by invitation. Make one for a person you know: you get a link and a QR code that work once.
+     Send the link in a message or an email, or let them scan the code. The people you invite can invite people too, and
+     each invitation records who invited whom.</p>
   <p id="signed-out" class="bad" hidden>Sign in to invite someone. <a href="/login.html">Sign in</a></p>
   <form id="form" hidden>
-    <label for="name">Their name <span class="mut">(so you can tell your invitations apart)</span></label>
+    <label for="name">Who it is for <span class="mut">(so you can tell your invitations apart)</span></label>
     <input id="name" maxlength="80" required>
-    <label for="email">Their email <span class="mut">(optional: we email them the link)</span></label>
+    <label for="email">Their email <span class="mut">(optional: fills in "Email it", and kept with your invitation)</span></label>
     <input id="email" type="email" autocomplete="off">
+    <label for="days">The link works for</label>
+    <select id="days"><option value="1">1 day</option><option value="7">7 days</option><option value="14" selected>14 days</option>
+      <option value="30">30 days</option><option value="90">90 days</option></select>
     <button id="make" type="submit">Make invitation</button>
+    <p class="mut" id="sent" role="status"></p>
   </form>
-  <section id="made" hidden>
-    <h2>Invitation link</h2>
+  <section id="made" class="card" hidden>
+    <h2>Invitation</h2>
+    <canvas id="qr" width="264" height="264" aria-label="QR code of the invitation link"></canvas>
     <p><code id="link"></code></p>
-    <button id="copy" type="button">Copy link</button>
-    <p class="mut" id="sent"></p>
+    <p class="mut">Code <code id="code"></code></p>
+    <p class="mut" id="until"></p>
+    <div class="row actions">
+      <button id="copy" type="button">Copy link</button>
+      <a id="mail" class="button" href="#">Email it</a>
+      <button id="share" type="button" hidden>Share</button>
+      <button id="print" type="button">Print</button>
+    </div>
   </section>
-  <h2>Your invitations</h2>
-  <table>
-    <thead><tr><th>Who</th><th>Made</th><th>State</th></tr></thead>
-    <tbody id="list"></tbody>
-  </table>
-  <p class="mut">Invitation emails will go out through the Nodus email manager table, which is not connected
-     yet. Until it is, copy the link and send it yourself.</p>
+  <section id="yours" hidden>
+    <h2>Your invitations</h2>
+    <table>
+      <thead><tr><th>For</th><th>Made</th><th>State</th><th></th></tr></thead>
+      <tbody id="list"></tbody>
+    </table>
+  </section>
 </main>
-<script src="invite.js"></script>
+<script type="module" src="/invite.js"></script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>
 </body>
 </html>
