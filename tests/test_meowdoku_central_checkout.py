@@ -197,3 +197,109 @@ def test_rest_takes_the_account_from_the_session_only(world):
     assert post("open", {"repository": "work", "branch": "ann/rest2"}, user=None, username=None)[0] == 401
     assert post("open", {"repository": "work", "branch": "ann/rest2"}, caps=())[0] == 403
     assert post("read", {"repository": "work", "branch": "ann/rest", "path": "../x"})[0] == 400
+
+
+def folder_of(world):
+    return Path(world["db"].execute("SELECT path FROM checkouts").fetchone()[0])
+
+
+def test_exact_edit_replaces_known_text_and_refuses_ambiguity(world):
+    call(world, "open", branch="ann/exact")
+    folder = folder_of(world)
+    call(world, "write", branch="ann/exact", path="a.txt", text="one\ntwo\ntwo\n")
+    done = call(world, "edit", branch="ann/exact", path="a.txt", old="one", new="ONE")
+    assert done["format"] == "exact" and (folder / "a.txt").read_text(encoding="utf-8") == "ONE\ntwo\ntwo\n"
+    with pytest.raises(central_checkout.CheckoutError, match="occurs 2 time"):
+        call(world, "edit", branch="ann/exact", path="a.txt", old="two", new="2")
+    call(world, "edit", branch="ann/exact", path="a.txt", old="two", new="2", count=2)
+    assert (folder / "a.txt").read_text(encoding="utf-8") == "ONE\n2\n2\n"
+    with pytest.raises(central_checkout.CheckoutError, match="occurs 0 time"):
+        call(world, "edit", branch="ann/exact", path="a.txt", old="three", new="3")
+    call(world, "write", branch="ann/exact", path="w.txt", text="x\r\ny\r\n")
+    call(world, "edit", branch="ann/exact", path="w.txt", old="x\ny", new="x\nz")
+    assert (folder / "w.txt").read_bytes() == b"x\r\nz\r\n", "Windows line endings in the file are kept"
+    with pytest.raises(central_checkout.CheckoutError):
+        call(world, "edit", branch="ann/exact", path="../a.txt", old="ONE", new="1")
+
+
+UNIFIED = """--- a/base.txt
++++ b/base.txt
+@@ -1 +1 @@
+-base
++base, patched
+diff --git a/new.txt b/new.txt
+new file mode 100644
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1 @@
++hello
+"""
+
+
+def test_a_unified_diff_is_checked_then_applied(world):
+    call(world, "open", branch="ann/unified")
+    folder = folder_of(world)
+    done = call(world, "edit", branch="ann/unified", patch=UNIFIED)
+    assert done["format"] == "unified" and done["files"] == ["base.txt", "new.txt"]
+    assert (folder / "base.txt").read_text(encoding="utf-8") == "base, patched\n"
+    assert (folder / "new.txt").read_text(encoding="utf-8") == "hello\n"
+    stale = UNIFIED.split("diff --git")[0]                # base.txt no longer reads "base": the hunk cannot apply
+    with pytest.raises(central_checkout.CheckoutError, match="nothing was changed"):
+        call(world, "edit", branch="ann/unified", patch=stale)
+    assert (folder / "base.txt").read_text(encoding="utf-8") == "base, patched\n"
+    for refused in ("--- a/../x.txt\n+++ b/../x.txt\n@@ -0,0 +1 @@\n+x\n",
+                    "--- a/.git/config\n+++ b/.git/config\n@@ -0,0 +1 @@\n+x\n",
+                    "diff --git a/b.bin b/b.bin\nGIT binary patch\nliteral 3\n",
+                    "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+..\n",
+                    "just some text\n"):
+        with pytest.raises(central_checkout.CheckoutError):
+            call(world, "edit", branch="ann/unified", patch=refused)
+    assert not (folder.parent / "x.txt").exists()
+
+
+CODEX = """*** Begin Patch
+*** Add File: docs/notes.md
++# Notes
++first
+*** Update File: base.txt
+@@
+-base
++base, by codex
+*** End Patch
+"""
+
+
+def test_a_codex_patch_applies_whole_or_not_at_all(world):
+    call(world, "open", branch="ann/codex")
+    folder = folder_of(world)
+    done = call(world, "edit", branch="ann/codex", patch=CODEX)
+    assert done["format"] == "codex" and done["files"] == ["base.txt", "docs/notes.md"]
+    assert (folder / "docs" / "notes.md").read_text(encoding="utf-8") == "# Notes\nfirst\n"
+    assert (folder / "base.txt").read_text(encoding="utf-8") == "base, by codex\n"
+    moved = """*** Begin Patch
+*** Update File: docs/notes.md
+*** Move to: docs/renamed.md
+@@ # Notes
+-first
++second
+*** End Patch"""
+    call(world, "edit", branch="ann/codex", patch=moved)
+    assert not (folder / "docs" / "notes.md").exists()
+    assert (folder / "docs" / "renamed.md").read_text(encoding="utf-8") == "# Notes\nsecond\n"
+    broken = """*** Begin Patch
+*** Add File: should-not-exist.txt
++x
+*** Update File: base.txt
+@@
+-this line is not there
++y
+*** End Patch"""
+    with pytest.raises(central_checkout.CheckoutError, match="not in the file"):
+        call(world, "edit", branch="ann/codex", patch=broken)
+    assert not (folder / "should-not-exist.txt").exists(), "a patch that fails part-way writes nothing"
+    call(world, "edit", branch="ann/codex", patch="*** Begin Patch\n*** Delete File: docs/renamed.md\n*** End Patch\n")
+    assert not (folder / "docs" / "renamed.md").exists()
+    with pytest.raises(central_checkout.CheckoutError):
+        call(world, "edit", branch="ann/codex", patch="*** Begin Patch\n*** Add File: ../out.txt\n+x\n*** End Patch\n")
+    recorded = [r[0] for r in world["db"].execute("SELECT path FROM checkout_calls WHERE operation = 'edit' AND ok = 1")]
+    assert "base.txt,docs/notes.md" in recorded, "a patch's call records the files it changed"
