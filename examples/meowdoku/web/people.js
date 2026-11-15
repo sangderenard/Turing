@@ -2,7 +2,7 @@
 // textContent only; the server decides every permission and checks every grant, this page only decides what to offer.
 //   GET  /api/account/admin/people                 accounts with their authority (account_admin.py)
 //   GET  /api/account/admin/tools?username=NAME    that account's capabilities and tools
-//   POST /api/account/authority/grant              {username, group: dev|operator|nodus, enabled}
+//   POST /api/account/authority/grant              {username, group: dev|operator|nodus|message, enabled}
 //   POST /api/account/admin/grant | revoke         {username}
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
@@ -69,7 +69,12 @@ async function open(username) {
   groups.append(el("span", "Groups:"));
   for (const g of a.groups || []) groups.append(el("span", g, "badge on"));
   panel.append(groups);
-  if (a.highest === "intern") panel.append(el("p", "An intern (kiosk) account takes no permission group; its role decides.", "muted"));
+  if (a.highest === "intern") {
+    const enabled = Boolean(a.modifiers?.message);
+    const button = el("button", `${enabled ? "Remove" : "Grant"} message`); button.type = "button";
+    button.onclick = () => grant(person, "message", !enabled);
+    panel.append(button, el("p", "An intern account may receive an account-specific message modifier for direct messages.", "muted"));
+  }
   else if (a.service) panel.append(el("p", "A service account is not on the people ladder; its role decides.", "muted"));
   else {
     const buttons = el("div", null, "actions");
