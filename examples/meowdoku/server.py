@@ -358,6 +358,8 @@ COOKIE = "meowdoku_session"
 PLAYER_COOKIE = "meowdoku_player"      # the long-lived player identity (per port, like COOKIE)
 PLAYER_COOKIE_SECONDS = 2 * 365 * 24 * 3600
 SESSION_IDLE_SECONDS = 2 * 3600
+# [LOGIN] the tier a signed-in account lifts a shader-tier request to, by its role (_classify; account_admin uses it too)
+SHADER_LIFT = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
 ACCOUNT_COOKIE = "meowdoku_account"    # a real login session token (accounts.py) -- distinct from
                                        # both COOKIE (game-table) and PLAYER_COOKIE (passwordless name)
 
@@ -593,9 +595,8 @@ def make_handler(sessions: Sessions):
             self._principal_cache = None
             if self._origin_tier == "shader":                    # [LOGIN] a signed-in account lifts the shader lock; its caps still come from its role
                 account = self._account()
-                lift = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
                 if account is not None:
-                    self._tier = lift.get(authz_mod.role_of(sessions.accounts_db, account["id"]), "shader")
+                    self._tier = SHADER_LIFT.get(authz_mod.role_of(sessions.accounts_db, account["id"]), "shader")
 
         # ---- [AUTHZ] the request's principal and its capabilities (authz.py); built lazily after _classify
         def _principal(self):
@@ -3066,6 +3067,12 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "no such marble object"}, HTTPStatus.NOT_FOUND)
                 except marble_objects_mod.ObjectError as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.INTERNAL_SERVER_ERROR))
+            if path in ("/api/account/admin/people", "/api/account/admin/tools"):   # [PEOPLE] the admin's account view (account_admin.py)
+                if not self._require("account_manage"):
+                    return
+                from meowdoku import account_admin
+                return account_admin.http_route(self, path, accounts_db=sessions.accounts_db, policy=sessions.authz_policy.get(),
+                                                catalog=shared_catalog, lift=SHADER_LIFT)
             if path == "/api/account/admin/list":
                 if not self._require("account_manage"):
                     return
