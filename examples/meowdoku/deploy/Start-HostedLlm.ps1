@@ -27,6 +27,31 @@ if ($GrantRead) {
 if ($Register) {
     $credential = Read-AgentCredential $account
     if (-not $credential) { throw "No saved credential for $account; run Set-AgentBox elevated" }
+    # Task Scheduler uses a batch logon for password-backed tasks. Preserve the
+    # current holders when adding this account, as Setup-ServiceAccount does for
+    # its service logon right.
+    $sid = (Get-LocalUser -Name $account).SID.Value
+    $prefix = Join-Path ([IO.Path]::GetTempPath()) "hosted-llm-secedit-$PID"
+    $export = "$prefix.export.inf"; $apply = "$prefix.apply.inf"; $database = "$prefix.sdb"
+    try {
+        & secedit.exe /export /cfg $export /areas USER_RIGHTS /quiet
+        if ($LASTEXITCODE -ne 0) { throw 'Could not read Windows logon rights' }
+        $batch = ''
+        foreach ($line in Get-Content -LiteralPath $export) {
+            if ($line -match '^SeBatchLogonRight\s*=\s*(.*)$') { $batch = $Matches[1].Trim(); break }
+        }
+        $holders = @($batch -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($holders -notcontains "*$sid") {
+            $holders += "*$sid"
+            $policy = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`"`r`nRevision=1`r`n[Privilege Rights]`r`nSeBatchLogonRight = $($holders -join ',')`r`n"
+            Set-Content -LiteralPath $apply -Value $policy -Encoding Unicode
+            & secedit.exe /configure /db $database /cfg $apply /areas USER_RIGHTS /quiet
+            if ($LASTEXITCODE -ne 0) { throw 'Could not grant Log on as a batch job to agents-llama' }
+            Write-Host "Granted Log on as a batch job to $account."
+        }
+    } finally {
+        Remove-Item -LiteralPath $export, $apply, $database -Force -ErrorAction SilentlyContinue
+    }
     $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') `
         -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$(Join-Path $PSScriptRoot 'Run-HostedLlm.ps1')`""
     $trigger = New-ScheduledTaskTrigger -AtStartup
