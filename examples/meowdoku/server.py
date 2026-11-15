@@ -943,10 +943,17 @@ def make_handler(sessions: Sessions):
                                      "(see /api/index)"}, HTTPStatus.UNAUTHORIZED)
             return True
 
-        def _route_gate(self, path: str) -> bool:
-            """--require-cap: True when the request was refused here (403 + the cookie reset to the Stable server's route).  The route cookie alone never grants access."""
+        def _route_gate(self, path: str, method: str) -> bool:
+            """--require-cap: True when the request was refused here (403 + the cookie reset to the Stable server's route).  The route cookie alone never grants access.
+
+            The catalog entries declared with a credential (the loopback admin-token lifecycle the supervisor's stop posts, the
+            engine mailbox) take no account, so no account's capability can admit them: their handler's own check is the authority,
+            as in _kiosk_gate.  Without the catalog they stay refused."""
             cap = getattr(sessions, "require_cap", "")
             if not cap or path in self._ROUTE_OPEN:
+                return False
+            entry = getattr(shared_catalog, "endpoint_for", lambda m, p: None)(method, path)
+            if entry is not None and entry.get("credential"):
                 return False
             self._classify()
             if cap in self._caps():
@@ -2464,7 +2471,7 @@ def make_handler(sessions: Sessions):
             self._classify()
             if self._kiosk_gate(self.path.split("?", 1)[0], "HEAD"):   # [KIOSK]
                 return
-            if self._route_gate(self.path.split("?", 1)[0]):      # [ROUTE]
+            if self._route_gate(self.path.split("?", 1)[0], "HEAD"):   # [ROUTE]
                 return
             if self._tier == "shader" or self.path.startswith("/api/") or self.path.startswith("/ws"):
                 self.send_response(HTTPStatus.FORBIDDEN); self.send_header("Content-Length", "0"); self.end_headers()
@@ -2880,7 +2887,7 @@ def make_handler(sessions: Sessions):
             self._classify()                                      # [ACCESS]
             if self._kiosk_gate(path, "GET"):                     # [KIOSK]
                 return
-            if self._route_gate(path):                            # [ROUTE]
+            if self._route_gate(path, "GET"):                     # [ROUTE]
                 return
             if path == "/api/pages" or path.startswith("/api/pages/") or path.startswith("/p/") or path.startswith("/site/programs/"):
                 return self._pages_route(path, "GET")
@@ -3454,7 +3461,7 @@ def make_handler(sessions: Sessions):
             self._classify()                                      # [KIOSK] first: no POST route answers an intern unless declared kiosk
             if self._kiosk_gate(path0, "POST"):
                 return
-            if self._route_gate(path0):                           # [ROUTE]
+            if self._route_gate(path0, "POST"):                   # [ROUTE]
                 return
             if path0 == "/api/pages" or path0.startswith("/api/pages/"):
                 return self._pages_route(path0, "POST")

@@ -260,3 +260,30 @@ def test_shared_accounts_member_is_refused_by_the_dev_gate(shared):
     status, cookies, body = _call(d.port, "/api/mathlab/jobs", headers={"Cookie": mem + "; " + ROUTE + "=b"})
     assert status == 403 and body["error"] == "this instance needs dev_ui" and _route_cookies(cookies) == [ROUTE + "=a"]
     assert _call(d.port, "/api/whoami", headers={"Cookie": mem})[2]["role"] == "member"
+
+
+def _loopback_admin(port, token, extra=None):
+    """The supervisor's stop (apache_supervisor.post_lifecycle): loopback, no account, the admin token."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    data = json.dumps({"op": "restart", "in": 1}).encode()
+    conn.request("POST", "/api/admin/lifecycle", body=data,
+                 headers=dict({"Host": f"127.0.0.1:{port}", "Content-Type": "application/json", "X-Meowdoku-Admin": token}, **(extra or {})))
+    r = conn.getresponse()
+    out = json.loads(r.read() or b"{}")
+    conn.close()
+    return r.status, out
+
+
+def test_dev_gate_admits_the_loopback_admin_lifecycle_and_its_handler_decides(pair):
+    """meowdoku-dev (--require-cap dev_ui) refused the supervisor's stop with 403 before the lifecycle handler ran, so every restart
+    waited 15 s and killed it (apache-supervisor.log, 2026-11-15 requests 36-49).  The credential entry passes the route gate."""
+    d = pair.dev
+    asked = []
+    d.sessions.lifecycle.request_json = lambda body: asked.append(body) or {"ok": True, "op": body.get("op")}
+    assert _loopback_admin(d.port, "t" * 40) == (200, {"ok": True, "op": "restart"}) and asked == [{"op": "restart", "in": 1}]
+    status, body = _loopback_admin(d.port, "x" * 40)
+    assert status == 401 and body == {"error": "bad admin token"}                      # the handler's own check is the authority
+    status, body = _loopback_admin(d.port, "t" * 40, {"X-Forwarded-For": "203.0.113.9"})
+    assert status == 403 and body["error"].startswith("admin is localhost only")
+    assert len(asked) == 1
+    assert _call(d.port, "/api/mathlab/jobs")[0] == 403                                # the rest of the dev host stays gated
