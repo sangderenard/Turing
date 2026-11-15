@@ -335,6 +335,85 @@ function mountRadio(wrap, host, canControl = false) {
     button.disabled = true; button.addEventListener("click", () => commandJukebox({action}));
     adminButtons.push(button); panel.append(button);
   }
+  // [RADIO] Suno playlists onto the jukebox (suno_playlists.py). Shown only to an account with a Suno connection, its
+  // own or one an owner shares with it; each song is saved as MP3 and requested in the playlist's order.
+  const sunoBox = el("div", {"aria-label": "Suno playlists", hidden: ""});
+  const sunoLists = el("select", {"aria-label": "Suno playlist"});
+  const sunoMore = el("button", {class: "chip", type: "button", text: "More playlists", hidden: ""});
+  const sunoQueue = el("button", {class: "chip", type: "button", text: "Put playlist on the jukebox"});
+  const sunoCredit = el("button", {class: "chip", type: "button", hidden: ""});
+  const sunoStatus = el("p", {role: "status", text: ""});
+  sunoBox.append(el("strong", {text: "Suno playlists"}), sunoLists, sunoMore, sunoQueue, sunoCredit, sunoStatus);
+  panel.append(sunoBox);
+  let sunoCursor = null, sunoBusy = false, sunoTimer = null, sunoLoaded = false, sunoRunning = false;
+  async function loadPlaylists(more) {
+    if (sunoBusy) return;
+    sunoBusy = true; sunoMore.disabled = sunoQueue.disabled = true;
+    try {
+      const data = await getJson("/api/radio/suno/playlists" + (more && sunoCursor ? "?cursor=" + encodeURIComponent(sunoCursor) : ""));
+      if (!more) sunoLists.replaceChildren();
+      for (const p of data.playlists || [])
+        sunoLists.append(el("option", {value: p.id, text: p.name + (p.songs != null ? " · " + p.songs + " songs" : "")}));
+      sunoCursor = data.next_cursor || null;
+      sunoMore.hidden = !sunoCursor;
+      sunoBox.hidden = false; sunoLoaded = true;
+      if (!more && !sunoRunning) sunoStatus.textContent = "Playlists of " + data.owner + "'s Suno" +
+        (data.shared ? " (shared with you)" : "") + ". Songs are saved as MP3 and requested in order.";
+    } catch (_error) {
+      if (!more) sunoBox.hidden = true;            // no Suno connection for this account: the section stays hidden
+    } finally {
+      sunoBusy = false; sunoMore.disabled = false; sunoQueue.disabled = sunoRunning || !sunoLists.value;
+    }
+  }
+  function showSunoJob(job) {
+    if (!job) return;
+    sunoRunning = job.state === "running";
+    const counts = {};
+    for (const song of job.songs || []) {
+      const kind = String(song.outcome).split(":")[0];
+      counts[kind] = (counts[kind] || 0) + 1;
+    }
+    const summary = Object.entries(counts).map(([kind, n]) => n + " " + kind).join(", ");
+    const credit = job.needs_credit ? " " + job.needs_credit + " need a Suno download credit" +
+      (job.credits_remaining != null ? " (" + job.credits_remaining + " credits left)" : "") + "." : "";
+    sunoStatus.textContent = sunoRunning
+      ? "Putting the playlist on the jukebox: " + job.done + " of " + (job.total ?? "?") + " songs" + (summary ? " (" + summary + ")" : "")
+      : job.state === "failed" ? "The playlist could not be put on the jukebox: " + job.error
+      : "Done: " + (summary || "no songs") + "." + credit;
+    sunoCredit.hidden = !(job.state === "done" && job.needs_credit > 0 && !job.confirm_credit);
+    sunoCredit.textContent = "Spend " + job.needs_credit + " Suno download credit(s) and add those songs";
+    sunoQueue.disabled = sunoRunning || sunoBusy || !sunoLists.value;
+  }
+  async function pollSunoJob(epoch) {
+    try {
+      const data = await getJson("/api/radio/suno/playlist-job");
+      if (epoch !== generation || panel.hidden) return;
+      showSunoJob(data.job);
+      if (data.job?.state === "running") sunoTimer = setTimeout(() => pollSunoJob(epoch), 2000);
+    } catch (_error) { /* not signed in, or no job: nothing to show */ }
+  }
+  async function queuePlaylist(confirmCredit) {
+    const id = sunoLists.value;
+    if (!id || sunoBusy || sunoRunning) return;
+    sunoBusy = true; sunoQueue.disabled = true; sunoCredit.hidden = true;
+    try {
+      const response = await fetch("/api/radio/suno/playlists/" + encodeURIComponent(id) + "/queue", {method: "POST",
+        credentials: "same-origin", cache: "no-store", headers: {"Content-Type": "application/json", "X-Meowdoku-Radio": "1"},
+        body: JSON.stringify({confirm_credit: confirmCredit})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
+      sunoBusy = false;
+      showSunoJob(data.job);
+      clearTimeout(sunoTimer); pollSunoJob(generation);
+    } catch (error) {
+      sunoStatus.textContent = error.message;
+    } finally {
+      sunoBusy = false; sunoQueue.disabled = sunoRunning || !sunoLists.value;
+    }
+  }
+  sunoMore.addEventListener("click", () => loadPlaylists(true));
+  sunoQueue.addEventListener("click", () => queuePlaylist(false));
+  sunoCredit.addEventListener("click", () => queuePlaylist(true));
   let paTimer = null, paBusy = false;
   const paStatus = el("p", {role: "status", text: "Server speakers: checking configuration"});
   const play = el("button", {class: "chip", type: "button", text: "Play on server speakers"});
@@ -409,11 +488,11 @@ function mountRadio(wrap, host, canControl = false) {
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
     generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
-    clearTimeout(historyTimer); historyTimer = null;
+    clearTimeout(historyTimer); historyTimer = null; clearTimeout(sunoTimer); sunoTimer = null;
     if (!open) stopAudio();
     if (!open) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
-    if (open) {poll(generation); pollPA(generation); pollHistory(generation);}
+    if (open) {poll(generation); pollPA(generation); pollHistory(generation); if (!sunoLoaded) loadPlaylists(false); pollSunoJob(generation);}
   }
   chip.addEventListener("click", () => setOpen(panel.hidden));
   close.addEventListener("click", () => {setOpen(false); chip.focus();});

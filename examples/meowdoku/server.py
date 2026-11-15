@@ -1220,6 +1220,14 @@ def make_handler(sessions: Sessions):
                 store, runner = self._radio_jukebox_services()
             return http_route(self, method, store, runner)
 
+        def _suno_playlists(self, path, method):
+            # [RADIO] a Suno connection's playlists onto the jukebox (suno_playlists.py): own or shared connection.
+            from meowdoku.remote_connections import service_for
+            from meowdoku.suno_playlists import route
+            with sessions.radio_lock:
+                store, _ = self._radio_jukebox_services()
+            return route(self, sessions, path, method, store, service_for)
+
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
         def _issues_route(self, path: str, method: str) -> None:
             from http.cookies import SimpleCookie, CookieError
@@ -2952,6 +2960,9 @@ def make_handler(sessions: Sessions):
             if path == "/api/radio/suno/assets":
                 from meowdoku.suno_radio_assets import route
                 return route(self, sessions, path, "GET")
+            if path in ("/api/radio/suno/playlists", "/api/radio/suno/playlist-job") \
+                    or path.startswith("/api/radio/suno/playlists/"):
+                return self._suno_playlists(path, "GET")
             if path == "/api/radio/playback":
                 return self._radio_playback("GET")
             if path.startswith("/api/radio/hls/"):
@@ -3470,6 +3481,8 @@ def make_handler(sessions: Sessions):
             if path0 == "/api/radio/suno/import":
                 from meowdoku.suno_radio_assets import route
                 return route(self, sessions, path0, "POST")
+            if path0.startswith("/api/radio/suno/playlists/"):
+                return self._suno_playlists(path0, "POST")
             if path0 == "/api/radio/playback":
                 return self._radio_playback("POST")
             if path0 == "/api/route":                             # [ROUTE]
