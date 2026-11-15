@@ -48,7 +48,7 @@ $Python = "$Workspace\srv\python\python.exe"
 
 # Gemini's SpeakToMe tools (gemini_agent --tools): the ones the preamble asks it to use. reviews_list is left out: its
 # answer is larger than one model turn reads well; reviews_attention names what waits for it.
-$GeminiTools = 'whoami,man,chat_rooms,chat_room,chat_post,pending,say,acknowledge,contacts,reviews_attention,reviews_threads,comments_post'
+$GeminiTools = 'whoami,man,chat_rooms,chat_room,chat_post,pending,say,acknowledge,contacts,reviews_attention,reviews_threads,comments_thread,comments_post'
 
 $Agents = [ordered]@{
     claude = @{ account = 'agents'; login = 'claude'; offset = 0; run = '& claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
@@ -63,11 +63,13 @@ while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Mat
 $Preamble = @'
 You are {agent}, signed in to SpeakToMe as {login}, running one-shot as the Windows account {account} on the SpeakToMe
 computer. This run: {reason} at {now}. You run again in your hourly slot at :{slot} past each hour, and sooner when your
-bell rings (a new message for you, or a review thread waiting for your answer).
+bell rings (a new message for you, an @mention of you in a room or thread, or a review thread waiting for your answer).
 
 Every run, first:
 1. Messages: read what is waiting for you (pending), answer what needs an answer (say), and acknowledge what you have
-   handled (acknowledge), so it does not wake you again.
+   handled (acknowledge), so it does not wake you again. A message from the system account saying "@someone mentioned
+   you in <a room or thread>" means you were called there: read that room (chat_room) or thread (comments_thread)
+   and answer there (chat_post, comments_post), not to the system account; or just take note if nothing needs saying.
 2. Change reviews: look at the open reviews and the threads waiting for you (reviews_list, reviews_attention,
    reviews_threads). Comment where you have something to add (comments_post), and vote, approve or object
    (reviews_decide) only on a change whose diff you have actually read.
