@@ -46,13 +46,17 @@ $Workspace = 'C:\dev\Powershell'
 $Base = 'https://stichka.duckdns.org:8766'
 $Python = "$Workspace\srv\python\python.exe"
 
+# Gemini's SpeakToMe tools (gemini_agent --tools): the ones the preamble asks it to use. reviews_list is left out: its
+# answer is larger than one model turn reads well; reviews_attention names what waits for it.
+$GeminiTools = 'whoami,man,chat_rooms,chat_room,chat_post,pending,say,acknowledge,contacts,reviews_attention,reviews_threads,comments_post'
+
 $Agents = [ordered]@{
     claude = @{ account = 'agents'; login = 'claude'; offset = 0; run = '& claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
     codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; run = '& codex exec --skip-git-repo-check $prompt 2>&1' }
     gemini = @{ account = 'agents-gemini'; login = 'gemini'; offset = 40; run = @"
 `$extra = @()
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
-& '$Python' '$Workspace\turing\examples\meowdoku\deploy\gemini_agent.py' --model '$GeminiModel' --prompt `$prompt @extra 2>&1
+& '$Python' '$Workspace\turing\examples\meowdoku\deploy\gemini_agent.py' --model '$GeminiModel' --tools '$GeminiTools' --prompt `$prompt @extra 2>&1
 "@ }
 }
 
@@ -172,12 +176,15 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
 
 # ---------------------------------------------------------------- the tasks
 if ($Register -or $Unregister) {
+    $order = 0
     foreach ($name in $Agents.Keys) {
         $task = "SpeakToMe agent $name"
         if ($Unregister) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue; Write-Host "removed '$task'"; continue }
         $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') `
             -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`" -Tick -Agent $name"
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 5)
+        # The tasks start 100 s apart within each 5 minutes: all three firing in the same second each saw fewer than
+        # -MaxRunning runs before any had written its record (2026-11-14 23:50: three ran at once under a limit of two).
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds(100 * $order++) -RepetitionInterval (New-TimeSpan -Minutes 5)
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
             -ExecutionTimeLimit (New-TimeSpan -Minutes ($TimeoutMinutes + 10))
