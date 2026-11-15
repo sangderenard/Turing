@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Register</title>
+<title>Request alpha access</title>
 <style>
   :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --ok:#17743a; --bad:#b3261e; --card:#fff; }
   @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --ok:#5fcf86; --bad:#ff8a80; --card:#202024; } }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
-  main { max-width:24rem; margin:0 auto; padding:2rem 16px 4rem; }
+  main { max-width:44rem; margin:0 auto; padding:2rem 16px 4rem; }
   h1 { font-size:1.3rem; margin:0 0 1rem; }
   label { display:block; margin:.7rem 0 .2rem; color:var(--mut); }
-  input { width:100%; box-sizing:border-box; font:inherit; padding:.5rem .6rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  input:not([type="checkbox"]) { width:100%; box-sizing:border-box; font:inherit; padding:.5rem .6rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
   button { font:inherit; padding:.45rem 1.1rem; margin-top:1rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   .bad { color:var(--bad); } .ok { color:var(--ok); } .mut { color:var(--mut); }
@@ -30,14 +30,53 @@
   th { color:var(--mut); font-weight:500; }
   code { font-size:.85rem; word-break:break-all; }
   h2 { font-size:1.05rem; margin:1.6rem 0 .3rem; }
+  .notice { border:1px solid var(--line); border-radius:8px; padding:.8rem 1rem; background:var(--card); }
+  .choices { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin:1rem 0; }
+  .choices button { margin:0; }
+  .choices a { display:inline-block; padding:.45rem 1.1rem; border-radius:6px; background:var(--fg); color:var(--bg); text-decoration:none; }
+  .agreements label { display:flex; align-items:flex-start; gap:.55rem; color:var(--fg); margin:.8rem 0; }
+  .agreements input { flex:none; margin:.25rem 0 0; }
+  .agreements span { display:block; }
 </style>
 </head>
 <body>
 <main>
-  <h1>Register</h1>
-  <p>Registration is by invitation. Anyone who has an account can invite you: ask someone you know who is on
-     here, or someone they know.</p>
+  <h1>Request alpha access</h1>
+  <p>This is an experimental research site. Alpha access creates a basic member account after you read and accept the terms below.</p>
+  <div class="choices">
+    <button type="button" disabled title="General registration is not open">Register</button>
+    <a href="#alpha-form">Alpha user request</a>
+  </div>
+  <section class="notice" aria-label="Alpha disclaimer">
+    <strong>Alpha disclaimer</strong>
+    <p>Features can be incomplete, changed, or removed. This is a working research environment, not a finished product or a private place for confidential material. Project operators and research agents may inspect what you submit and do here.</p>
+  </section>
+  <h2>What sits behind this page</h2>
+  <p>The visible front end was assembled in about 20 minutes. It opens a window onto roughly four years of backend development. SpeakToMe began as a way to explore branching language-model possibilities. The surrounding work grew into separate systems for graph execution, tensor and compiler research, managed scientific time, geometry, audio, optics, and simulation. Some of those systems are demonstrated here; an isolated demo does not mean every part is integrated into one finished product.</p>
+  <p>Alpha participants help expose the seams between those systems: where an interface is unclear, a computation fails, a result needs verification, or a research idea meets real use. Activity and feedback can inform debugging, evaluation, and training. Expect experiments and revisions rather than a polished service contract.</p>
+  <h2>Terms for alpha access</h2>
+  <p><strong>MIT software license.</strong> First-party source code is published under the MIT license where its repository says so. The license lets you use, copy, modify, and distribute that software with its notice. It does not automatically license third-party assets, models, or your personal content. If you intentionally contribute code for inclusion, submit only code you have the right to offer under MIT terms. <a href="https://github.com/sangderenard/Turing/blob/main/LICENSE">Read the Turing license</a>.</p>
+  <p><strong>Observation and training.</strong> Your site activity, submissions, messages, outputs, and diagnostic information may be recorded, reviewed by people or agents, and used to evaluate, improve, and train computational systems. Avoid entering secrets, confidential information, or material you lack permission to share.</p>
+  <p><strong>Research participation.</strong> You are joining an evolving computational research project. Your interactions may be studied for system behavior, usability, failures, and model or workflow development. You can stop participating by stopping use; work already observed or incorporated into research may remain in that work.</p>
+  <form id="alpha-form" data-terms-version="alpha-2026-11-15" autocomplete="on">
+    <h2>Create a basic member account</h2>
+    <label for="username">Username <span class="mut">(3 to 32 letters, digits, _ or -)</span></label>
+    <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required pattern="[A-Za-z0-9_\-]{3,32}">
+    <label for="password">Password <span class="mut">(at least 8 characters)</span></label>
+    <input id="password" type="password" autocomplete="new-password" required minlength="8">
+    <label for="password2">Password again</label>
+    <input id="password2" type="password" autocomplete="new-password" required minlength="8">
+    <fieldset class="agreements">
+      <legend>Agree to each term to request access</legend>
+      <label><input id="agree-mit" type="checkbox" required><span>I understand the MIT license applies to identified software, and I will only offer code I have the right to contribute under MIT.</span></label>
+      <label><input id="agree-observation" type="checkbox" required><span>I agree that my activity and submitted content may be observed, recorded, reviewed, and used to train computational systems.</span></label>
+      <label><input id="agree-research" type="checkbox" required><span>I agree to participate in this computational research environment under the description above.</span></label>
+    </fieldset>
+    <button id="alpha-submit" type="submit">Request alpha user access</button>
+    <p id="status" class="mut" role="status"></p>
+  </form>
   <h2>I have an invitation</h2>
+  <p>Invitation links still work. If someone invited you, open the link or paste its code below.</p>
   <form id="code-form" class="row">
     <div style="flex:1"><label for="code">Invitation link or code</label>
     <input id="code" autocapitalize="none" spellcheck="false" autocomplete="off" required></div>

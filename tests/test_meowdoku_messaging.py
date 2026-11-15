@@ -85,6 +85,23 @@ def _send(server, cookie, to, text):
     return _call(server.port, "/api/messages/send", "POST", cookie, {"to": to, "body": text})
 
 
+def test_agent_introductions_reconcile_existing_accounts_without_overriding_blocks(server):
+    accounts = server.sessions.accounts
+    ann = accounts.ensure_user("ann", PASSWORD)
+    codex = accounts.ensure_user("codex", PASSWORD)
+    accounts.ensure_user("gemini", PASSWORD)
+    db = messaging.connect(server.sessions.accounts_db)
+    try:
+        messaging.block(db, ann, "codex")
+        assert messaging.introduce_agents(db) == 3  # ann/gemini and codex/gemini; blocked ann/codex is excluded
+        assert messaging._state(db, ann, codex) == "blocked"
+        assert messaging._state(db, codex, ann) is None
+        assert messaging.introduce_agents(db) == 3
+        assert {row[0] for row in db.execute("SELECT username FROM users")} == {"ann", "codex", "gemini"}
+    finally:
+        db.close()
+
+
 def test_guest_is_refused_naming_message(server):
     for path in ("/api/messages/contacts", "/api/messages/since?after=0"):
         status, body = _call(server.port, path)

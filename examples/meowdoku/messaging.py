@@ -184,11 +184,13 @@ def _mutual(db, a, b) -> bool:
     return _state(db, a, b) == "accepted" and _state(db, b, a) == "accepted"
 
 
-# ---- the system as a contact ------------------------------------------------------------------------------------------------------
+# ---- managed contacts -------------------------------------------------------------------------------------------------------------
+INTRODUCTION_AGENTS = ("codex", "gemini", "claude", "dot", "llama")
+
+
 def system_contact(db, system_id: int, user_id: int, now: float | None = None) -> bool:
-    """Make the system account and one account mutual contacts.  For system broadcasts only: the system is not a
-    person, so this is not a request the account answers and the contact limits do not apply to it.  An account that
-    has BLOCKED the system stays blocked and gets nothing.  True when the two are mutual afterwards."""
+    """Make a managed system or named agent account and one account mutual contacts. The operator provisions these
+    contacts without a request, outside contact limits. A block on either side still wins. True when mutual."""
     if system_id == user_id:
         return False
     now = time.time() if now is None else now
@@ -210,6 +212,21 @@ def system_contact(db, system_id: int, user_id: int, now: float | None = None) -
 def befriend_all(db, system_id: int, user_ids) -> int:
     """``system_contact`` for each given account; returns how many are mutual with the system afterwards."""
     return sum(1 for user_id in user_ids if system_contact(db, system_id, int(user_id)))
+
+
+def introduce_agents(db, user_id: int | None = None) -> int:
+    """Connect existing accounts to the five provisioned agent accounts. Never create identities or override blocks.
+
+    With a user id, reconcile that account; if it is a named agent, reconcile everyone. Without one, reconcile all
+    accounts at startup. Missing agent accounts are skipped until they are provisioned and an introduction runs again.
+    """
+    agents = {row["username"].lower(): row["id"] for row in db.execute(
+        "SELECT id, username FROM users WHERE username COLLATE NOCASE IN (?,?,?,?,?)", INTRODUCTION_AGENTS)}
+    if user_id is None or user_id in agents.values():
+        users = [row[0] for row in db.execute("SELECT id FROM users")]
+    else:
+        users = [user_id] if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() else []
+    return sum(1 for uid in users for aid in agents.values() if uid != aid and system_contact(db, aid, uid))
 
 
 # ---- contacts -------------------------------------------------------------------------------------------------------------------

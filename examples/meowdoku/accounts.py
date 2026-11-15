@@ -7,7 +7,7 @@ Studio marble designs and marble photos, and that can carry forward the
 browser's existing passwordless profile (its game stats/inventory) on first
 signup or login, so nothing already played is lost by creating an account.
 
-One SQLite file (``accounts.db``) under the given directory. Three tables:
+One SQLite file (``accounts.db``) under the given directory. Four tables:
 
 ``users``        -- the login identity: username, salted password hash.
 ``sessions``      -- bearer tokens for the account cookie (a different
@@ -21,6 +21,8 @@ One SQLite file (``accounts.db``) under the given directory. Three tables:
                      reaches it first through a logged-in session can claim
                      it, and nothing already stored needs to move or change
                      shape.
+``alpha_agreements`` -- the terms version and acceptance time for an account
+                       created through the alpha request form.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
 USERNAME = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
 MIN_PASSWORD = 8
 SESSION_SECONDS = 30 * 24 * 3600
+ALPHA_TERMS_VERSION = "alpha-2026-11-15"
 # scrypt cost parameters: the stdlib default-ish "interactive" tuning (~tens
 # of milliseconds per hash on ordinary hardware) -- real KDF stretching, not
 # a bare sha256, with no third-party dependency.
@@ -99,8 +102,13 @@ class Accounts:
                 created_at REAL NOT NULL,
                 PRIMARY KEY (asset_type, asset_key)
             );
+            CREATE TABLE IF NOT EXISTS alpha_agreements (
+                user_id INTEGER PRIMARY KEY,
+                terms_version TEXT NOT NULL,
+                accepted_at REAL NOT NULL
+            );
         """)
-        _schema_version.declare(self._conn, "accounts", 1)
+        _schema_version.declare(self._conn, "accounts", 2)
         self._conn.commit()
 
     # ---- identity -----------------------------------------------------------
@@ -111,8 +119,10 @@ class Accounts:
             raise AccountError("username must be 3-32 letters, digits, _ or -")
         return username
 
-    def signup(self, username: str, password: str) -> dict:
+    def signup(self, username: str, password: str, *, alpha_terms_version: str | None = None) -> dict:
         username = self._clean_username(username)
+        if alpha_terms_version is not None and alpha_terms_version != ALPHA_TERMS_VERSION:
+            raise AccountError("the alpha terms have changed; reload registration and agree to the current terms")
         if len(str(password)) < MIN_PASSWORD:
             raise AccountError(f"password must be at least {MIN_PASSWORD} characters")
         password_hash = _hash_password(str(password))
@@ -121,10 +131,17 @@ class Accounts:
                 "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone()
             if existing:
                 raise AccountError("that username is taken", 409)
-            cursor = self._conn.execute(
-                "INSERT INTO users (username, password_hash, display_name, created_at) VALUES (?, ?, ?, ?)",
-                (username, password_hash, username, time.time()))
-            self._conn.commit()
+            try:
+                cursor = self._conn.execute(
+                    "INSERT INTO users (username, password_hash, display_name, created_at) VALUES (?, ?, ?, ?)",
+                    (username, password_hash, username, time.time()))
+                if alpha_terms_version is not None:
+                    self._conn.execute("INSERT INTO alpha_agreements (user_id, terms_version, accepted_at) VALUES (?, ?, ?)",
+                                       (cursor.lastrowid, alpha_terms_version, time.time()))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
             return {"id": cursor.lastrowid, "username": username}
 
     def ensure_user(self, username: str, password: str, display_name: str | None = None) -> int:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import sys
 import threading
 from http.server import ThreadingHTTPServer
@@ -19,6 +20,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import authz  # noqa: E402
 from meowdoku import login_guard  # noqa: E402
+from meowdoku import messaging  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
 
 OUTSIDE = {"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https", "Host": "cats.example.org"}
@@ -85,11 +87,35 @@ def test_anonymous_outside_visitor_keeps_the_shader_lock(server):
     assert _call(server.port, "/api/account/me", headers=OUTSIDE)[3]["account"] is None
 
 
-def test_login_page_is_reachable_and_signup_is_closed(server):
+def test_login_page_and_consented_alpha_signup_are_public(server):
+    for name in messaging.INTRODUCTION_AGENTS:
+        server.sessions.accounts.ensure_user(name, PASSWORD)
+    page = (ROOT / "examples" / "meowdoku" / "web" / "register.html").read_text(encoding="utf-8")
+    assert f'data-terms-version="{srv.accounts_mod.ALPHA_TERMS_VERSION}"' in page
     assert _call(server.port, "/login.html", headers=OUTSIDE)[3] == "<html>LOGIN-PAGE</html>"
     assert _call(server.port, "/login.js", headers=OUTSIDE)[3] == "// login"
     status, _, _, body = _call(server.port, "/api/account/signup", "POST", OUTSIDE, {"username": "newcat", "password": PASSWORD})
-    assert status == 403 and body == {"error": "sign-up is closed here"}
+    assert status == 400 and "agree" in body["error"]
+    terms = {"alpha_terms_version": srv.accounts_mod.ALPHA_TERMS_VERSION,
+             "agree_mit": True, "agree_observation": True, "agree_research": True}
+    assert _call(server.port, "/api/account/signup", "POST", OUTSIDE,
+                 {"username": "newcat", "password": PASSWORD, **terms, "agree_research": False})[0] == 400
+    assert _call(server.port, "/api/account/signup", "POST", OUTSIDE,
+                 {"username": "newcat", "password": PASSWORD, **terms, "alpha_terms_version": "old"})[0] == 400
+    status, _, cookies, body = _call(server.port, "/api/account/signup", "POST", OUTSIDE,
+                                    {"username": "newcat", "password": PASSWORD, **terms})
+    assert status == 201 and body["account"]["username"] == "newcat"
+    assert any(c.startswith(srv.ACCOUNT_COOKIE + "=") for c in cookies)
+    assert authz.role_of(server.sessions.accounts_db, body["account"]["id"]) == "member"
+    with sqlite3.connect(server.sessions.accounts_db) as db:
+        assert db.execute("SELECT terms_version FROM alpha_agreements WHERE user_id = ?",
+                          (body["account"]["id"],)).fetchone() == (terms["alpha_terms_version"],)
+        for name in messaging.INTRODUCTION_AGENTS:
+            agent_id = db.execute("SELECT id FROM users WHERE username=?", (name,)).fetchone()[0]
+            states = db.execute("SELECT user_id,peer_id,state FROM msg_contacts WHERE (user_id=? AND peer_id=?) "
+                                "OR (user_id=? AND peer_id=?)", (agent_id, body["account"]["id"],
+                                body["account"]["id"], agent_id)).fetchall()
+            assert len(states) == 2 and all(row[2] == "accepted" for row in states)
 
 
 def test_wrong_password_six_times_locks_with_retry_after(server, monkeypatch):

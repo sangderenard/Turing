@@ -177,7 +177,7 @@ def test_the_public_site_registers_by_invitation_only(tmp_path):
         return r.status, answer, cookies
 
     try:
-        assert post("/api/account/signup", {"username": "sam", "password": "correcthorse1"})[0] == 403, "sign-up is closed here"
+        assert post("/api/account/signup", {"username": "sam_direct", "password": "correcthorse1"})[0] == 201, "LAN signup stays available"
         status, checked, _ = post("/api/invitations/check", {"code": code})
         assert status == 200 and checked["inviter"] == "ownercat"
         status, done, cookies = post("/api/invitations/redeem", {"code": code, "username": "sam", "password": "correcthorse1"})

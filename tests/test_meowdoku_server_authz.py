@@ -110,7 +110,9 @@ def test_trusted_proxy_forwarding_a_public_client_is_dns_and_guest(server):
 
 
 def test_secure_cookie_follows_the_trusted_forwarded_scheme(server):
-    body = {"username": "cat1", "password": "correcthorse1"}
+    body = {"username": "cat1", "password": "correcthorse1",
+            "alpha_terms_version": srv.accounts_mod.ALPHA_TERMS_VERSION,
+            "agree_mit": True, "agree_observation": True, "agree_research": True}
     cookies = _call(server.port, "/api/account/signup", "POST", PUBLIC_XFF, body)[2]
     assert any(c.startswith(srv.ACCOUNT_COOKIE) and "; Secure" in c for c in cookies)
     cookies = _call(server.port, "/api/account/signup", "POST", {"Host": "127.0.0.1"}, {**body, "username": "cat2"})[2]

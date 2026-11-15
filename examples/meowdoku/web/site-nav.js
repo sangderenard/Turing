@@ -51,6 +51,7 @@ const CSS = `
         color: #e8e8ee; font: inherit; text-decoration: none; display: inline-block; }
 .chip:hover, .chip:focus-visible { background: rgba(48,48,62,.95); outline: 2px solid #7aa2ff; outline-offset: 1px; }
 .chip.quiet { opacity: .55; } .chip.quiet:hover, .chip.quiet:focus-visible { opacity: 1; }
+.chip:disabled, .chip.quiet:disabled { opacity: .35; cursor: default; }
 .menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 210px; max-width: calc(100vw - 48px); max-height: 65vh; overflow: auto; background: #1c1c24; border: 1px solid rgba(255,255,255,.18);
         border-radius: 8px; padding: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
 .menu a, .menu button { all: unset; display: block; box-sizing: border-box; width: 100%; padding: 6px 10px; border-radius: 5px; cursor: pointer;
@@ -546,7 +547,8 @@ async function main() {
 
   if (!who.signed_in) {
     actions.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }),
-      el("a", { class: "chip quiet", href: "/register.html", text: "Register" }));   // MOCKUP: registration is by invitation
+      el("button", { class: "chip quiet", type: "button", disabled: "", text: "Register", title: "General registration is not open" }),
+      el("a", { class: "chip quiet", href: "/register.html#alpha-form", text: "Alpha user request" }));
     reserveSpace();
     return;
   }

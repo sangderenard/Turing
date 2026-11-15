@@ -18,7 +18,7 @@ prebaked board database) and a JSON API over the games in ``games.py``:
     GET  /api/state
     POST /api/profile {"name": "..."}      -> pick this session's player profile
     GET  /api/profile                      -> the profile, and the current game's top scores
-    POST /api/account/signup {"username","password"}  -> create a real login, own this browser's content
+    POST /api/account/signup {"username","password", alpha agreement}  -> create a real login, own this browser's content
     POST /api/account/login  {"username","password"}  -> real login (accounts.py; separate from /api/profile)
     POST /api/account/logout {}
     GET  /api/account/me                   -> the logged-in account, or null
@@ -450,6 +450,14 @@ class Sessions:
         finally:
             db.close()
 
+    def introduce_agents(self, user_id: int | None = None) -> None:
+        """Reconcile the site's provisioned agent contacts through messaging's contact writer."""
+        db = messaging_mod.connect(self.accounts_db)
+        try:
+            messaging_mod.introduce_agents(db, user_id)
+        finally:
+            db.close()
+
     def federation_identity(self) -> dict:
         """{"graph_definition_digest", "api_digests", "port"} of the Nodus instance this server fronts: sha256 of its canvas file and the
         sorted ``module:entry`` pairs of every ``*.api.yaml`` under web_dir (federation_peer.identity_digests, the same function the peer
@@ -775,10 +783,7 @@ def make_handler(sessions: Sessions):
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
                 return False                                   # [LOGIN] served by do_POST's login/logout branches
             if method == "POST" and path == "/api/account/signup":
-                self.close_connection = True
-                self._set_cookie = []
-                self._json({"error": "sign-up is closed here"}, HTTPStatus.FORBIDDEN)
-                return True
+                return False                                  # alpha agreement is checked in the signup handler
             if method != "GET":
                 self.close_connection = True
                 self._set_cookie = []
@@ -884,7 +889,8 @@ def make_handler(sessions: Sessions):
         # ---- [ROUTE] Stable server / Development server selection behind the Apache front (cookie meowdoku_route; the proxy's rewrite rule
         # sends route b to the Development server).  Two shared instances of the whole service.  Not the dev page vs shader page (access tier
         # + role) and not a per-user leased server.  Stored preference values: 'stable' | 'dev'.
-        _ROUTE_OPEN = ("/login.html", "/login.js", "/api/account/login", "/api/account/logout", "/api/account/me", "/api/whoami", "/api/route", "/site-nav.js")
+        _ROUTE_OPEN = ("/login.html", "/login.js", "/register.html", "/register.js", "/api/account/login",
+                       "/api/account/signup", "/api/account/logout", "/api/account/me", "/api/whoami", "/api/route", "/site-nav.js")
 
         def _route_stable(self) -> str:
             return getattr(sessions, "stable_route", "") or "a"
@@ -1162,6 +1168,7 @@ def make_handler(sessions: Sessions):
             from meowdoku import invitations
 
             def sign_in(user):
+                sessions.introduce_agents(user["id"])
                 self._bind_instance(user["id"])
                 self._set_account_cookie(sessions.accounts.create_session(user["id"]))
 
@@ -3828,9 +3835,20 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "expected {\"username\", \"password\"}"}, HTTPStatus.BAD_REQUEST)
                 try:
                     body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict):
+                        raise ValueError("expected an object")
                     username, password = str(body.get("username", "")), str(body.get("password", ""))
-                    user = (sessions.accounts.signup(username, password) if path0.endswith("signup")
-                            else sessions.accounts.login(username, password))
+                    if path0.endswith("signup"):
+                        alpha = body.get("alpha_terms_version")
+                        if alpha is not None or self._origin != "lan":
+                            if (alpha != accounts_mod.ALPHA_TERMS_VERSION or
+                                    any(body.get(key) is not True for key in
+                                        ("agree_mit", "agree_observation", "agree_research"))):
+                                raise ValueError("agree to the current MIT, observation, and research terms to request alpha access")
+                        user = sessions.accounts.signup(username, password, alpha_terms_version=alpha)
+                    else:
+                        user = sessions.accounts.login(username, password)
+                    sessions.introduce_agents(user["id"])
                     self._set_cookie = []
                     self._bind_instance(user["id"])
                     self._set_account_cookie(sessions.accounts.create_session(user["id"]))
@@ -4402,6 +4420,7 @@ def main(argv: list[str] | None = None) -> int:
         sessions.accounts_db = Path(args.accounts_db)
         sessions.accounts = accounts_mod.Accounts(sessions.accounts_db)
         sessions.authz_policy = authz_mod.Policy.beside(sessions.accounts_db)
+    sessions.introduce_agents()                                                     # [MESSAGES] existing accounts, after --accounts-db overrides
     authored_pages.connect(sessions.accounts_db).close()                          # [PAGES] declare once before concurrent feed requests
     sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
