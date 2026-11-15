@@ -34,27 +34,24 @@
 </head>
 <body>
 <main>
-  <p class="mock">Mockup. Nothing on this page is sent or saved yet.</p>
   <h1>You've been invited</h1>
   <p id="lead">Checking your invitation...</p>
   <section id="finish" hidden>
     <p class="mut" id="chain"></p>
     <form id="form" autocomplete="on">
-      <label for="username">Choose a username</label>
-      <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-      <label for="email">Email <span class="mut">(for recovering your account)</span></label>
-      <input id="email" type="email" autocomplete="email">
-      <label for="password">Password</label>
-      <input id="password" type="password" autocomplete="new-password" required>
+      <label for="username">Choose a username <span class="mut">(3 to 32 letters, digits, _ or -)</span></label>
+      <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required pattern="[A-Za-z0-9_\-]{3,32}">
+      <label for="password">Password <span class="mut">(at least 8 characters)</span></label>
+      <input id="password" type="password" autocomplete="new-password" required minlength="8">
       <label for="password2">Password again</label>
-      <input id="password2" type="password" autocomplete="new-password" required>
+      <input id="password2" type="password" autocomplete="new-password" required minlength="8">
       <button id="submit" type="submit">Finish registration</button>
     </form>
   </section>
   <p id="status" class="mut" role="status"></p>
   <p class="mut">Already have an account? <a href="/login.html">Sign in</a>.</p>
 </main>
-<script src="invited.js"></script>
+<script src="/invited.js"></script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>
 </body>
 </html>

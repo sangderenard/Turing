@@ -571,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("mathlab.html", "mathlab.js", "mathlab_wgsl_timing.js", "divider.html", "divider.js", "login.html", "login.js", "messenger-widget.js", "site-nav.js", "radio-hls.min.js", "RADIO_HLS_LICENSE.txt", "profile.html", "profile.js", "worldmap.html", "worldmap.js", "console.html", "console.js", "nodus.html", "nodus.js"):  # [MATHLAB] the math lab page (server.py /api/mathlab/*)
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("files.html", "files.js", "file-crypto.js", "keys.html", "keys.js", "connected-services.html", "connected-services.js", "markets.html", "markets.js",
-                 "register.html", "register.js", "invited.html", "invited.js", "invite.html", "invite.js"):   # MOCKUP: invitation registration
+                 "register.html", "register.js", "invited.html", "invited.js", "invite.html", "invite.js"):   # [INVITE] registration by invitation (invitations.py)
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("browse.html", "browse.js"):                                                            # [LISTING] the /browse page (server.py /browse/*, listing.py)
         shutil.copyfile(HERE / "web" / name, out / name)

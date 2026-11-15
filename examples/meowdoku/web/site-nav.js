@@ -556,7 +556,7 @@ async function main() {
     link("People (accounts and groups)", "/people.html", caps.has("account_manage")),
     link("Admin room", "/rooms.html?room=reviewers", caps.has("account_manage")),
     link("Account and password", "/login.html"),
-    link("Invite someone", "/invite.html"),                                         // MOCKUP: any account may invite
+    link("Invite someone", "/invite.html"),                                         // [INVITE] invitations.py: a link and a QR code, once
   ]) if (item) menu.append(item);
   if (pageRouteControl) {
     menu.append(el("div", { class: "sep" }), el("div", { class: "head", text: "Server: " + (who.instance || serverName) }),
