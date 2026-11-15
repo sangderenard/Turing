@@ -21,12 +21,21 @@ room may then call those tools; the call runs under the LENDER's connection and 
 lender revokes at any time; each call is audited (who, which tool, the outcome) and limited per caller (CALLS_PER_HOUR). A
 bot forwards what its own account holds in the same way.
 
-Tables in accounts.db (schema module ``chat_rooms`` 2; this module is their one writer):
+ROUND TABLE. A room may hold a round table: its seats (accounts, the person who switched it on among them) speak in turn,
+round after round. The room's owner, or an admin (who alone runs a system room), switches it on with the seats and off
+again; the room page shows whether it is on and whose turn it is, so a table is never mistaken for the usual chat. The
+runner (deploy/Start-RoundTable.ps1) watches the switch and runs the agents' seats as their own accounts: each seat reports
+whose turn it is, and a seat may switch the table off when it ends, saying why. While a table is on, every message a seat
+writes in the room is marked with the round it was written in.
+
+Tables in accounts.db (schema module ``chat_rooms`` 3; this module is their one writer):
     chat_messages      (id, room, user_id, username, body, created, removed_at, removed_by)
     chat_audit         (at, admin, action, message_id)
     chat_room_defs     (room, title, about, owner_id, owner_name, stage, write, objects, bridges, created, updated)
     chat_room_grants   (id, room, owner_id, owner_name, provider, tools, created, expires, revoked_at)
     chat_grant_calls   (at, grant_id, caller_id, caller, tool, ok)
+    chat_tables        (room, state, seats, owner, switched_by, switched_at, turn, round, turn_at, note)   one row per room
+    chat_table_marks   (message_id, round)   the round a seat's message was written in, while its table was on
 
 Text is stored stripped and only ever returned as a JSON string. Who is asking always comes from the authenticated session.
 
@@ -45,6 +54,10 @@ wanted, is the site's own, over its authenticated federation; this module keeps 
     POST /api/chat/rooms/<room>/forward   {provider, tools, hours?}   lend tools of your own connection to the room
     POST /api/chat/rooms/<room>/forward/<grant>/revoke   the lender takes them back
     POST /api/chat/rooms/<room>/forward/<grant>/call  {name, arguments}   call one, under the lender's connection
+    GET  /api/chat/rooms/<room>/table                    its round table: on or off, the seats, whose turn
+    POST /api/chat/rooms/<room>/table     {state: on, seats} | {state: off, note?}   the owner or an admin switches it
+                                                         (a seat may switch it off)
+    POST /api/chat/rooms/<room>/table/turn  {turn, round}   a seat reports whose turn it is
     POST /api/chat/remove            {id}                an admin soft-deletes a message
 """
 from __future__ import annotations
@@ -57,13 +70,15 @@ from contextlib import contextmanager
 
 from meowdoku import schema_version
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_BODY = 4000
 MAX_TAIL = 1000
 MAX_OBJECTS = 8
 MAX_BRIDGES = 8
 MAX_FORWARDED_TOOLS = 16
 MAX_GRANT_HOURS = 720
+MAX_SEATS = 8
+SEAT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 CALLS_PER_HOUR = 30
 ROOM = re.compile(r"[a-z0-9][a-z0-9-]{2,39}\Z")
 TOOL = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{0,63}\Z")
@@ -91,6 +106,10 @@ DDL = (
     "CREATE TABLE IF NOT EXISTS chat_grant_calls (at REAL NOT NULL, grant_id TEXT NOT NULL, caller_id INTEGER NOT NULL, "
     "caller TEXT NOT NULL, tool TEXT NOT NULL, ok INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS chat_grant_calls_by_caller ON chat_grant_calls(grant_id, caller_id, at)",
+    "CREATE TABLE IF NOT EXISTS chat_tables (room TEXT PRIMARY KEY, state TEXT NOT NULL CHECK(state IN ('on','off')), "
+    "seats TEXT NOT NULL, owner TEXT NOT NULL, switched_by TEXT NOT NULL, switched_at REAL NOT NULL, turn TEXT, "
+    "round INTEGER NOT NULL DEFAULT 0, turn_at REAL, note TEXT NOT NULL DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS chat_table_marks (message_id INTEGER PRIMARY KEY, round INTEGER NOT NULL)",
 )
 
 
@@ -383,10 +402,99 @@ def forwarded_call(db, room, grant, *, user_id, username, name, arguments, call,
 
 def _row(r) -> dict:
     removed = r[5] is not None
-    return {"id": r[0], "room": r[1], "username": r[2], "body": "" if removed else r[3], "at": r[4], "removed": removed}
+    row = {"id": r[0], "room": r[1], "username": r[2], "body": "" if removed else r[3], "at": r[4], "removed": removed}
+    if r[6] is not None:
+        row["round"] = r[6]                    # written by a seat while the room's round table was on
+    return row
 
 
-_SELECT = "SELECT id, room, username, body, created, removed_at FROM chat_messages"
+_SELECT = ("SELECT id, room, username, body, created, removed_at, (SELECT round FROM chat_table_marks WHERE message_id = chat_messages.id) "
+           "FROM chat_messages")
+
+
+# ---------------------------------------------------------------- the round table
+def _table_row(db, room):
+    row = db.execute("SELECT room, state, seats, owner, switched_by, switched_at, turn, round, turn_at, note FROM chat_tables "
+                     "WHERE room = ?", (room,)).fetchone()
+    if row is None:
+        return None
+    keys = ("room", "state", "seats", "owner", "switched_by", "switched_at", "turn", "round", "turn_at", "note")
+    record = dict(zip(keys, row))
+    record["seats"] = json.loads(record["seats"])
+    return record
+
+
+def _off(room) -> dict:
+    return {"room": room, "state": "off", "seats": [], "owner": None, "switched_by": None, "switched_at": None, "turn": None,
+            "round": 0, "turn_at": None, "note": ""}
+
+
+def table(db, room, *, user_id, caps=frozenset()) -> dict:
+    """The room's round table, on or off; anyone who may enter the room reads it."""
+    _enter(db, room, user_id, caps)
+    return _table_row(db, room) or _off(room)
+
+
+def _runs_tables(db, room, user_id) -> bool:
+    """Who switches a table: an admin, or the owner of an owned room. A system room has no owner, so only an admin."""
+    if role_of(db, user_id) == "admin":
+        return True
+    owned = _owned(db, room)
+    return owned is not None and owned["owner_id"] == user_id
+
+
+def switch(db, room, *, user_id, username, caps=frozenset(), state, seats=None, note="", caps_for=None, now=None) -> dict:
+    """Switch the room's round table on (with its seats) or off. ``caps_for(account)`` gives a seat's capabilities, so
+    every seat must be an account that may enter the room."""
+    _enter(db, room, user_id, caps)
+    now = time.time() if now is None else now
+    current = _table_row(db, room)
+    note = _text(note or "", "a note", 300, empty=True)
+    if state == "off":
+        seated = current is not None and current["state"] == "on" and str(username) in current["seats"]
+        if not (_runs_tables(db, room, user_id) or seated):
+            raise ChatError("only the room's owner, an admin, or one of its seats switches its round table off", 403)
+        if current is None or current["state"] == "off":
+            return current or _off(room)
+        db.execute("UPDATE chat_tables SET state = 'off', switched_by = ?, switched_at = ?, turn = NULL, turn_at = NULL, note = ? "
+                   "WHERE room = ?", (str(username), now, note, room))
+        return _table_row(db, room)
+    if state != "on":
+        raise ChatError("state is on or off")
+    if not _runs_tables(db, room, user_id):
+        raise ChatError("only the room's owner, or an admin, switches its round table on" if room not in ROOMS
+                        else "only an admin switches a system room's round table on", 403)
+    if current is not None and current["state"] == "on":
+        raise ChatError("the round table is already on; switch it off first", 409)
+    if not isinstance(seats, list) or not 2 <= len(seats) <= MAX_SEATS \
+            or not all(isinstance(s, str) and SEAT.match(s) for s in seats) or len(set(seats)) != len(seats):
+        raise ChatError(f"seats are 2 to {MAX_SEATS} different account names, in turn order")
+    if str(username) not in seats:
+        raise ChatError("the one who switches a round table on takes a seat at it")
+    for seat in seats:
+        row = db.execute("SELECT id FROM users WHERE username = ?", (seat,)).fetchone()
+        account = {"id": row[0], "username": seat} if row else None
+        if account is None or not may_enter(db, room, user_id=account["id"],
+                                            caps=caps_for(account) if caps_for else frozenset()):
+            raise ChatError(f"{seat} is not an account that may enter this room")
+    db.execute("INSERT OR REPLACE INTO chat_tables (room, state, seats, owner, switched_by, switched_at, turn, round, turn_at, note) "
+               "VALUES (?, 'on', ?, ?, ?, ?, NULL, 0, NULL, ?)", (room, json.dumps(seats), str(username), str(username), now, note))
+    return _table_row(db, room)
+
+
+def report_turn(db, room, *, user_id, username, caps=frozenset(), turn, round_no, now=None) -> dict:
+    """A seat says whose turn it now is, in which round."""
+    _enter(db, room, user_id, caps)
+    current = _table_row(db, room)
+    if current is None or current["state"] != "on":
+        raise ChatError("the round table is off", 409)
+    if str(username) not in current["seats"]:
+        raise ChatError("only a seat at the table reports its turns", 403)
+    if turn not in current["seats"] or not isinstance(round_no, int) or isinstance(round_no, bool) or round_no < 1:
+        raise ChatError("turn is one of the seats and round a count from 1")
+    now = time.time() if now is None else now
+    db.execute("UPDATE chat_tables SET turn = ?, round = ?, turn_at = ? WHERE room = ?", (turn, round_no, now, room))
+    return _table_row(db, room)
 
 
 def tail_of(value) -> int:
@@ -410,6 +518,9 @@ def post(db, room, *, user_id, username, body, caps=frozenset(), now=None) -> di
     now = time.time() if now is None else now
     cursor = db.execute("INSERT INTO chat_messages (room, user_id, username, body, created) VALUES (?, ?, ?, ?, ?)",
                         (room, int(user_id), str(username), body.strip(), now))
+    running = _table_row(db, room)
+    if running and running["state"] == "on" and running["round"] >= 1 and str(username) in running["seats"]:
+        db.execute("INSERT INTO chat_table_marks (message_id, round) VALUES (?, ?)", (cursor.lastrowid, running["round"]))
     return _row(db.execute(_SELECT + " WHERE id = ?", (cursor.lastrowid,)).fetchone())
 
 
@@ -466,6 +577,8 @@ def http_route(self, path, method, *, accounts_db, connections=None, notify=None
                 return self._json({"settings": settings(db, room, **me)})
             if room and rest == ["tools"]:
                 return self._json(tools(db, room, **me))
+            if room and rest == ["table"]:
+                return self._json({"table": table(db, room, **me)})
             return self._json({"error": "not found"}, 404)
         if method != "POST":
             return self._json({"error": "not found"}, 404)
@@ -494,6 +607,12 @@ def http_route(self, path, method, *, accounts_db, connections=None, notify=None
             return self._json({"message": made, "mentioned": told})
         if room and rest == ["settings"]:
             return self._json({"settings": configure(db, room, **me, changes=body)})
+        if room and rest == ["table"]:
+            return self._json({"table": switch(db, room, **me, username=principal.username, state=body.get("state"),
+                                               seats=body.get("seats"), note=body.get("note") or "", caps_for=caps_for)})
+        if room and rest == ["table", "turn"]:
+            return self._json({"table": report_turn(db, room, **me, username=principal.username, turn=body.get("turn"),
+                                                    round_no=body.get("round"))})
         if room and rest == ["access"]:
             return self._json({"sharing": share(db, room, user_id=principal.user_id, body=body)})
         if room and rest[:1] == ["forward"]:

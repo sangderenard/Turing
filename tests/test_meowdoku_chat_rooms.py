@@ -273,3 +273,75 @@ def test_overlapping_forwarded_calls_never_pass_the_hourly_limit(tmp_path):
     check = sqlite3.connect(path)
     assert check.execute("SELECT count(*), sum(ok) FROM chat_grant_calls").fetchone() == (30, 30)
     check.close()
+
+
+# ---------------------------------------------------------------- the round table
+@pytest.fixture
+def seated(db):
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL)")
+    db.executemany("INSERT INTO users VALUES (?, ?)", [(1, "admin"), (2, "opal"), (3, "devi"), (6, "intern"), (7, "svc"),
+                                                       (10, "claude"), (11, "gemini")])
+    db.executemany("INSERT INTO account_roles VALUES (?, ?)", [(10, "operator"), (11, "member")])
+    return db
+
+
+def test_a_round_table_is_switched_on_with_its_seats_and_marks_their_messages(seated):
+    db = seated
+    assert chat_rooms.table(db, "agents", user_id=11)["state"] == "off", "off until it is switched on"
+    for user, name in ((2, "opal"), (11, "gemini")):
+        with pytest.raises(chat_rooms.ChatError, match="admin") as refused:
+            chat_rooms.switch(db, "agents", user_id=user, username=name, state="on", seats=[name, "claude"])
+        assert refused.value.status == 403, "a system room's table is the admin's to switch"
+    for seats, why in ((["admin"], "2 to"), (["admin", "admin"], "different"), (["claude", "gemini"], "takes a seat"),
+                       (["admin", "nobody"], "nobody"), (["admin", "svc"], "svc")):
+        with pytest.raises(chat_rooms.ChatError, match=why):
+            chat_rooms.switch(db, "agents", user_id=1, username="admin", state="on", seats=seats)
+    on = chat_rooms.switch(db, "agents", user_id=1, username="admin", state="on", seats=["admin", "claude", "gemini"], now=5.0)
+    assert (on["state"], on["seats"], on["owner"], on["round"], on["turn"]) == ("on", ["admin", "claude", "gemini"], "admin", 0, None)
+    with pytest.raises(chat_rooms.ChatError) as twice:
+        chat_rooms.switch(db, "agents", user_id=1, username="admin", state="on", seats=["admin", "claude"])
+    assert twice.value.status == 409
+    before = chat_rooms.post(db, "agents", user_id=10, username="claude", body="before the first turn")
+    assert "round" not in before, "nothing is marked before the table's first turn"
+    turned = chat_rooms.report_turn(db, "agents", user_id=10, username="claude", turn="admin", round_no=1, now=6.0)
+    assert (turned["turn"], turned["round"], turned["turn_at"]) == ("admin", 1, 6.0)
+    for user, name, turn, round_no, status in ((2, "opal", "admin", 1, 403), (10, "claude", "opal", 1, 400),
+                                               (10, "claude", "admin", 0, 400), (10, "claude", "admin", True, 400)):
+        with pytest.raises(chat_rooms.ChatError) as wrong:
+            chat_rooms.report_turn(db, "agents", user_id=user, username=name, turn=turn, round_no=round_no)
+        assert wrong.value.status == status
+    said = chat_rooms.post(db, "agents", user_id=1, username="admin", body="my turn")
+    aside = chat_rooms.post(db, "agents", user_id=2, username="opal", body="not seated")
+    assert said["round"] == 1 and "round" not in aside, "a seat's message is marked with its round; anyone else's is not"
+    assert [m.get("round") for m in chat_rooms.messages(db, "agents", user_id=2, tail=3)] == [None, 1, None]
+    with pytest.raises(chat_rooms.ChatError) as stranger:
+        chat_rooms.switch(db, "agents", user_id=2, username="opal", state="off")
+    assert stranger.value.status == 403
+    ended = chat_rooms.switch(db, "agents", user_id=11, username="gemini", state="off", note="admin did not write", now=9.0)
+    assert (ended["state"], ended["switched_by"], ended["note"], ended["turn"]) == ("off", "gemini", "admin did not write", None)
+    assert "round" not in chat_rooms.post(db, "agents", user_id=1, username="admin", body="after"), "off: usual chat again"
+    with pytest.raises(chat_rooms.ChatError) as off:
+        chat_rooms.report_turn(db, "agents", user_id=10, username="claude", turn="admin", round_no=2)
+    assert off.value.status == 409
+    assert chat_rooms.switch(db, "agents", user_id=1, username="admin", state="off")["state"] == "off", "switching off twice is fine"
+
+
+def test_an_owned_rooms_owner_runs_its_table_over_rest(seated, tmp_path):
+    db = seated
+    chat_rooms.create(db, user_id=3, username="devi", caps=DEV, room="lab", title="Lab")
+
+    def ask(url, method="GET", **kw):
+        handler = Handler(url, **kw)
+        chat_rooms.http_route(handler, url.split("?")[0], method, accounts_db=tmp_path / "accounts.db",
+                              caps_for=lambda account: DEV)
+        return handler.sent
+
+    _public(db, "lab", 3)
+    status, made = ask("/api/chat/rooms/lab/table", "POST", user=3, username="devi",
+                       body={"state": "on", "seats": ["devi", "claude"]})
+    assert status == 200 and made["table"]["state"] == "on"
+    assert ask("/api/chat/rooms/lab/table/turn", "POST", user=10, username="claude",
+               body={"turn": "devi", "round": 1})[1]["table"]["turn"] == "devi"
+    assert ask("/api/chat/rooms/lab/table", user=2, username="opal")[1]["table"]["turn"] == "devi"
+    assert ask("/api/chat/rooms/lab/table", "POST", user=2, username="opal", body={"state": "off"})[0] == 403
+    assert ask("/api/chat/rooms/lab/table", "POST", user=3, username="devi", body={"state": "off"})[1]["table"]["state"] == "off"

@@ -554,7 +554,7 @@ async function main() {
     link("T4 wave arena", "/wave_arena.html", caps.has("dev_ui")),
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
     link("People (accounts and groups)", "/people.html", caps.has("account_manage")),
-    link("Admin room", "/rooms.html?room=reviewers", caps.has("account_manage")),
+    link("Rooms", "/rooms.html"),
     link("Account and password", "/login.html"),
     link("Invite someone", "/invite.html"),                                         // MOCKUP: any account may invite
   ]) if (item) menu.append(item);

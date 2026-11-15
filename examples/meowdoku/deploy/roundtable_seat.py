@@ -1,5 +1,10 @@
 """One seat at a round table: an agent kept running as its own Windows account, given its turns by Start-RoundTable.ps1.
 
+A table runs only while the room's round table is switched on (chat_rooms.py, the switch on the room page). Before each
+turn the seat reads the switch; it reports whose turn it is, so the room page shows it; and when the switch is off the
+seat answers {"op": "off"} and the runner stops the table. A lookout (--agent none) runs no agent: it only watches the
+switch for the runner.
+
 Start-RoundTable.ps1 starts each seat as the agent's account (AgentAccounts.psm1 Start-AsAgent -Redirect), so the seat
 has that account's own environment and signs in to SpeakToMe as the agent itself:
 
@@ -15,11 +20,15 @@ The agent stays one process for the whole table, so it keeps the conversation fr
 The coordinator and the seat speak one JSON object per line, ASCII only:
   in   {"op": "turn", "turn": k, "round": r, "tail": n}   read the room's last n messages, give them to the agent,
                                                           post its answer to the room
-       {"op": "wait", "turn": k, "for": "admin", "after": id, "seconds": s}   wait until that account writes in the
-                                                          room after message id (after the newest one when omitted)
+       {"op": "wait", "turn": k, "round": r, "for": "admin", "after": id, "seconds": s}   wait until that account
+                                                          writes in the room after message id (the newest when omitted)
+       {"op": "watch", "seconds": s}                      wait until the room's round table is switched on
+       {"op": "end", "note": text}                        switch the table off, saying why (a seat may)
        {"op": "stop"}, or the end of input                stop the agent and end
   out  {"op": "ready"} once signed in with the agent running; {"op": "posted", "turn": k, "id": id};
-       {"op": "passed", "turn": k}; {"op": "timeout", "turn": k}; {"op": "error", "turn": k, "error": text}
+       {"op": "passed", "turn": k}; {"op": "timeout", "turn": k}; {"op": "error", "turn": k, "error": text};
+       {"op": "off", "turn": k} when the table was switched off; {"op": "on", "seats": [...], "owner": name} for a watch;
+       {"op": "ended"} for an end
 The seat posts as the agent's own account; the coordinator never signs in and never sees a password or a message. Room
 text is data from other accounts and is framed as data for the agent. Diagnostics go to standard error.
 """
@@ -45,6 +54,7 @@ BASE = "https://stichka.duckdns.org:8766"
 PASS = "(pass)"
 MAX_POST = 4000                          # chat_rooms.MAX_BODY
 POLL_SECONDS = 5
+WATCH_SECONDS = 10
 GEMINI_TOOLS = ("whoami", "man", "chat_rooms", "chat_room", "pending", "contacts", "reviews_attention", "reviews_threads",
                 "comments_thread")
 
@@ -242,6 +252,16 @@ class Codex:
         _stop(self.process)
 
 
+class Lookout:
+    """No agent: a seat that only watches the switch (watch) for the runner."""
+
+    def ask(self, text: str, seconds: float) -> str:
+        raise SeatError("a lookout has no agent to ask")
+
+    def close(self):
+        pass
+
+
 class Gemini:
     """gemini_agent in this process, the conversation kept as its history."""
 
@@ -270,6 +290,26 @@ def room_messages(world, room: str, **query) -> list:
     return [m for m in data.get("messages") or [] if isinstance(m, dict)]
 
 
+def table_of(world, room: str) -> dict:
+    """The room's round table (chat_room_table)."""
+    result = world.call("chat_room_table", {"room": room})
+    data = _data(result)
+    if result.get("is_error") or data.get("error") or not isinstance(data.get("table"), dict):
+        raise SeatError(f"chat_room_table {room}: {data.get('error') or result.get('text') or 'refused'}")
+    return data["table"]
+
+
+def report_turn(world, room: str, turn: str, round_no: int) -> bool:
+    """Tell the room whose turn it is; False when the table has been switched off meanwhile."""
+    result = world.call("chat_room_table_turn", {"room": room, "turn": turn, "round": int(round_no)})
+    data = _data(result)
+    if result.get("is_error") or data.get("error"):
+        if "off" in str(data.get("error") or ""):
+            return False
+        raise SeatError(f"chat_room_table_turn {room}: {data.get('error') or result.get('text') or 'refused'}")
+    return True
+
+
 def post(world, room: str, text: str):
     if len(text) > MAX_POST:
         text = text[:MAX_POST - 40].rstrip() + "\n[cut at the room's length limit]"
@@ -291,6 +331,9 @@ class Seat:
         k = command.get("turn")
         tail = max(1, int(command.get("tail") or len(self.order) - 1))
         try:
+            if table_of(self.world, self.room).get("state") != "on" or \
+                    not report_turn(self.world, self.room, self.login, int(command.get("round") or 1)):
+                return {"op": "off", "turn": k}
             text = framed(self.room, room_messages(self.world, self.room, tail=tail), tail, command.get("round"))
             if not self.introduced:
                 text = intro(self.name, self.login, self.room, self.order, self.owner, tail) + "\n\n" + text
@@ -305,11 +348,17 @@ class Seat:
     def wait(self, command: dict) -> dict:
         k, who = command.get("turn"), str(command.get("for") or self.owner)
         until = self.clock() + float(command.get("seconds") or 3600)
-        after, failed = command.get("after"), None
+        after, failed, reported = command.get("after"), None, False
         while True:
             # A read that fails is not the end of the turn: measured 2026-11-15 05:36, one "cannot reach the server: The
             # read operation timed out" ended the first table four minutes in. The wait reads again until its time is up.
             try:
+                if table_of(self.world, self.room).get("state") != "on":
+                    return {"op": "off", "turn": k}
+                if not reported:
+                    if not report_turn(self.world, self.room, who, int(command.get("round") or 1)):
+                        return {"op": "off", "turn": k}
+                    reported = True
                 if after is None:
                     newest = room_messages(self.world, self.room, tail=1)
                     after = newest[-1]["id"] if newest else 0
@@ -324,6 +373,29 @@ class Seat:
             if self.clock() >= until:
                 return {"op": "error", "turn": k, "error": failed} if failed else {"op": "timeout", "turn": k}
             self.sleep(POLL_SECONDS)
+
+    def watch(self, command: dict) -> dict:
+        """Until the room's round table is on: its seats and who switched it on. Failed reads are read again."""
+        until = self.clock() + float(command.get("seconds") or 3600)
+        while True:
+            try:
+                found = table_of(self.world, self.room)
+                if found.get("state") == "on":
+                    return {"op": "on", "seats": list(found.get("seats") or []), "owner": found.get("owner"),
+                            "switched_at": found.get("switched_at")}
+            except SeatError as error:
+                log(f"watch: {error}; reading again")
+            if self.clock() >= until:
+                return {"op": "timeout"}
+            self.sleep(WATCH_SECONDS)
+
+    def end(self, command: dict) -> dict:
+        result = self.world.call("chat_room_table_switch", {"room": self.room, "state": "off",
+                                                            "note": str(command.get("note") or "the table ended")[:300]})
+        data = _data(result)
+        if result.get("is_error") or data.get("error"):
+            return {"op": "error", "error": f"chat_room_table_switch: {data.get('error') or 'refused'}"}
+        return {"op": "ended"}
 
     def serve(self, lines, write) -> None:
         for line in lines:
@@ -342,6 +414,10 @@ class Seat:
                 write(self.turn(command))
             elif op == "wait":
                 write(self.wait(command))
+            elif op == "watch":
+                write(self.watch(command))
+            elif op == "end":
+                write(self.end(command))
             else:
                 write({"op": "error", "turn": command.get("turn") if isinstance(command, dict) else None,
                        "error": f"not a seat command: {op}"})
@@ -349,10 +425,11 @@ class Seat:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--agent", required=True, choices=("claude", "codex", "gemini"))
+    parser.add_argument("--agent", required=True, choices=("claude", "codex", "gemini", "none"),
+                        help="none: a lookout that only watches the room's round table switch")
     parser.add_argument("--login", required=True)
     parser.add_argument("--room", required=True)
-    parser.add_argument("--order", required=True, help="the seats in turn order, comma separated, the owner included")
+    parser.add_argument("--order", default="", help="the seats in turn order, comma separated, the owner included")
     parser.add_argument("--owner", default="admin")
     parser.add_argument("--base", default=BASE)
     parser.add_argument("--turn-minutes", type=float, default=10)
@@ -379,6 +456,8 @@ def main(argv=None) -> int:
             agent = Claude()
         elif args.agent == "codex":
             agent = Codex()
+        elif args.agent == "none":
+            agent = Lookout()
         else:
             agent = Gemini(world, args.model, gemini_agent.gemini_caller(gemini_agent.read_key(args.key_file)))
     except Exception as error:                                # reported to the coordinator, never a traceback
@@ -387,7 +466,7 @@ def main(argv=None) -> int:
             agent.close()
         return 2
     write({"op": "ready", "agent": args.agent, "login": args.login})
-    seat = Seat(world, agent, name=args.agent, login=args.login, room=args.room, order=args.order.split(","),
+    seat = Seat(world, agent, name=args.agent, login=args.login, room=args.room, order=[s for s in args.order.split(",") if s],
                 owner=args.owner, turn_seconds=args.turn_minutes * 60)
     try:
         seat.serve((raw.decode("utf-8", "replace") for raw in sys.stdin.buffer), write)

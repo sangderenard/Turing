@@ -90,12 +90,23 @@ def test_codex_a_failed_turn_is_an_error():
 
 
 class World:
-    def __init__(self, messages):
-        self.messages, self.posted, self.calls = list(messages), [], []
+    def __init__(self, messages, state="on"):
+        self.messages, self.posted, self.calls, self.turns = list(messages), [], [], []
         self.tools, self.instructions = {}, ""
+        self.table = {"state": state, "seats": ["admin", "claude", "codex", "gemini"], "owner": "admin", "note": ""}
 
     def call(self, name, arguments):
         self.calls.append((name, dict(arguments)))
+        if name == "chat_room_table":
+            return {"data": {"table": dict(self.table)}}
+        if name == "chat_room_table_turn":
+            if self.table["state"] != "on":
+                return {"is_error": True, "data": {"error": "the round table is off"}}
+            self.turns.append((arguments["turn"], arguments["round"]))
+            return {"data": {"table": dict(self.table)}}
+        if name == "chat_room_table_switch":
+            self.table.update(state=arguments["state"], note=arguments.get("note", ""))
+            return {"data": {"table": dict(self.table)}}
         if name == "chat_room":
             if "after" in arguments:
                 return {"data": {"messages": [m for m in self.messages if m["id"] > int(arguments["after"])]}}
@@ -126,6 +137,7 @@ def test_a_turn_gives_the_last_messages_and_posts_the_answer_as_the_agent():
     world, agent = World(MESSAGES), Agent("my answer", "(pass)", seat.SeatError("the agent did not answer in time"), "x" * 5000)
     s = seat.Seat(world, agent, name="claude", login="claude", room="agents", order=["admin", "claude", "codex", "gemini"], owner="admin")
     assert s.turn({"op": "turn", "turn": 2, "round": 1}) == {"op": "posted", "turn": 2, "id": 100}
+    assert world.turns == [("claude", 1)], "the seat says on the room page that it is its turn"
     first = agent.asked[0]
     assert ("chat_room", {"room": "agents", "tail": "3"}) in world.calls, "n-1 messages: four seats, three messages"
     assert "[2] codex: m2" in first and "[4] admin: m4" in first and "m1" not in first.split("follow")[-1]
@@ -205,3 +217,44 @@ def test_gemini_keeps_its_history_between_turns():
     assert gemini.ask("turn three", 60) == "second answer"
     texts = [c["parts"][0]["text"] for c in sent[-1]["contents"]]
     assert texts == ["turn one", "first answer", "turn three"]
+
+
+def test_a_switched_off_table_stops_turns_and_waits():
+    world = World(MESSAGES, state="off")
+    s = seat.Seat(world, Agent("never asked"), name="claude", login="claude", room="agents",
+                  order=["admin", "claude"], owner="admin", sleep=lambda seconds: None, clock=lambda: 0.0)
+    assert s.turn({"op": "turn", "turn": 2, "round": 1}) == {"op": "off", "turn": 2}
+    assert s.agent.asked == [] and world.posted == [], "nothing is asked or posted once the switch is off"
+    assert s.wait({"op": "wait", "turn": 3, "round": 1, "for": "admin", "seconds": 60}) == {"op": "off", "turn": 3}
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] == 10:
+            world.table["state"] = "off"           # the owner switches it off while it is their turn
+
+    world.table["state"] = "on"
+    s.sleep, s.clock = sleep, lambda: clock[0]
+    assert s.wait({"op": "wait", "turn": 5, "round": 2, "for": "admin", "seconds": 60}) == {"op": "off", "turn": 5}
+    assert world.turns == [("admin", 2)], "the person's turn is reported once"
+
+
+def test_the_lookout_watches_the_switch_and_a_seat_ends_the_table():
+    world, clock = World([], state="off"), [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] == 20:
+            world.table["state"] = "on"
+
+    lookout = seat.Seat(world, seat.Lookout(), name="none", login="gemini", room="agents", order=[], owner="admin",
+                        sleep=sleep, clock=lambda: clock[0])
+    assert lookout.watch({"op": "watch", "seconds": 600}) == {"op": "on", "seats": ["admin", "claude", "codex", "gemini"],
+                                                              "owner": "admin", "switched_at": None}
+    world.table["state"] = "off"
+    assert lookout.watch({"op": "watch", "seconds": 30}) == {"op": "timeout"}
+    world.table["state"] = "on"
+    assert lookout.end({"op": "end", "note": "admin did not write for 60 minutes"}) == {"op": "ended"}
+    assert world.table["state"] == "off" and world.table["note"] == "admin did not write for 60 minutes"
+    with pytest.raises(seat.SeatError):
+        seat.Lookout().ask("x", 1)

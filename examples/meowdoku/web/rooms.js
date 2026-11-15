@@ -47,14 +47,17 @@ async function open(name, { quiet = false } = {}) {
   if (quiet && typing) return;
   try {
     const tail = encodeURIComponent(byId("tail").value);
-    const [{ settings }, { messages }, set] = await Promise.all([request(`/api/chat/rooms/${name}/settings`),
-      request(`/api/chat/rooms/${name}?tail=${tail}`), request(`/api/chat/rooms/${name}/tools`)]);
-    panel.replaceChildren(el("h2", settings.title), el("p", settings.about || "", "muted"));
+    const [{ settings }, { messages }, set, { table }] = await Promise.all([request(`/api/chat/rooms/${name}/settings`),
+      request(`/api/chat/rooms/${name}?tail=${tail}`), request(`/api/chat/rooms/${name}/tools`),
+      request(`/api/chat/rooms/${name}/table`)]);
+    panel.replaceChildren(el("h2", settings.title), el("p", settings.about || "", "muted"), roundTable(name, settings, table));
     // the chat
     const list = el("ul", null, "msgs");
     for (const m of messages) {
       const li = el("li");
-      li.append(el("span", m.username, "who"), document.createTextNode(m.removed ? "(removed by an admin)" : m.body), el("span", when(m.at), "at"));
+      li.append(el("span", m.username, "who"));
+      if (m.round) li.append(el("span", `round ${m.round}`, "badge round"));          // written at the round table
+      li.append(document.createTextNode(m.removed ? "(removed by an admin)" : m.body), el("span", when(m.at), "at"));
       list.append(li);
     }
     if (!messages.length) list.append(el("li", "No message yet.", "muted"));
@@ -69,6 +72,43 @@ async function open(name, { quiet = false } = {}) {
 }
 
 const isOwner = settings => who && (settings.owner_name === who.username || who.role === "admin");
+
+// The round table (chat_rooms.py): whether it is on, whose turn it is, and, for whoever runs it, the switch. The runner
+// (Start-RoundTable.ps1) starts the agents' seats when it is switched on and stops them when it is switched off.
+function roundTable(name, settings, table) {
+  const box = el("section", null, "table " + (table.state === "on" ? "on" : "off"));
+  if (table.state === "on") {
+    box.append(el("strong", "Round table on"), el("span", ` · seats in turn: ${table.seats.join(" → ")}`),
+      el("div", table.turn ? `Now: ${table.turn}'s turn, round ${table.round} (since ${when(table.turn_at)})`
+                           : "Waiting for the runner to start the seats…"),
+      el("small", `Switched on by ${table.owner} at ${when(table.switched_at)}. Messages from the seats are marked with their round.`));
+  } else {
+    box.append(el("span", "Round table off: this is the usual chat."));
+    if (table.switched_by) box.append(el("small", ` Last ended ${when(table.switched_at)} by ${table.switched_by}${table.note ? `: ${table.note}` : ""}.`));
+  }
+  const runs = who && (who.role === "admin" || (!settings.system && settings.owner_name === who.username));
+  if (!runs) return box;
+  const controls = el("div", null, "actions");
+  if (table.state === "on") {
+    const stop = el("button", "Switch the round table off"); stop.type = "button";
+    stop.onclick = async () => {
+      try { await request(`/api/chat/rooms/${name}/table`, { state: "off", note: `switched off by ${who.username}` }); await open(name); }
+      catch (error) { status(`Not switched off: ${error.message}`); }
+    };
+    controls.append(stop);
+  } else {
+    const seats = input(`${who.username}, claude, codex, gemini`); seats.setAttribute("aria-label", "Seats in turn order");
+    const start = el("button", "Switch the round table on"); start.type = "button";
+    start.onclick = async () => {
+      const chosen = seats.value.split(",").map(s => s.trim()).filter(Boolean);
+      try { await request(`/api/chat/rooms/${name}/table`, { state: "on", seats: chosen }); await open(name); }
+      catch (error) { status(`Not switched on: ${error.message}`); }
+    };
+    controls.append(field("Seats, in turn order (yours among them)", seats), start);
+  }
+  box.append(controls);
+  return box;
+}
 
 function roomSet(name, set) {
   const box = el("section", null, "part");
