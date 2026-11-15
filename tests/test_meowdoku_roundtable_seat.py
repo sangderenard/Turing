@@ -155,6 +155,30 @@ def test_waiting_for_the_owner():
     assert s.wait({"op": "wait", "turn": 3, "for": "admin", "after": 6, "seconds": 30}) == {"op": "timeout", "turn": 3}
 
 
+def test_a_failed_read_does_not_end_the_owners_turn():
+    world = World(MESSAGES)
+    real, failures, clock = world.call, [2], [0.0]
+
+    def flaky(name, arguments):
+        if name == "chat_room" and failures[0]:
+            failures[0] -= 1
+            return {"is_error": True, "data": {"error": "cannot reach the server: The read operation timed out"}}
+        return real(name, arguments)
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] == 15:
+            world.messages.append({"id": 5, "username": "admin", "body": "here"})
+
+    world.call = flaky
+    s = seat.Seat(world, Agent(), name="claude", login="claude", room="agents", order=["admin", "claude"], owner="admin",
+                  sleep=sleep, clock=lambda: clock[0])
+    assert s.wait({"op": "wait", "turn": 1, "for": "admin", "seconds": 60}) == {"op": "posted", "turn": 1, "id": 5}
+    failures[0] = 99
+    answer = s.wait({"op": "wait", "turn": 3, "for": "admin", "after": 5, "seconds": 10})
+    assert answer["op"] == "error" and "timed out" in answer["error"], "still failing when its time is up: said so"
+
+
 def test_the_seat_serves_lines_until_stop():
     world, agent = World(MESSAGES), Agent("hi")
     s = seat.Seat(world, agent, name="gemini", login="gemini", room="agents", order=["admin", "gemini"], owner="admin")

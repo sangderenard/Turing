@@ -305,21 +305,25 @@ class Seat:
     def wait(self, command: dict) -> dict:
         k, who = command.get("turn"), str(command.get("for") or self.owner)
         until = self.clock() + float(command.get("seconds") or 3600)
-        try:
-            after = command.get("after")
-            if after is None:
-                newest = room_messages(self.world, self.room, tail=1)
-                after = newest[-1]["id"] if newest else 0
-            while True:
+        after, failed = command.get("after"), None
+        while True:
+            # A read that fails is not the end of the turn: measured 2026-11-15 05:36, one "cannot reach the server: The
+            # read operation timed out" ended the first table four minutes in. The wait reads again until its time is up.
+            try:
+                if after is None:
+                    newest = room_messages(self.world, self.room, tail=1)
+                    after = newest[-1]["id"] if newest else 0
                 for message in room_messages(self.world, self.room, after=after):
                     after = max(int(after), int(message.get("id") or 0))
                     if message.get("username") == who and not message.get("removed"):
                         return {"op": "posted", "turn": k, "id": message.get("id")}
-                if self.clock() >= until:
-                    return {"op": "timeout", "turn": k}
-                self.sleep(POLL_SECONDS)
-        except SeatError as error:
-            return {"op": "error", "turn": k, "error": str(error)}
+                failed = None
+            except SeatError as error:
+                failed = str(error)
+                log(f"wait: {failed}; reading again")
+            if self.clock() >= until:
+                return {"op": "error", "turn": k, "error": failed} if failed else {"op": "timeout", "turn": k}
+            self.sleep(POLL_SECONDS)
 
     def serve(self, lines, write) -> None:
         for line in lines:
