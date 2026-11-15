@@ -21,9 +21,12 @@ What -Apply does, in this order:
   (g) reports every listening port with its process and account, so each loopback service can be checked for its own
       authentication (any account on this computer reaches a loopback port)
 
-Not here yet: the core service (MeowdokuCore) that will run git and the workspace commands for the agents. Until it is
-installed, an agent signed in as "agents" can read the code but not change it, so keep the agents on the operator's
-account until then. Undo: Restore-AgentBoxAcls.ps1 -Manifest <the manifest this run printed>.
+Once the trees are locked (C:\dev\Powershell has no "Authenticated Users" or "Users" entry), -CreateAgentAccount and
+-CopyAgentCredentials skip (b) to (d): they only add, so no new backup is needed, and each prints its own undo.
+
+An agent signed in as "agents" changes the code through the central checkout (checkout_* tools; the service makes the
+branch and commits) and cannot run commands in it yet. Undo the lock: Restore-AgentBoxAcls.ps1 -Manifest <the manifest
+this run printed>.
 .EXAMPLE   .\Set-AgentBox.ps1                                  # report only
 .EXAMPLE   .\Set-AgentBox.ps1 -Apply -CreateAgentAccount        # lock, make the account
 #>
@@ -74,6 +77,16 @@ foreach ($p in @($Dev, $Workspace, $Apache, (Join-Path $Workspace 'srv\python'),
     Write-Host ("{0,-40} {1}" -f $p, (Broad $p))
 }
 
+$policy = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'branch_policy.json') | ConvertFrom-Json
+$broadNow = @((Get-Acl -LiteralPath $Workspace).Access | Where-Object {
+    try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in @('S-1-5-11', 'S-1-5-32-545') } catch { $false } })
+$skipLock = ($broadNow.Count -eq 0) -and ($CreateAgentAccount -or $CopyAgentCredentials)
+$manifest = $null
+if ($skipLock) {
+    Write-Host ''
+    Write-Host "== (b) to (d) skipped: $Workspace is already locked, and the account steps only add (no new backup needed)"
+} else {
+
 # ---------------------------------------------------------------- (b)
 Step "(b) save every folder permission to $BackupDir"
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -111,7 +124,6 @@ foreach ($w in ($writes | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') } |
 }
 # The lander and the cleaner run inside the service's task worker: fetch, push, update-ref and branch in every repository of
 # branch_policy.json (the live checkouts' .git), and the removal notices file is rewritten and committed in the workspace.
-$policy = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'branch_policy.json') | ConvertFrom-Json
 foreach ($r in $policy.repositories.PSObject.Properties) {
     $gitDir = Join-Path ([string]$r.Value.path).Replace('/', '\') '.git'
     if (Test-Path -LiteralPath $gitDir -PathType Container) { Run 'icacls.exe' @($gitDir, '/grant', "${ServiceAccount}:(OI)(CI)M") }
@@ -132,6 +144,7 @@ Run 'icacls.exe' @($Workspace, '/grant', "${Operator}:(OI)(CI)F", "${ADMINS}:(OI
 Run 'icacls.exe' @($Apache, '/inheritance:d')
 Run 'icacls.exe' @($Apache, '/remove:g', $AUTH_USERS)
 Run 'icacls.exe' @($Apache, '/grant', "${Operator}:(OI)(CI)F")
+}   # end of (b) to (d)
 
 # ---------------------------------------------------------------- (e)
 Step "(e) the standard account $AgentAccount"
@@ -145,7 +158,7 @@ if ($CreateAgentAccount) {
         if ($Apply) {
             $password = Read-Host -AsSecureString "A password for $AgentAccount (you sign in with it; keep it in your password manager)"
             New-LocalUser -Name $AgentAccount -Password $password -PasswordNeverExpires -AccountNeverExpires `
-                -Description 'The agents box: reads the code; writes only through the system' | Out-Null
+                -Description 'Agents box: reads code; writes via the system' | Out-Null
             $password = $null
             Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-545') -Member $AgentAccount
         }
@@ -155,6 +168,7 @@ if ($CreateAgentAccount) {
     }
     Run 'icacls.exe' @($Workspace, '/grant', "${AgentAccount}:RX")         # the folder itself, to reach the repositories
     foreach ($repo in $codeRepos) { if (Test-Path -LiteralPath $repo) { Run 'icacls.exe' @($repo, '/grant', "${AgentAccount}:(OI)(CI)RX") } }
+    Write-Host "undo (e): Remove-LocalUser $AgentAccount; then icacls <path> /remove:g $AgentAccount on $Workspace and on each of: $($codeRepos -join ', ')"
 } else { Write-Host 'skipped (no -CreateAgentAccount)' }
 
 # ---------------------------------------------------------------- (f)
@@ -186,6 +200,8 @@ Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Sort-Object L
     "{0,-10} {1,-6} {2,-22} {3}" -f $_.LocalAddress, $_.LocalPort, $(if ($proc) { $proc.Name } else { '?' }), $owner
 } | Write-Host
 
-Step 'after (d), check the stack'
-Write-Host "Restart it (Apache-Service.ps1 -Restart) and open the site. If anything refuses, undo with:"
-Write-Host "  .\Restore-AgentBoxAcls.ps1 -Manifest $manifest"
+if (-not $skipLock) {
+    Step 'after (d), check the stack'
+    Write-Host "Restart it (Apache-Service.ps1 -Restart) and open the site. If anything refuses, undo with:"
+    Write-Host "  .\Restore-AgentBoxAcls.ps1 -Manifest $manifest"
+}
