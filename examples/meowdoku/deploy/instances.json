@@ -272,6 +272,8 @@
         "C:/dev/Powershell/srv/state/sql/accounts.db",
         "--system-account",
         "svc-nodus-messenger",
+        "--hosted-agents",
+        "llama",
         "--userlist-jobs-dir",
         "C:/dev/Powershell/srv/state/jobs/userlist",
         "--branch-policy",

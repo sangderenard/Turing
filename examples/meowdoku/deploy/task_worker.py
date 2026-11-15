@@ -52,6 +52,7 @@ def main(argv=None) -> int:
     parser.add_argument("--accounts-db", default=None, help="the accounts database; with --system-account, system.broadcast is offered")
     parser.add_argument("--system-account", default=None,
                         help="the account system events are sent as (the Nodus host's service account, shown as Nodus)")
+    parser.add_argument("--hosted-agents", default="", help="comma-separated hosted agent account names for cron room dispatch")
     parser.add_argument("--branch-policy", default=None,
                         help="the branch policy file; with --accounts-db, reviews.land and branches.clean are offered")
     parser.add_argument("--federation-port", default=None, help=argparse.SUPPRESS)      # the supervisor passes these to any
@@ -79,7 +80,8 @@ def main(argv=None) -> int:
 
     native, tools = studio_product_nodus.nodus_modules()[0], studio_product_nodus.DEFAULT_NODUS_TOOLS
     if args.accounts_db and args.system_account:
-        needs["system"] = {"accounts_db": args.accounts_db, "username": args.system_account, "module": messaging}
+        needs["system"] = {"accounts_db": args.accounts_db, "username": args.system_account, "module": messaging,
+                           "hosted_agents": tuple(name.strip() for name in args.hosted_agents.split(",") if name.strip())}
         if args.userlist_port and args.userlist_jobs_dir:      # the broadcast finds its audience by asking this table
             needs["system"]["userlist"] = {"port": args.userlist_port, "jobs_dir": args.userlist_jobs_dir, "native": native,
                                            "task_request": scheduled_tasks.load_task_request(tools)}

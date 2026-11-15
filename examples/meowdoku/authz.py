@@ -71,11 +71,12 @@ SCRIPT ACCESS.  ``deploy_scripts`` is granted by no tier, only by role admin/ope
 verify, be in ``script_access`` (explicit allow-list) and hold deploy_scripts; every attempt is a ``script_audit`` row (exit 3 refuses).
 CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude.
 
-KIOSK.  ``intern`` is a read-only guest agent, like a kiosk at an amusement park.  It holds view_site and photo_read whatever
-its origin tier, takes no permission group (permission_groups.authority keeps it off the human ladder, like service), and the
-server answers it only on the catalog endpoints declared ``kiosk`` (speaktome_api.catalog.kiosk_endpoint): every other
-method and path is refused before any handler runs, failing closed when the catalog is not loaded.  An intern therefore
-cannot write, submit, message or touch the lifecycle even where a handler asks for no capability.
+KIOSK.  ``intern`` is a limited guest agent. It holds view_site and photo_read whatever its origin tier and takes no
+permission group (permission_groups.authority keeps it off the human ladder). The server answers it only on catalog
+endpoints declared ``kiosk`` (speaktome_api.catalog.kiosk_endpoint), failing closed when the catalog is absent. It may
+read and post in rooms it can enter, and react to their messages. An admin may explicitly grant the audited ``message``
+capability modifier to one intern account for direct messaging; other interns retain no message capability. Neither a
+tier nor that modifier opens lifecycle, submissions, files, or other endpoints outside the kiosk catalog.
 
 GUEST.  A visitor with no account (a cookie guest, or a guest agent: a guest agent has no account, owner 2026-11-13) holds at
 most role_caps['guest'] and is answered only on the server's pages (paths outside /api/ and /ws) and on the catalog entries
@@ -210,6 +211,7 @@ class Principal:
     origin: str               # lan | ip | dns
     tier: str                 # the origin tier string as access.py gives it
     groups: frozenset[str] = frozenset()
+    modifiers: frozenset[str] = frozenset()
 
 
 # ---- policy -------------------------------------------------------------------------------------------------------------
@@ -277,6 +279,9 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
                 caps |= set(policy["role_caps"].get(group, ()))
     else:
         caps |= set(policy["role_caps"].get(principal.role, ()))
+    for cap in principal.modifiers:
+        if cap == "message" and principal.role == "intern":
+            caps.add(cap)
     if principal.origin != "lan":
         caps.discard("lifecycle_admin")
     if principal.role != "admin":
@@ -305,7 +310,7 @@ def _connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     try:
-        _schema_version.declare(conn, "authz", 4)       # 4: account_roles admits 'intern'.  First: a newer database is refused before this module writes anything
+        _schema_version.declare(conn, "authz", 5)       # 5: audited account capability modifiers. First: a newer database is refused before this module writes anything
     except _schema_version.SchemaVersionError:
         conn.close()
         raise
@@ -416,7 +421,8 @@ def principal_from(account, origin: str, tier: str, db_path) -> Principal:
         db.close()
     role = "service" if rank["service"] else rank["highest"]
     groups = frozenset(rank["groups"])
-    return Principal(role, account["id"], account["username"], origin, tier, groups)
+    modifiers = frozenset(cap for cap, enabled in rank["modifiers"].items() if enabled)
+    return Principal(role, account["id"], account["username"], origin, tier, groups, modifiers)
 
 
 def grant_role(db_path, username: str, role: str, granted_by: str) -> int:

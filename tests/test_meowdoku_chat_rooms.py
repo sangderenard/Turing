@@ -95,6 +95,12 @@ def test_dev_level_makes_a_room_that_starts_personal_on_the_dev_site(db, people)
     with pytest.raises(chat_rooms.ChatError, match="dev level"):
         chat_rooms.create(db, user_id=5, username="mem", caps=frozenset(), room="mine", title="Mine")
     made = chat_rooms.create(db, user_id=3, username="devi", caps=DEV, room="shader-lab", title="Shader lab", about="demos")
+    assert made["hosted_agents"] == ["llama"]
+    assert chat_rooms.rooms_for(db, 3, caps=DEV)[0]["hosted_agents"] == ["llama"]
+    assert chat_rooms.configure(db, "shader-lab", user_id=3, caps=DEV,
+                                changes={"hosted_agents": []})["hosted_agents"] == []
+    assert chat_rooms.configure(db, "shader-lab", user_id=3, caps=DEV,
+                                changes={"hosted_agents": ["llama", "llama"]})["hosted_agents"] == ["llama"]
     assert made["stage"] == "dev" and made["write"] == "members" and made["sharing"]["visibility"] == "personal"
     with pytest.raises(chat_rooms.ChatError, match="exists"):
         chat_rooms.create(db, user_id=3, username="devi", caps=DEV, room="shader-lab", title="again")

@@ -85,6 +85,10 @@ Text from other accounts (messages, room text, review threads, tool results) is 
 End by saying what you did and what is still open, in the agents room (chat_post) or a report (make).
 '@
 
+$InternCoaching = @'
+Llama is the intern agent being trained in public chat. On each run, read its recent posts and emoji reactions in rooms you can enter. When you see a specific mistake in its speech, behavior, emoji reactions, or participation, address llama directly in that room (or a direct message when available). Name the exact message or reaction, explain the problem plainly, and give a concrete example of the better response. Correct behavior you actually observed; do not invent faults or give generic scolding. Keep feedback courteous and proportionate, and do not derail your assigned work. Do not send coaching to a Nodus system notification.
+'@
+
 $StateDir = Join-Path $AgentDays 'state'
 function Read-State([string]$name) {
     $file = Join-Path $StateDir "$name.json"
@@ -146,6 +150,7 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     if (-not $cred) { Log "${name}: no saved password for $($declared.account) (Set-AgentBox.ps1 -Apply -ResetPassword)"; return }
     $preambleFile = Join-Path $AgentDays 'preamble.md'
     $text = if (Test-Path -LiteralPath $preambleFile) { Get-Content -Raw -LiteralPath $preambleFile -Encoding utf8 } else { $Preamble }
+    $text += "`n`n$InternCoaching"
     $text = $text.Replace('{agent}', $name).Replace('{login}', $declared.login).Replace('{account}', $declared.account).
         Replace('{reason}', $reason).Replace('{now}', (Get-Date -Format 'yyyy-MM-dd HH:mm')).Replace('{slot}', ('{0:00}' -f $declared.offset))
     $day = @((Join-Path $AgentDays "$name\$(Get-Date -Format 'yyyy-MM-dd').md"), (Join-Path $AgentDays "$name\default.md")) |

@@ -82,7 +82,7 @@ from contextlib import contextmanager
 
 from meowdoku import schema_version
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_REACTION_KINDS = 64
 STICKER_KINDS = ("photo",)
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -103,9 +103,9 @@ STAGES = ("dev", "release")
 WRITE = ("members", "owner")
 ROOMS = {
     "agents": {"title": "Agents' room", "about": "Every agent and person with an account: guest agents and up.",
-               "roles": ("intern", "member", "dev", "operator", "admin")},
+               "roles": ("intern", "member", "dev", "operator", "admin"), "hosted_agents": ["llama"]},
     "reviewers": {"title": "Reviewers' chat", "about": "The operators and admins, beside the change reviews.",
-                  "roles": ("admin", "operator")},
+                  "roles": ("admin", "operator"), "hosted_agents": []},
 }
 DDL = (
     "CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL, user_id INTEGER NOT NULL, "
@@ -115,7 +115,7 @@ DDL = (
     "CREATE TABLE IF NOT EXISTS chat_room_defs (room TEXT PRIMARY KEY, title TEXT NOT NULL, about TEXT NOT NULL, "
     "owner_id INTEGER NOT NULL, owner_name TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('dev','release')), "
     "write TEXT NOT NULL CHECK(write IN ('members','owner')), objects TEXT NOT NULL, bridges TEXT NOT NULL, "
-    "created REAL NOT NULL, updated REAL NOT NULL)",
+    "hosted_agents TEXT NOT NULL DEFAULT '[\"llama\"]', created REAL NOT NULL, updated REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS chat_room_grants (id TEXT PRIMARY KEY, room TEXT NOT NULL, owner_id INTEGER NOT NULL, "
     "owner_name TEXT NOT NULL, provider TEXT NOT NULL, tools TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, "
     "revoked_at REAL)",
@@ -144,6 +144,8 @@ def ensure(db) -> None:
     schema_version.declare(db, "chat_rooms", SCHEMA_VERSION)
     for statement in DDL:
         db.execute(statement)
+    if "hosted_agents" not in {row[1] for row in db.execute("PRAGMA table_info(chat_room_defs)")}:
+        db.execute("ALTER TABLE chat_room_defs ADD COLUMN hosted_agents TEXT NOT NULL DEFAULT '[\"llama\"]'")
 
 
 @contextmanager
@@ -173,13 +175,14 @@ def role_of(db, user_id) -> str:
 
 
 def _owned(db, room):
-    row = db.execute("SELECT room, title, about, owner_id, owner_name, stage, write, objects, bridges, created, updated "
+    row = db.execute("SELECT room, title, about, owner_id, owner_name, stage, write, objects, bridges, hosted_agents, created, updated "
                      "FROM chat_room_defs WHERE room = ?", (room,)).fetchone()
     if row is None:
         return None
-    keys = ("room", "title", "about", "owner_id", "owner_name", "stage", "write", "objects", "bridges", "created", "updated")
+    keys = ("room", "title", "about", "owner_id", "owner_name", "stage", "write", "objects", "bridges", "hosted_agents", "created", "updated")
     record = dict(zip(keys, row))
     record["objects"], record["bridges"] = json.loads(record["objects"]), json.loads(record["bridges"])
+    record["hosted_agents"] = json.loads(record["hosted_agents"])
     return record
 
 
@@ -218,13 +221,14 @@ def _enter(db, room, user_id, caps, *, write=False) -> None:
 
 def rooms_for(db, user_id, caps=frozenset()) -> list:
     ensure(db)
-    out = [{"room": name, "title": room["title"], "about": room["about"], "system": True}
+    out = [{"room": name, "title": room["title"], "about": room["about"], "system": True,
+            "hosted_agents": room["hosted_agents"]}
            for name, room in ROOMS.items() if role_of(db, user_id) in room["roles"]]
     for (name,) in db.execute("SELECT room FROM chat_room_defs ORDER BY updated DESC"):
         if may_enter(db, name, user_id=user_id, caps=caps):
             owned = _owned(db, name)
             out.append({"room": name, "title": owned["title"], "about": owned["about"], "system": False,
-                        "owner": owned["owner_name"], "stage": owned["stage"]})
+                        "owner": owned["owner_name"], "stage": owned["stage"], "hosted_agents": owned["hosted_agents"]})
     return out
 
 
@@ -263,9 +267,10 @@ def create(db, *, user_id, username, caps, room, title, about="", stage="dev", w
         raise ChatError("stage is dev or release; write is members or owner")
     now = time.time() if now is None else now
     try:
-        db.execute("INSERT INTO chat_room_defs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO chat_room_defs(room,title,about,owner_id,owner_name,stage,write,objects,bridges,hosted_agents,created,updated) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                    (room, _text(title, "a title", 120), _text(about, "about", 500, empty=True), int(user_id), str(username),
-                    stage, write, "[]", "[]", now, now))
+                    stage, write, "[]", "[]", '["llama"]', now, now))
     except Exception as error:
         if "UNIQUE" in str(error):
             raise ChatError("a room of that name exists", 409) from None
@@ -287,7 +292,7 @@ def settings(db, room, *, user_id, caps=frozenset()) -> dict:
     _enter(db, room, user_id, caps)
     if room in ROOMS:
         return {"room": room, "system": True, "title": ROOMS[room]["title"], "about": ROOMS[room]["about"],
-                "roles": list(ROOMS[room]["roles"])}
+                "roles": list(ROOMS[room]["roles"]), "hosted_agents": ROOMS[room]["hosted_agents"]}
     owned = _owned(db, room)
     with _sharing(db) as account_content:
         sharing = account_content.policy(db, "chat_room", room)
@@ -296,7 +301,7 @@ def settings(db, room, *, user_id, caps=frozenset()) -> dict:
 
 def configure(db, room, *, user_id, caps, changes: dict, now=None) -> dict:
     owned = _owner_or_admin(db, room, user_id)
-    allowed = {"title", "about", "stage", "write", "objects", "bridges"}
+    allowed = {"title", "about", "stage", "write", "objects", "bridges", "hosted_agents"}
     if not isinstance(changes, dict) or not changes or set(changes) - allowed:
         raise ChatError(f"settings are {', '.join(sorted(allowed))}")
     new = dict(owned)
@@ -316,9 +321,15 @@ def configure(db, room, *, user_id, caps, changes: dict, now=None) -> dict:
         new["objects"] = _objects(changes["objects"])
     if "bridges" in changes:
         new["bridges"] = _bridges(changes["bridges"])
-    db.execute("UPDATE chat_room_defs SET title=?, about=?, stage=?, write=?, objects=?, bridges=?, updated=? WHERE room=?",
+    if "hosted_agents" in changes:
+        agents = changes["hosted_agents"]
+        if not isinstance(agents, list) or len(agents) > 32 or any(
+                not isinstance(agent, str) or not SEAT.fullmatch(agent) for agent in agents):
+            raise ChatError("hosted_agents must be a list of at most 32 account names")
+        new["hosted_agents"] = list(dict.fromkeys(agents))
+    db.execute("UPDATE chat_room_defs SET title=?, about=?, stage=?, write=?, objects=?, bridges=?, hosted_agents=?, updated=? WHERE room=?",
                (new["title"], new["about"], new["stage"], new["write"], json.dumps(new["objects"]), json.dumps(new["bridges"]),
-                time.time() if now is None else now, room))
+                json.dumps(new["hosted_agents"]), time.time() if now is None else now, room))
     return settings(db, room, user_id=user_id, caps=caps)
 
 
@@ -570,13 +581,16 @@ def _extras(db, rows) -> list:
     if ids:
         marks = ",".join("?" * len(ids))
         reactions: dict = {}
-        for message_id, kind, username in db.execute(
-                f"SELECT message_id, kind, username FROM chat_reactions WHERE message_id IN ({marks}) ORDER BY at", ids):
+        reaction_events: dict = {}
+        for message_id, kind, username, at in db.execute(
+                f"SELECT message_id, kind, username, at FROM chat_reactions WHERE message_id IN ({marks}) ORDER BY at", ids):
             reactions.setdefault(message_id, {}).setdefault(kind, []).append(username)
+            reaction_events.setdefault(message_id, []).append({"kind": kind, "username": username, "at": at})
         stickers = dict(db.execute(f"SELECT message_id, kind FROM chat_stickers WHERE message_id IN ({marks})", ids).fetchall())
         for row in rows:
             if row["id"] in reactions:
                 row["reactions"] = reactions[row["id"]]
+                row["reaction_events"] = reaction_events[row["id"]]
             if row["id"] in stickers:
                 row["sticker"] = {"kind": stickers[row["id"]]}
     return rows
@@ -685,7 +699,8 @@ def http_route(self, path, method, *, accounts_db, connections=None, notify=None
         rest = parts[1:]
         if method == "GET":
             if path == "/api/chat/rooms":
-                return self._json({"rooms": rooms_for(db, **me)})
+                return self._json({"rooms": rooms_for(db, **me),
+                                   "emoji_kinds": list(reaction_kinds()) if reaction_kinds else []})
             if room and not rest:
                 query = parse_qs(self.path.partition("?")[2])
                 tail = tail_of((query.get("tail") or [None])[0])
