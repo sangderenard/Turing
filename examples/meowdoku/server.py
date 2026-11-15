@@ -1942,6 +1942,12 @@ def make_handler(sessions: Sessions):
             return relay.http_route(self, path, method, accounts_db=sessions.accounts_db,
                                     config=relay.load_config(declared if declared.is_file() else None))
 
+        def _fortune_route(self, path: str, method: str) -> None:
+            """[FORTUNE] fortune(): an I Ching style reading; a repeated question waits out a per-account cool-down (fortune.py)."""
+            from meowdoku import fortune
+            self._classify()
+            return fortune.http_route(self, path, method, accounts_db=sessions.accounts_db)
+
         def _instance_control(self, method: str, cancel: bool = False) -> None:
             import sqlite3
             from meowdoku import instance_control
@@ -2945,6 +2951,8 @@ def make_handler(sessions: Sessions):
                 return self._orientation_route(path, "GET")
             if path.startswith("/api/relay/"):                    # [RELAY]
                 return self._relay_route(path, "GET")
+            if path.startswith("/api/fortune/"):                  # [FORTUNE]
+                return self._fortune_route(path, "GET")
             if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
                 from meowdoku import file_index
                 self._classify()
@@ -3470,6 +3478,8 @@ def make_handler(sessions: Sessions):
                 return self._orientation_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
                 return self._relay_route(path0, "POST")
+            if path0 == "/api/fortune" or path0.startswith("/api/fortune/"):   # [FORTUNE]
+                return self._fortune_route(path0, "POST")
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")
             if path0 == "/api/control/instances/cancel":
