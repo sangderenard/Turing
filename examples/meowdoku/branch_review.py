@@ -29,6 +29,10 @@ A branch is registered to an account by checking it out from the server (``regis
 registered to nobody is given a short one. ``branch_removed`` records every branch the cleaner removed and the commit
 it was at, so a removal can be undone while Git still holds the commit.
 
+A revoked change is hidden from the default listing a week after its revoke, or as soon as its author or an admin marks
+it read (``mark_read``; the ``branch_review_read`` table). Nothing is deleted: ``listing`` marks each record ``hidden``
+and GET /api/reviews?all=1 still returns every record.
+
 ``advice`` is the one text that says how a change is made here. The lock prints it, in mock and in earnest.
 
 Who a caller is comes from the authenticated host, never from a request. Who is an admin is the ``account_roles``
@@ -45,6 +49,7 @@ STATUSES = ("open", "approved", "rejected", "withdrawn")
 VERDICTS = ("agree", "object")
 MAX_NOTE = 2000
 MAX_TIMEOUT_S = 30 * 86400.0
+REVOKED_SHOWN_S = 7 * 86400.0      # a revoked change leaves the default listing this long after its revoke
 HEAD = re.compile(r"[0-9a-f]{40}\Z")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 DDL = (
@@ -73,6 +78,8 @@ DDL = (
     # The Git author identity an account declares for its own commits (identity()/set_identity()).
     "CREATE TABLE IF NOT EXISTS account_git_identity (user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, "
     "declared_at REAL NOT NULL)",
+    # A revoked change its author or an admin has marked read: hidden from the default listing, never deleted (mark_read()).
+    "CREATE TABLE IF NOT EXISTS branch_review_read (review_id TEXT PRIMARY KEY, read_by TEXT NOT NULL, read_at REAL NOT NULL)",
 )
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
             "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail",
@@ -183,17 +190,35 @@ def get(db, review_id, now=None) -> dict:
 
 
 def listing(db, now=None, *, limit: int = 100) -> list:
-    """Every change still in play, then the most recent settled ones."""
+    """Every change still in play, then the most recent settled ones. Each record says whether the default listing hides
+    it (``hidden``): a revoked change read by its author or an admin, or revoked more than REVOKED_SHOWN_S ago."""
     ensure(db)
     now = time.time() if now is None else now
     rows = db.execute(f"SELECT {', '.join(_COLUMNS)} FROM branch_reviews ORDER BY (status = 'open' AND landed_at IS NULL) DESC, "
                       "created_at DESC LIMIT ?", (int(limit),)).fetchall()
+    read = {r[0] for r in db.execute("SELECT review_id FROM branch_review_read")}
     out = []
     for row in rows:
         record = _record(db, row)
         record["standing"] = standing(record, now)
+        record["hidden"] = record["standing"] == "revoked" and (
+            record["id"] in read or now - record["revoked_at"] >= REVOKED_SHOWN_S)
         out.append(record)
     return out
+
+
+def mark_read(db, review_id, *, user_id, username, now=None) -> dict:
+    """The author or an admin marks a revoked change read: the default listing hides it from then on. Nothing is
+    deleted; an admin's new approval or the author's withdrawal settles it as before."""
+    _account(user_id)
+    now = time.time() if now is None else now
+    record = get(db, review_id, now)
+    if record["owner_id"] != user_id and not is_admin(db, user_id):
+        raise ReviewError("the author or an admin marks a revoked change read", 403)
+    if record["standing"] != "revoked":
+        raise ReviewError("only a revoked change is marked read", 409)
+    db.execute("INSERT OR IGNORE INTO branch_review_read VALUES (?,?,?)", (record["id"], str(username), now))
+    return get(db, review_id, now)
 
 
 def standing(record: dict, now: float) -> str:
@@ -662,7 +687,9 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
     """The reviews over REST. ``self`` is the host's request handler; ``policy`` the loaded branch policy.
 
         GET  /api/reviews                 the changes in play and the recent settled ones (dev_ui, signed in), and the
-                                          landing queue: accepted changes not yet landed, with the last attempt's result
+                                          landing queue: accepted changes not yet landed, with the last attempt's result.
+                                          Hidden revoked changes are left out and counted ("hidden"); ?all=1 keeps them
+        POST /api/reviews/read            {id}                      the author or an admin marks a revoked change read
         POST /api/reviews/land            {ids: [...]} or {all: true}   an admin asks the updater to land them now
         POST /api/reviews/revoke          {id, reason}              an operator or admin takes back an approval
         GET  /api/reviews/threads?tail=N  the changes with a thread or a revoked approval, each with its last N messages
@@ -722,7 +749,11 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         if method == "GET" and path == "/api/reviews/attention":
             return self._json({"attention": attention(db, username=principal.username)})
         if method == "GET" and path == "/api/reviews":
-            return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
+            every = (parse_qs(self.path.partition("?")[2]).get("all") or [""])[0].lower() in ("1", "true", "yes")
+            records = listing(db)
+            shown = records if every else [record for record in records if not record["hidden"]]
+            return self._json({"reviews": shown, "hidden": len(records) - len(shown),
+                               "repositories": {name: known[name]["default"] for name in sorted(known)},
                                "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock"),
                                "queue": queue(db), "updater": land_request is not None, "apply": bool(policy.get("apply")),
                                "server_now": time.time(), "automatic_landing": next_scheduled_landing(landing_schedule_path),
@@ -761,6 +792,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             made = decide(db, body.get("id"), **who, head=body.get("head"), decision=body.get("decision"), note=body.get("note", ""))
         elif path == "/api/reviews/withdraw":
             made = withdraw(db, body.get("id"), user_id=principal.user_id)
+        elif path == "/api/reviews/read":
+            made = mark_read(db, body.get("id"), **who)
         elif path == "/api/reviews/revoke":
             told = revoke(db, body.get("id"), **who, reason=body.get("reason"))
             made = told["review"]

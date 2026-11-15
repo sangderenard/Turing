@@ -137,7 +137,8 @@ function render() {
 
 async function load({quiet = false} = {}) {
   try {
-    const result = await request("/api/reviews");
+    // Revoked changes that were marked read or revoked over a week ago are left out unless settled changes are shown.
+    const result = await request(byId("settled").checked ? "/api/reviews?all=1" : "/api/reviews");
     const priorStanding = reviews.find(r => r.id === selected)?.standing;
     reviews = result.reviews;
     landing = { queue: result.queue || [], updater: Boolean(result.updater), apply: result.apply !== false,
@@ -148,6 +149,7 @@ async function load({quiet = false} = {}) {
     renderQueue();
     const open = reviews.filter(r => OPEN.has(r.standing)).length;
     status(`${open} change${open === 1 ? "" : "s"} in play. Lock: ${result.lock}.` +
+      (result.hidden ? ` ${result.hidden} revoked change${result.hidden === 1 ? " is" : "s are"} hidden (marked read or revoked over a week ago); show settled changes to see them.` : "") +
       (who.role === "admin" ? "" : " Only an admin account can approve or reject; you can agree or object."));
     const approvable = reviews.filter(r => r.standing === "waiting" || r.standing === "accepted");
     byId("approve-all").hidden = who.role !== "admin" || !approvable.length;
@@ -360,7 +362,14 @@ function controls(review, detail) {
       post("/api/reviews/decide", { id: review.id, head: review.head, decision: "rejected", note: note.value }, feedback); };
     buttons.append(approve, reject);
   } else box.append(el("h3", "Remark"));
-  if (String(review.owner_name).toLowerCase() === String(who.username).toLowerCase()) {
+  const mine = String(review.owner_name).toLowerCase() === String(who.username).toLowerCase();
+  if (review.standing === "revoked" && !review.hidden && (mine || who.role === "admin")) {
+    const read = el("button", "Mark read"); read.type = "button";
+    read.title = "Hide this revoked change from the default list. Nothing is deleted.";
+    read.onclick = () => post("/api/reviews/read", { id: review.id }, feedback);
+    buttons.append(read);
+  }
+  if (mine) {
     const withdraw = el("button", "Withdraw my change"); withdraw.type = "button";
     withdraw.onclick = () => { if (confirm("Withdraw this change?")) post("/api/reviews/withdraw", { id: review.id }, feedback); };
     buttons.append(withdraw);
@@ -441,7 +450,7 @@ async function main() {
   byId("refresh").onclick = load;
   byId("approve-all").onclick = approveAll;
   byId("land-all").onclick = () => landNow({ all: true }, `all ${landing.queue.length} queued changes`, byId("land-all"));
-  byId("settled").onchange = render;
+  byId("settled").onchange = () => load();
   byId("tail").onchange = () => { loadThreads(); loadRoom(); };
   byId("chat-send").onclick = sendRoom;
   await load();

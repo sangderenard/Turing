@@ -836,6 +836,48 @@ def test_revoke_and_threads_over_rest_and_the_notice_they_send(world):
     assert ask("/api/reviews/threads?tail=nope", user=ANN, username="ann")[0] == 400
 
 
+def test_a_revoked_change_leaves_the_default_listing_when_read_or_a_week_old_and_is_never_deleted(world):
+    db, policy, db_file = world["db"], world["policy"], world["db_file"]
+    opal = _with_operator(world)
+    one, two = branch(world, "one"), branch(world, "two")
+    first, second = submit(world, "one", one), submit(world, "two", two)
+    for made, head in ((first, one), (second, two)):
+        branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    branch_review.revoke(db, first["id"], user_id=opal, username="opal", reason="superseded", now=2000.0)
+    branch_review.revoke(db, second["id"], user_id=opal, username="opal", reason="superseded")    # revoked just now
+    revoked_at = branch_review.get(db, second["id"])["revoked_at"]
+    shown = {r["id"]: r["hidden"] for r in branch_review.listing(db, now=2001.0)}
+    assert shown == {first["id"]: False, second["id"]: False}
+    with pytest.raises(branch_review.ReviewError, match="author or an admin"):
+        branch_review.mark_read(db, first["id"], user_id=BOB, username="bob")
+    with pytest.raises(branch_review.ReviewError, match="author or an admin"):
+        branch_review.mark_read(db, first["id"], user_id=opal, username="opal")
+    assert branch_review.mark_read(db, first["id"], user_id=ANN, username="ann", now=2002.0)["standing"] == "revoked"
+    shown = {r["id"]: r["hidden"] for r in branch_review.listing(db, now=2003.0)}
+    assert shown == {first["id"]: True, second["id"]: False}, "read by its author: hidden, still listed"
+    week = revoked_at + branch_review.REVOKED_SHOWN_S
+    assert [r["hidden"] for r in branch_review.listing(db, now=week - 1.0) if r["id"] == second["id"]] == [False]
+    assert all(r["hidden"] for r in branch_review.listing(db, now=week)), "a week after its revoke, unread too"
+
+    def ask(path, method="GET", **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path.split("?")[0], method, policy=policy, accounts_db=db_file)
+        return handler.sent
+
+    status, answer = ask("/api/reviews", user=BOB, username="bob")
+    assert status == 200 and [r["id"] for r in answer["reviews"]] == [second["id"]] and answer["hidden"] == 1
+    status, answer = ask("/api/reviews?all=1", user=BOB, username="bob")
+    assert answer["hidden"] == 0 and {r["id"] for r in answer["reviews"]} == {first["id"], second["id"]}
+    assert ask("/api/reviews/read", "POST", user=BOB, username="bob", body={"id": second["id"]})[0] == 403
+    status, answer = ask("/api/reviews/read", "POST", user=ADMIN, username="admin", body={"id": second["id"]})
+    assert status == 200 and answer["review"]["standing"] == "revoked"
+    assert ask("/api/reviews", user=BOB, username="bob")[1]["reviews"] == []
+    branch_review.decide(db, second["id"], user_id=ADMIN, username="admin", head=two, decision="approved")
+    assert ask("/api/reviews/read", "POST", user=ADMIN, username="admin", body={"id": second["id"]})[0] == 409
+    assert [r["id"] for r in ask("/api/reviews", user=BOB, username="bob")[1]["reviews"]] == [second["id"]], \
+        "approved again: shown, whatever was read before"
+
+
 def test_each_landing_run_is_recorded_for_the_page_with_its_trigger_and_outcome(world, monkeypatch):
     import time as clock
     from types import SimpleNamespace
