@@ -44,6 +44,16 @@ def needs(endpoint: dict) -> str:
     return (" and " if endpoint.get("capability_all") else " or ").join(names)
 
 
+def capabilities_for(db_path, account: dict, *, origin: str, origin_tier: str, policy: dict, lift: dict):
+    """(principal, capabilities) of an account ({"id", "username"}) as if it connected from this origin: the shader
+    lift as the server applies it, then authz's own rules. The People page and @mentions both ask this."""
+    tier = origin_tier
+    if origin_tier == "shader":                             # the server's own rule: a signed-in account lifts the shader lock
+        tier = lift.get(authz_mod.role_of(db_path, account["id"]), "shader")
+    principal = authz_mod.principal_from(account, origin, tier, db_path)
+    return principal, frozenset(authz_mod.capabilities(principal, policy))
+
+
 def tools_for(db_path, username: str, *, origin: str, origin_tier: str, policy: dict, catalog, lift: dict) -> dict:
     conn = sqlite3.connect(str(db_path), timeout=10)
     try:
@@ -53,11 +63,8 @@ def tools_for(db_path, username: str, *, origin: str, origin_tier: str, policy: 
     if row is None:
         raise LookupError("account not found")
     account = {"id": row[0], "username": row[1]}
-    tier = origin_tier
-    if origin_tier == "shader":                             # the server's own rule: a signed-in account lifts the shader lock
-        tier = lift.get(authz_mod.role_of(db_path, account["id"]), "shader")
-    principal = authz_mod.principal_from(account, origin, tier, db_path)
-    caps = authz_mod.capabilities(principal, policy)
+    principal, caps = capabilities_for(db_path, account, origin=origin, origin_tier=origin_tier, policy=policy, lift=lift)
+    tier = principal.tier
     kiosk = authz_mod.kiosk(principal)
     index = catalog.index(sorted(caps), True, None, kiosk, False)
     tools, not_offered = [], []

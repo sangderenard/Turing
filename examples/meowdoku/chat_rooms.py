@@ -434,9 +434,10 @@ def remove(db, message_id, *, admin, now=None) -> dict:
     return _row(db.execute(_SELECT + " WHERE id = ?", (int(message_id),)).fetchone())
 
 
-def http_route(self, path, method, *, accounts_db, connections=None):
+def http_route(self, path, method, *, accounts_db, connections=None, notify=None, caps_for=None):
     """``connections`` is the host's connection service (remote_connections.service_for), or None when there is none:
-    forwarding then answers 503."""
+    forwarding then answers 503. ``notify(usernames, text, kind, ref)`` tells an @mentioned account (mentions.py), and
+    ``caps_for(account)`` gives that account's capabilities, so it is told only of a room it may enter."""
     import sqlite3
     from urllib.parse import parse_qs
     principal = self._principal()
@@ -483,7 +484,14 @@ def http_route(self, path, method, *, accounts_db, connections=None):
             fields = {k: body[k] for k in ("room", "title", "about", "stage", "write") if k in body}
             return self._json({"settings": create(db, **me, username=principal.username, **fields)})
         if room and not rest:
-            return self._json({"message": post(db, room, **me, username=principal.username, body=body.get("body"))})
+            from meowdoku import mentions
+            made = post(db, room, **me, username=principal.username, body=body.get("body"))
+            told = mentions.tell(db, writer_id=principal.user_id, writer=principal.username, body=made["body"],
+                                 where=f"the room {room}", answer=f"chat_post room={room}, or /rooms.html?room={room}",
+                                 may_read=lambda account: may_enter(db, room, user_id=account["id"],
+                                                                    caps=caps_for(account) if caps_for else frozenset()),
+                                 notify=notify, kind="room", ref=room)
+            return self._json({"message": made, "mentioned": told})
         if room and rest == ["settings"]:
             return self._json({"settings": configure(db, room, **me, changes=body)})
         if room and rest == ["access"]:

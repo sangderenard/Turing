@@ -157,9 +157,10 @@ def _allowed(answer) -> None:
         raise CommentError(answer if isinstance(answer, str) and answer else "this thread is not open to you", 403)
 
 
-def http_route(self, path, method, *, accounts_db, kinds: dict, notify=None):
+def http_route(self, path, method, *, accounts_db, kinds: dict, notify=None, caps_for=None):
     """The threads over REST. ``kinds`` maps a kind to its ``Kind``; ``notify(usernames, text, kind, ref)`` tells people of a
-    new comment (None: they find it on the page)."""
+    new comment (None: they find it on the page). An account @mentioned in a comment and not already told is told too,
+    when the kind's may_read lets it read the thread; ``caps_for(account)`` gives that account's capabilities."""
     import sqlite3
     from urllib.parse import parse_qs
     principal = self._principal()
@@ -205,8 +206,16 @@ def http_route(self, path, method, *, accounts_db, kinds: dict, notify=None):
         if notify is not None and tell:
             notify(tell, f"{principal.username} wrote in the thread of {kinds[kind].label(db, ref)}: {made['body'][:300]}",
                    kind, ref)
-        print(f"[comments] {principal.username} wrote in {kind} {ref[:12]} ({len(tell)} told)", flush=True)
-        return self._json({"comment": made, "told": tell})
+        from meowdoku import mentions
+        mentioned = mentions.tell(
+            db, writer_id=principal.user_id, writer=principal.username, body=made["body"],
+            where=f"the thread of {kinds[kind].label(db, ref)}", answer=f"comments_post kind={kind} ref={ref}",
+            may_read=lambda account: kinds[kind].may_read(
+                db, {"user_id": account["id"], "username": account["username"],
+                     "caps": caps_for(account) if caps_for else frozenset()}, ref),
+            notify=notify, kind=kind, ref=ref, already=tell)
+        print(f"[comments] {principal.username} wrote in {kind} {ref[:12]} ({len(tell)} told, {len(mentioned)} mentioned)", flush=True)
+        return self._json({"comment": made, "told": tell, "mentioned": mentioned})
     except CommentError as error:
         return self._json({"error": error.message}, error.status)
     finally:

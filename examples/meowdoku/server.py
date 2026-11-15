@@ -1834,14 +1834,21 @@ def make_handler(sessions: Sessions):
         # POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
         def _talk_route(self, path: str, method: str) -> None:
-            """[TALK] comments under a post (comments.py) and the chat server's rooms (chat_rooms.py)."""
+            """[TALK] comments under a post (comments.py) and the chat server's rooms (chat_rooms.py); an @mention in either
+            tells that account (mentions.py) when it may read the place."""
             self._classify()
+            policy, origin, origin_tier = sessions.authz_policy.get(), self._origin, self._origin_tier
+
+            def caps_for(account):
+                from meowdoku import account_admin
+                return account_admin.capabilities_for(sessions.accounts_db, account, origin=origin, origin_tier=origin_tier,
+                                                      policy=policy, lift=SHADER_LIFT)[1]
             if path == "/api/comments" or path.startswith("/api/comments/"):
                 from meowdoku import authored_pages, branch_review, comments
                 return comments.http_route(self, path, method, accounts_db=sessions.accounts_db,
                                            kinds={branch_review.THREAD_KIND: branch_review.comment_kind(),
                                                   "page": authored_pages.comment_kind()},
-                                           notify=sessions.system_notify)
+                                           notify=sessions.system_notify, caps_for=caps_for)
             from meowdoku import chat_rooms
             connections = None
             if "/forward" in path:                  # a lender's connection service, only when forwarding is asked for
@@ -1850,7 +1857,8 @@ def make_handler(sessions: Sessions):
                     connections = remote_connections.service_for(sessions)
                 except Exception:
                     connections = None              # not configured here: forwarding answers 503, nothing else changes
-            return chat_rooms.http_route(self, path, method, accounts_db=sessions.accounts_db, connections=connections)
+            return chat_rooms.http_route(self, path, method, accounts_db=sessions.accounts_db, connections=connections,
+                                         notify=sessions.system_notify, caps_for=caps_for)
 
         def _reviews_route(self, path: str, method: str) -> None:
             """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""
