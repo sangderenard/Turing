@@ -746,6 +746,10 @@ def make_handler(sessions: Sessions):
                 return False
             if path == "/api/foyer" or path.startswith("/api/foyer/"):
                 return False                                   # [FOYER] the public front face; its route bounds itself
+            if path == "/api/newsletter" or path.startswith("/api/newsletter/"):
+                return False                                   # [NEWSLETTER] published articles are public; the route bounds itself
+            if method == "GET" and path in ("/newsletter.html", "/newsletter.js"):
+                return False
             if method == "GET" and path in ("/reports.html", "/reports.js"):
                 return False
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
@@ -1124,6 +1128,13 @@ def make_handler(sessions: Sessions):
                 service_type=account_content.Groups, accounts=sessions.accounts,
                 account_cookie=ACCOUNT_COOKIE, AccessError=account_content.AccessError,
                 SchemaVersionError=account_content.schema_version.SchemaVersionError)
+
+        def _newsletter_route(self, path: str, method: str) -> None:
+            """[NEWSLETTER] the server's articles (newsletter.py): anyone reads what is published; the route bounds itself."""
+            from meowdoku import newsletter
+            self._classify()
+            self._set_cookie = []
+            return newsletter.http_route(self, path, method, accounts_db=sessions.accounts_db, notify=sessions.system_notify)
 
         def _reports_route(self, path: str, method: str) -> None:
             return shared_reports.route(self, path, method,
@@ -1844,10 +1855,11 @@ def make_handler(sessions: Sessions):
                 return account_admin.capabilities_for(sessions.accounts_db, account, origin=origin, origin_tier=origin_tier,
                                                       policy=policy, lift=SHADER_LIFT)[1]
             if path == "/api/comments" or path.startswith("/api/comments/"):
-                from meowdoku import authored_pages, branch_review, comments
+                from meowdoku import authored_pages, branch_review, comments, newsletter
                 return comments.http_route(self, path, method, accounts_db=sessions.accounts_db,
                                            kinds={branch_review.THREAD_KIND: branch_review.comment_kind(),
-                                                  "page": authored_pages.comment_kind()},
+                                                  "page": authored_pages.comment_kind(),
+                                                  "article": newsletter.comment_kind()},
                                            notify=sessions.system_notify, caps_for=caps_for)
             from meowdoku import chat_rooms
             connections = None
@@ -2847,6 +2859,8 @@ def make_handler(sessions: Sessions):
                     return self._json(permission_groups_mod.authority(conn, account["id"]))
                 finally:
                     conn.close()
+            if path == "/api/newsletter" or path.startswith("/api/newsletter/"):
+                return self._newsletter_route(path, "GET")
             if path == "/api/reports" or path.startswith("/api/reports/"):
                 return self._reports_route(path, "GET")
             if path == "/api/tickets":
@@ -3473,6 +3487,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": str(error)}, HTTPStatus.FORBIDDEN if isinstance(error, PermissionError) else HTTPStatus.BAD_REQUEST)
                 finally:
                     conn.close()
+            if path0 == "/api/newsletter" or path0.startswith("/api/newsletter/"):
+                return self._newsletter_route(path0, "POST")
             if path0 == "/api/reports" or path0.startswith("/api/reports/"):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]

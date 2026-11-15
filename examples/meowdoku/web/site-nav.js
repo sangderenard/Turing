@@ -538,6 +538,7 @@ async function main() {
   } }));
   for (const item of [
     link("Home", "/"),
+    link("Newsletter", "/newsletter.html"),
     link("Games", "/games.html", !onDev || caps.has("dev_ui")),
     link("Profile and servers", "/profile.html"),
     link("Keys", "/keys.html", caps.has("message")),
