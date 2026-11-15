@@ -30,8 +30,9 @@ What -Apply does, in this order:
 Once the trees are locked (C:\dev\Powershell has no "Authenticated Users" or "Users" entry), the account steps skip
 (b) to (d): they only add, so no new backup is needed, and each prints its own undo.
 
--OpenConsole -AgentAccount <name> opens a PowerShell console as that account with its saved password, which is never
-shown and never reaches the clipboard. It changes nothing and needs no elevation.
+-OpenConsole -AgentAccount <name> opens a PowerShell console as that account, in the workspace folder, with its saved
+password (never shown, never on the clipboard) and the account's own environment ($HOME, TEMP, APPDATA and PATH are its
+own, not the operator's). It changes nothing and needs no elevation.
 
 An agent signed in as one of these accounts changes the code through the central checkout (checkout_* tools; the
 service makes the branch and commits) and cannot run commands in it yet. Undo the lock: Restore-AgentBoxAcls.ps1
@@ -121,12 +122,29 @@ function Read-AgentCredential([string]$name) {
     $file = Credential-File $name
     if (Test-Path -LiteralPath $file) { Import-Clixml -LiteralPath $file } else { $null }
 }
+# Start a program as an agent account with that account's own environment. Start-Process -Credential copies the caller's
+# environment (HOME, TEMP, APPDATA and PATH pointed at the operator's profile: the first -OpenConsole on 2026-11-14 tried
+# to write its history and $HOME\gemini.key into C:\Users\alber and was refused), and -UseNewEnvironment gives only the
+# machine scope (USERNAME reads SYSTEM). A ProcessStartInfo whose Environment is never touched passes no environment
+# block, so CreateProcessWithLogonW builds one from the account's own profile; it also opens a new console by default.
+function Start-AsAgent([pscredential]$cred, [string]$file, [string[]]$arguments, [string]$directory, [switch]$Hidden) {
+    $info = [System.Diagnostics.ProcessStartInfo]::new($file)
+    foreach ($a in $arguments) { $info.ArgumentList.Add($a) }
+    $info.UserName = $cred.UserName
+    $info.Domain = $env:COMPUTERNAME
+    $info.Password = $cred.Password
+    $info.LoadUserProfile = $true
+    $info.UseShellExecute = $false
+    $info.WorkingDirectory = $directory
+    $info.CreateNoWindow = [bool]$Hidden
+    [System.Diagnostics.Process]::Start($info)
+}
 
 # ---------------------------------------------------------------- console
 if ($OpenConsole) {
     $cred = Read-AgentCredential $AgentAccount
     if (-not $cred) { Write-Host "REFUSED: no saved password for $AgentAccount; run -Apply -ResetPassword -AgentAccount $AgentAccount first."; exit 2 }
-    Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $cred -LoadUserProfile -WorkingDirectory (Join-Path $Workspace 'turing')
+    Start-AsAgent $cred (Join-Path $PSHOME 'pwsh.exe') @() $Workspace | Out-Null
     Write-Host "opened a console as $AgentAccount (its password was not shown)"
     exit 0
 }
@@ -270,8 +288,8 @@ if ($CreateAgentAccount -or $ResetPassword) {
         if ($Apply) {
             if (-not $cred) { $cred = Read-AgentCredential $AgentAccount }
             if ($cred) {
-                Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList '/c', 'exit' -Credential $cred -LoadUserProfile `
-                    -WorkingDirectory (Join-Path $env:SystemRoot 'System32') -WindowStyle Hidden -Wait
+                $made = Start-AsAgent $cred (Join-Path $env:SystemRoot 'System32\cmd.exe') @('/c', 'exit') (Join-Path $env:SystemRoot 'System32') -Hidden
+                $made.WaitForExit()
             } else { Write-Host "  no saved password: add -ResetPassword, or sign in as $AgentAccount once" }
         }
     }
