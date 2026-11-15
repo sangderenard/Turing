@@ -575,6 +575,8 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("browse.html", "browse.js"):                                                            # [LISTING] the /browse page (server.py /browse/*, listing.py)
         shutil.copyfile(HERE / "web" / name, out / name)
+    for name in ("people.html", "people.js", "newsletter.html", "newsletter.js"):                       # [PEOPLE] account admin (account_admin.py); [NEWSLETTER] newsletter.py
+        shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("issues.html", "issues.js", "reviews.html", "reviews.js", "rooms.html", "rooms.js", "reports.html", "reports.js"):   # [REVIEWS] change reviews; [TALK] rooms; [REPORTS] the report reader
         shutil.copyfile(HERE / "web" / name, out / name)
     # Studio imports these authored modules transitively. A partial publication
