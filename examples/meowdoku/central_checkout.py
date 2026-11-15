@@ -10,6 +10,8 @@ The account then works through declared operations only, each a name and typed a
     read    {repository, branch, path}      read one text file
     write   {repository, branch, path, text}   create or replace one text file
     remove  {repository, branch, path}      delete one file
+    edit    {repository, branch, path, old, new, count?}   replace exact text (count times; once by default)
+            {repository, branch, patch}     apply a unified diff (git diff, diff -u) or a Codex patch (*** Begin Patch)
     status  {repository, branch}            what differs from the branch's last commit
     diff    {repository, branch, path?}     the change in the tracked files, as a unified diff
     commit  {repository, branch, message}   commit everything, as the author identity this account declared
@@ -36,7 +38,7 @@ MAX_LISTING = 2000
 MAX_DIFF_BYTES = 400_000
 MAX_MESSAGE = 5000
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-OPERATIONS = ("open", "files", "read", "write", "remove", "status", "diff", "commit", "close")
+OPERATIONS = ("open", "files", "read", "write", "remove", "edit", "status", "diff", "commit", "close")
 
 DDL = (
     "CREATE TABLE IF NOT EXISTS checkouts (repository TEXT NOT NULL, branch TEXT NOT NULL, user_id INTEGER NOT NULL, "
@@ -228,6 +230,225 @@ def remove(row, path) -> dict:
     return {"path": path, "removed": True}
 
 
+# ---------------------------------------------------------------- edit: a change described, not a whole file sent
+# Three forms, one operation. The service applies each; the account never runs Git, and a large file never needs a
+# whole-file write (the MCP caps a text argument at 65536 characters; server.py alone is about 290 kB).
+#   {path, old, new, count?}   exact replacement: old must occur exactly count times (1 when omitted)
+#   {patch} in unified diff form (diff -u, git diff): every path is checked first, then git apply --check, then git apply
+#   {patch} in Codex's form (*** Begin Patch ... *** End Patch): Add, Delete and Update File (with Move to), each hunk
+#           found by its context lines in order
+# Nothing is written until the whole edit is known to apply.
+
+def _text_of(place: Path) -> str:
+    if not place.is_file():
+        raise CheckoutError(f"no such file: {place.name}", 404)
+    if place.stat().st_size > MAX_FILE_BYTES:
+        raise CheckoutError(f"the file is larger than {MAX_FILE_BYTES} bytes", 413)
+    data = place.read_bytes()
+    if b"\0" in data:
+        raise CheckoutError("that is a binary file; only text is edited", 415)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise CheckoutError("that file is not UTF-8 text", 415) from None
+
+
+def _put(folder, relative, text: str) -> int:
+    data = text.encode("utf-8")
+    if len(data) > MAX_FILE_BYTES:
+        raise CheckoutError(f"the edited file would be larger than {MAX_FILE_BYTES} bytes", 413)
+    place = target(folder, relative)
+    if place.is_dir():
+        raise CheckoutError(f"{relative} names a folder", 409)
+    place.parent.mkdir(parents=True, exist_ok=True)
+    target(folder, relative)                      # again, now that the folders exist: none of them may be a link
+    with open(place, "wb") as handle:             # the bytes as computed: no newline translation
+        handle.write(data)
+    return len(data)
+
+
+def _replace_exact(text: str, old: str, new: str, count: int) -> str:
+    found = text.count(old)
+    if found == 0 and "\r\n" in text and "\r\n" not in old:      # the file has Windows line endings, the edit does not
+        old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+        found = text.count(old)
+    if found != count:
+        raise CheckoutError(f"old text occurs {found} time(s), not {count}: give more of its surroundings so it is "
+                            f"unique, or the count it really has", 409)
+    return text.replace(old, new)
+
+
+def _unified_paths(patch: str) -> list:
+    """Every path a unified diff names, without its a/ or b/ prefix; refuses what this edit does not change."""
+    paths, prefixed = [], []
+    for line in patch.splitlines():
+        if line.startswith("GIT binary patch") or line.startswith("Binary files "):
+            raise CheckoutError("binary patches are not applied here; only text", 415)
+        if line.startswith(("new mode ", "old mode ", "new file mode ", "deleted file mode ")) and \
+                line.split()[-1] in ("120000", "160000"):
+            raise CheckoutError("a patch may not make or remove a link or a submodule", 400)
+        if line.startswith(("--- ", "+++ ", "rename from ", "rename to ", "copy from ", "copy to ")):
+            name = line.split(" ", 1)[1] if line.startswith(("--- ", "+++ ")) else line.split(" ", 2)[2]
+            name = name.split("\t", 1)[0].strip()
+            if name.startswith('"'):
+                raise CheckoutError("quoted (escaped) paths are not applied here", 400)
+            if name == "/dev/null":
+                continue
+            if line.startswith(("--- ", "+++ ")):            # only these carry the a/ b/ prefixes git diff writes
+                prefixed.append(name.startswith(("a/", "b/")))
+                name = name[2:] if name.startswith(("a/", "b/")) else name
+            paths.append(name)
+    if not paths:
+        raise CheckoutError("that is not a unified diff: no --- / +++ file lines", 400)
+    return sorted(set(paths)), bool(prefixed) and all(prefixed)
+
+
+def _apply_unified(folder, patch: str) -> dict:
+    import subprocess
+    paths, prefixed = _unified_paths(patch)
+    for relative in paths:
+        target(folder, relative)                  # every path, before Git sees the patch
+    strip = "-p1" if prefixed else "-p0"
+    for check in (True, False):
+        arguments = ["git", "-C", str(folder), "apply", strip, "--whitespace=nowarn"] + (["--check"] if check else []) + ["-"]
+        done = subprocess.run(arguments, input=patch, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if done.returncode != 0:
+            raise CheckoutError(f"the patch does not apply{' (nothing was changed)' if check else ''}: "
+                                f"{(done.stderr or done.stdout).strip()[-600:]}", 409)
+    return {"files": paths, "format": "unified", "bytes": len(patch.encode("utf-8"))}
+
+
+def _codex_actions(patch: str) -> list:
+    """Codex's patch as [(kind, path, move_to, lines)], kind add | delete | update."""
+    lines = patch.replace("\r\n", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[0].strip() != "*** Begin Patch" or lines[-1].strip() != "*** End Patch":
+        raise CheckoutError("a Codex patch begins with *** Begin Patch and ends with *** End Patch", 400)
+    actions, current = [], None
+    for line in lines[1:-1]:
+        for kind, marker in (("add", "*** Add File: "), ("delete", "*** Delete File: "), ("update", "*** Update File: ")):
+            if line.startswith(marker):
+                current = [kind, line[len(marker):].strip(), None, []]
+                actions.append(current)
+                break
+        else:
+            if current is None:
+                raise CheckoutError(f"patch line outside any file: {line[:80]!r}", 400)
+            if line.startswith("*** Move to: ") and current[0] == "update":
+                current[2] = line[len("*** Move to: "):].strip()
+            else:
+                current[3].append(line)
+    if not actions:
+        raise CheckoutError("the patch names no file", 400)
+    return actions
+
+
+def _codex_update(text: str, body: list, name: str) -> str:
+    """The hunks of one Update File, applied in order: each @@ line may name a line to find first; each hunk's context
+    and removed lines (' ', '-') must follow it, exactly or ignoring trailing spaces; added lines ('+') replace them."""
+    crlf = "\r\n" in text
+    ends_open = text.endswith(("\n", "\r\n"))
+    lines = text.replace("\r\n", "\n").split("\n")
+    if ends_open:
+        lines.pop()
+    hunks, current = [], None
+    for line in body:
+        if line.startswith("@@"):
+            current = {"anchor": line[2:].strip(), "lines": [], "at_end": False}
+            hunks.append(current)
+        elif line.strip() == "*** End of File":
+            if current is not None:
+                current["at_end"] = True
+        else:
+            if current is None:
+                current = {"anchor": "", "lines": [], "at_end": False}
+                hunks.append(current)
+            if line[:1] not in (" ", "-", "+") and line != "":
+                raise CheckoutError(f"{name}: a hunk line starts with ' ', '-' or '+', not {line[:40]!r}", 400)
+            current["lines"].append(line if line else " ")
+    cursor = 0
+    for number, hunk in enumerate(hunks, 1):
+        if hunk["anchor"]:
+            found = next((i for i in range(cursor, len(lines)) if lines[i].strip() == hunk["anchor"].strip()), None)
+            if found is None:
+                raise CheckoutError(f"{name}: hunk {number}'s @@ line {hunk['anchor'][:80]!r} is not in the file", 409)
+            cursor = found + 1
+        old = [l[1:] for l in hunk["lines"] if l[:1] in (" ", "-")]
+        new = [l[1:] for l in hunk["lines"] if l[:1] in (" ", "+")]
+        if not old:
+            at = len(lines) if hunk["at_end"] or not hunk["anchor"] else cursor
+            lines[at:at] = new
+            cursor = at + len(new)
+            continue
+        start = None
+        for same in (lambda a, b: a == b, lambda a, b: a.rstrip() == b.rstrip()):
+            starts = range(len(lines) - len(old), cursor - 1, -1) if hunk["at_end"] else range(cursor, len(lines) - len(old) + 1)
+            start = next((i for i in starts if all(same(lines[i + k], old[k]) for k in range(len(old)))), None)
+            if start is not None:
+                break
+        if start is None:
+            raise CheckoutError(f"{name}: hunk {number}'s context and removed lines are not in the file after the "
+                                f"previous hunk (nothing was changed)", 409)
+        lines[start:start + len(old)] = new
+        cursor = start + len(new)
+    joined = ("\r\n" if crlf else "\n").join(lines)
+    return joined + ("\r\n" if crlf else "\n") if ends_open or not lines else joined
+
+
+def _apply_codex(folder, patch: str) -> dict:
+    actions = _codex_actions(patch)
+    writes, deletes = {}, []
+    for kind, name, move_to, body in actions:
+        place = target(folder, name)
+        if kind == "add":
+            if place.exists():
+                raise CheckoutError(f"{name} already exists; Update File changes it", 409)
+            if any(line[:1] != "+" for line in body if line != ""):
+                raise CheckoutError(f"{name}: every line of an added file starts with '+'", 400)
+            writes[name] = "\n".join(line[1:] for line in body) + "\n"
+        elif kind == "delete":
+            _text_of(place)
+            deletes.append(name)
+        else:
+            new_text = _codex_update(writes.get(name) if name in writes else _text_of(place), body, name)
+            if move_to:
+                if target(folder, move_to).exists():
+                    raise CheckoutError(f"{move_to} already exists", 409)
+                writes[move_to] = new_text
+                deletes.append(name)
+            else:
+                writes[name] = new_text
+    total = sum(_put(folder, name, text) for name, text in writes.items())     # only now: everything applied in memory
+    for name in deletes:
+        if name not in writes:
+            target(folder, name).unlink()
+    return {"files": sorted(set(writes) | set(deletes)), "format": "codex", "bytes": total}
+
+
+def edit(row, body) -> dict:
+    folder = row["path"]
+    patch = body.get("patch")
+    if patch is not None:
+        if not isinstance(patch, str) or not patch.strip():
+            raise CheckoutError("patch must be the text of a patch")
+        if len(patch.encode("utf-8")) > MAX_FILE_BYTES:
+            raise CheckoutError(f"the patch is larger than {MAX_FILE_BYTES} bytes", 413)
+        if patch.lstrip().startswith("*** Begin Patch"):
+            return _apply_codex(folder, patch)
+        return _apply_unified(folder, patch)
+    path, old, new, count = body.get("path"), body.get("old"), body.get("new"), body.get("count", 1)
+    if not isinstance(old, str) or not old or not isinstance(new, str):
+        raise CheckoutError("give path, old (the exact text there now) and new; or a patch")
+    if old == new:
+        raise CheckoutError("old and new are the same text")
+    if type(count) is not int or count < 1:
+        raise CheckoutError("count must be a whole number of at least 1")
+    place = target(folder, path)
+    written = _put(folder, path, _replace_exact(_text_of(place), old, new, count))
+    return {"path": path, "files": [path], "format": "exact", "replaced": count, "bytes": written}
+
+
 def _porcelain(folder) -> list:
     """``git status --porcelain`` lines as Git wrote them: the shared helper strips the output, which would cut the
     leading space of the first line's two-letter state (" M base.txt" read as "M base.txt")."""
@@ -309,6 +530,8 @@ def run(db, policy, root, *, user_id, username, operation, body) -> dict:
                 result = write(row, path, body.get("text"))
             elif operation == "remove":
                 result = remove(row, path)
+            elif operation == "edit":
+                result = edit(row, body)
             elif operation == "status":
                 result = status(row)
             elif operation == "diff":
@@ -323,7 +546,7 @@ def run(db, policy, root, *, user_id, username, operation, body) -> dict:
     except OSError as error:
         _record(db, who, repository, branch, operation, path, error=f"{type(error).__name__}: {error}")
         raise CheckoutError(f"the service could not do that: {type(error).__name__}", 500) from None
-    _record(db, who, repository, branch, operation, path, size=result.get("bytes"))
+    _record(db, who, repository, branch, operation, path or ",".join(result.get("files", [])) or None, size=result.get("bytes"))
     return {"operation": operation, **result}
 
 
