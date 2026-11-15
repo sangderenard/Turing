@@ -578,23 +578,29 @@ LANDER_IDENTITY = ("SpeakToMe lander", "lander@speaktome.invalid")   # the autho
 
 
 def landing_merge(path, base, head):
-    """(tree, None) when ``head`` can land on ``base`` as a merge that changes nothing it was approved as: since their
-    common ancestor, the change and the default branch touch no file in common, so the merged tree is the default branch's
-    files plus exactly the reviewed change. Otherwise (None, why). The tree is made without a working folder
+    """(tree, None) when Git merges ``head`` onto ``base`` without a conflict; otherwise (None, why), naming the
+    conflicted files. The owner's rule (2026-11-15): land by an automatic merge unless the merge has an error. The two
+    sides may change the same file, in places Git can combine. The tree is made without a working folder
     (git merge-tree --write-tree), so the same answer comes from the lander and from the push check."""
     ancestor = git(path, "merge-base", base, head, check=False)
     if not ancestor:
         return None, "it has no common ancestor with the default branch"
-    moved = set(git(path, "diff", "--name-only", "--no-renames", ancestor, base).splitlines())
-    changed = set(git(path, "diff", "--name-only", "--no-renames", ancestor, head).splitlines())
-    shared = sorted(moved & changed)
-    if shared:
-        return None, f"both it and the default branch changed {', '.join(shared[:5])}{' ...' if len(shared) > 5 else ''}"
-    done = subprocess.run(["git", "-C", str(path), "merge-tree", "--write-tree", base, head], capture_output=True,
-                          text=True, encoding="utf-8", errors="replace")
-    tree = done.stdout.split("\n", 1)[0].strip()
+    done = subprocess.run(["git", "-C", str(path), "merge-tree", "--write-tree", "--name-only", "--no-messages", base, head],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    lines = done.stdout.splitlines()
+    tree = lines[0].strip() if lines else ""
+    if done.returncode == 1 and len(tree) == 40:
+        # A conflict: with --name-only the lines after the tree are the conflicted files, up to a blank line.
+        conflicted = []
+        for line in lines[1:]:
+            if not line.strip():
+                break
+            conflicted.append(line.strip())
+        conflicted = list(dict.fromkeys(conflicted))
+        return None, (f"git could not merge it: conflict in {', '.join(conflicted[:5])}"
+                      f"{' ...' if len(conflicted) > 5 else ''}")
     if done.returncode != 0 or len(tree) != 40:
-        return None, f"git could not merge it cleanly ({(done.stderr or done.stdout).strip()[-200:]})"
+        return None, f"git could not merge it ({(done.stderr or done.stdout).strip()[-200:]})"
     return tree, None
 
 
@@ -637,20 +643,20 @@ def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> li
             landing, how = review["head"], f"a fast-forward of {review['base']}"
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
                               capture_output=True).returncode != 0:
-                # Not a fast-forward: the default branch moved after the change was made. When the two touch no file in
-                # common, the reviewed commit lands unchanged as the second parent of a merge whose tree is exactly the
-                # default branch plus that change; anything else is held, for its author to bring up to date.
+                # Not a fast-forward: the default branch moved after the change was made. When Git merges the two
+                # without a conflict, the reviewed commit lands unchanged as the second parent of that merge; a
+                # conflict is held, for its author to bring up to date.
                 tree, why = landing_merge(path, base, review["head"])
                 if tree is None:
                     raise GateError(f"not a fast-forward of {review['base']}, and {why}; merge {review['base']} into "
                                     f"the branch and submit again")
-                how = f"merged onto {review['base']} (no file in common with what landed meanwhile)"
+                how = f"merged onto {review['base']} (Git merged it with what landed meanwhile, without a conflict)"
                 if apply:
                     tip = git(path, "rev-parse", base)
                     message = (f"Land {review['branch']} (review {review['id'][:8]}) onto {review['base']}\n\n"
-                               f"{review['base']} moved after this change was made, and since their common ancestor the two "
-                               f"touch no file in common, so the reviewed commit {review['head'][:12]} is merged exactly as "
-                               f"it was accepted ({review['standing']}).")
+                               f"{review['base']} moved after this change was made, and Git merges the two without a "
+                               f"conflict, so the reviewed commit {review['head'][:12]} is merged as it was accepted "
+                               f"({review['standing']}).")
                     landing = git(path, "-c", f"user.name={LANDER_IDENTITY[0]}", "-c", f"user.email={LANDER_IDENTITY[1]}",
                                   "commit-tree", tree, "-p", tip, "-p", review["head"], "-m", message)
             authors = [line for line in git(path, "log", "--format=%an <%ae>", f"{base}..{review['head']}").splitlines() if line]

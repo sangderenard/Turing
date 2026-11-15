@@ -238,7 +238,7 @@ def test_a_change_that_is_not_a_fast_forward_or_has_moved_is_held(world):
     submit(world, "feature", head, timeout_s=0)
     held = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
     assert held[0]["action"] == "held" and "not a fast-forward" in held[0]["reason"]
-    assert "changed shared.txt" in held[0]["reason"], "the hold names the file both changed"
+    assert "conflict in shared.txt" in held[0]["reason"], "the hold names the conflicted file"
     assert remote_has(world, "feature") == head and remote_has(world, "main") != head
     other = branch(world, "second", push=True)
     submit(world, "second", "f" * 40, timeout_s=0)
@@ -960,6 +960,27 @@ def test_a_change_that_touches_no_file_main_changed_lands_as_a_merge_of_the_revi
     record = branch_review.get(db, made["id"])
     assert record["standing"] == "landed" and "second parent" in record["landed_detail"]
     assert "SpeakToMe lander" in run(world["remote"], "log", "-1", "--format=%an", landed)
+
+
+def test_a_change_to_a_file_main_also_changed_lands_when_git_merges_it_cleanly(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    lines = [f"line {n}" for n in range(1, 21)]
+    commit(work, "shared.txt", "\n".join(lines) + "\n")
+    run(work, "push", "-q", "origin", "main")
+    run(work, "checkout", "-q", "-b", "feature", "main")
+    head = commit(work, "shared.txt", "\n".join(["feature's top"] + lines[1:]) + "\n")       # the first line
+    run(work, "push", "-q", "origin", "feature")
+    run(work, "checkout", "-q", "main")
+    before = commit(work, "shared.txt", "\n".join(lines[:-1] + ["main's bottom"]) + "\n")   # the last line
+    run(work, "push", "-q", "origin", "main")
+    made = submit(world, "feature", head, timeout_s=0)
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "landed", done[0]["reason"]
+    landed = remote_has(world, "main")
+    assert parents_of(world, landed) == [before, head]
+    text = run(world["remote"], "show", f"{landed}:shared.txt").splitlines()
+    assert text[0] == "feature's top" and text[-1] == "main's bottom" and text[1:-1] == lines[1:-1]
+    assert branch_review.get(db, made["id"])["standing"] == "landed"
 
 
 def test_the_push_check_accepts_the_landers_merge_and_nothing_dressed_as_one(world):
