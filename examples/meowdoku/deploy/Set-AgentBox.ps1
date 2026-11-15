@@ -126,8 +126,8 @@ function Save-AgentCredential([pscredential]$cred) {
 if ($OpenConsole) {
     $cred = Read-AgentCredential $AgentAccount
     if (-not $cred) { Write-Host "REFUSED: no saved password for $AgentAccount; run -Apply -ResetPassword -AgentAccount $AgentAccount first."; exit 2 }
-    Start-AsAgent $cred (Join-Path $PSHOME 'pwsh.exe') @() $Workspace | Out-Null
-    Write-Host "opened a console as $AgentAccount (its password was not shown)"
+    $console = Open-AgentConsole $AgentAccount $Workspace          # recorded, so a scheduled run of this account waits for it
+    Write-Host "opened a console as $AgentAccount, pid $($console.Id) (its password was not shown; Start-AgentDay -Status lists it)"
     exit 0
 }
 

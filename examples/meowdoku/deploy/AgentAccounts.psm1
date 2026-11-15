@@ -1,5 +1,6 @@
-# The agent accounts' saved passwords and how a program is started as one of them. Shared by Set-AgentBox.ps1 (which
-# makes the accounts and saves the passwords) and Start-AgentDay.ps1 (which runs the agents).
+# The agent accounts' saved passwords, how a program is started as one of them, and the records of what is running as
+# them. Shared by Set-AgentBox.ps1 (which makes the accounts and saves the passwords) and Start-AgentDay.ps1 (which runs
+# the agents).
 
 # Each password is saved by Set-AgentBox with Export-Clixml: DPAPI, the operator's key, so it opens only for the operator.
 function Get-AgentCredentialFile([string]$Name) {
@@ -45,4 +46,38 @@ function Invoke-AsAgent([pscredential]$Credential, [string]$Script, [string]$Dir
     [pscustomobject]@{ ExitCode = $(if ($timedOut) { $null } else { $process.ExitCode }); Output = $text; TimedOut = $timedOut }
 }
 
-Export-ModuleMember -Function Get-AgentCredentialFile, Read-AgentCredential, Start-AsAgent, Invoke-AsAgent
+# ---------------------------------------------------------------- what is running as the agents
+# One small file per thing running as an agent account: a scheduled run or a console. A record whose process is gone is
+# stale and is removed when read. The records live in <AgentDays>\running.
+function Get-AgentDaysDir { Join-Path $env:USERPROFILE 'AgentDays' }
+
+function Add-AgentRecord([string]$AgentDays, [string]$Kind, [string]$Account, [int]$ProcessId, [hashtable]$More = @{}) {
+    $dir = Join-Path $AgentDays 'running'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $file = Join-Path $dir "$Kind-$Account-$ProcessId.json"
+    ([ordered]@{ kind = $Kind; account = $Account; pid = $ProcessId; started = (Get-Date).ToString('o') } + $More) |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath $file -Encoding utf8
+    $file
+}
+
+function Get-AgentRecords([string]$AgentDays) {
+    $dir = Join-Path $AgentDays 'running'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    foreach ($file in Get-ChildItem -LiteralPath $dir -Filter '*.json') {
+        try { $record = Get-Content -Raw -LiteralPath $file.FullName | ConvertFrom-Json } catch { continue }
+        if (Get-Process -Id $record.pid -ErrorAction SilentlyContinue) { $record }
+        else { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# A console as an agent account, recorded so a scheduled run of that account waits while it is open.
+function Open-AgentConsole([string]$Account, [string]$Directory, [string]$AgentDays = (Get-AgentDaysDir)) {
+    $credential = Read-AgentCredential $Account
+    if (-not $credential) { return $null }
+    $process = Start-AsAgent $credential (Join-Path $PSHOME 'pwsh.exe') @() $Directory
+    Add-AgentRecord $AgentDays 'console' $Account $process.Id | Out-Null
+    $process
+}
+
+Export-ModuleMember -Function Get-AgentCredentialFile, Read-AgentCredential, Start-AsAgent, Invoke-AsAgent, Get-AgentDaysDir,
+    Add-AgentRecord, Get-AgentRecords, Open-AgentConsole
