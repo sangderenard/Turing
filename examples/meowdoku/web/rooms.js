@@ -73,8 +73,13 @@ async function open(name, { quiet = false } = {}) {
     const compose = el("div", null, "compose"), text = document.createElement("textarea"), send = el("button", "Send");
     text.rows = 2; text.maxLength = 4000; text.setAttribute("aria-label", `Message to ${settings.title} (Enter sends, Shift+Enter starts a new line)`);
     send.type = "button";
-    send.onclick = async () => { if (!text.value.trim()) return;
-      try { await request(`/api/chat/rooms/${name}`, { body: text.value }); text.value = ""; await open(name); } catch (error) { status(`Not sent: ${error.message}`); } };
+    // One post per press: while a post is in flight the composer is busy (Send disabled, text read-only), so a slow or
+    // paused server cannot turn impatient presses or repeated Enter into two or three copies of the same message.
+    const busy = on => { send.disabled = text.readOnly = on; send.textContent = on ? "Sending…" : "Send"; compose.setAttribute("aria-busy", String(on)); };
+    send.onclick = async () => { if (send.disabled || !text.value.trim()) return;
+      busy(true);
+      try { await request(`/api/chat/rooms/${name}`, { body: text.value }); text.value = ""; busy(false); await open(name); }
+      catch (error) { busy(false); status(`Not sent: ${error.message}`); } };
     text.addEventListener("keydown", event => {                                        // Enter sends; Shift+Enter is a new line
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); send.click(); }
     });
