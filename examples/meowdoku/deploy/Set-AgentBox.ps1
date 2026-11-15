@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS  Prepare the agents' box: no account but the operator, the service and Windows itself may change the workspace,
-and a standard (non-admin) Windows account "agents" that can read the code and nothing else. Run ELEVATED.
+and standard (non-admin) Windows accounts, one per agent, that can read the code and nothing else. Run ELEVATED.
 
 REPORT ONLY unless -Apply: every step is printed before it runs, and without -Apply nothing is changed.
 
@@ -14,28 +14,42 @@ What -Apply does, in this order:
   (d) locks the trees: C:\dev and C:\Apache24 lose "Authenticated Users: Modify" (they keep "Users: Read", which the
       service needs to list the parents of every path it opens); C:\dev\Powershell loses both "Authenticated Users" and
       "Users". The operator keeps Full control; every explicit grant (the service's, codex's sandbox group) is kept.
-  (e) with -CreateAgentAccount: the standard account (its password is asked for here and stored nowhere), member of Users
-      only, with read on the code repositories of branch_policy.json and nothing on srv\state, the secrets or Apache
-  (f) with -CopyAgentCredentials: copies the SpeakToMe sign-in files of -AgentLogins into that account's own profile,
-      readable by it alone (it must have signed in once, so the profile exists). Their contents are never printed.
+  (e) with -CreateAgentAccount: one standard account -AgentAccount, member of Users only. Its password is generated here,
+      never shown, and saved encrypted (Windows DPAPI) for the operator alone, so nobody types or pastes it and no agent
+      holds it. It gets read on the code repositories of branch_policy.json, the service's Python (instances.json
+      supervisor_python) and the workspace's tracked top-level files, and nothing on srv\state, the secrets or Apache.
+      Its profile is made by starting one hidden process as it. It is refused while any folder on the PATH can be
+      written by every account (an agent could plant a program that the operator or the service would then run).
+      -ResetPassword gives an existing account a generated, saved password the same way.
+  (f) with -AgentLogins <one login> (and -CreateAgentAccount or -CopyAgentCredentials): copies that one SpeakToMe sign-in
+      file into the account's own profile, readable by it alone, and removes any other agent's sign-in file found
+      there. One Windows account holds one agent's sign-in, so no agent can read another's. Contents are never printed.
   (g) reports every listening port with its process and account, so each loopback service can be checked for its own
       authentication (any account on this computer reaches a loopback port)
 
-Once the trees are locked (C:\dev\Powershell has no "Authenticated Users" or "Users" entry), -CreateAgentAccount and
--CopyAgentCredentials skip (b) to (d): they only add, so no new backup is needed, and each prints its own undo.
+Once the trees are locked (C:\dev\Powershell has no "Authenticated Users" or "Users" entry), the account steps skip
+(b) to (d): they only add, so no new backup is needed, and each prints its own undo.
 
-An agent signed in as "agents" changes the code through the central checkout (checkout_* tools; the service makes the
-branch and commits) and cannot run commands in it yet. Undo the lock: Restore-AgentBoxAcls.ps1 -Manifest <the manifest
-this run printed>.
-.EXAMPLE   .\Set-AgentBox.ps1                                  # report only
-.EXAMPLE   .\Set-AgentBox.ps1 -Apply -CreateAgentAccount        # lock, make the account
+-OpenConsole -AgentAccount <name> opens a PowerShell console as that account with its saved password, which is never
+shown and never reaches the clipboard. It changes nothing and needs no elevation.
+
+An agent signed in as one of these accounts changes the code through the central checkout (checkout_* tools; the
+service makes the branch and commits) and cannot run commands in it yet. Undo the lock: Restore-AgentBoxAcls.ps1
+-Manifest <the manifest this run printed>.
+.EXAMPLE   .\Set-AgentBox.ps1                                                                    # report only
+.EXAMPLE   .\Set-AgentBox.ps1 -Apply -CreateAgentAccount -AgentAccount agents-codex -AgentLogins codex
+.EXAMPLE   .\Set-AgentBox.ps1 -Apply -ResetPassword -AgentAccount agents                         # manage an existing one
+.EXAMPLE   .\Set-AgentBox.ps1 -OpenConsole -AgentAccount agents-codex
 #>
+#Requires -Version 7
 param(
     [switch]$Apply,
     [switch]$CreateAgentAccount,
     [switch]$CopyAgentCredentials,
+    [switch]$ResetPassword,
+    [switch]$OpenConsole,
     [string]$AgentAccount = 'agents',
-    [string[]]$AgentLogins = @('claude', 'codex', 'guest_agent'),
+    [string[]]$AgentLogins = @(),
     [string]$ServiceAccount = 'svc-meowdoku',
     [string]$Operator = $env:USERNAME,
     [string]$BackupDir = 'C:\dev\acl-backups'
@@ -46,12 +60,9 @@ $Dev = 'C:\dev'
 $Apache = 'C:\Apache24'
 $Deploy = $PSScriptRoot
 $Secrets = Join-Path $Workspace 'srv\state\secrets'
+$StoreDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SpeakToMe\agent-accounts'
 $AUTH_USERS, $USERS, $ADMINS, $SYSTEM = '*S-1-5-11', '*S-1-5-32-545', '*S-1-5-32-544', '*S-1-5-18'
 
-$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-if ($Apply -and -not $elevated) { Write-Host 'REFUSED: -Apply needs an elevated PowerShell.'; exit 2 }
-if (-not $Apply) { Write-Host '[report only] nothing is changed; run again with -Apply to perform the steps below.' }
 function Step($t) { Write-Host ''; Write-Host "== $t" }
 function Cmd($display) { Write-Host "cmd: $display" }
 function Run([string]$exe, [string[]]$arguments) {
@@ -70,6 +81,60 @@ function Broad([string]$path) {
     }
     if ($rows) { ($rows | Select-Object -Unique) -join '; ' } else { '(none)' }
 }
+# Folders on the machine's or the operator's PATH that every account may write: a program planted there by an agent
+# would run as whoever next calls that command, the operator or the service included.
+function Open-PathFolders {
+    $dirs = @([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';') + @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';')
+    foreach ($d in ($dirs | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {
+        $w = (Get-Acl -LiteralPath $d).Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -match 'Modify|FullControl|Write|CreateFiles') -and
+            $(try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in @('S-1-5-11', 'S-1-5-32-545', 'S-1-1-0') } catch { $false }) }
+        if ($w) { $d }
+    }
+}
+# A generated password: 64 characters with every class Windows' complexity rule asks for. It exists only as a SecureString.
+function New-AgentPassword {
+    $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!#%+-.:=?@^_~')
+    $all = -join $sets
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]
+    $chars = [System.Collections.Generic.List[char]]::new()
+    foreach ($s in $sets) { $chars.Add($s[$rng::GetInt32($s.Length)]) }
+    while ($chars.Count -lt 64) { $chars.Add($all[$rng::GetInt32($all.Length)]) }
+    for ($i = $chars.Count - 1; $i -gt 0; $i--) { $j = $rng::GetInt32($i + 1); $t = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $t }
+    $secure = [securestring]::new()
+    foreach ($c in $chars) { $secure.AppendChar($c) }
+    $chars.Clear()
+    $secure.MakeReadOnly()
+    $secure
+}
+function Credential-File([string]$name) { Join-Path $StoreDir "$name.xml" }
+# Export-Clixml encrypts the password with the current user's DPAPI key: only the operator, signed in as themself, can read it.
+function Save-AgentCredential([pscredential]$cred) {
+    if (-not (Test-Path -LiteralPath $StoreDir)) {
+        New-Item -ItemType Directory -Force -Path $StoreDir | Out-Null
+        & icacls.exe $StoreDir /inheritance:r /grant "${Operator}:(OI)(CI)F" "${SYSTEM}:(OI)(CI)F" | Out-Null
+    }
+    $cred | Export-Clixml -LiteralPath (Credential-File $cred.UserName)
+    Write-Host "  password saved encrypted for $Operator only: $(Credential-File $cred.UserName) (not shown)"
+}
+function Read-AgentCredential([string]$name) {
+    $file = Credential-File $name
+    if (Test-Path -LiteralPath $file) { Import-Clixml -LiteralPath $file } else { $null }
+}
+
+# ---------------------------------------------------------------- console
+if ($OpenConsole) {
+    $cred = Read-AgentCredential $AgentAccount
+    if (-not $cred) { Write-Host "REFUSED: no saved password for $AgentAccount; run -Apply -ResetPassword -AgentAccount $AgentAccount first."; exit 2 }
+    Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $cred -LoadUserProfile -WorkingDirectory (Join-Path $Workspace 'turing')
+    Write-Host "opened a console as $AgentAccount (its password was not shown)"
+    exit 0
+}
+
+$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($Apply -and -not $elevated) { Write-Host 'REFUSED: -Apply needs an elevated PowerShell.'; exit 2 }
+if (-not $Apply) { Write-Host '[report only] nothing is changed; run again with -Apply to perform the steps below.' }
 
 # ---------------------------------------------------------------- (a)
 Step '(a) who besides named accounts may touch the trees now'
@@ -78,9 +143,10 @@ foreach ($p in @($Dev, $Workspace, $Apache, (Join-Path $Workspace 'srv\python'),
 }
 
 $policy = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'branch_policy.json') | ConvertFrom-Json
+$instances = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'instances.json') | ConvertFrom-Json
 $broadNow = @((Get-Acl -LiteralPath $Workspace).Access | Where-Object {
     try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in @('S-1-5-11', 'S-1-5-32-545') } catch { $false } })
-$skipLock = ($broadNow.Count -eq 0) -and ($CreateAgentAccount -or $CopyAgentCredentials)
+$skipLock = ($broadNow.Count -eq 0) -and ($CreateAgentAccount -or $CopyAgentCredentials -or $ResetPassword)
 $manifest = $null
 if ($skipLock) {
     Write-Host ''
@@ -113,7 +179,6 @@ if ($Apply) {
 
 # ---------------------------------------------------------------- (c)
 Step "(c) explicit Modify for $ServiceAccount where the stack writes"
-$instances = Get-Content -Raw -LiteralPath (Join-Path $Deploy 'instances.json') | ConvertFrom-Json
 $writes = [System.Collections.Generic.List[string]]::new()
 if ($instances.state_dir) { $writes.Add([string]$instances.state_dir) }
 foreach ($i in $instances.instances) { if ($i.state_dir) { $writes.Add([string]$i.state_dir) } }
@@ -150,47 +215,97 @@ Run 'icacls.exe' @($Apache, '/grant', "${Operator}:(OI)(CI)F")
 Step "(e) the standard account $AgentAccount"
 $codeRepos = @($policy.repositories.PSObject.Properties | ForEach-Object { ([string]$_.Value.path).Replace('/', '\').TrimEnd('\') } |
     Where-Object { $_ -ne $Workspace })
-if ($CreateAgentAccount) {
+$pythonDir = (Split-Path ([string]$instances.supervisor_python).Replace('/', '\') -Parent)
+$cred = $null
+if ($CreateAgentAccount -or $ResetPassword) {
+    $open = @(Open-PathFolders)
+    if ($open.Count) {
+        Write-Host 'these folders on the PATH can be written by every account; an agent could plant a program there that you or the service would run:'
+        $open | ForEach-Object { Write-Host "  $_" }
+        Write-Host "close each the way six were closed on 2026-11-14: icacls <folder> /save <file> /C /Q; icacls <folder> /inheritance:d;"
+        Write-Host "  icacls <folder> /grant ${Operator}:(OI)(CI)F; then remove the broad group's write entry (icacls <folder> /remove:g *S-1-5-11)"
+        if ($Apply) { Write-Host "REFUSED: no agent account while the PATH is open."; exit 2 }
+    }
     $exists = Get-LocalUser -Name $AgentAccount -ErrorAction SilentlyContinue
-    if ($exists) { Write-Host "account $AgentAccount exists: not made again" }
-    else {
-        Cmd "New-LocalUser $AgentAccount (password asked for now, stored nowhere); Add-LocalGroupMember Users"
+    if (-not $exists -and -not $CreateAgentAccount) { Write-Host "REFUSED: $AgentAccount does not exist; -CreateAgentAccount makes it."; exit 2 }
+    if (-not $exists) {
+        Cmd "New-LocalUser $AgentAccount with a generated password; Add-LocalGroupMember Users"
         if ($Apply) {
-            $password = Read-Host -AsSecureString "A password for $AgentAccount (you sign in with it; keep it in your password manager)"
+            $password = New-AgentPassword
             New-LocalUser -Name $AgentAccount -Password $password -PasswordNeverExpires -AccountNeverExpires `
                 -Description 'Agents box: reads code; writes via the system' | Out-Null
-            $password = $null
             Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-545') -Member $AgentAccount
+            $cred = [pscredential]::new($AgentAccount, $password)
+            Save-AgentCredential $cred
         }
+    } elseif ($ResetPassword) {
+        Cmd "Set-LocalUser $AgentAccount with a new generated password (a scheduled task registered with the old one must be registered again)"
+        if ($Apply) {
+            $password = New-AgentPassword
+            Set-LocalUser -Name $AgentAccount -Password $password
+            $cred = [pscredential]::new($AgentAccount, $password)
+            Save-AgentCredential $cred
+        }
+    } else {
+        Write-Host "account $AgentAccount exists: not made again"
+        if (-not (Test-Path -LiteralPath (Credential-File $AgentAccount))) { Write-Host "  no saved password for it: add -ResetPassword to give it a generated one, so -OpenConsole works" }
     }
+    $password = $null
     if ((Get-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-544') -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\$AgentAccount" })) {
         throw "$AgentAccount is an administrator: the box needs a standard account. Remove it from Administrators first."
     }
     Run 'icacls.exe' @($Workspace, '/grant', "${AgentAccount}:RX")         # the folder itself, to reach the repositories
     foreach ($repo in $codeRepos) { if (Test-Path -LiteralPath $repo) { Run 'icacls.exe' @($repo, '/grant', "${AgentAccount}:(OI)(CI)RX") } }
-    Write-Host "undo (e): Remove-LocalUser $AgentAccount; then icacls <path> /remove:g $AgentAccount on $Workspace and on each of: $($codeRepos -join ', ')"
-} else { Write-Host 'skipped (no -CreateAgentAccount)' }
+    if (Test-Path -LiteralPath $pythonDir) { Run 'icacls.exe' @($pythonDir, '/grant', "${AgentAccount}:(OI)(CI)RX") }   # runs the SpeakToMe MCP
+    else { Write-Host "skip (missing): the service's Python $pythonDir" }
+    # The workspace's tracked top-level files (AGENTS.md, README.md, the SPEAKTOME_* history ...) are published with the
+    # repository; everything else at the top level stays closed.
+    $topFiles = @(& git -C $Workspace ls-files 2>$null | Where-Object { $_ -and $_ -notmatch '/' } | ForEach-Object { Join-Path $Workspace $_ } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    Cmd "icacls <each of the $($topFiles.Count) tracked top-level files of $Workspace> /grant ${AgentAccount}:R"
+    if ($Apply) { foreach ($f in $topFiles) { & icacls.exe $f /grant "${AgentAccount}:R" | Out-Null; if ($LASTEXITCODE -ne 0) { throw "icacls $f exited $LASTEXITCODE" } } }
+    $profileDir = (Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$AgentAccount" } | Select-Object -First 1).LocalPath
+    if (-not $profileDir) {
+        Cmd "make $AgentAccount's profile: start one hidden process as it, with its profile loaded"
+        if ($Apply) {
+            if (-not $cred) { $cred = Read-AgentCredential $AgentAccount }
+            if ($cred) {
+                Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList '/c', 'exit' -Credential $cred -LoadUserProfile `
+                    -WorkingDirectory (Join-Path $env:SystemRoot 'System32') -WindowStyle Hidden -Wait
+            } else { Write-Host "  no saved password: add -ResetPassword, or sign in as $AgentAccount once" }
+        }
+    }
+    Write-Host "undo (e): Remove-LocalUser $AgentAccount; Remove-Item $(Credential-File $AgentAccount); icacls <path> /remove:g $AgentAccount on"
+    Write-Host "  $Workspace, $pythonDir, each of $($codeRepos -join ', ') and each tracked top-level file; its profile folder stays"
+    Write-Host "  until removed in System Properties > User Profiles"
+} else { Write-Host 'skipped (no -CreateAgentAccount or -ResetPassword)' }
 
 # ---------------------------------------------------------------- (f)
-Step "(f) the agents' SpeakToMe sign-in files, in $AgentAccount's own profile"
-if ($CopyAgentCredentials) {
+Step "(f) the agent's SpeakToMe sign-in file, in $AgentAccount's own profile"
+if ($CopyAgentCredentials -or ($CreateAgentAccount -and $AgentLogins.Count)) {
+    if ($AgentLogins.Count -ne 1) { Write-Host "REFUSED: name exactly one SpeakToMe login with -AgentLogins; one Windows account holds one agent's sign-in, so no agent can read another's."; exit 2 }
+    $login = $AgentLogins[0]
     $profileDir = (Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$AgentAccount" } | Select-Object -First 1).LocalPath
-    if (-not $profileDir) { Write-Host "no profile for $AgentAccount yet: sign in as it once, then run this step again" }
+    if (-not $profileDir) { Write-Host "no profile for $AgentAccount yet: run -CreateAgentAccount (or -ResetPassword) with -Apply first" }
     else {
         $target = Join-Path $profileDir 'speaktome-credentials'
+        $source = Join-Path $Secrets "operator_credentials\$login.secret"
         Cmd "New-Item $target; icacls $target /inheritance:r /grant ${AgentAccount}:(OI)(CI)R Administrators:F SYSTEM:F"
         if ($Apply) {
             New-Item -ItemType Directory -Force -Path $target | Out-Null
             & icacls.exe $target /inheritance:r /grant "${AgentAccount}:(OI)(CI)R" "${ADMINS}:(OI)(CI)F" "${SYSTEM}:(OI)(CI)F" | Out-Null
         }
-        foreach ($login in $AgentLogins) {
-            $source = Join-Path $Secrets "operator_credentials\$login.secret"
-            if (-not (Test-Path -LiteralPath $source)) { Write-Host "no sign-in file for $login"; continue }
+        if (-not (Test-Path -LiteralPath $source)) { Write-Host "no sign-in file for $login" }
+        else {
             Cmd "copy $login.secret -> $target  (contents not shown)"
             if ($Apply) { Copy-Item -LiteralPath $source -Destination (Join-Path $target "$login.secret") -Force }
         }
+        foreach ($other in @(Get-ChildItem -LiteralPath $target -Filter '*.secret' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "$login.secret" })) {
+            Cmd "remove $($other.Name) from $target (another agent's sign-in; the original stays in $Secrets)"
+            if ($Apply) { Remove-Item -LiteralPath $other.FullName -Force }
+        }
     }
-} else { Write-Host 'skipped (no -CopyAgentCredentials)' }
+} else { Write-Host 'skipped (no -AgentLogins with -CreateAgentAccount or -CopyAgentCredentials)' }
 
 # ---------------------------------------------------------------- (g)
 Step '(g) listening ports: every account here reaches the loopback ones, so each must check who is asking'
