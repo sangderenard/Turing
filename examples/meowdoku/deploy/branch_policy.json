@@ -6,7 +6,7 @@
   "stale_days": 1,
   "unregistered_days": 30,
   "registered_days": 365,
-  "review_timeout_hours": 24,
+  "review_timeout_hours": 0.5,
   "delete_after_landing": true,
   "delete_remote": true,
   "remote": "origin",

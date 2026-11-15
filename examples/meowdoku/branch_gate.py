@@ -95,7 +95,7 @@ HOOK_MARK = "# speaktome branch gate"
 DEFAULTS = {"grace_days": 14, "stale_days": 30, "unregistered_days": 30, "registered_days": 365, "lock": "mock",
             "worktree_idle_days": 1, "cleaner": "svc-pale-rider", "cleaner_display_name": "Pale Rider",
             "notices_file": "C:/dev/Powershell/REMOVAL_NOTICES.csv",
-            "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
+            "review_timeout_hours": 0.5, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
 
@@ -564,7 +564,11 @@ def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None, trigge
     Each run is recorded for the reviews page (branch_review.run_started / run_finished): when it started and finished,
     what asked for it (``trigger``: schedule, request or cli), what it did, and the error that stopped it, if one did. A
     run that never finishes (a Git call waiting on a sign-in nobody sees) stays "running", and the page says so."""
-    run = branch_review.run_started(db, trigger=trigger, asked=only, apply=apply)
+    run = branch_review.run_started(db, trigger=trigger, asked=only, apply=apply, now=now,
+                                    cooldown_s=300.0 if apply and trigger in ("schedule", "request") else 0.0)
+    if run is None:
+        log("[reviews] landing attempt deferred: the previous attempt started less than five minutes ago")
+        return []
     try:
         results = _land(policy, db, apply=apply, now=now, log=log, gh=gh, only=only)
     except BaseException as error:

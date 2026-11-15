@@ -522,12 +522,23 @@ STUCK_AFTER_S = 300.0          # a landing run this old and unfinished is report
 LAND_RUN_KEEP = 200
 
 
-def run_started(db, *, trigger, asked=None, apply=True) -> int:
+def run_started(db, *, trigger, asked=None, apply=True, now=None, cooldown_s=0.0) -> int | None:
     ensure(db)
-    cursor = db.execute("INSERT INTO branch_land_runs (started, trigger, asked, apply) VALUES (?, ?, ?, ?)",
-                        (time.time(), str(trigger), None if not asked else ",".join(str(a) for a in asked), int(bool(apply))))
-    db.execute("DELETE FROM branch_land_runs WHERE id <= ?", (cursor.lastrowid - LAND_RUN_KEEP,))
-    return cursor.lastrowid
+    started = time.time() if now is None else now
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if cooldown_s and db.execute("SELECT 1 FROM branch_land_runs WHERE apply = 1 AND started <= ? AND started > ? "
+                                     "LIMIT 1", (started, started - cooldown_s)).fetchone():
+            db.execute("COMMIT")
+            return None
+        cursor = db.execute("INSERT INTO branch_land_runs (started, trigger, asked, apply) VALUES (?, ?, ?, ?)",
+                            (started, str(trigger), None if not asked else ",".join(str(a) for a in asked), int(bool(apply))))
+        db.execute("DELETE FROM branch_land_runs WHERE id <= ?", (cursor.lastrowid - LAND_RUN_KEEP,))
+        db.execute("COMMIT")
+        return cursor.lastrowid
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
 
 
 def run_finished(db, run_id, results, *, error=None) -> None:

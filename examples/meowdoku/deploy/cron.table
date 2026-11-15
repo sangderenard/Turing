@@ -16,9 +16,9 @@ hosted.dispatch */5 * * * * missed=skip
 # only the last one is kept (no rolling window). Binary products are a different policy. After a gap, one run covers it.
 state.backup 30 9 * * * missed=once
 
-# Land the changes whose review is accepted (branch_review.py), every ten minutes. While the branch policy's
+# Land the changes whose individual review window has expired (branch_review.py), every five minutes. While the branch policy's
 # apply is false this only reports what it would land.
-reviews.land */10 * * * * missed=once
+reviews.land */5 * * * * missed=once
 
 # Once a day (09:45 UTC), remove branches that have been fully merged for the policy's grace period. While the
 # branch policy's apply is false this only reports what it would remove.

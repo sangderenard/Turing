@@ -670,6 +670,28 @@ def test_accepted_queue_timer_reads_the_installed_cron_table(tmp_path):
     assert branch_review.next_scheduled_landing(table, now=600) is None
 
 
+def test_review_window_and_landing_schedule_are_five_minute_batches(world, monkeypatch):
+    source = Path(__file__).resolve().parents[1] / "examples" / "meowdoku" / "deploy"
+    policy = branch_gate.load_policy(source / "branch_policy.json")
+    assert policy["review_timeout_hours"] == branch_gate.DEFAULTS["review_timeout_hours"] == 0.5
+    assert branch_review.next_scheduled_landing(source / "cron.table", now=1800) == {
+        "next_at": 2100, "interval_seconds": 300}
+    first = submit(world, "first", "a" * 40, timeout_s=1800, now=1000)
+    second = submit(world, "second", "b" * 40, timeout_s=1800, now=1100)
+    assert first["accept_after"] == 2800 and second["accept_after"] == 2900
+    assert [r["id"] for r in branch_review.landable(world["db"], 2800)] == [first["id"]]
+    assert {r["id"] for r in branch_review.landable(world["db"], 2900)} == {first["id"], second["id"]}
+
+    attempts = []
+    monkeypatch.setattr(branch_gate, "_land", lambda *args, **kwargs: attempts.append(kwargs["now"]) or [])
+    db = world["db"]
+    branch_gate.land(world["policy"], db, apply=True, now=2900, trigger="schedule", log=lambda line: None)
+    branch_gate.land(world["policy"], db, apply=True, now=2901, trigger="request", log=lambda line: None)
+    branch_gate.land(world["policy"], db, apply=True, now=3200, trigger="schedule", log=lambda line: None)
+    assert attempts == [2900, 3200]
+    assert [r["started"] for r in branch_review.lander_status(db, now=3200)["recent"]] == [3200, 2900]
+
+
 def test_land_now_over_rest_is_an_admins_and_asks_the_updater_for_exactly_the_queue(world):
     policy, db_file = world["policy"], world["db_file"]
     head = branch(world, "feature")
