@@ -241,6 +241,7 @@ function ownerSettings(name, settings) {
   const box = el("section", null, "part");
   const title = input(settings.title), about = input(settings.about), stage = choice(["dev", "release"], settings.stage);
   const write = choice(["members", "owner"], settings.write), objects = document.createElement("textarea"), bridges = input(settings.bridges.join(", "));
+  const hosted = input((settings.hosted_agents || ["llama"]).join(", "));
   objects.rows = 3; objects.value = JSON.stringify(settings.objects);
   const save = el("button", "Save settings"); save.type = "button";
   save.onclick = async () => {
@@ -248,7 +249,8 @@ function ownerSettings(name, settings) {
     try { parsed = JSON.parse(objects.value || "[]"); } catch (error) { status("Site objects must be a JSON list of {kind, ref}."); return; }
     try {
       await request(`/api/chat/rooms/${name}/settings`, { title: title.value, about: about.value, stage: stage.value, write: write.value,
-        objects: parsed, bridges: bridges.value.split(",").map(t => t.trim()).filter(Boolean) });
+        objects: parsed, bridges: bridges.value.split(",").map(t => t.trim()).filter(Boolean),
+        hosted_agents: hosted.value.split(",").map(t => t.trim()).filter(Boolean) });
       status("Settings saved."); await load();
     } catch (error) { status(`Not saved: ${error.message}`); }
   };
@@ -266,7 +268,8 @@ function ownerSettings(name, settings) {
   box.append(el("h3", "Settings (owner)"), field("Title", title), field("About", about),
     field("Stage: dev is the development site and needs dev permission; release is public facing", stage),
     field("Who writes", write), field("Site objects (JSON list of {kind, ref}; kinds: page, render, mesh, shader, media, room; at most 8)", objects),
-    field("Bridges (tool names, comma separated; at most 8)", bridges), save,
+    field("Bridges (tool names, comma separated; at most 8)", bridges),
+    field("Hosted agent accounts (comma separated; llama is on by default; sharing still controls access)", hosted), save,
     el("h3", "Who may enter, beyond the stage"), field("Sharing", visibility), field("Group id (for group)", group), share);
   return box;
 }

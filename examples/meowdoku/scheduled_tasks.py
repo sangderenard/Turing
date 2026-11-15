@@ -43,7 +43,7 @@ SYSTEM_DISPLAY_NAME = "Nodus"
 USERLIST_ENGINE_ID = 7203
 # Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
 PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean",
-                         "core.index"),
+                         "core.index", "hosted.dispatch"),
                 "userlist": ("identity.search", "identity.represent")}
 
 
@@ -190,6 +190,40 @@ def load_cron_host(nodus_tools):
     return sys.modules[name]
 
 
+def dispatch_hosted_agents(accounts_db, system_username, agent_names, *, messaging):
+    """Send a room assignment as Nodus control data; the agent never trains on it."""
+    from meowdoku import chat_rooms, schema_version
+    db = messaging.connect(accounts_db)
+    try:
+        schema_version.declare(db, "hosted_dispatch", 1)
+        db.execute("CREATE TABLE IF NOT EXISTS hosted_dispatch_cursor "
+                   "(agent_id INTEGER PRIMARY KEY, room TEXT NOT NULL, updated REAL NOT NULL)")
+        chat_rooms.ensure(db)
+        system_id = _system(db, system_username)
+        sent = []
+        for name in agent_names:
+            row = db.execute("SELECT id,username FROM users WHERE username=? COLLATE NOCASE", (name,)).fetchone()
+            if row is None or row["id"] == system_id:
+                continue
+            agent_id, canonical = row["id"], row["username"]
+            available = sorted(r["room"] for r in chat_rooms.rooms_for(db, agent_id)
+                               if canonical in r.get("hosted_agents", []))
+            if not available:
+                continue
+            old = db.execute("SELECT room FROM hosted_dispatch_cursor WHERE agent_id=?", (agent_id,)).fetchone()
+            room = available[(available.index(old[0]) + 1) % len(available)] if old and old[0] in available else available[0]
+            messaging.befriend_all(db, system_id, [agent_id])
+            messaging.send(db, system_id, canonical, f"hosted-dispatch: visit {room}",
+                           subject={"kind": "control", "ref": room}, msg_type="status")
+            db.execute("INSERT INTO hosted_dispatch_cursor(agent_id,room,updated) VALUES(?,?,?) "
+                       "ON CONFLICT(agent_id) DO UPDATE SET room=excluded.room,updated=excluded.updated",
+                       (agent_id, room, time.time()))
+            sent.append(f"{canonical}:{room}")
+        return sent
+    finally:
+        db.close()
+
+
 def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None,
              branches=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
@@ -259,6 +293,13 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                                                 text_only=bool(backup.get("text_only")))
         table["state.backup"] = state_backup_task
     if system is not None:
+        if system.get("hosted_agents"):
+            def hosted_dispatch(request):
+                sent = dispatch_hosted_agents(system["accounts_db"], system["username"], system["hosted_agents"],
+                                              messaging=system["module"])
+                return (cron_host.DONE if sent else cron_host.UNCHANGED), ", ".join(sent) or "no enrolled hosted agents"
+            table["hosted.dispatch"] = hosted_dispatch
+
         def system_broadcast(request):
             return cron_host.DONE, broadcast(system["accounts_db"], system["username"], request, messaging=system["module"],
                                              userlist=system.get("userlist"))

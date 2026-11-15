@@ -2897,6 +2897,9 @@ def make_handler(sessions: Sessions):
                 return
             if self._route_gate(path, "GET"):                     # [ROUTE]
                 return
+            if path.startswith("/api/hosted-agents/") and path.endswith("/last-word"):
+                from meowdoku import hosted_agent_modes
+                return hosted_agent_modes.http_route(self, path, "GET", accounts_db=sessions.accounts_db)
             if path == "/api/pages" or path.startswith("/api/pages/") or path.startswith("/p/") or path.startswith("/site/programs/"):
                 return self._pages_route(path, "GET")
             if path == "/api/route":                              # [ROUTE]
@@ -3474,6 +3477,9 @@ def make_handler(sessions: Sessions):
                 return
             if self._route_gate(path0, "POST"):                   # [ROUTE]
                 return
+            if path0.startswith("/api/hosted-agents/") and path0.endswith("/last-word"):
+                from meowdoku import hosted_agent_modes
+                return hosted_agent_modes.http_route(self, path0, "POST", accounts_db=sessions.accounts_db)
             if path0 == "/api/pages" or path0.startswith("/api/pages/"):
                 return self._pages_route(path0, "POST")
             if path0 == "/api/radio/jukebox":

@@ -213,13 +213,34 @@ def test_intern_is_off_the_human_ladder_and_takes_no_group(db):
     authz.grant_role(db, "bob", "intern", "alice")
     groups = authz._permission_groups
     with authz._connect(db) as conn:
-        assert groups.authority(conn, 2) == {"highest": "intern", "direct": ["intern"], "groups": ["intern"], "service": False}
+        assert groups.authority(conn, 2) == {"highest": "intern", "direct": ["intern"], "groups": ["intern"], "service": False, "modifiers": {}}
         for group in ("dev", "operator", "nodus"):
             with pytest.raises(PermissionError):
                 groups.set_grant(conn, 1, 2, group, True)
     assert authz.role_of(db, 2) == "intern"
     principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
     assert principal.role == "intern" and principal.groups == frozenset({"intern"})
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
+
+
+def test_only_an_admin_can_grant_message_to_one_intern(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    authz.grant_role(db, "bob", "intern", "alice")
+    groups = authz._permission_groups
+    with authz._connect(db) as conn:
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 2, "message", True)
+        with pytest.raises(ValueError):
+            groups.set_grant(conn, 1, 2, "account_manage", True)
+        granted = groups.set_grant(conn, 1, 2, "message", True)
+        assert granted["modifiers"] == {"message": True}
+        assert conn.execute("SELECT count(*) FROM account_capability_modifier_audit").fetchone()[0] == 1
+    principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "message"}
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "message", False)
+        assert conn.execute("SELECT count(*) FROM account_capability_modifier_audit").fetchone()[0] == 2
+    principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
     assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
 
 

@@ -260,7 +260,7 @@ def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
         # writes, messaging, lifecycle and handlers that ask for no capability: refused before any handler runs
         for method, path, body in (("POST", "/api/reports", {"request_id": "r1"}), ("POST", "/api/relay/send", {}),
                                    ("GET", "/api/relay/addresses", None), ("GET", "/api/account/groups", None),
-                                   ("POST", "/api/account/groups", {"name": "g"}), ("POST", "/api/messages/send", {}),
+                                   ("POST", "/api/account/groups", {"name": "g"}),
                                    ("POST", "/api/tickets", {}), ("POST", "/api/admin/lifecycle", {}), ("GET", "/api/log", None),
                                    ("GET", "/api/paper/account", None), ("POST", "/api/account/signup", {"username": "x"}),
                                    # no personal storage: material is burned on delivery
@@ -275,7 +275,8 @@ def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
     assert _call(port, "/api/account/me", headers=public)[0] == 200
     index = _call(port, "/api/index", headers=public)[1]
     kiosk = {e["name"] for e in srv.shared_catalog.ENDPOINTS if e["kiosk"]}
-    assert index["kiosk"] is True and {e["name"] for e in index["endpoints"] if e["allowed"]} == kiosk
+    assert index["kiosk"] is True and {e["name"] for e in index["endpoints"] if e["allowed"]} == {e["name"] for e in srv.shared_catalog.ENDPOINTS if e["kiosk"] and e["capability"] != "message"}
+    assert _call(port, "/api/messages/send", "POST", public, {})[1] == {"error": "this needs message"}
     member_index = _call(port, "/api/index", headers={**PUBLIC_XFF, "Cookie": _signup(port, "plain_cat")})[1]
     assert member_index["kiosk"] is False and "messages_send" in {e["name"] for e in member_index["endpoints"] if e["allowed"]}
     # a kiosk path still meets its handler's own gate: the system map needs dev_ui
@@ -283,6 +284,51 @@ def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
     assert status == 403 and out == {"error": "this needs dev_ui"}
     assert _call(port, "/api/account/logout", "POST", public, {})[0] == 200
     assert _call(port, "/api/whoami", headers=public)[1]["role"] == "guest"
+
+
+def test_message_modifier_admits_only_the_selected_intern(server):
+    port = server.port
+    boss, llama, other = (_signup(port, name) for name in ("modifier_boss", "modifier_llama", "modifier_other"))
+    srv.authz_mod.grant_role(server.sessions.accounts_db, "modifier_llama", "intern", "operator:test")
+    srv.authz_mod.grant_role(server.sessions.accounts_db, "modifier_other", "intern", "operator:test")
+    assert _call(port, "/api/admin/account/grant", "POST",
+                 {"Host": "127.0.0.1", "X-Meowdoku-Admin": TOKEN}, {"username": "modifier_boss"})[0] == 200
+    admin = {**PUBLIC_XFF, "Cookie": boss}
+    llama_headers = {**PUBLIC_XFF, "Cookie": llama}
+    other_headers = {**PUBLIC_XFF, "Cookie": other}
+    grant = {"username": "modifier_llama", "group": "message", "enabled": True}
+    assert _call(port, "/api/account/authority/grant", "POST", other_headers, grant)[0] == 403
+    status, result, _, _ = _call(port, "/api/account/authority/grant", "POST", admin, grant)
+    assert status == 200 and result["authority"]["modifiers"] == {"message": True}
+    assert "message" in _call(port, "/api/whoami", headers=llama_headers)[1]["capabilities"]
+    assert "message" not in _call(port, "/api/whoami", headers=other_headers)[1]["capabilities"]
+    assert _call(port, "/api/messages/inbox", headers=llama_headers)[0] == 200
+    assert _call(port, "/api/messages/inbox", headers=other_headers)[1] == {"error": "this needs message"}
+    assert _call(port, "/api/user-files", headers=llama_headers)[0] == 403
+    assert _call(port, "/api/account/authority/grant", "POST", admin, {**grant, "enabled": False})[0] == 200
+    assert _call(port, "/api/messages/inbox", headers=llama_headers)[1] == {"error": "this needs message"}
+
+
+def test_operator_controls_scoped_last_word_without_opening_intern_writes(server):
+    port = server.port
+    operator, llama, member = (_signup(port, name) for name in ("mode_operator", "mode_llama", "mode_member"))
+    srv.authz_mod.grant_role(server.sessions.accounts_db, "mode_operator", "operator", "operator:test")
+    srv.authz_mod.grant_role(server.sessions.accounts_db, "mode_llama", "intern", "operator:test")
+    control = {**PUBLIC_XFF, "Cookie": operator}
+    intern = {**PUBLIC_XFF, "Cookie": llama}
+    ordinary = {**PUBLIC_XFF, "Cookie": member}
+    path = "/api/hosted-agents/mode_llama/last-word"
+    body = {"scope": "global", "key": "", "mode": "on"}
+    assert _call(port, path + "?scope=global&key=", headers=intern)[1]["effective"] is False
+    assert _call(port, path, "POST", ordinary, body)[0] == 403
+    assert _call(port, path, "POST", intern, body)[0] == 403
+    assert _call(port, path, "POST", {**control, "Origin": "https://elsewhere.example"}, body)[0] == 403
+    assert _call(port, path, "POST", control, body)[1]["effective"] is True
+    assert _call(port, path + "?scope=conversation&key=mode_member", headers=intern)[1]["effective"] is True
+    assert _call(port, path, "POST", control,
+                 {"scope": "conversation", "key": "mode_member", "mode": "off"})[1]["effective"] is False
+    assert _call(port, path + "?scope=conversation&key=mode_member", headers=intern)[1]["effective"] is False
+    assert _call(port, "/api/user-files", headers=intern)[0] == 403
 
 
 def test_a_guest_keeps_pages_game_and_machine_routes_and_nothing_else(server):

@@ -23,6 +23,18 @@ AUDIT_DDL = """CREATE TABLE IF NOT EXISTS account_permission_audit (
     id INTEGER PRIMARY KEY, actor_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
     group_name TEXT NOT NULL, enabled INTEGER NOT NULL, created_at REAL NOT NULL
 )"""
+MODIFIER_DDL = """CREATE TABLE IF NOT EXISTS account_capability_modifiers (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    capability TEXT NOT NULL CHECK(capability IN ('message')),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    actor_id INTEGER NOT NULL REFERENCES users(id),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(user_id, capability)
+)"""
+MODIFIER_AUDIT_DDL = """CREATE TABLE IF NOT EXISTS account_capability_modifier_audit (
+    id INTEGER PRIMARY KEY, actor_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    capability TEXT NOT NULL, enabled INTEGER NOT NULL, created_at REAL NOT NULL
+)"""
 NODUS_DDL = """CREATE TABLE IF NOT EXISTS account_nodus_grants (
     user_id INTEGER PRIMARY KEY REFERENCES users(id),
     granted_by INTEGER NOT NULL REFERENCES users(id),
@@ -34,6 +46,8 @@ def prepare(db):
     db.execute(DDL)
     db.execute(AUDIT_DDL)
     db.execute(NODUS_DDL)
+    db.execute(MODIFIER_DDL)
+    db.execute(MODIFIER_AUDIT_DDL)
 
 
 def authority(db, user_id):
@@ -45,12 +59,14 @@ def authority(db, user_id):
     no implied member group and no dev/operator/nodus grants.
     """
     if user_id is None:
-        return {"highest": None, "direct": [], "groups": [], "service": False}
+        return {"highest": None, "direct": [], "groups": [], "service": False, "modifiers": {}}
     prepare(db)
     role_row = db.execute("SELECT role FROM account_roles WHERE user_id=?", (user_id,)).fetchone()
     role = role_row[0] if role_row else "member"
+    modifiers = {cap: bool(enabled) for cap, enabled in db.execute(
+        "SELECT capability, enabled FROM account_capability_modifiers WHERE user_id=?", (user_id,))}
     if role == KIOSK:
-        return {"highest": KIOSK, "direct": [KIOSK], "groups": [KIOSK], "service": False}
+        return {"highest": KIOSK, "direct": [KIOSK], "groups": [KIOSK], "service": False, "modifiers": modifiers}
     direct = {"member"}
     if role in RANKS:
         direct.add(role)
@@ -60,18 +76,20 @@ def authority(db, user_id):
     groups = [name for name in ORDER if RANKS[name] <= RANKS[highest]]
     nodus = db.execute("SELECT 1 FROM account_nodus_grants WHERE user_id=?", (user_id,)).fetchone() is not None
     return {"highest": highest, "direct": [*sorted(direct, key=RANKS.__getitem__), *(["nodus"] if nodus else [])],
-            "groups": [*groups, *(["nodus"] if nodus else [])], "service": role == "service"}
+            "groups": [*groups, *(["nodus"] if nodus else [])], "service": role == "service", "modifiers": modifiers}
 
 
 def set_grant(db, actor_id, user_id, group_name, enabled):
     """Admin-only caller sets a dev/operator grant; admin uses grant_admin."""
-    if group_name not in ("dev", "operator", "nodus") or type(enabled) is not bool:
-        raise ValueError("expected dev, operator or nodus and boolean enabled")
+    if group_name not in ("dev", "operator", "nodus", "message") or type(enabled) is not bool:
+        raise ValueError("expected dev, operator, nodus or message and boolean enabled")
     actor = authority(db, actor_id)
     if actor["highest"] != "admin":
         raise PermissionError("admin permission group required")
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         raise LookupError("account not found")
+    if group_name == "message":
+        return set_modifier(db, actor_id, user_id, group_name, enabled)
     if enabled and authority(db, user_id)["highest"] == KIOSK:
         raise PermissionError("an intern account takes no permission group; change its role instead")
     if group_name == "nodus":
@@ -89,6 +107,26 @@ def set_grant(db, actor_id, user_id, group_name, enabled):
                    (user_id, group_name))
     db.execute("INSERT INTO account_permission_audit(actor_id,user_id,group_name,enabled,created_at) VALUES(?,?,?,?,?)",
                (actor_id, user_id, group_name, int(enabled), time.time()))
+    return authority(db, user_id)
+
+
+def set_modifier(db, actor_id, user_id, capability, enabled):
+    """Admin-audited, account-specific capability override. Only DM for interns is grantable."""
+    if capability != "message" or type(enabled) is not bool:
+        raise ValueError("expected message and boolean enabled")
+    if authority(db, actor_id)["highest"] != "admin":
+        raise PermissionError("admin permission group required")
+    if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
+        raise LookupError("account not found")
+    target = authority(db, user_id)
+    if target["highest"] != KIOSK:
+        raise PermissionError("message modifier is reserved for intern accounts")
+    db.execute("INSERT INTO account_capability_modifiers(user_id,capability,enabled,actor_id,updated_at) "
+               "VALUES(?,?,?,?,?) ON CONFLICT(user_id,capability) DO UPDATE SET enabled=excluded.enabled, "
+               "actor_id=excluded.actor_id, updated_at=excluded.updated_at",
+               (user_id, capability, int(enabled), actor_id, time.time()))
+    db.execute("INSERT INTO account_capability_modifier_audit(actor_id,user_id,capability,enabled,created_at) "
+               "VALUES(?,?,?,?,?)", (actor_id, user_id, capability, int(enabled), time.time()))
     return authority(db, user_id)
 
 
