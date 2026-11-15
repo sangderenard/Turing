@@ -501,6 +501,16 @@ def make_handler(sessions: Sessions):
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                 pass
 
+        def handle_one_request(self):
+            # [IDENTITY] One handler serves one connection, and behind Apache one backend connection carries many
+            # visitors' requests in turn (see do_POST). The cookies a request is going to set are per request: measured
+            # 2026-11-15, the agent account codex signed in (POST /api/account/login filled _set_cookie with its
+            # meowdoku_account session), and the owner's next GET /api/chat/rooms/agents on the same connection, whose
+            # route never assigns _set_cookie, was answered with codex's session cookie: the owner's browser became codex.
+            # Each request now starts with nothing to set (tests/test_meowdoku_connection_cookies.py).
+            self._set_cookie = []
+            super().handle_one_request()
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(web_dir), **kwargs)
 
