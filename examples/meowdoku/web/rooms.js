@@ -2,7 +2,7 @@
 // decides every permission, this page only decides what to offer.
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
-let who = null, rooms = [], selected = null;
+let who = null, rooms = [], selected = new URLSearchParams(location.search).get("room");   // ?room=NAME opens that room (a menu link)
 
 async function request(path, body) {
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store",
