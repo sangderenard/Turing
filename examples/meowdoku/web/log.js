@@ -1,14 +1,15 @@
 // [LOG] The log page: the server's text ring (/api/log) drawn as GLYPH MESHES in a small instanced scene -- the exported letter/digit
 // token meshes of assets.json (the ones the main page's Phong scene draws), lit by a Phong light.  Only the lines in view, and only the
 // characters on them, become instances; the text itself lives in plain JS strings.
-import { SOURCES, visibleRange, clampScroll, tailScroll, atTail, glyphFor, lineText, matches, searchTerms, groupKeys } from "./log_view.js";
+import { SOURCES, WINDOWS, visibleRange, clampScroll, tailScroll, atTail, glyphFor, lineText, matches, searchTerms, groupKeys } from "./log_view.js";
 import { resetSettings, settingsKeys } from "./settings_reset.js";
 
 const $ = (id) => document.getElementById(id);
-const COLORS = { "client-error": [1.0, 0.48, 0.38], "fountain-diag": [0.42, 0.85, 1.0], "server": [0.62, 0.95, 0.55] };
+const COLORS = { "client-error": [1.0, 0.48, 0.38], "fountain-diag": [0.42, 0.85, 1.0], "login": [1.0, 0.82, 0.35],
+                 "activity": [0.78, 0.6, 1.0], "server": [0.62, 0.95, 0.55] };
 const MAX_ENTRIES = 20000, POLL_MS = 1500;
 
-const S = { entries: [], lines: [], sources: new Set(SOURCES), terms: [], last: 0, follow: true, fontPx: 18,
+const S = { entries: [], lines: [], sources: new Set(SOURCES), terms: [], window: 0, last: 0, follow: true, fontPx: 18,
             scroll: 0, target: 0, scrollX: 0, maxCols: 0, dirty: true, subst: 0, visibleText: [], error: "" };
 try { S.last = Math.max(0, Number(new URLSearchParams(location.search).get("since")) || 0); } catch { /* ordinary log view starts at zero */ }
 window.__log = S;                                   // for tests and the curious
@@ -60,9 +61,9 @@ function rebuildLines() {
   for (const e of S.entries) addLine(e);
 }
 function addLine(e) {
-  if (!matches(e, S.sources, S.terms)) return;
+  if (!matches(e, S.sources, S.terms, S.window ? Date.now() / 1000 - S.window : 0)) return;
   const text = lineText(e);
-  S.lines.push({ text, src: e.src }); if (text.length > S.maxCols) S.maxCols = text.length;
+  S.lines.push({ text, src: e.src, ts: e.ts }); if (text.length > S.maxCols) S.maxCols = text.length;
 }
 function ingest(list) {
   for (const e of list) { S.entries.push(e); addLine(e); S.last = Math.max(S.last, e.seq); }
@@ -78,6 +79,7 @@ async function poll() {
       S.error = "";
       if (j.last < S.last) { S.entries = []; S.last = 0; rebuildLines(); continue; }        // the server restarted without its ring
       ingest(j.entries);
+      if (S.window && S.lines.length && S.lines[0].ts < Date.now() / 1000 - S.window) rebuildLines();   // lines age out of the window
       $("stats").textContent = `${S.lines.length} lines shown / ${S.entries.length} held  (server ring ${(j.bytes / 1024).toFixed(0)} of ${(j.cap / 1024).toFixed(0)} KiB)`;
       if (j.entries.length < 1000) break;
     }
@@ -162,6 +164,15 @@ $("follow").onclick = () => setFollow(!S.follow);
 $("zoomin").onclick = () => { S.fontPx = Math.min(48, S.fontPx + 2); S.dirty = true; };
 $("zoomout").onclick = () => { S.fontPx = Math.max(8, S.fontPx - 2); S.dirty = true; };
 $("q").oninput = (ev) => { S.terms = searchTerms(ev.target.value); rebuildLines(); S.dirty = true; };
+for (const [label, seconds] of WINDOWS) $("window").add(new Option(label, String(seconds)));
+$("window").onchange = (ev) => { S.window = Number(ev.target.value) || 0; rebuildLines(); S.dirty = true; };
+$("people").onclick = () => {                                   // logins and activity only: who signed in, failed, left or came back, and when
+  for (const l of $("srcs").querySelectorAll("label")) {
+    const on = l.dataset.src === "login" || l.dataset.src === "activity", box = l.querySelector("input");
+    box.checked = on; l.className = on ? "on" : ""; on ? S.sources.add(l.dataset.src) : S.sources.delete(l.dataset.src);
+  }
+  rebuildLines(); S.dirty = true;
+};
 async function copy(text, btn) {
   try { await navigator.clipboard.writeText(text); } catch (_) {
     const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove();
@@ -172,7 +183,7 @@ $("copyvis").onclick = (ev) => copy(S.visibleText.join("\n"), ev.target);
 $("copyall").onclick = (ev) => copy(S.lines.map((l) => l.text).join("\n"), ev.target);
 for (const src of SOURCES) {
   const col = COLORS[src].map((v) => Math.round(v * 255)).join(","), l = document.createElement("label");
-  l.className = "on"; l.innerHTML = `<input type="checkbox" checked><span class="sw" style="background:rgb(${col})"></span>${src}`;
+  l.className = "on"; l.dataset.src = src; l.innerHTML = `<input type="checkbox" checked><span class="sw" style="background:rgb(${col})"></span>${src}`;
   l.querySelector("input").onchange = (ev) => { ev.target.checked ? S.sources.add(src) : S.sources.delete(src); l.className = ev.target.checked ? "on" : ""; rebuildLines(); S.dirty = true; };
   $("srcs").appendChild(l);
 }

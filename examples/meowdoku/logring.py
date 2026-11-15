@@ -1,8 +1,9 @@
 """[LOG] A size-capped in-memory ring of the server's text log (and the clients' error beacons), fetched incrementally by sequence.
 
 Every line has a ``seq`` (monotonic for the process, continuing across restarts when the ring is persisted), a timestamp and a source:
-``client-error`` (a page's uncaught error), ``fountain-diag`` (an owner device's 5 s diagnostics) or ``server`` (everything else the
-server prints).  The cap is in BYTES; the oldest lines are dropped first.  ``tee_stdout`` copies what the server prints into the ring
+``client-error`` (a page's uncaught error), ``fountain-diag`` (an owner device's 5 s diagnostics), ``login`` (each sign-in outcome and
+sign-out, filed by ``note_login``), ``activity`` (an account's first request after ``IDLE_SECONDS`` quiet, filed by ``note_activity``)
+or ``server`` (everything else the server prints).  The cap is in BYTES; the oldest lines are dropped first.  ``tee_stdout`` copies what the server prints into the ring
 without changing what reaches stdout.  The ring may hold IPs and user agents: ``GET /api/log`` is for the dev tier and above only.
 """
 from __future__ import annotations
@@ -17,7 +18,8 @@ from pathlib import Path
 DEFAULT_CAP = 2 * 1024 * 1024
 LINE_CAP = 4000                  # one line's text is cut here (a stack trace stays a line)
 OVERHEAD = 48                    # per-entry bytes counted besides the text (seq, timestamp, source)
-SOURCES = ("client-error", "fountain-diag", "server")
+SOURCES = ("client-error", "fountain-diag", "login", "activity", "server")
+IDLE_SECONDS = 600.0             # an account quiet this long is "active" again on its next request (one ``activity`` line, not one per request)
 
 
 def classify(text: str) -> str:
@@ -92,6 +94,27 @@ class Ring:
 
 
 RING = Ring()
+
+
+def note_login(outcome: str, username, client) -> int:
+    """One ``login`` line: ``<outcome> user=<name> client=<address>``; outcome is ok, fail, limited or logout."""
+    name = "".join(ch for ch in str(username).strip().lower()[:64] if ch.isprintable() and not ch.isspace())   # a failed name is caller-typed text
+    return RING.add(f"{outcome} user={name or '-'} client={client or '-'}", source="login")
+
+
+_last_seen: dict = {}
+_seen_lock = threading.Lock()
+
+
+def note_activity(user_id, username, client, now: float | None = None) -> int | None:
+    """Files ``active user=<name> client=<address>`` when this account has been quiet ``IDLE_SECONDS``; otherwise only updates its clock."""
+    now = time.time() if now is None else now
+    with _seen_lock:
+        last = _last_seen.get(user_id)
+        _last_seen[user_id] = now
+    if last is not None and now - last < IDLE_SECONDS:
+        return None
+    return RING.add(f"active user={username} client={client or '-'}", source="activity", ts=now)
 
 
 class _Tee:

@@ -45,6 +45,35 @@ def test_incremental_fetch_and_sources():
     assert [e["src"] for e in ring.fetch(0, sources={"server"})["entries"]] == ["server", "server"]
 
 
+def test_login_and_activity_lines(monkeypatch):
+    monkeypatch.setattr(L, "RING", L.Ring(cap_bytes=10000))
+    monkeypatch.setattr(L, "_last_seen", {})
+    L.note_login("fail", " Ad min\nX ", "1.2.3.4")                          # caller-typed name: no whitespace survives
+    L.note_login("ok", "admin", "1.2.3.4")
+    assert L.note_activity(7, "admin", "1.2.3.4", now=100.0) is not None     # first sight is a line
+    assert L.note_activity(7, "admin", "1.2.3.4", now=100.0 + L.IDLE_SECONDS - 1) is None
+    assert L.note_activity(7, "admin", "1.2.3.4", now=100.0 + 2 * L.IDLE_SECONDS) is not None   # quiet IDLE_SECONDS since the last request
+    got = L.RING.fetch(0, sources={"login", "activity"})["entries"]
+    assert [(e["src"], e["text"]) for e in got] == [
+        ("login", "fail user=adminx client=1.2.3.4"), ("login", "ok user=admin client=1.2.3.4"),
+        ("activity", "active user=admin client=1.2.3.4"), ("activity", "active user=admin client=1.2.3.4")]
+
+
+def test_login_endpoint_files_login_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "RING", L.Ring(cap_bytes=10000))
+    httpd = _server(tmp_path, {"lan": "dev"})
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+        for pw in ("wrong-password", "correcthorse1"):
+            c.request("POST", "/api/account/login", body=json.dumps({"username": "log_cat", "password": pw}),
+                      headers={"Content-Type": "application/json"})
+            c.getresponse().read()
+        texts = [e["text"] for e in L.RING.fetch(0, sources={"login"})["entries"]]
+        assert texts == ["fail user=log_cat client=127.0.0.1", "ok user=log_cat client=127.0.0.1"]
+    finally:
+        httpd.shutdown(); httpd.server_close()
+
+
 def test_persistence_survives_restart(tmp_path):
     p = tmp_path / "ring.jsonl"
     a = L.Ring(cap_bytes=5000, path=p)

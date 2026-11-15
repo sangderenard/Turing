@@ -571,7 +571,10 @@ def make_handler(sessions: Sessions):
                     return sessions.accounts.user_for_token(parts[1])
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
-            return sessions.accounts.user_for_token(token)
+            user = sessions.accounts.user_for_token(token)
+            if user is not None:                                  # [LOG] an `activity` line when this account was quiet IDLE_SECONDS
+                logring_mod.note_activity(user["id"], user["username"], getattr(self, "_client_ip", None))
+            return user
 
         def _set_account_cookie(self, token: str) -> None:
             if not getattr(self, "_set_cookie", None):
@@ -707,6 +710,7 @@ def make_handler(sessions: Sessions):
             try:
                 wait = login_guard_mod.check(db, client, username)
                 if wait:
+                    logring_mod.note_login("limited", username, client)          # [LOG]
                     out = json.dumps({"error": "too many attempts", "retry_after": int(wait)}).encode("utf-8")
                     self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
                     self.send_header("Content-Type", "application/json")
@@ -720,9 +724,11 @@ def make_handler(sessions: Sessions):
                     user = sessions.accounts.login(username, password)
                 except accounts_mod.AccountError:                 # wrong password, unknown user and a malformed name look the same
                     login_guard_mod.record(db, client, username, False)
+                    logring_mod.note_login("fail", username, client)             # [LOG]
                     time.sleep(0.25)
                     return self._json({"error": "wrong username or password"}, HTTPStatus.UNAUTHORIZED)
                 login_guard_mod.record(db, client, username, True)
+                logring_mod.note_login("ok", user["username"], client)           # [LOG]
             finally:
                 db.close()
             self._bind_instance(user["id"])
@@ -3833,7 +3839,11 @@ def make_handler(sessions: Sessions):
             if path0 == "/api/account/logout":
                 from http.cookies import SimpleCookie
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
-                sessions.accounts.logout(jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
+                logout_token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                leaving = sessions.accounts.user_for_token(logout_token)
+                if leaving is not None:                           # [LOG] only a real session's sign-out is a line
+                    logring_mod.note_login("logout", leaving["username"], getattr(self, "_client_ip", None))
+                sessions.accounts.logout(logout_token)
                 self._set_cookie = []
                 self._clear_account_cookie()
                 self._route_set(self._route_stable())             # [ROUTE]

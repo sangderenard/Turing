@@ -32,6 +32,10 @@ const e = { seq: 1, ts: 0, src: "client-error", text: "TypeError boom at page" }
 eq(matches(e, new Set(["client-error"]), searchTerms("boom PAGE")), true, "terms all present");
 eq(matches(e, new Set(["server"]), []), false, "source filtered");
 eq(matches(e, new Set(["client-error"]), searchTerms("nope")), false, "term absent");
+const lg = { seq: 2, ts: 1000, src: "login", text: "ok user=admin client=1.2.3.4" };
+eq(matches(lg, new Set(["login"]), searchTerms("user=admin"), 999), true, "login line inside the window");
+eq(matches(lg, new Set(["login"]), [], 1001), false, "older than the window");
+if (!/^\d\d:\d\d:\d\d LGN ok user=admin/.test(lineText(lg))) fail("login line text " + lineText(lg));
 if (!/^\d\d:\d\d:\d\d ERR TypeError/.test(lineText(e))) fail("line text " + lineText(e));
 globalThis.document = { getElementById: () => null };
 const { settingsKeys, resetSettings } = await import("../examples/meowdoku/web/settings_reset.js");
