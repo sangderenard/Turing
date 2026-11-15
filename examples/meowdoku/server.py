@@ -1903,8 +1903,32 @@ def make_handler(sessions: Sessions):
                     connections = remote_connections.service_for(sessions)
                 except Exception:
                     connections = None              # not configured here: forwarding answers 503, nothing else changes
+            # [REACTIONS] the site's emoji kinds, as published (web_export.emoji_kinds -> emoji_atlas.json); [STICKERS] a
+            # writer's own studio photo: "own" is the photo jobs list's rule (job_library.entries), and the picture is
+            # opened by the marble_photo store itself.
+            def reaction_kinds():
+                try:
+                    atlas = json.loads((Path(web_dir) / "emoji_atlas.json").read_text(encoding="utf-8"))
+                    return [k["name"] for k in atlas.get("kinds", [])[:chat_rooms.MAX_REACTION_KINDS] if isinstance(k, dict)]
+                except (OSError, ValueError):
+                    return []
+
+            def photo_owned(digest):
+                from meowdoku import job_library
+                if sessions.marble_photos is None:
+                    return False
+                keys, account = self._job_identity()
+                digests = sessions.accounts.assets_for_user(account["id"], "marble_photo") if account else ()
+                listed = job_library.entries(sessions.marble_photos, keys, digests)["entries"]
+                return any(e.get("digest") == digest and e.get("state") == "complete" for e in listed)
+
+            def open_photo(digest, name):
+                return sessions.marble_photos.open_artifact(digest, name)
+
             return chat_rooms.http_route(self, path, method, accounts_db=sessions.accounts_db, connections=connections,
-                                         notify=sessions.system_notify, caps_for=caps_for)
+                                         notify=sessions.system_notify, caps_for=caps_for, reaction_kinds=reaction_kinds,
+                                         photo_owned=photo_owned if sessions.marble_photos is not None else None,
+                                         open_photo=open_photo if sessions.marble_photos is not None else None)
 
         def _reviews_route(self, path: str, method: str) -> None:
             """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""

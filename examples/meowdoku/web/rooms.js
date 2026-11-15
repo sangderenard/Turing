@@ -43,7 +43,9 @@ async function load() {
 async function open(name, { quiet = false } = {}) {
   selected = name;
   const panel = byId("room");
-  const typing = panel.contains(document.activeElement) && ["TEXTAREA", "INPUT"].includes(document.activeElement.tagName);
+  const typing = (panel.contains(document.activeElement) && ["TEXTAREA", "INPUT"].includes(document.activeElement.tagName)) ||
+    !!panel.querySelector(".picker:not([hidden]), .quickbar:not([hidden])");        // an open picker is not refreshed away
+  await emojiAtlas();
   if (quiet && typing) return;
   try {
     const tail = encodeURIComponent(byId("tail").value);
@@ -58,20 +60,117 @@ async function open(name, { quiet = false } = {}) {
       li.append(el("span", m.username, "who"));
       if (m.round) li.append(el("span", `round ${m.round}`, "badge round"));          // written at the round table
       li.append(document.createTextNode(m.removed ? "(removed by an admin)" : m.body), el("span", when(m.at), "at"));
+      if (m.sticker && !m.removed) {                                                   // a picture the site made, through the room
+        const picture = document.createElement("img");
+        picture.src = `/api/chat/rooms/${encodeURIComponent(name)}/sticker/${m.id}`; picture.alt = `A sticker from ${m.username}`;
+        picture.className = "sticker"; picture.loading = "lazy";
+        li.append(picture);
+      }
+      if (!m.removed) li.append(reactions(name, m));
       list.append(li);
     }
     if (!messages.length) list.append(el("li", "No message yet.", "muted"));
     const compose = el("div", null, "compose"), text = document.createElement("textarea"), send = el("button", "Send");
-    text.rows = 2; text.maxLength = 4000; text.setAttribute("aria-label", `Message to ${settings.title}`); send.type = "button";
+    text.rows = 2; text.maxLength = 4000; text.setAttribute("aria-label", `Message to ${settings.title} (Enter sends, Shift+Enter starts a new line)`);
+    send.type = "button";
     send.onclick = async () => { if (!text.value.trim()) return;
       try { await request(`/api/chat/rooms/${name}`, { body: text.value }); text.value = ""; await open(name); } catch (error) { status(`Not sent: ${error.message}`); } };
-    compose.append(text, send);
-    panel.append(list, compose);
+    text.addEventListener("keydown", event => {                                        // Enter sends; Shift+Enter is a new line
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); send.click(); }
+    });
+    const sticker = el("button", "Sticker"), picker = stickerPicker(name, text);
+    sticker.type = "button"; sticker.setAttribute("aria-expanded", "false");
+    sticker.onclick = () => { picker.hidden = !picker.hidden; sticker.setAttribute("aria-expanded", String(!picker.hidden)); if (!picker.hidden) picker.load(); };
+    compose.append(text, send, sticker);
+    panel.append(list, compose, picker);
     if (!settings.system) panel.append(roomSet(name, set), ...(isOwner(settings) ? [ownerSettings(name, settings)] : []), forwarding(name, set));
   } catch (error) { panel.replaceChildren(el("p", `The room could not be read: ${error.message}`, "muted")); }
 }
 
 const isOwner = settings => who && (settings.owner_name === who.username || who.role === "admin");
+
+// The site's emoji (web_export.emoji_kinds, published as emoji_atlas.json and its picture emoji_atlas.png): the quick bar.
+// The page holds no list of its own; the server accepts exactly these kinds as reactions.
+let atlas = null;
+async function emojiAtlas() {
+  if (!atlas) {
+    try { atlas = await (await fetch("/emoji_atlas.json", { cache: "no-store" })).json(); } catch (error) { atlas = null; }
+    if (!atlas || !Array.isArray(atlas.kinds)) atlas = { kinds: [], cols: 1, rows: 1 };
+  }
+  return atlas;
+}
+
+function emojiCell(kind, px) {
+  const at = atlas.kinds.findIndex(k => k.name === kind), cell = el("span", null, "emoji");
+  if (at < 0) { cell.textContent = kind; return cell; }
+  Object.assign(cell.style, { width: `${px}px`, height: `${px}px`, backgroundImage: "url(/emoji_atlas.png)",
+    backgroundSize: `${atlas.cols * px}px ${atlas.rows * px}px`,
+    backgroundPosition: `-${(at % atlas.cols) * px}px -${Math.floor(at / atlas.cols) * px}px` });
+  return cell;
+}
+
+// A message's reactions (each kind, how many, who; pressed when one is yours) and the quick bar to add one.
+function reactions(name, m) {
+  const box = el("div", null, "reacts"), mine = kind => (m.reactions?.[kind] || []).includes(who.username);
+  const toggle = async kind => {
+    try { await request(`/api/chat/rooms/${name}/react`, { id: m.id, kind, on: !mine(kind) }); await open(name); }
+    catch (error) { status(`No reaction: ${error.message}`); }
+  };
+  for (const [kind, people] of Object.entries(m.reactions || {})) {
+    const chip = el("button", null, "react"); chip.type = "button"; chip.title = `${kind}: ${people.join(", ")}`;
+    chip.setAttribute("aria-pressed", String(mine(kind))); chip.setAttribute("aria-label", `${kind}, ${people.length}: ${people.join(", ")}`);
+    chip.append(emojiCell(kind, 18), el("span", String(people.length)));
+    chip.onclick = () => toggle(kind);
+    box.append(chip);
+  }
+  if (atlas.kinds.length) {
+    const add = el("button", "+", "react add"), bar = el("div", null, "quickbar");
+    add.type = "button"; add.setAttribute("aria-label", "React with one of the site's emoji"); add.setAttribute("aria-expanded", "false");
+    bar.hidden = true;
+    for (const k of atlas.kinds) {
+      const pick = el("button", null, "react"); pick.type = "button"; pick.title = k.name; pick.setAttribute("aria-label", k.name);
+      pick.append(emojiCell(k.name, 22));
+      pick.onclick = () => toggle(k.name);
+      bar.append(pick);
+    }
+    add.onclick = () => { bar.hidden = !bar.hidden; add.setAttribute("aria-expanded", String(!bar.hidden)); };
+    box.append(add, bar);
+  }
+  return box;
+}
+
+// Stickers: pictures the site made. Yours to post are your own finished studio photos (the server checks they are yours);
+// everyone in the room then sees the one you post, through the room.
+function stickerPicker(name, text) {
+  const picker = el("div", null, "picker");
+  picker.hidden = true;
+  let loaded = false;
+  picker.load = async () => {
+    if (loaded) return;
+    loaded = true;
+    picker.replaceChildren(el("p", "Reading your studio photos…", "muted"));
+    try {
+      const { entries } = await request("/api/marble_photo/jobs");
+      const done = (entries || []).filter(e => e.state === "complete" && e.image);
+      picker.replaceChildren(el("p", done.length ? "Your studio photos: choose one to post as a sticker." :
+        "You have no finished studio photo yet. Take one in the Marble studio.", "muted"));
+      for (const e of done) {
+        const pick = el("button", null, "pick"), thumb = document.createElement("img");
+        pick.type = "button"; pick.setAttribute("aria-label", `Post your photo from ${when(e.created_at)}`);
+        thumb.alt = ""; thumb.loading = "lazy";
+        thumb.src = `/api/marble_photo/image?digest=${encodeURIComponent(e.digest)}&name=${encodeURIComponent(e.image)}`;
+        pick.append(thumb);
+        pick.onclick = async () => {
+          try { await request(`/api/chat/rooms/${name}`, { body: text.value, sticker: { kind: "photo", digest: e.digest, name: e.image } });
+            text.value = ""; picker.hidden = true; await open(name); }
+          catch (error) { status(`Not sent: ${error.message}`); }
+        };
+        picker.append(pick);
+      }
+    } catch (error) { loaded = false; picker.replaceChildren(el("p", `Your studio photos could not be read: ${error.message}`, "muted")); }
+  };
+  return picker;
+}
 
 // The round table (chat_rooms.py): whether it is on, whose turn it is, and, for whoever runs it, the switch. The runner
 // (Start-RoundTable.ps1) starts the agents' seats when it is switched on and stops them when it is switched off.

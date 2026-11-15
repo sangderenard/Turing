@@ -28,7 +28,15 @@ runner (deploy/Start-RoundTable.ps1) watches the switch and runs the agents' sea
 whose turn it is, and a seat may switch the table off when it ends, saying why. While a table is on, every message a seat
 writes in the room is marked with the round it was written in.
 
-Tables in accounts.db (schema module ``chat_rooms`` 3; this module is their one writer):
+REACTIONS AND STICKERS. Anyone who may write in a room reacts to a message with one of the site's emoji: the kinds of the
+published emoji atlas (web_export.emoji_kinds, emoji_atlas.json, the same glyphs the games use), passed in by the host,
+so this module holds no list of its own. A message may carry a sticker instead of, or beside, its text: a picture the site
+made. Today that is one of the writer's own finished studio photos (marble_photo): the host says whether the writer owns
+it (the jobs list's own rule), and the picture is then served to everyone who may enter the room, through the room
+(GET .../sticker/<id>), never by its digest. Nobody posts another account's photo. (The studio's shared catalogue of
+marble objects holds designs, not pictures, so it gives no stickers yet.)
+
+Tables in accounts.db (schema module ``chat_rooms`` 4; this module is their one writer):
     chat_messages      (id, room, user_id, username, body, created, removed_at, removed_by)
     chat_audit         (at, admin, action, message_id)
     chat_room_defs     (room, title, about, owner_id, owner_name, stage, write, objects, bridges, created, updated)
@@ -36,6 +44,8 @@ Tables in accounts.db (schema module ``chat_rooms`` 3; this module is their one 
     chat_grant_calls   (at, grant_id, caller_id, caller, tool, ok)
     chat_tables        (room, state, seats, owner, switched_by, switched_at, turn, round, turn_at, note)   one row per room
     chat_table_marks   (message_id, round)   the round a seat's message was written in, while its table was on
+    chat_reactions     (message_id, user_id, username, kind, at)   one per account and emoji kind
+    chat_stickers      (message_id, kind, digest, name, owner_id)   the picture a message carries
 
 Text is stored stripped and only ever returned as a JSON string. Who is asking always comes from the authenticated session.
 
@@ -46,7 +56,9 @@ wanted, is the site's own, over its authenticated federation; this module keeps 
     GET  /api/chat/rooms                                 the rooms this account may enter
     POST /api/chat/rooms             {room, title, about?, stage?, write?}   make a room (dev level and up)
     GET  /api/chat/rooms/<room>?tail=N|after=ID          its messages, oldest first (a count or all; 20 by default)
-    POST /api/chat/rooms/<room>      {body}              one message
+    POST /api/chat/rooms/<room>      {body, sticker?}    one message; sticker {kind: "photo", digest, name}, your own photo
+    POST /api/chat/rooms/<room>/react     {id, kind, on}   add (on true) or take back your reaction to a message
+    GET  /api/chat/rooms/<room>/sticker/<id>             the picture message <id> carries (PNG)
     GET  /api/chat/rooms/<room>/settings                 its settings, set and sharing (who may enter)
     POST /api/chat/rooms/<room>/settings  {title?, about?, stage?, write?, objects?, bridges?}   the owner changes them
     POST /api/chat/rooms/<room>/access    {visibility, group_id, expected_revision, sign_off}   the owner's sharing
@@ -70,7 +82,11 @@ from contextlib import contextmanager
 
 from meowdoku import schema_version
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+MAX_REACTION_KINDS = 64
+STICKER_KINDS = ("photo",)
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_PHOTO_NAME = re.compile(r"preview-[0-9]{6}\.png\Z")      # marble_photo._IMAGE: a finished photo's picture
 MAX_BODY = 4000
 MAX_TAIL = 1000
 MAX_OBJECTS = 8
@@ -110,6 +126,11 @@ DDL = (
     "seats TEXT NOT NULL, owner TEXT NOT NULL, switched_by TEXT NOT NULL, switched_at REAL NOT NULL, turn TEXT, "
     "round INTEGER NOT NULL DEFAULT 0, turn_at REAL, note TEXT NOT NULL DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS chat_table_marks (message_id INTEGER PRIMARY KEY, round INTEGER NOT NULL)",
+    # version 4: reactions and stickers
+    "CREATE TABLE IF NOT EXISTS chat_reactions (message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT NOT NULL, "
+    "kind TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (message_id, user_id, kind))",
+    "CREATE TABLE IF NOT EXISTS chat_stickers (message_id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('photo')), "
+    "digest TEXT NOT NULL, name TEXT NOT NULL, owner_id INTEGER NOT NULL)",
 )
 
 
@@ -511,17 +532,54 @@ def tail_of(value) -> int:
     return count
 
 
-def post(db, room, *, user_id, username, body, caps=frozenset(), now=None) -> dict:
+def _sticker(value, photo_owned) -> dict:
+    """A sticker the writer may post: {kind: "photo", digest, name}, one of the writer's own finished studio photos
+    (``photo_owned(digest)`` is the host's ownership rule)."""
+    if not isinstance(value, dict) or set(value) != {"kind", "digest", "name"} or value["kind"] not in STICKER_KINDS:
+        raise ChatError('a sticker is {kind: "photo", digest, name}')
+    digest, name = value["digest"], value["name"]
+    if not isinstance(digest, str) or not _HEX64.match(digest) or not isinstance(name, str) or not _PHOTO_NAME.match(name):
+        raise ChatError("a photo sticker names a photo's digest and its picture (preview-NNNNNN.png)")
+    if photo_owned is None or not photo_owned(digest):
+        raise ChatError("a sticker is one of your own studio photos", 403)
+    return {"kind": "photo", "digest": digest, "name": name}
+
+
+def post(db, room, *, user_id, username, body, caps=frozenset(), now=None, sticker=None, photo_owned=None) -> dict:
     _enter(db, room, user_id, caps, write=True)
-    if not isinstance(body, str) or not body.strip() or len(body) > MAX_BODY:
-        raise ChatError(f"a message must be text of 1 to {MAX_BODY} characters")
+    body = "" if body is None and sticker is not None else body
+    if not isinstance(body, str) or len(body) > MAX_BODY or (sticker is None and not body.strip()):
+        raise ChatError(f"a message must be text of 1 to {MAX_BODY} characters (or a sticker)")
+    chosen = _sticker(sticker, photo_owned) if sticker is not None else None
     now = time.time() if now is None else now
     cursor = db.execute("INSERT INTO chat_messages (room, user_id, username, body, created) VALUES (?, ?, ?, ?, ?)",
                         (room, int(user_id), str(username), body.strip(), now))
     running = _table_row(db, room)
     if running and running["state"] == "on" and running["round"] >= 1 and str(username) in running["seats"]:
         db.execute("INSERT INTO chat_table_marks (message_id, round) VALUES (?, ?)", (cursor.lastrowid, running["round"]))
-    return _row(db.execute(_SELECT + " WHERE id = ?", (cursor.lastrowid,)).fetchone())
+    if chosen:
+        db.execute("INSERT INTO chat_stickers (message_id, kind, digest, name, owner_id) VALUES (?, ?, ?, ?, ?)",
+                   (cursor.lastrowid, chosen["kind"], chosen["digest"], chosen["name"], int(user_id)))
+    return _extras(db, [_row(db.execute(_SELECT + " WHERE id = ?", (cursor.lastrowid,)).fetchone())])[0]
+
+
+def _extras(db, rows) -> list:
+    """Each message's reactions ({kind: [usernames]}, when it has any) and its sticker ({kind}, when it carries one; the
+    picture itself is fetched through the room). A removed message keeps neither."""
+    ids = [row["id"] for row in rows if not row["removed"]]
+    if ids:
+        marks = ",".join("?" * len(ids))
+        reactions: dict = {}
+        for message_id, kind, username in db.execute(
+                f"SELECT message_id, kind, username FROM chat_reactions WHERE message_id IN ({marks}) ORDER BY at", ids):
+            reactions.setdefault(message_id, {}).setdefault(kind, []).append(username)
+        stickers = dict(db.execute(f"SELECT message_id, kind FROM chat_stickers WHERE message_id IN ({marks})", ids).fetchall())
+        for row in rows:
+            if row["id"] in reactions:
+                row["reactions"] = reactions[row["id"]]
+            if row["id"] in stickers:
+                row["sticker"] = {"kind": stickers[row["id"]]}
+    return rows
 
 
 def messages(db, room, *, user_id, caps=frozenset(), tail=20, after=None) -> list:
@@ -529,9 +587,70 @@ def messages(db, room, *, user_id, caps=frozenset(), tail=20, after=None) -> lis
     _enter(db, room, user_id, caps)
     if after is not None:
         rows = db.execute(_SELECT + " WHERE room = ? AND id > ? ORDER BY id LIMIT ?", (room, int(after), MAX_TAIL)).fetchall()
-        return [_row(r) for r in rows]
+        return _extras(db, [_row(r) for r in rows])
     rows = db.execute(_SELECT + " WHERE room = ? ORDER BY id DESC LIMIT ?", (room, int(tail))).fetchall()
-    return [_row(r) for r in reversed(rows)]
+    return _extras(db, [_row(r) for r in reversed(rows)])
+
+
+def react(db, room, *, user_id, username, caps=frozenset(), message_id, kind, on=True, kinds=(), now=None) -> dict:
+    """Add (``on``) or take back this account's reaction of ``kind`` to a message of the room. ``kinds`` are the site's
+    emoji kinds (the host reads them from the published emoji atlas). Answers the message's reactions."""
+    _enter(db, room, user_id, caps, write=True)
+    if not isinstance(kind, str) or kind not in kinds:
+        raise ChatError(f"a reaction is one of the site's emoji: {', '.join(kinds) or 'none is published'}")
+    if not isinstance(message_id, int) or isinstance(message_id, bool):
+        raise ChatError("id is a message id")
+    found = db.execute("SELECT removed_at FROM chat_messages WHERE id = ? AND room = ?", (message_id, room)).fetchone()
+    if found is None or found[0] is not None:
+        raise ChatError("no such message in this room", 404)
+    if on is True:
+        db.execute("INSERT OR IGNORE INTO chat_reactions (message_id, user_id, username, kind, at) VALUES (?, ?, ?, ?, ?)",
+                   (message_id, int(user_id), str(username), kind, time.time() if now is None else now))
+    elif on is False:
+        db.execute("DELETE FROM chat_reactions WHERE message_id = ? AND user_id = ? AND kind = ?", (message_id, int(user_id), kind))
+    else:
+        raise ChatError("on must be true or false")
+    reactions: dict = {}
+    for name, who in db.execute("SELECT kind, username FROM chat_reactions WHERE message_id = ? ORDER BY at", (message_id,)):
+        reactions.setdefault(name, []).append(who)
+    return {"id": message_id, "reactions": reactions}
+
+
+def sticker_of(db, room, message_id, *, user_id, caps=frozenset()) -> dict:
+    """The picture a message of the room carries, for anyone who may enter the room: {kind, digest, name}."""
+    _enter(db, room, user_id, caps)
+    found = db.execute("SELECT s.kind, s.digest, s.name FROM chat_stickers s JOIN chat_messages m ON m.id = s.message_id "
+                       "WHERE s.message_id = ? AND m.room = ? AND m.removed_at IS NULL", (int(message_id), room)).fetchone()
+    if found is None:
+        raise ChatError("no such sticker in this room", 404)
+    return {"kind": found[0], "digest": found[1], "name": found[2]}
+
+
+MAX_STICKER_BYTES = 16 << 20
+
+
+def _send_sticker(self, sticker, open_photo):
+    """Stream a sticker's picture (PNG) to someone who may enter its room; the photo's owner chose to post it there."""
+    if open_photo is None:
+        return self._json({"error": "this server offers no stickers"}, 503)
+    try:
+        handle = open_photo(sticker["digest"], sticker["name"])
+    except Exception:
+        return self._json({"error": "the sticker's picture is no longer there"}, 404)
+    try:
+        data = handle.read(MAX_STICKER_BYTES + 1)
+    finally:
+        handle.close()
+    if len(data) > MAX_STICKER_BYTES:
+        return self._json({"error": "the sticker's picture is too large"}, 413)
+    self._set_cookie = []
+    self.send_response(200)
+    self.send_header("Content-Type", "image/png")
+    self.send_header("Content-Length", str(len(data)))
+    self.send_header("Cache-Control", "private, max-age=3600")
+    self.send_header("X-Content-Type-Options", "nosniff")
+    self.end_headers()
+    self.wfile.write(data)
 
 
 def remove(db, message_id, *, admin, now=None) -> dict:
@@ -545,10 +664,14 @@ def remove(db, message_id, *, admin, now=None) -> dict:
     return _row(db.execute(_SELECT + " WHERE id = ?", (int(message_id),)).fetchone())
 
 
-def http_route(self, path, method, *, accounts_db, connections=None, notify=None, caps_for=None):
+def http_route(self, path, method, *, accounts_db, connections=None, notify=None, caps_for=None, reaction_kinds=None,
+               photo_owned=None, open_photo=None):
     """``connections`` is the host's connection service (remote_connections.service_for), or None when there is none:
     forwarding then answers 503. ``notify(usernames, text, kind, ref)`` tells an @mentioned account (mentions.py), and
-    ``caps_for(account)`` gives that account's capabilities, so it is told only of a room it may enter."""
+    ``caps_for(account)`` gives that account's capabilities, so it is told only of a room it may enter.
+    ``reaction_kinds()`` lists the site's emoji kinds (the published emoji atlas); ``photo_owned(digest)`` says whether
+    this request's account owns a studio photo, and ``open_photo(digest, name)`` opens a finished photo's picture (the
+    host's marble_photo store). Without them, reactions and stickers answer 503."""
     import sqlite3
     from urllib.parse import parse_qs
     principal = self._principal()
@@ -579,6 +702,8 @@ def http_route(self, path, method, *, accounts_db, connections=None, notify=None
                 return self._json(tools(db, room, **me))
             if room and rest == ["table"]:
                 return self._json({"table": table(db, room, **me)})
+            if room and len(rest) == 2 and rest[0] == "sticker" and rest[1].isdecimal():
+                return _send_sticker(self, sticker_of(db, room, int(rest[1]), **me), open_photo)
             return self._json({"error": "not found"}, 404)
         if method != "POST":
             return self._json({"error": "not found"}, 404)
@@ -598,13 +723,21 @@ def http_route(self, path, method, *, accounts_db, connections=None, notify=None
             return self._json({"settings": create(db, **me, username=principal.username, **fields)})
         if room and not rest:
             from meowdoku import mentions
-            made = post(db, room, **me, username=principal.username, body=body.get("body"))
+            if body.get("sticker") is not None and photo_owned is None:
+                return self._json({"error": "this server offers no stickers"}, 503)
+            made = post(db, room, **me, username=principal.username, body=body.get("body"), sticker=body.get("sticker"),
+                        photo_owned=photo_owned)
             told = mentions.tell(db, writer_id=principal.user_id, writer=principal.username, body=made["body"],
                                  where=f"the room {room}", answer=f"chat_post room={room}, or /rooms.html?room={room}",
                                  may_read=lambda account: may_enter(db, room, user_id=account["id"],
                                                                     caps=caps_for(account) if caps_for else frozenset()),
                                  notify=notify, kind="room", ref=room)
             return self._json({"message": made, "mentioned": told})
+        if room and rest == ["react"]:
+            if reaction_kinds is None:
+                return self._json({"error": "this server offers no reactions"}, 503)
+            return self._json(react(db, room, **me, username=principal.username, message_id=body.get("id"),
+                                    kind=body.get("kind"), on=body.get("on", True), kinds=tuple(reaction_kinds())))
         if room and rest == ["settings"]:
             return self._json({"settings": configure(db, room, **me, changes=body)})
         if room and rest == ["table"]:
