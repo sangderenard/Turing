@@ -60,6 +60,12 @@ code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
 <button id="suno-call" type="button" disabled>Send this tool call</button>
 <pre id="suno-result" role="status" aria-live="polite"></pre>
 </div>
+<div id="suno-share" hidden>
+<h4>Share this connection</h4>
+<p class="muted">Ticked operator and admin accounts may list and call Suno's tools under this connection. They never see its credentials and cannot disconnect it; every call they make is recorded. Their calls can spend your Suno credits.</p>
+<div id="suno-share-list"></div>
+<p id="suno-share-status" role="status" aria-live="polite"></p>
+</div>
 <div id="suno-radio" hidden>
 <h4>Put one of my songs on the server Radio</h4>
 <p class="muted">Importing offers the selected song to the shared jukebox. The file belongs to your site account. MP3 saves space; FLAC keeps the WAV download losslessly compressed. Radio decodes either through Nodus when it plays.</p>

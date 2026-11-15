@@ -54,6 +54,7 @@ function resetSuno() {
   clearTimeout(sunoTimer);
   sunoTools = []; $("suno-tools").hidden = true;
   radioSongs = []; $("suno-radio").hidden = true; $("suno-radio-song").replaceChildren();
+  $("suno-share").hidden = true; $("suno-share-list").replaceChildren(); $("suno-share-status").textContent = "";
   $("suno-radio-credit").hidden = true; $("suno-radio-status").textContent = "";
   $("suno-authorize").hidden = true; $("suno-authorize").removeAttribute("href");
   $("suno-schema").textContent = ""; $("suno-result").textContent = "";
@@ -110,6 +111,9 @@ function showSunoStatus(data) {
     $("suno-schema").textContent = ""; $("suno-result").textContent = "";
   }
   $("suno-radio").hidden = !["connected", "authorized"].includes(sunoState);
+  const sharing = ["connected", "authorized"].includes(sunoState);
+  if (sharing && $("suno-share").hidden) void loadShares();
+  $("suno-share").hidden = !sharing;
   clearTimeout(sunoTimer);
   if (workingStates.includes(sunoState)) sunoTimer = setTimeout(refreshSuno, 2000);
 }
@@ -128,6 +132,37 @@ async function sunoAction(action, body, consume = showSunoStatus) {
   }
 }
 function refreshSuno() { return sunoAction("status"); }
+// Sharing: the owner ticks which operator and admin accounts may call this connection's tools (connection_shares.py).
+function showShares(data) {
+  if (!data || !Array.isArray(data.accounts)) throw Error("Invalid share list.");
+  $("suno-share-list").replaceChildren();
+  for (const account of data.accounts) {
+    if (!account || typeof account.username !== "string") continue;
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox"; box.checked = account.shared === true;
+    box.addEventListener("change", () => setShare(account.username, box));
+    label.append(box, " " + account.username + " (" + String(account.role) + ")");
+    $("suno-share-list").appendChild(label);
+    $("suno-share-list").appendChild(document.createElement("br"));
+  }
+  $("suno-share-status").textContent = data.accounts.length ? "" : "There are no other operator or admin accounts.";
+}
+async function loadShares() {
+  try { showShares(await sunoRequest("shares")); }
+  catch (error) { $("suno-share-status").textContent = error.message; }
+}
+async function setShare(username, box) {
+  box.disabled = true;
+  try {
+    showShares(await sunoRequest("shares", {account:username, shared:box.checked}));
+    $("suno-share-status").textContent = box.checked ? username + " may now use this connection." :
+      username + " may no longer use this connection.";
+  } catch (error) {
+    box.checked = !box.checked;
+    $("suno-share-status").textContent = error.message;
+  } finally { box.disabled = false; }
+}
 function showTool() {
   const tool = sunoTools[Number($("suno-tool").value)];
   $("suno-schema").textContent = tool ? JSON.stringify(tool, null, 2) : "";

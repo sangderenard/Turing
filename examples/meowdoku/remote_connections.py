@@ -74,6 +74,10 @@ def route(handler, sessions, path, method):
     if owner is None:
         return handler._json({'error': 'sign in first'}, 401)
     action = path.removeprefix('/api/connections/suno/')
+    from meowdoku import connection_shares
+    if path == '/api/connections/suno/' + action and action in connection_shares.ACTIONS:
+        # The owner ticks which operator and admin accounts may use this connection; they call it under the owner.
+        return connection_shares.http_route(handler, sessions, 'suno', action, method, owner, service_for)
     if path != '/api/connections/suno/' + action or action not in {
             'status', 'connect', 'callback', 'tools', 'call', 'disconnect'}:
         return handler._json({'error': 'unknown connection action'}, 404)
