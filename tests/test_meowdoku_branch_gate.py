@@ -232,12 +232,13 @@ def test_a_kept_branch_stays_and_is_never_cleaned(world):
 
 def test_a_change_that_is_not_a_fast_forward_or_has_moved_is_held(world):
     work, db, policy = world["work"], world["db"], world["policy"]
-    head = branch(world, "feature")
-    commit(work, "meanwhile.txt")
+    head = branch(world, "feature", file="shared.txt")
+    commit(work, "shared.txt", "main's own text")         # the default branch changed the same file meanwhile
     run(work, "push", "-q", "origin", "main")
     submit(world, "feature", head, timeout_s=0)
     held = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
     assert held[0]["action"] == "held" and "not a fast-forward" in held[0]["reason"]
+    assert "changed shared.txt" in held[0]["reason"], "the hold names the file both changed"
     assert remote_has(world, "feature") == head and remote_has(world, "main") != head
     other = branch(world, "second", push=True)
     submit(world, "second", "f" * 40, timeout_s=0)
@@ -632,7 +633,11 @@ def test_an_account_declares_its_own_git_identity_and_mismatches_are_named(world
 
 def test_the_landing_queue_lands_only_what_is_asked_and_keeps_why_the_rest_held(world):
     db, policy = world["db"], world["policy"]
-    first, second = branch(world, "first"), branch(world, "second")
+    first = branch(world, "first", file="same.txt")       # both change one file, differently: no merge, the second holds
+    run(world["work"], "checkout", "-q", "-b", "second", "main")
+    second = commit(world["work"], "same.txt", "the second's own text")
+    run(world["work"], "push", "-q", "origin", "second")
+    run(world["work"], "checkout", "-q", "main")
     one, two = submit(world, "first", first, timeout_s=0), submit(world, "second", second, timeout_s=0)
     assert [r["id"] for r in branch_review.queue(db, now=1000.0)] == [one["id"], two["id"]]
     done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[two["id"]])
@@ -877,7 +882,11 @@ def test_a_landing_run_fetches_each_repository_once_and_still_lands_a_chain(worl
     second = commit(work, "second.txt")
     run(work, "push", "-q", "origin", "second")
     run(work, "checkout", "-q", "main")
-    for name, head in (("first", first), ("second", second), ("third", branch(world, "third"))):
+    run(work, "checkout", "-q", "-b", "third", "main")      # third changes first.txt as well, with its own text
+    third = commit(work, "first.txt", "third's own text")
+    run(work, "push", "-q", "origin", "third")
+    run(work, "checkout", "-q", "main")
+    for name, head in (("first", first), ("second", second), ("third", third)):
         submit(world, name, head, timeout_s=0)
     fetches = []
     real = branch_gate.git
@@ -890,7 +899,7 @@ def test_a_landing_run_fetches_each_repository_once_and_still_lands_a_chain(worl
     done = actions(branch_gate.land(policy, db, apply=True, log=lambda line: None))
     assert len(fetches) == 1, "one fetch for the one repository, not one per change"
     assert done["first"] == "landed" and done["second"] == "landed", "a chain lands in one run: the push moved the tracked base"
-    assert done["third"] == "held" and remote_has(world, "main") == second
+    assert done["third"] == "held" and remote_has(world, "main") == second, "third changed first.txt too: held, not merged"
 
 
 def test_a_worktree_the_cleaner_cannot_read_is_kept_and_never_lets_a_prune_drop_it(world, monkeypatch, tmp_path):
@@ -927,3 +936,54 @@ def test_an_unreadable_folder_is_never_reported_gone(monkeypatch, tmp_path):
     monkeypatch.setattr(os, "listdir", denied)
     assert branch_gate.folder_state(str(folder)) == "unreadable"
     assert branch_gate.folder_state(str(tmp_path / "nothing")) == "gone"
+
+
+def parents_of(world, ref):
+    return run(world["remote"], "rev-list", "--parents", "-n", "1", ref).split()[1:]
+
+
+def test_a_change_that_touches_no_file_main_changed_lands_as_a_merge_of_the_reviewed_commit(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    head = branch(world, "feature")                         # adds feature.txt
+    before = commit(work, "meanwhile.txt")                  # main moves meanwhile, in another file
+    run(work, "push", "-q", "origin", "main")
+    made = submit(world, "feature", head, timeout_s=0)
+    dry = branch_gate.land(policy, db, apply=False, now=1000.0, log=lambda line: None)
+    assert dry[0]["action"] == "would land" and "merged onto main" in dry[0]["reason"]
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "landed", done[0]["reason"]
+    landed = remote_has(world, "main")
+    assert landed not in (head, before) and parents_of(world, landed) == [before, head], \
+        "a merge whose second parent is exactly the reviewed commit"
+    files = set(run(world["remote"], "ls-tree", "--name-only", landed).split())
+    assert {"base.txt", "meanwhile.txt", "feature.txt"} <= files
+    record = branch_review.get(db, made["id"])
+    assert record["standing"] == "landed" and "second parent" in record["landed_detail"]
+    assert "SpeakToMe lander" in run(world["remote"], "log", "-1", "--format=%an", landed)
+
+
+def test_the_push_check_accepts_the_landers_merge_and_nothing_dressed_as_one(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    assert branch_gate.install_hooks(policy, world["policy_file"], world["db_file"], log=lambda line: None) == [("work", "installed")]
+    head = branch(world, "feature")
+    made = submit(world, "feature", head)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    other = branch(world, "elsewhere")
+    second = submit(world, "elsewhere", other)
+    branch_review.decide(db, second["id"], user_id=ADMIN, username="admin", head=other, decision="approved")
+    first = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[second["id"]])
+    assert actions(first) == {"elsewhere": "landed"}
+    tip = remote_has(world, "main")
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[made["id"]])
+    assert actions(done) == {"feature": "landed"}, done
+    merged = remote_has(world, "main")
+    assert parents_of(world, merged) == [tip, head], "the installed hook let the lander's merge through"
+    run(work, "fetch", "-q", "origin")
+    lines = lambda sha: [f"{sha} {sha} refs/heads/main {merged}"]
+    tree = run(work, "rev-parse", f"{head}^{{tree}}")
+    forged = run(work, "commit-tree", tree, "-p", merged, "-p", head, "-m", "dressed as a landing")
+    assert branch_gate.check_push(policy, db, "work", lines(forged), 1000.0, path=work), "a merge with another tree is refused"
+    stray = branch(world, "stray")
+    unreviewed = run(work, "commit-tree", run(work, "rev-parse", f"{stray}^{{tree}}"), "-p", merged, "-p", stray, "-m", "x")
+    assert branch_gate.check_push(policy, db, "work", lines(unreviewed), 1000.0, path=work), "a second parent nobody accepted"
+    branch_gate.install_hooks(policy, world["policy_file"], world["db_file"], remove=True, log=lambda line: None)

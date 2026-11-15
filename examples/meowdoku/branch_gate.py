@@ -574,6 +574,30 @@ def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None, trigge
     return results
 
 
+LANDER_IDENTITY = ("SpeakToMe lander", "lander@speaktome.invalid")   # the author of a landing merge, never a person
+
+
+def landing_merge(path, base, head):
+    """(tree, None) when ``head`` can land on ``base`` as a merge that changes nothing it was approved as: since their
+    common ancestor, the change and the default branch touch no file in common, so the merged tree is the default branch's
+    files plus exactly the reviewed change. Otherwise (None, why). The tree is made without a working folder
+    (git merge-tree --write-tree), so the same answer comes from the lander and from the push check."""
+    ancestor = git(path, "merge-base", base, head, check=False)
+    if not ancestor:
+        return None, "it has no common ancestor with the default branch"
+    moved = set(git(path, "diff", "--name-only", "--no-renames", ancestor, base).splitlines())
+    changed = set(git(path, "diff", "--name-only", "--no-renames", ancestor, head).splitlines())
+    shared = sorted(moved & changed)
+    if shared:
+        return None, f"both it and the default branch changed {', '.join(shared[:5])}{' ...' if len(shared) > 5 else ''}"
+    done = subprocess.run(["git", "-C", str(path), "merge-tree", "--write-tree", base, head], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
+    tree = done.stdout.split("\n", 1)[0].strip()
+    if done.returncode != 0 or len(tree) != 40:
+        return None, f"git could not merge it cleanly ({(done.stderr or done.stdout).strip()[-200:]})"
+    return tree, None
+
+
 def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> list:
     now = time.time() if now is None else now
     wanted = None if only is None else {str(review_id) for review_id in only}
@@ -610,21 +634,39 @@ def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> li
                     raise GateError("the branch is not at the reviewed commit, here or on the remote; submit the commit it is at")
                 if apply:                        # the author never pushed: this tool does the talking to GitHub
                     git(path, "push", remote, f"{review['head']}:refs/heads/{review['branch']}")
+            landing, how = review["head"], f"a fast-forward of {review['base']}"
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
                               capture_output=True).returncode != 0:
-                raise GateError(f"not a fast-forward of {review['base']}; merge {review['base']} into the branch and submit again")
+                # Not a fast-forward: the default branch moved after the change was made. When the two touch no file in
+                # common, the reviewed commit lands unchanged as the second parent of a merge whose tree is exactly the
+                # default branch plus that change; anything else is held, for its author to bring up to date.
+                tree, why = landing_merge(path, base, review["head"])
+                if tree is None:
+                    raise GateError(f"not a fast-forward of {review['base']}, and {why}; merge {review['base']} into "
+                                    f"the branch and submit again")
+                how = f"merged onto {review['base']} (no file in common with what landed meanwhile)"
+                if apply:
+                    tip = git(path, "rev-parse", base)
+                    message = (f"Land {review['branch']} (review {review['id'][:8]}) onto {review['base']}\n\n"
+                               f"{review['base']} moved after this change was made, and since their common ancestor the two "
+                               f"touch no file in common, so the reviewed commit {review['head'][:12]} is merged exactly as "
+                               f"it was accepted ({review['standing']}).")
+                    landing = git(path, "-c", f"user.name={LANDER_IDENTITY[0]}", "-c", f"user.email={LANDER_IDENTITY[1]}",
+                                  "commit-tree", tree, "-p", tip, "-p", review["head"], "-m", message)
             authors = [line for line in git(path, "log", "--format=%an <%ae>", f"{base}..{review['head']}").splitlines() if line]
             authors = list(dict.fromkeys(authors))
             authorship = branch_review.authorship(db, review, authors)
             if not apply:
-                entry.update(action="would land", reason=f"{review['standing']}; a fast-forward of {review['base']}")
+                entry.update(action="would land", reason=f"{review['standing']}; {how}")
             else:
                 # The record on GitHub: a pull request naming who submitted and who accepted, opened before the push
                 # so that GitHub marks it merged when the fast-forward arrives. A remote that is not GitHub has none.
                 slug = github_slug(path, remote)
                 pull = record_pull_request(slug, review, authors, authorship=authorship, gh=gh) if slug else None
-                git(path, "push", remote, f"{review['head']}:refs/heads/{review['base']}")
-                detail = f"{review['base']} is at {review['head'][:12]}"
+                git(path, "push", remote, f"{landing}:refs/heads/{review['base']}")
+                detail = f"{review['base']} is at {landing[:12]}"
+                if landing != review["head"]:
+                    detail += f" ({how}; the reviewed commit {review['head'][:12]} is its second parent)"
                 if pull:
                     detail += f"; {pull}"
                 detail += f"; authors {', '.join(authors) or 'none'}; {authorship}"
@@ -651,8 +693,21 @@ def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> li
     return results
 
 
-def check_push(policy, db, repository, lines, now=None) -> list:
-    """The refusals for one push (empty when it may go): a default branch moves only to a commit a review accepts."""
+def _is_landing_merge(path, db, repository, default, sha, old, now) -> bool:
+    """A merge the lander makes (landing_merge): two parents, the first the default branch as it was, the second a
+    commit a review accepts, and a tree exactly what landing_merge makes of them. Checked by recomputing it."""
+    if path is None or set(old) == {"0"}:
+        return False
+    parents = git(path, "rev-list", "--parents", "-n", "1", sha, check=False).split()
+    if len(parents) != 3 or parents[1] != old or not branch_review.accepted_head(db, repository, default, parents[2], now):
+        return False
+    tree, _ = landing_merge(path, parents[1], parents[2])
+    return tree is not None and tree == git(path, "rev-parse", f"{sha}^{{tree}}", check=False)
+
+
+def check_push(policy, db, repository, lines, now=None, path=None) -> list:
+    """The refusals for one push (empty when it may go): a default branch moves only to a commit a review accepts, or to
+    the lander's merge of one (``path``: the repository, to recompute that merge)."""
     declared = policy["repositories"][repository]
     target = f"refs/heads/{declared['default']}"
     refused = []
@@ -663,7 +718,8 @@ def check_push(policy, db, repository, lines, now=None) -> list:
         sha = parts[1]
         if set(sha) == {"0"}:
             refused.append(f"{declared['default']} is never deleted")
-        elif not branch_review.accepted_head(db, repository, declared["default"], sha, now):
+        elif not branch_review.accepted_head(db, repository, declared["default"], sha, now) and \
+                not _is_landing_merge(path, db, repository, declared["default"], sha, parts[3], now):
             refused.append(f"{sha[:12]} has no accepted review")
     return refused
 
@@ -769,7 +825,7 @@ def main(argv=None) -> int:
                 return 0
             if args.command == "check-push":
                 name = args.repository or repository_of(policy, os.getcwd())
-                refused = check_push(policy, db, name, sys.stdin.read().splitlines()) if name else []
+                refused = check_push(policy, db, name, sys.stdin.read().splitlines(), path=os.getcwd()) if name else []
                 mock = policy["lock"] != "enforce"
                 for line in refused:
                     print(f"{'would be refused' if mock else 'refused'}: {line}", file=sys.stderr)
