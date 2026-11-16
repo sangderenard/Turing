@@ -21,6 +21,9 @@ from http.cookies import SimpleCookie
 CODE_LIFETIME = 300
 TOKEN_LIFETIME = 3600
 MAX_JSON = 1 << 20
+MAX_MCP_SESSIONS = 128
+MAX_GUEST_SESSIONS = 96
+MCP_SESSION_IDLE = 600.0
 
 
 def _digest(value: str) -> str:
@@ -84,7 +87,7 @@ class OAuthMCP:
         self.db.commit()
         self.servers = {}
         self.register_hits = {}
-        self.guest_hits = {}
+        self.server_used = {}
 
     def user_for_token(self, token):
         if not isinstance(token, str) or not 20 <= len(token) <= 256 or not token.isascii():
@@ -300,6 +303,7 @@ class OAuthMCP:
                 if entry is None or entry[:3] != (identity, handler._origin, handler._tier):
                     return _json(handler, 404, {"error": "MCP session not found"})
                 del self.servers[session_id]
+                self.server_used.pop(session_id, None)
             return _response(handler, 204, b"")
         if method == "GET":
             return _response(handler, 405, b"", headers=[("Allow", "POST, DELETE")])
@@ -326,17 +330,19 @@ class OAuthMCP:
             if session_id is not None:
                 return _json(handler, 400, {"error": "initialize must start a new session"})
             with self.lock:
+                now = time.monotonic()
+                for expired, used in tuple(self.server_used.items()):
+                    if now - used >= MCP_SESSION_IDLE:
+                        self.servers.pop(expired, None)
+                        del self.server_used[expired]
+                if (len(self.servers) >= MAX_MCP_SESSIONS or
+                    (guest and sum(entry[0] == "guest" for entry in self.servers.values()) >= MAX_GUEST_SESSIONS)):
+                    return _json(handler, 503, {"error": "MCP session capacity reached"}, [("Retry-After", "10")])
                 from meowdoku import rest_api
                 rest_api._load("speaktome_mcp")
                 from speaktome_mcp.api import ApiServer
                 from speaktome_mcp.http import BearerRest, PreviewRest
                 if guest:
-                    peer, now = handler._client_ip, time.time()
-                    hits = [at for at in self.guest_hits.get(peer, []) if now - at < 3600]
-                    if len(hits) >= 30:
-                        return _json(handler, 429, {"error": "guest session limit reached"})
-                    hits.append(now)
-                    self.guest_hits[peer] = hits
                     preview = self.accounts.create_preview()
                     preview_token = self.accounts.create_session(preview["id"])
                     rest = PreviewRest(f"https://127.0.0.1:{handler.server.server_port}", preview_token,
@@ -345,15 +351,16 @@ class OAuthMCP:
                     rest = BearerRest(f"https://127.0.0.1:{handler.server.server_port}", token,
                                       handler._origin, handler._tier, ca_file=self.loopback_ca)
                 session_id = secrets.token_urlsafe(32)
-                if len(self.servers) >= 128:
-                    self.servers.clear()
                 entry = (identity, handler._origin, handler._tier, threading.Lock(), ApiServer(rest))
                 self.servers[session_id] = entry
+                self.server_used[session_id] = now
         else:
             if session_id is None:
                 return _json(handler, 400, {"error": "MCP-Session-Id required"})
             with self.lock:
                 entry = self.servers.get(session_id)
+                if entry is not None:
+                    self.server_used[session_id] = time.monotonic()
             if entry is None or entry[:3] != (identity, handler._origin, handler._tier):
                 return _json(handler, 404, {"error": "MCP session not found"})
         _, _, _, lock, server = entry
