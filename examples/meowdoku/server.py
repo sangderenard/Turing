@@ -3048,6 +3048,9 @@ def make_handler(sessions: Sessions):
                 return
             if path.startswith("/api/guest/"):
                 return self._guest_route(path, "GET")
+            if path == "/api/palette":
+                from meowdoku import palette_feedback
+                return palette_feedback.route(self, path, "GET", accounts_db=sessions.accounts_db)
             if path.startswith("/api/hosted-agents/") and path.endswith("/last-word"):
                 from meowdoku import hosted_agent_modes
                 return hosted_agent_modes.http_route(self, path, "GET", accounts_db=sessions.accounts_db)
@@ -3645,7 +3648,7 @@ def make_handler(sessions: Sessions):
                     return sessions.oauth_mcp.mcp(self, "POST", guest=True)
             if self._principal().role == "trial" and path0 not in (
                     "/api/account/keep", "/api/account/logout", "/api/account/login", "/api/account/signup",
-                    "/api/guest/tests", "/api/guest/submissions"):
+                    "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
                 return
@@ -3653,6 +3656,9 @@ def make_handler(sessions: Sessions):
                 return
             if path0.startswith("/api/guest/"):
                 return self._guest_route(path0, "POST")
+            if path0 in ("/api/palette/rank", "/api/palette/feedback"):
+                from meowdoku import palette_feedback
+                return palette_feedback.route(self, path0, "POST", accounts_db=sessions.accounts_db)
             if path0.startswith("/api/hosted-agents/") and path0.endswith("/last-word"):
                 from meowdoku import hosted_agent_modes
                 return hosted_agent_modes.http_route(self, path0, "POST", accounts_db=sessions.accounts_db)

@@ -6,11 +6,11 @@
 <title>Pages · Meowdoku</title>
 <style>
   :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
-  body { margin: 0; background: #121822; color: #edf2fb; }
+  body { margin: 0; background: radial-gradient(circle at 90% 0%, color-mix(in srgb, var(--palette-accent, #4b6888) 28%, #121822), #121822 32rem); color: #edf2fb; }
   main { max-width: 56rem; margin: auto; padding: 2rem 1rem 5rem; }
-  a { color: #a9cfff; }
+  a { color: var(--palette-accent, #a9cfff); }
   .row { display: flex; gap: .7rem; align-items: center; flex-wrap: wrap; }
-  .card { border: 1px solid #34455c; border-radius: 12px; padding: 1rem; margin: 1rem 0; background: #1a2534; }
+  .card { border: 1px solid color-mix(in srgb, var(--palette-accent, #34455c) 40%, #34455c); border-radius: 12px; padding: 1rem; margin: 1rem 0; background: #1a2534; }
   .card h2 { margin: .1rem 0 .4rem; }
   .muted { color: #becbe0; }
   button, input, select, textarea { font: inherit; color: inherit; background: #101a29; border: 1px solid #506582; border-radius: 6px; padding: .45rem; }
@@ -36,7 +36,7 @@
 <main>
   <header class="mast"><div class="mast-copy"><div class="eyebrow">Meowdoku · made here</div><h1>Pages from people</h1>
     <p class="muted">Games, experiments, and places their authors chose to publish. Open a creator to explore more.</p></div>
-    <nav class="quick-links" aria-label="Pages"><a href="/">Public feed</a><a id="games-link" href="/games.html" hidden>Built-in games</a><a id="files-link" href="/files.html" hidden>My files</a></nav></header>
+    <nav class="quick-links" aria-label="Pages"><a href="/">Public feed</a><a href="/palette.html">Color game</a><a id="games-link" href="/games.html" hidden>Built-in games</a><a id="files-link" href="/files.html" hidden>My files</a></nav></header>
   <p id="notice" role="status"></p>
   <section id="author-heading" hidden><div class="section-head"><h2 id="author-title"></h2><a href="/">All authors</a></div></section>
   <section aria-label="Released pages"><div class="section-head"><div><h2>Public feed</h2><p>Released pages anyone can visit.</p></div><span class="views" role="group" aria-label="View"><button id="view-icons" type="button" aria-pressed="true">Icons</button><button id="view-thread" type="button" aria-pressed="false">Thread</button></span><span id="release-count" class="count"></span></div>
@@ -59,6 +59,7 @@
   </section>
 </main>
 <script type="module" src="/pages.js"></script>
+<script type="module">import {loadPersonalPalette} from "/palette-theme.js"; loadPersonalPalette();</script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>
 </body>
 </html>

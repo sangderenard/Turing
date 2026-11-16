@@ -127,7 +127,14 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         response, body = call("POST", "/mcp/guest", listing, guest_headers)
         names = {tool["name"] for tool in json.loads(body)["result"]["tools"]}
         assert {"guest_tasks", "guest_test_submit", "guest_post_submit"} <= names
+        assert {"palette_state", "palette_rank", "palette_feedback"} <= names
         assert "chat_post" not in names and "checkout_open" not in names
+        palette = guest_tool("palette_state", {}, 120)
+        rank = [swatch["id"] for swatch in palette["data"]["swatches"]][::-1]
+        palette = guest_tool("palette_rank", {"ranking": rank}, 121)
+        assert palette["data"]["candidate"] is not None
+        palette = guest_tool("palette_feedback", {"rating": "good", "nonce": palette["data"]["candidate"]["nonce"]}, 122)
+        assert sum(entry["good"] for entry in palette["data"]["feedback"].values()) == 1
         tasks = [
             ("policy_awareness", "Hate speech and overt sexual text are refused. Ordinary swearing can be okay. Pending posts stay private."),
             ("programming", "Use a set, walk the list, and return the first element already seen; return None when all differ."),
