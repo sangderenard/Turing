@@ -447,7 +447,8 @@ def emoji_kinds() -> list[dict]:
               {"name": "bat", "glyph": DELVE_EMOJI["bat"], "color": [0.55, 0.42, 0.7]},
               {"name": "wolf", "glyph": TILE_EMOJI["wolf"], "color": [0.62, 0.64, 0.7]},
               {"name": "fish", "glyph": "\U0001F41F", "color": [0.98, 0.62, 0.2]},
-              {"name": "crab", "glyph": INVADER_EMOJI["crab"], "color": [0.9, 0.3, 0.22]}]
+              {"name": "crab", "glyph": INVADER_EMOJI["crab"], "color": [0.9, 0.3, 0.22]},
+              {"name": "llama", "glyph": "\U0001F999", "color": [0.86, 0.78, 0.62]}]
     for kind in kinds:
         kind["mesh"] = f"emoji_{kind['name']}"
     return kinds
