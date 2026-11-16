@@ -19,6 +19,8 @@ prebaked board database) and a JSON API over the games in ``games.py``:
     POST /api/profile {"name": "..."}      -> pick this session's player profile
     GET  /api/profile                      -> the profile, and the current game's top scores
     POST /api/account/signup {"username","password", alpha agreement}  -> create a real login, own this browser's content
+    POST /api/account/preview {}  -> seven-day read-only cookie account
+    POST /api/account/keep {"username","password", alpha agreement}  -> keep the preview
     POST /api/account/login  {"username","password"}  -> real login (accounts.py; separate from /api/profile)
     POST /api/account/logout {}
     GET  /api/account/me                   -> the logged-in account, or null
@@ -594,12 +596,12 @@ def make_handler(sessions: Sessions):
                 logring_mod.note_activity(user["id"], user["username"], getattr(self, "_client_ip", None))
             return user
 
-        def _set_account_cookie(self, token: str) -> None:
+        def _set_account_cookie(self, token: str, max_age: int = accounts_mod.SESSION_SECONDS) -> None:
             if not getattr(self, "_set_cookie", None):
                 self._set_cookie = []
             secure = "; Secure" if self._is_secure() else ""
             self._set_cookie.append(
-                f"{ACCOUNT_COOKIE}={token}; Path=/; Max-Age={accounts_mod.SESSION_SECONDS}; HttpOnly; SameSite=Lax{secure}")
+                f"{ACCOUNT_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}")
 
         def _clear_account_cookie(self) -> None:
             if not getattr(self, "_set_cookie", None):
@@ -890,7 +892,8 @@ def make_handler(sessions: Sessions):
         # sends route b to the Development server).  Two shared instances of the whole service.  Not the dev page vs shader page (access tier
         # + role) and not a per-user leased server.  Stored preference values: 'stable' | 'dev'.
         _ROUTE_OPEN = ("/login.html", "/login.js", "/register.html", "/register.js", "/api/account/login",
-                       "/api/account/signup", "/api/account/logout", "/api/account/me", "/api/whoami", "/api/route", "/site-nav.js")
+                       "/api/account/signup", "/api/account/preview", "/api/account/keep", "/api/account/logout",
+                       "/api/account/me", "/api/whoami", "/api/route", "/site-nav.js")
 
         def _route_stable(self) -> str:
             return getattr(sessions, "stable_route", "") or "a"
@@ -3217,7 +3220,7 @@ def make_handler(sessions: Sessions):
             if path == "/api/account/me":
                 self._set_cookie = []
                 account = self._account()
-                role = authz_mod.role_of(sessions.accounts_db, account["id"]) if account else "guest"
+                role = ("trial" if account.get("temporary") else authz_mod.role_of(sessions.accounts_db, account["id"])) if account else "guest"
                 return self._json({"account": account, "role": role,
                                    "instance": self._instance_of(account["id"] if account else None)})
             if path == "/api/account/assets":
@@ -3487,6 +3490,9 @@ def make_handler(sessions: Sessions):
         def _do_post(self):
             path0 = self.path.split("?", 1)[0]
             self._classify()                                      # [KIOSK] first: no POST route answers an intern unless declared kiosk
+            if self._principal().role == "trial" and path0 not in (
+                    "/api/account/keep", "/api/account/logout", "/api/account/login", "/api/account/signup"):
+                return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
                 return
             if self._route_gate(path0, "POST"):                   # [ROUTE]
@@ -3833,6 +3839,45 @@ def make_handler(sessions: Sessions):
                     return self._json(sessions.marble_photos.cancel(digest))
                 except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 in ("/api/account/preview", "/api/account/keep"):
+                self._set_cookie = []
+                if self.headers.get("X-Meowdoku-Preview") != "1" or not (
+                        self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                    return self._json({"error": "expected a same-site preview request"}, HTTPStatus.BAD_REQUEST)
+                body = self._body_json(1024)
+                if body is None:
+                    return
+                account = self._account()
+                if path0.endswith("preview"):
+                    if account is not None:
+                        return self._json({"error": "already signed in"}, HTTPStatus.CONFLICT)
+                    user = sessions.accounts.create_preview()
+                    self._set_account_cookie(sessions.accounts.create_session(user["id"]),
+                                             accounts_mod.PREVIEW_SECONDS)
+                    return self._json({"account": user}, HTTPStatus.CREATED)
+                if account is None or not account.get("temporary"):
+                    return self._json({"error": "a live preview is required"}, HTTPStatus.UNAUTHORIZED)
+                if (body.get("alpha_terms_version") != accounts_mod.ALPHA_TERMS_VERSION or
+                        any(body.get(key) is not True for key in
+                            ("agree_mit", "agree_observation", "agree_research"))):
+                    return self._json({"error": "agree to the current MIT, observation, and research terms to keep this account"},
+                                      HTTPStatus.BAD_REQUEST)
+                try:
+                    user = sessions.accounts.keep_preview(
+                        account["id"], str(body.get("username", "")), str(body.get("password", "")),
+                        alpha_terms_version=body["alpha_terms_version"])
+                except accounts_mod.AccountError as error:
+                    return self._json({"error": str(error)}, error.status)
+                sessions.introduce_agents(user["id"])
+                self._bind_instance(user["id"])
+                from http.cookies import SimpleCookie
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                held = jar[PLAYER_COOKIE].value if PLAYER_COOKIE in jar else None
+                name = sessions.profiles.by_token(held) if held else None
+                if name:
+                    sessions.accounts.claim(user["id"], "profile", name)
+                self._set_account_cookie(sessions.accounts.create_session(user["id"]))
+                return self._json({"account": user}, HTTPStatus.OK)
             if path0 == "/api/account/login":
                 return self._login_post()
             if path0 in ("/api/account/signup", "/api/account/login"):

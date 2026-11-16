@@ -7,7 +7,7 @@ Studio marble designs and marble photos, and that can carry forward the
 browser's existing passwordless profile (its game stats/inventory) on first
 signup or login, so nothing already played is lost by creating an account.
 
-One SQLite file (``accounts.db``) under the given directory. Four tables:
+One SQLite file (``accounts.db``) under the given directory. Five tables:
 
 ``users``        -- the login identity: username, salted password hash.
 ``sessions``      -- bearer tokens for the account cookie (a different
@@ -23,6 +23,7 @@ One SQLite file (``accounts.db``) under the given directory. Four tables:
                      shape.
 ``alpha_agreements`` -- the terms version and acceptance time for an account
                        created through the alpha request form.
+``temporary_accounts`` -- the seven-day expiry for a read-only preview; absence means the account is kept.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
 USERNAME = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
 MIN_PASSWORD = 8
 SESSION_SECONDS = 30 * 24 * 3600
+PREVIEW_SECONDS = 7 * 24 * 3600
 ALPHA_TERMS_VERSION = "alpha-2026-11-15"
 # scrypt cost parameters: the stdlib default-ish "interactive" tuning (~tens
 # of milliseconds per hash on ordinary hardware) -- real KDF stretching, not
@@ -107,8 +109,12 @@ class Accounts:
                 terms_version TEXT NOT NULL,
                 accepted_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS temporary_accounts (
+                user_id INTEGER PRIMARY KEY,
+                expires_at REAL NOT NULL
+            );
         """)
-        _schema_version.declare(self._conn, "accounts", 2)
+        _schema_version.declare(self._conn, "accounts", 3)
         self._conn.commit()
 
     # ---- identity -----------------------------------------------------------
@@ -144,6 +150,63 @@ class Accounts:
                 raise
             return {"id": cursor.lastrowid, "username": username}
 
+    def create_preview(self) -> dict:
+        """Create a read-only account with a random password known only to the server."""
+        now = time.time()
+        expires = now + PREVIEW_SECONDS
+        with self.lock:
+            while True:
+                username = "look_" + secrets.token_hex(6)
+                if not self._conn.execute(
+                    "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone():
+                    break
+            try:
+                cursor = self._conn.execute(
+                    "INSERT INTO users (username, password_hash, display_name, created_at) VALUES (?, ?, ?, ?)",
+                    (username, _hash_password(secrets.token_urlsafe(32)), username, now))
+                self._conn.execute("INSERT INTO temporary_accounts (user_id, expires_at) VALUES (?, ?)",
+                                   (cursor.lastrowid, expires))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return {"id": cursor.lastrowid, "username": username, "temporary": True, "expires_at": expires}
+
+    def keep_preview(self, user_id: int, username: str, password: str, *, alpha_terms_version: str) -> dict:
+        """Convert a live preview to a normal account with a chosen login."""
+        username = self._clean_username(username)
+        if alpha_terms_version != ALPHA_TERMS_VERSION:
+            raise AccountError("the alpha terms have changed; reload registration and agree to the current terms")
+        if len(str(password)) < MIN_PASSWORD:
+            raise AccountError(f"password must be at least {MIN_PASSWORD} characters")
+        password_hash = _hash_password(str(password))
+        with self.lock:
+            row = self._conn.execute(
+                "SELECT expires_at FROM temporary_accounts WHERE user_id = ?", (user_id,)).fetchone()
+            if row is None or row[0] <= time.time():
+                raise AccountError("this preview has expired; start a new preview", 410)
+            existing = self._conn.execute(
+                "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE AND id != ?", (username, user_id)).fetchone()
+            if existing:
+                raise AccountError("that username is taken", 409)
+            try:
+                self._conn.execute(
+                    "UPDATE users SET username = ?, display_name = ?, password_hash = ? WHERE id = ?",
+                    (username, username, password_hash, user_id))
+                self._conn.execute(
+                    "INSERT INTO alpha_agreements (user_id, terms_version, accepted_at) VALUES (?, ?, ?)",
+                    (user_id, alpha_terms_version, time.time()))
+                self._conn.execute("DELETE FROM temporary_accounts WHERE user_id = ?", (user_id,))
+                self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+                self._conn.commit()
+            except sqlite3.IntegrityError as error:
+                self._conn.rollback()
+                raise AccountError("that username is taken", 409) from error
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return {"id": user_id, "username": username}
+
     def ensure_user(self, username: str, password: str, display_name: str | None = None) -> int:
         """Create the account if absent (same hashing as signup) and return its id; an existing account is left unchanged."""
         username = self._clean_username(username)
@@ -174,9 +237,11 @@ class Accounts:
         username = self._clean_username(username)
         with self.lock:
             row = self._conn.execute(
-                "SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+                "SELECT users.id, users.username, users.password_hash, temporary_accounts.user_id "
+                "FROM users LEFT JOIN temporary_accounts ON temporary_accounts.user_id = users.id "
+                "WHERE users.username = ? COLLATE NOCASE",
                 (username,)).fetchone()
-        if row is None or not _verify_password(str(password), row[2]):
+        if row is None or row[3] is not None or not _verify_password(str(password), row[2]):
             raise AccountError("wrong username or password", 401)
         return {"id": row[0], "username": row[1]}
 
@@ -184,9 +249,14 @@ class Accounts:
         token = secrets.token_urlsafe(32)
         now = time.time()
         with self.lock:
+            preview = self._conn.execute(
+                "SELECT expires_at FROM temporary_accounts WHERE user_id = ?", (user_id,)).fetchone()
+            if preview is not None and preview[0] <= now:
+                raise AccountError("this preview has expired; start a new preview", 410)
+            expires = min(now + SESSION_SECONDS, preview[0]) if preview else now + SESSION_SECONDS
             self._conn.execute(
                 "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                (token, user_id, now, now + SESSION_SECONDS))
+                (token, user_id, now, expires))
             self._conn.commit()
         return token
 
@@ -196,16 +266,18 @@ class Accounts:
         now = time.time()
         with self.lock:
             row = self._conn.execute(
-                "SELECT sessions.user_id, users.username, users.display_name, sessions.expires_at "
-                "FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
+                "SELECT sessions.user_id, users.username, users.display_name, sessions.expires_at, temporary_accounts.expires_at "
+                "FROM sessions JOIN users ON users.id = sessions.user_id "
+                "LEFT JOIN temporary_accounts ON temporary_accounts.user_id = users.id WHERE sessions.token = ?",
                 (token,)).fetchone()
             if row is None:
                 return None
-            if row[3] < now:
+            if row[3] <= now or (row[4] is not None and row[4] <= now):
                 self._conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
                 self._conn.commit()
                 return None
-        return {"id": row[0], "username": row[1], "display_name": row[2]}
+        return {"id": row[0], "username": row[1], "display_name": row[2],
+                "temporary": row[4] is not None, "expires_at": row[4]}
 
     def logout(self, token: str | None) -> None:
         if not token:

@@ -78,6 +78,45 @@ def _login(server, name, password=PASSWORD):
     return status, retry, cookie, body, cookies
 
 
+def test_read_only_preview_can_be_kept_with_a_unique_chosen_password(server):
+    terms = {"alpha_terms_version": srv.accounts_mod.ALPHA_TERMS_VERSION,
+             "agree_mit": True, "agree_observation": True, "agree_research": True}
+    preview_headers = {**OUTSIDE, "X-Meowdoku-Preview": "1"}
+    assert _call(server.port, "/api/account/preview", "POST", OUTSIDE, {})[0] == 400
+    status, _, cookies, body = _call(server.port, "/api/account/preview", "POST", preview_headers, {})
+    assert status == 201 and body["account"]["temporary"] is True
+    assert "password" not in body["account"]
+    cookie = next(c.split(";")[0] for c in cookies if c.startswith(srv.ACCOUNT_COOKIE + "="))
+    assert any("Max-Age=604800" in c and "HttpOnly" in c for c in cookies)
+    authorized = {**OUTSIDE, "Cookie": cookie}
+    me = _call(server.port, "/api/account/me", headers=authorized)[3]
+    assert me["role"] == "trial" and me["account"]["temporary"] is True
+    who = _call(server.port, "/api/whoami", headers=authorized)[3]
+    assert who["role"] == "trial" and set(who["capabilities"]) == {"view_site", "photo_read"}
+    assert _call(server.port, "/api/reports", "POST", authorized, {"title": "blocked"})[0] == 403
+    assert _call(server.port, "/api/account/keep", "POST", {**authorized, "X-Meowdoku-Preview": "1"},
+                 {"username": "keeper", "password": PASSWORD, **terms, "agree_research": False})[0] == 400
+    status, _, kept_cookies, kept = _call(server.port, "/api/account/keep", "POST",
+                                          {**authorized, "X-Meowdoku-Preview": "1"},
+                                          {"username": "keeper", "password": PASSWORD, **terms})
+    assert status == 200 and kept["account"]["username"] == "keeper"
+    new_cookie = next(c.split(";")[0] for c in kept_cookies if c.startswith(srv.ACCOUNT_COOKIE + "="))
+    assert new_cookie != cookie
+    assert _call(server.port, "/api/account/me", headers=authorized)[3]["account"] is None
+    assert _call(server.port, "/api/account/me", headers={**OUTSIDE, "Cookie": new_cookie})[3]["role"] == "member"
+    assert _login(server, "keeper", PASSWORD)[0] == 200
+
+
+def test_preview_expires_after_seven_days(server):
+    headers = {**OUTSIDE, "X-Meowdoku-Preview": "1"}
+    status, _, cookies, body = _call(server.port, "/api/account/preview", "POST", headers, {})
+    assert status == 201
+    cookie = next(c.split(";")[0] for c in cookies if c.startswith(srv.ACCOUNT_COOKIE + "="))
+    with sqlite3.connect(server.sessions.accounts_db) as db:
+        db.execute("UPDATE temporary_accounts SET expires_at = 1 WHERE user_id = ?", (body["account"]["id"],))
+    assert _call(server.port, "/api/account/me", headers={**OUTSIDE, "Cookie": cookie})[3]["account"] is None
+
+
 def test_anonymous_outside_visitor_keeps_the_shader_lock(server):
     assert "FEED-PAGE" in _call(server.port, "/", headers=OUTSIDE)[3]
     assert "SHADER-PAGE" in _call(server.port, "/play.html", headers=OUTSIDE)[3]

@@ -11,7 +11,10 @@
     form.hidden = !!account;
     who.hidden = !account;
     if (account) { $("name").textContent = account.username; $("role").textContent = info.role || "member"; }
-    if (account) serverPanel(); else $("server").hidden = true;
+    $("preview-note").hidden = !(account && account.temporary);
+    if (account && account.temporary) $("preview-date").textContent = new Date(account.expires_at * 1000).toLocaleString();
+    $("signout").textContent = account && account.temporary ? "End preview (cannot return)" : "Sign out";
+    if (account && !account.temporary) serverPanel(); else $("server").hidden = true;
   }
 
   // Stable server / Development server: two shared instances of the whole service (not the dev page vs shader page, not a per-user server).

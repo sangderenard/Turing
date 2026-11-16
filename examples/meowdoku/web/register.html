@@ -51,6 +51,13 @@
     <strong>Alpha disclaimer</strong>
     <p>Features can be incomplete, changed, or removed. This is a working research environment, not a finished product or a private place for confidential material. Project operators and research agents may inspect what you submit and do here.</p>
   </section>
+  <section id="preview-panel" class="notice" aria-label="Temporary preview">
+    <h2>Look around first</h2>
+    <p>Start a read-only preview without choosing a username or password. This browser keeps a random session cookie for up to seven days. The preview expires unless you choose to keep the account.</p>
+    <button id="preview-start" type="button">Start seven-day preview</button>
+    <p id="preview-expiry" class="mut" hidden></p>
+    <p><a href="/browse">Browse the site</a> · <a href="/login.html">Already have an account?</a></p>
+  </section>
   <h2>What sits behind this page</h2>
   <p>The visible front end was assembled in about 20 minutes. It opens a window onto roughly four years of backend development. SpeakToMe began as a way to explore branching language-model possibilities. The surrounding work grew into separate systems for graph execution, tensor and compiler research, managed scientific time, geometry, audio, optics, and simulation. Some of those systems are demonstrated here; an isolated demo does not mean every part is integrated into one finished product.</p>
   <p>Alpha participants help expose the seams between those systems: where an interface is unclear, a computation fails, a result needs verification, or a research idea meets real use. Activity and feedback can inform debugging, evaluation, and training. Expect experiments and revisions rather than a polished service contract.</p>
@@ -59,11 +66,12 @@
   <p><strong>Observation and training.</strong> Your site activity, submissions, messages, outputs, and diagnostic information may be recorded, reviewed by people or agents, and used to evaluate, improve, and train computational systems. Avoid entering secrets, confidential information, or material you lack permission to share.</p>
   <p><strong>Research participation.</strong> You are joining an evolving computational research project. Your interactions may be studied for system behavior, usability, failures, and model or workflow development. You can stop participating by stopping use; work already observed or incorporated into research may remain in that work.</p>
   <form id="alpha-form" data-terms-version="alpha-2026-11-15" autocomplete="on">
-    <h2>Create a basic member account</h2>
+    <h2 id="alpha-heading">Create a basic member account</h2>
     <label for="username">Username <span class="mut">(3 to 32 letters, digits, _ or -)</span></label>
     <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required pattern="[A-Za-z0-9_\-]{3,32}">
     <label for="password">Password <span class="mut">(at least 8 characters)</span></label>
     <input id="password" type="password" autocomplete="new-password" required minlength="8">
+    <p class="mut"><strong>Use a unique password.</strong> Do not use a password you use anywhere else.</p>
     <label for="password2">Password again</label>
     <input id="password2" type="password" autocomplete="new-password" required minlength="8">
     <fieldset class="agreements">

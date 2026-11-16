@@ -50,3 +50,49 @@ test("successful alpha signup keeps confirmation and profile link visible", asyn
   assert.equal(link?.href, "/profile.html");
   assert.equal(visible(link), true);
 });
+
+test("a visitor can start a preview and keep it with a chosen password", async () => {
+  const script = readFileSync(new URL("register.js", web), "utf8");
+  const calls = [];
+  const alpha = { hidden: false, dataset: { termsVersion: "alpha-2026-11-15" },
+    addEventListener(name, handler) { if (name === "submit") this.submit = handler; } };
+  const previewStart = { hidden: false, disabled: false,
+    addEventListener(name, handler) { if (name === "click") this.click = handler; } };
+  const status = { textContent: "", className: "", after() {} };
+  const elements = {
+    "code-form": { addEventListener() {} }, code: { value: "" }, "alpha-form": alpha,
+    "alpha-submit": { disabled: false, textContent: "" }, status,
+    "preview-panel": { hidden: false }, "preview-start": previewStart,
+    "preview-expiry": { hidden: true, textContent: "" },
+    "alpha-heading": { textContent: "" }, username: { value: "keeper" },
+    password: { value: "unique-password-123" }, password2: { value: "unique-password-123" },
+    "agree-mit": { checked: true }, "agree-observation": { checked: true },
+    "agree-research": { checked: true },
+  };
+  const document = {
+    getElementById(id) { return elements[id]; },
+    createElement(tagName) { return { tagName, appendChild() {} }; },
+  };
+  const fetch = async (path, options) => {
+    calls.push({ path, options });
+    const body = path === "/api/account/me" ? { account: null }
+      : path === "/api/account/preview" ? { account: { temporary: true, expires_at: 1795400000 } }
+      : { account: { username: "keeper" } };
+    return { ok: true, json: async () => body };
+  };
+  vm.runInNewContext(script, { document, fetch, location: { origin: "http://localhost" },
+    URL, URLSearchParams, encodeURIComponent, Date });
+  await new Promise(resolve => setImmediate(resolve));
+  previewStart.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls[1].path, "/api/account/preview");
+  assert.equal(calls[1].options.headers["X-Meowdoku-Preview"], "1");
+  assert.equal(elements["preview-expiry"].hidden, false);
+  assert.match(elements["alpha-heading"].textContent, /Keep/);
+  alpha.submit({ preventDefault() {} });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls[2].path, "/api/account/keep");
+  assert.equal(calls[2].options.headers["X-Meowdoku-Preview"], "1");
+  assert.equal(JSON.parse(calls[2].options.body).password, "unique-password-123");
+  assert.equal(alpha.hidden, true);
+});

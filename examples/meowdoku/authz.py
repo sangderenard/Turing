@@ -273,6 +273,8 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
     if guest_gated(principal):
         return frozenset(c for c in caps & set(policy["role_caps"].get("guest", ())) if c in CAPS and c not in (
             "lifecycle_admin", "account_manage", "paper_train", "nodus_edit", "compile_unstable"))
+    if principal.role == "trial":
+        return frozenset({"view_site", "photo_read"})
     if principal.role in _permission_groups.RANKS:
         for group in _permission_groups.ORDER:
             if _permission_groups.RANKS[group] <= _permission_groups.RANKS[principal.role]:
@@ -414,6 +416,8 @@ def revoke_admin(db_path, username: str, granted_by: str) -> int:
 def principal_from(account, origin: str, tier: str, db_path) -> Principal:
     if account is None:
         return Principal("guest", None, None, origin, tier)
+    if account.get("temporary"):
+        return Principal("trial", account["id"], account["username"], origin, tier)
     db = _connect(db_path)
     try:
         rank = _permission_groups.authority(db, account["id"])
