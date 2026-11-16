@@ -2131,6 +2131,13 @@ def make_handler(sessions: Sessions):
             return relay.http_route(self, path, method, accounts_db=sessions.accounts_db,
                                     config=relay.load_config(declared if declared.is_file() else None))
 
+        def _condition_route(self, path: str, method: str) -> None:
+            """[CONDITION] the operators' switch for the site's condition card at the Apache front (site_condition.py)."""
+            from meowdoku import site_condition
+            self._classify()
+            return site_condition.http_route(self, path, method, accounts_db=sessions.accounts_db,
+                                             folder=getattr(sessions, "condition_dir", None))
+
         def _fortune_route(self, path: str, method: str) -> None:
             """[FORTUNE] fortune(): an I Ching style reading; a repeated question waits out a per-account cool-down (fortune.py)."""
             from meowdoku import fortune
@@ -3174,6 +3181,8 @@ def make_handler(sessions: Sessions):
                 return self._relay_route(path, "GET")
             if path.startswith("/api/fortune/"):                  # [FORTUNE]
                 return self._fortune_route(path, "GET")
+            if path in ("/api/condition", "/api/condition/controls.js"):   # [CONDITION]
+                return self._condition_route(path, "GET")
             if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
                 from meowdoku import file_index
                 self._classify()
@@ -3732,6 +3741,8 @@ def make_handler(sessions: Sessions):
                 return self._relay_route(path0, "POST")
             if path0 == "/api/fortune" or path0.startswith("/api/fortune/"):   # [FORTUNE]
                 return self._fortune_route(path0, "POST")
+            if path0 == "/api/condition":                         # [CONDITION]
+                return self._condition_route(path0, "POST")
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")
             if path0 == "/api/control/instances/cancel":
@@ -4546,6 +4557,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
     parser.add_argument("--retain-fountain-products", metavar="RECEIPT",
                         help="serve SHA-256-pinned existing fountain products without rebuilding; validate before binding; other startup lanes are unchanged")
+    parser.add_argument("--condition-dir", default=None,
+                        help="[CONDITION] the Apache front's condition folder (srv/state/condition): where an operator's switch "
+                             "posts the yellow or red card (site_condition.py); without it the switch answers 503")
     parser.add_argument("--route", default="",
                         help="balancer route name: every response that sets a cookie also sets meowdoku_route=NAME (Apache stickysession)")
     parser.add_argument("--instance", default="",
@@ -4631,6 +4645,7 @@ def main(argv: list[str] | None = None) -> int:
     sessions = Sessions(web_dir, Profiles(profiles_path), state)
     sessions.nodus_ui_ports = nodus_ui_ports
     sessions.route = args.route
+    sessions.condition_dir = Path(args.condition_dir) if args.condition_dir else None   # [CONDITION]
     sessions.routes = [r for r in args.routes.split(",") if r]                    # [ROUTE]
     if args.accounts_db:                                                          # [ROUTE] every module opens sessions.accounts_db; Accounts and the policy follow it
         sessions.accounts_db = Path(args.accounts_db)

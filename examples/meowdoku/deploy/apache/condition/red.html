@@ -27,6 +27,14 @@
   <h1>We are under genuine threat, or we are down</h1>
   <p>The site has closed itself off to stay safe. No one is getting in right now.</p>
   <p class="small">Please come back later.</p>
+  <div id="controls" style="max-width:22rem;margin:2rem auto 0;"></div>
 </main>
+<script type="module">
+  // [CONDITION] For an operator or an admin only: the server answers this module to no one else and checks the role on
+  // every switch (site_condition.py). Anyone else gets nothing from it.
+  import("/api/condition/controls.js")
+    .then(m => m.mount(document.getElementById("controls"), { onCard: state => { if (!state.card) location.reload(); } }))
+    .catch(() => {});
+</script>
 </body>
 </html>

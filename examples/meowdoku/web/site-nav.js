@@ -615,6 +615,13 @@ async function main() {
   }
 
   menu.append(el("div", { class: "head", text: "Signed in as " + who.username + " (" + (who.role || "member") + ")" }));
+  if (who.role === "admin" || who.role === "operator") {
+    // [CONDITION] The yellow and red card switch. Its code is not in this public file: the server answers the module only to
+    // an operator or an admin and checks the role again on every switch (site_condition.py).
+    const slot = el("div", { class: "condition" });
+    menu.append(slot, el("div", { class: "sep" }));
+    import("/api/condition/controls.js").then(m => m.mount(slot)).catch(() => slot.remove());
+  }
   if (caps.has("message")) menu.append(el("button", { role: "menuitem", type: "button", text: "Messages", onclick: () => {
     setOpen(false);
     if (window.MeowdokuMessenger) window.MeowdokuMessenger.open();
