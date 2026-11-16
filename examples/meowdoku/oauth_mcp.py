@@ -57,7 +57,7 @@ def _json(handler, status, value, headers=()):
 
 
 class OAuthMCP:
-    def __init__(self, accounts, db_path, public_origin: str, lift, route_getter):
+    def __init__(self, accounts, db_path, public_origin: str, lift, route_getter, loopback_ca):
         parsed = urllib.parse.urlsplit(public_origin)
         if parsed.scheme != "https" or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username:
             raise ValueError("SPEAKTOME_PUBLIC_ORIGIN must be an HTTPS origin")
@@ -66,6 +66,7 @@ class OAuthMCP:
         self.accounts = accounts
         self.lift = lift
         self.route_getter = route_getter
+        self.loopback_ca = str(loopback_ca)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -338,11 +339,11 @@ class OAuthMCP:
                     self.guest_hits[peer] = hits
                     preview = self.accounts.create_preview()
                     preview_token = self.accounts.create_session(preview["id"])
-                    rest = PreviewRest(f"http://127.0.0.1:{handler.server.server_port}", preview_token,
-                                       handler._origin, handler._tier)
+                    rest = PreviewRest(f"https://127.0.0.1:{handler.server.server_port}", preview_token,
+                                       handler._origin, handler._tier, ca_file=self.loopback_ca)
                 else:
-                    rest = BearerRest(f"http://127.0.0.1:{handler.server.server_port}", token,
-                                      handler._origin, handler._tier)
+                    rest = BearerRest(f"https://127.0.0.1:{handler.server.server_port}", token,
+                                      handler._origin, handler._tier, ca_file=self.loopback_ca)
                 session_id = secrets.token_urlsafe(32)
                 if len(self.servers) >= 128:
                     self.servers.clear()

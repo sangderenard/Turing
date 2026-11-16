@@ -427,7 +427,7 @@ class Sessions:
         self.accounts_db = self.state.accounts_db
         public_origin = os.environ.get("SPEAKTOME_PUBLIC_ORIGIN")
         self.oauth_mcp = OAuthMCP(self.accounts, self.accounts_db, public_origin, SHADER_LIFT,
-                                  lambda: self.route) if public_origin else None
+                                  lambda: self.route, self.state.tls_dir / "ca.crt") if public_origin else None
         self.radio_lock = threading.Lock()
         self.radio_control = None
         self.radio_jukebox = None

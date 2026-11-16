@@ -3,6 +3,9 @@ import base64
 import hashlib
 import http.client
 import json
+import shutil
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -20,11 +23,23 @@ from test_meowdoku_access import _web  # noqa: E402
 
 def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
     monkeypatch.setenv("SPEAKTOME_PUBLIC_ORIGIN", "https://stichka.duckdns.org:8766")
+    tls_dir = tmp_path / "build" / "meowdoku" / "tls"
+    tls_dir.mkdir(parents=True)
+    cert, key = tls_dir / "cert.pem", tls_dir / "key.pem"
+    openssl = shutil.which("openssl") or "C:/Program Files/Git/usr/bin/openssl.exe"
+    subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-keyout", str(key), "-out", str(cert), "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"], check=True, capture_output=True)
+    (tls_dir / "ca.crt").write_bytes(cert.read_bytes())
     sessions = srv.Sessions(_web(tmp_path), None)
     sessions.accounts.ensure_user("agentbot", "correcthorse1")
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(sessions))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=30)
+    conn = http.client.HTTPSConnection("127.0.0.1", httpd.server_port, timeout=30,
+                                      context=ssl.create_default_context(cafile=str(tls_dir / "ca.crt")))
     proxy = {"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https",
              "Host": "stichka.duckdns.org:8766"}
 
