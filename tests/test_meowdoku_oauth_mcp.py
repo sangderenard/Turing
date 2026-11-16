@@ -126,6 +126,12 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         assert response.status == 200, body
         guest_headers["MCP-Session-Id"] = response.getheader("MCP-Session-Id")
         assert guest_headers["MCP-Session-Id"]
+        # Several connectors behind one forwarded address must not exhaust a
+        # five-session hourly budget during ordinary tool discovery.
+        for _ in range(6):
+            response, body = call("POST", "/mcp/guest", initialize,
+                                  {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
+            assert response.status == 200, body
 
         def guest_tool(name, arguments, rid):
             request = json.dumps({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
