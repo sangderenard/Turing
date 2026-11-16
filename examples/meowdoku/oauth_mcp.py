@@ -83,6 +83,7 @@ class OAuthMCP:
         self.db.commit()
         self.servers = {}
         self.register_hits = {}
+        self.guest_hits = {}
 
     def user_for_token(self, token):
         if not isinstance(token, str) or not 20 <= len(token) <= 256 or not token.isascii():
@@ -264,7 +265,7 @@ class OAuthMCP:
         except (ValueError, KeyError, TypeError):
             return _json(handler, 400, {"error": "invalid_grant"})
 
-    def mcp(self, handler, method):
+    def mcp(self, handler, method, *, guest=False):
         if not handler._is_secure():
             return _json(handler, 403, {"error": "HTTPS required"})
         origin = handler.headers.get("Origin")
@@ -272,21 +273,30 @@ class OAuthMCP:
         if origin is not None and origin not in allowed:
             return _json(handler, 403, {"error": "invalid origin"})
         auth = handler.headers.get_all("Authorization", [])
-        user = self.user_for_token(auth[0][7:]) if len(auth) == 1 and auth[0].startswith("Bearer ") else None
-        if user is None:
-            return self.challenge(handler)
-        token = auth[0][7:]
+        if guest:
+            if auth:
+                return _json(handler, 400, {"error": "use /mcp for an OAuth account"})
+            identity = "guest"
+            # A preview has fixed read-only capabilities; play tier only lets it
+            # reach the public REST surface through the loopback hop.
+            handler._tier = "play"
+        else:
+            user = self.user_for_token(auth[0][7:]) if len(auth) == 1 and auth[0].startswith("Bearer ") else None
+            if user is None:
+                return self.challenge(handler)
+            token = auth[0][7:]
+            identity = _digest(token)
         version = handler.headers.get("MCP-Protocol-Version")
         if version is not None and version not in ("2025-11-25", "2025-06-18", "2025-03-26"):
             return _json(handler, 400, {"error": "unsupported MCP protocol version"})
-        if handler._origin_tier == "shader":
+        if not guest and handler._origin_tier == "shader":
             from meowdoku import authz
             handler._tier = self.lift.get(authz.role_of(self.accounts.path, user["id"]), "shader")
         if method == "DELETE":
             session_id = handler.headers.get("MCP-Session-Id")
             with self.lock:
                 entry = self.servers.get(session_id)
-                if entry is None or entry[:3] != (_digest(token), handler._origin, handler._tier):
+                if entry is None or entry[:3] != (identity, handler._origin, handler._tier):
                     return _json(handler, 404, {"error": "MCP session not found"})
                 del self.servers[session_id]
             return _response(handler, 204, b"")
@@ -318,24 +328,41 @@ class OAuthMCP:
                 from meowdoku import rest_api
                 rest_api._load("speaktome_mcp")
                 from speaktome_mcp.api import ApiServer
-                from speaktome_mcp.http import BearerRest
-                rest = BearerRest(f"http://127.0.0.1:{handler.server.server_port}", token,
-                                  handler._origin, handler._tier)
+                from speaktome_mcp.http import BearerRest, PreviewRest
+                if guest:
+                    peer, now = handler._client_ip, time.time()
+                    hits = [at for at in self.guest_hits.get(peer, []) if now - at < 3600]
+                    if len(hits) >= 5:
+                        return _json(handler, 429, {"error": "guest session limit reached"})
+                    hits.append(now)
+                    self.guest_hits[peer] = hits
+                    preview = self.accounts.create_preview()
+                    preview_token = self.accounts.create_session(preview["id"])
+                    rest = PreviewRest(f"http://127.0.0.1:{handler.server.server_port}", preview_token,
+                                       handler._origin, handler._tier)
+                else:
+                    rest = BearerRest(f"http://127.0.0.1:{handler.server.server_port}", token,
+                                      handler._origin, handler._tier)
                 session_id = secrets.token_urlsafe(32)
                 if len(self.servers) >= 128:
                     self.servers.clear()
-                entry = (_digest(token), handler._origin, handler._tier, threading.Lock(), ApiServer(rest))
+                entry = (identity, handler._origin, handler._tier, threading.Lock(), ApiServer(rest))
                 self.servers[session_id] = entry
         else:
             if session_id is None:
                 return _json(handler, 400, {"error": "MCP-Session-Id required"})
             with self.lock:
                 entry = self.servers.get(session_id)
-            if entry is None or entry[:3] != (_digest(token), handler._origin, handler._tier):
+            if entry is None or entry[:3] != (identity, handler._origin, handler._tier):
                 return _json(handler, 404, {"error": "MCP session not found"})
         _, _, _, lock, server = entry
         with lock:
             answer = server.handle(message)
+        if guest and isinstance(answer, dict) and message.get("method") == "initialize" and "result" in answer:
+            answer["result"]["instructions"] += (" This is a seven-day preview with no signup or password. "
+                                                    "Use guest_tasks and guest_test_submit; three distinct answers "
+                                                    "must be accepted before guest_post_submit queues opinions. "
+                                                    "Pending text is private until an operator approves it.")
         if answer is None:
             return _response(handler, 202, b"")
         headers = []

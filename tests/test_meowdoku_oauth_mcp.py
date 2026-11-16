@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples"), str(ROOT / "tests")]
 
 from meowdoku import server as srv  # noqa: E402
+from meowdoku import authz  # noqa: E402
 from test_meowdoku_access import _web  # noqa: E402
 
 
@@ -100,6 +101,82 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         assert response.status == 204
         response, _ = call("POST", "/mcp", request, accept)
         assert response.status == 404
+
+        # The public MCP URL creates a temporary identity without exposing its
+        # internal session credential. Tests and opinions remain unpublished.
+        guest_headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        initialize = json.dumps({"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "guest", "version": "1"}}})
+        response, body = call("POST", "/mcp/guest", initialize, guest_headers)
+        assert response.status == 200, body
+        guest_headers["MCP-Session-Id"] = response.getheader("MCP-Session-Id")
+        assert guest_headers["MCP-Session-Id"]
+
+        def guest_tool(name, arguments, rid):
+            request = json.dumps({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                                  "params": {"name": name, "arguments": arguments}})
+            response, body = call("POST", "/mcp/guest", request, guest_headers)
+            assert response.status == 200, body
+            result = json.loads(body)["result"]
+            assert not result["isError"], result
+            return json.loads(result["content"][0]["text"])
+
+        identity = guest_tool("whoami", {}, 11)
+        assert identity["role"] == "trial" and identity["signed_in"]
+        listing = json.dumps({"jsonrpc": "2.0", "id": 12, "method": "tools/list"})
+        response, body = call("POST", "/mcp/guest", listing, guest_headers)
+        names = {tool["name"] for tool in json.loads(body)["result"]["tools"]}
+        assert {"guest_tasks", "guest_test_submit", "guest_post_submit"} <= names
+        assert "chat_post" not in names and "checkout_open" not in names
+        tasks = [
+            ("policy_awareness", "Hate speech and overt sexual text are refused. Ordinary swearing can be okay. Pending posts stay private."),
+            ("programming", "Use a set, walk the list, and return the first element already seen; return None when all differ."),
+            ("syllogism", "No. Every silver key opens the east door, and no key for that door opens the vault."),
+        ]
+        evidence_ids = []
+        for i, (task, answer) in enumerate(tasks, 13):
+            result = guest_tool("guest_test_submit", {"task": task, "response": answer, "actor_kind": "agent"}, i)
+            evidence_ids.append(result["data"]["evidence"]["id"])
+        import sqlite3
+        with sqlite3.connect(sessions.accounts_db) as db:
+            user_id = db.execute("SELECT id FROM users WHERE username=?", (identity["username"],)).fetchone()[0]
+        request = json.dumps({"jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                              "params": {"name": "guest_post_submit", "arguments": {
+                                  "target": "chat", "room": "agents", "body": "An idea for the room."}}})
+        response, body = call("POST", "/mcp/guest", request, guest_headers)
+        assert response.status == 200 and json.loads(body)["result"]["isError"]
+
+        reviewer_id = sessions.accounts.ensure_user("reviewer", "correcthorse1")
+        authz.grant_role(sessions.accounts_db, "reviewer", "operator", "test")
+        reviewer_cookie = f"{srv.ACCOUNT_COOKIE}={sessions.accounts.create_session(reviewer_id)}"
+        for evidence_id in evidence_ids:
+            response, body = call("POST", "/api/guest/review/test",
+                                  json.dumps({"id": evidence_id, "decision": "accepted"}),
+                                  {"Content-Type": "application/json", "Cookie": reviewer_cookie})
+            assert response.status == 200, body
+        response, body = call("POST", "/api/guest/review/qualify", json.dumps({"user_id": user_id}),
+                              {"Content-Type": "application/json", "Cookie": reviewer_cookie})
+        assert response.status == 200, body
+        queued = guest_tool("guest_post_submit", {"target": "chat", "room": "agents", "body": "An idea for the room."}, 17)
+        post_id = queued["data"]["submission"]["id"]
+        with sqlite3.connect(sessions.accounts_db) as db:
+            assert db.execute("SELECT COUNT(*) FROM chat_messages WHERE room='agents'").fetchone()[0] == 0
+        response, body = call("POST", "/api/guest/review/post",
+                              json.dumps({"id": post_id, "decision": "approved", "policy_confirmed": True}),
+                              {"Content-Type": "application/json", "Cookie": reviewer_cookie})
+        assert response.status == 200, body
+        with sqlite3.connect(sessions.accounts_db) as db:
+            assert db.execute("SELECT body FROM chat_messages WHERE room='agents'").fetchone()[0] == "An idea for the room."
+
+        intern_id = sessions.accounts.ensure_user("internbot", "correcthorse1")
+        authz.grant_role(sessions.accounts_db, "internbot", "intern", "test")
+        intern_cookie = f"{srv.ACCOUNT_COOKIE}={sessions.accounts.create_session(intern_id)}"
+        response, body = call("POST", "/api/chat/rooms/agents", json.dumps({"body": "An intern's opinion."}),
+                              {"Content-Type": "application/json", "Cookie": intern_cookie})
+        assert response.status == 202, body
+        with sqlite3.connect(sessions.accounts_db) as db:
+            assert db.execute("SELECT COUNT(*) FROM chat_messages WHERE room='agents'").fetchone()[0] == 1
+            assert db.execute("SELECT state FROM guest_post_queue WHERE user_id=?", (intern_id,)).fetchone()[0] == "pending"
     finally:
         conn.close()
         httpd.shutdown()
