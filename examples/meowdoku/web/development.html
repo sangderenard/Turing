@@ -14,7 +14,7 @@
 <section id="case" hidden>
 <div class="row"><h2 id="case-heading"></h2><span id="case-phase" class="muted"></span><a id="other-stage" href="#"></a></div>
 <p id="case-goal-text"></p><p id="case-tickets-text" class="muted"></p>
-<section id="affirmation-gate" class="panel" hidden><h3>Your affirmation phrase</h3><p>Enter a phrase to join this case. It appears to other participants.</p>
+<section id="affirmation-gate" class="panel" hidden><h3>Your affirmation phrase</h3><p>Joining this case shares your username and affirmation phrase with everyone who has joined it. Any document you add, including a readable copy of a private file, will also be visible to them.</p>
 <form id="affirmation-gate-form"><input id="affirmation-gate-input" type="text" maxlength="160" required><button type="submit">Enter case</button></form></section>
 <div id="workspace" class="layout" hidden>
 <aside class="stack"><section class="panel"><h2>Design invariants</h2><ul id="invariants"></ul>
@@ -32,7 +32,7 @@
 <div id="file-unlock" hidden><label>File key passphrase<input id="file-passphrase" type="password" autocomplete="off"></label><button id="unlock-files" type="button">Unlock files</button> <a href="/files.html">Set up file encryption</a></div>
 <label id="inventory-label" hidden>My inventory<select id="document-inventory"></select></label>
 <label id="document-text-label">Document text<textarea id="document-text" maxlength="60000"></textarea></label>
-<p id="copy-warning" class="muted" hidden>Choosing a private file creates a readable Research copy for all signed-in participants. The encrypted original remains private. Text files only, up to 60,000 characters.</p>
+<p id="copy-warning" class="muted" hidden>Choosing a private file creates a readable case copy for everyone who has joined this case. The encrypted original remains private. Text files only, up to 60,000 characters.</p>
 <button type="submit">Save my tab</button></form></section>
 <section class="panel"><h2>Development chat</h2><p class="muted">Live room shared by signed-in participants. Include the case title when discussing a specific case.</p>
 <ul id="chat-messages" class="messages"></ul><form id="chat-form"><label>Message<textarea id="chat-text" maxlength="4000" required></textarea></label><button type="submit">Send</button></form></section>
