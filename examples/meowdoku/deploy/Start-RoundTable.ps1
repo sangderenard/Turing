@@ -14,11 +14,13 @@ The table stops at the next turn after it is switched off. When it ends by itsel
 -PersonWaitMinutes, or no agent seat is left) a seat switches it off and says why, and the room shows that. Then the
 lookout watches again. While a seat is open, Start-AgentDay.ps1 does not start that agent's hourly or bell runs (each seat
 is recorded in <AgentDays>\running). A turn that runs past -TurnMinutes is skipped; an agent answers "(pass)" to say
-nothing in a round. What the runner does is written to <AgentDays>\roundtable.log.
-.EXAMPLE   .\Start-RoundTable.ps1 -Register        # a task that keeps the runner going while you are signed in
-.EXAMPLE   .\Start-RoundTable.ps1 -Watch           # the runner in this window (Ctrl+C stops it and closes the seats)
-.EXAMPLE   .\Start-RoundTable.ps1 -Status          # the task, the runner's last lines, the open seats
-.EXAMPLE   .\Start-RoundTable.ps1 -Unregister
+nothing in a round. What the runner does is written to <AgentDays>\roundtable.log for agents, or
+<AgentDays>\roundtable-<room>.log for another room. Each room has its own task; the agents task keeps its existing name.
+.EXAMPLE   .\Start-RoundTable.ps1 -Register        # the agents room's task, while you are signed in
+.EXAMPLE   .\Start-RoundTable.ps1 -Register -Room research  # a separate task for Research
+.EXAMPLE   .\Start-RoundTable.ps1 -Watch -Room research  # run Research in this window (Ctrl+C stops it)
+.EXAMPLE   .\Start-RoundTable.ps1 -Status -Room research # the task, last lines, and open seats
+.EXAMPLE   .\Start-RoundTable.ps1 -Unregister -Room research
 #>
 #Requires -Version 7
 param(
@@ -26,7 +28,7 @@ param(
     [switch]$Status,
     [switch]$Register,
     [switch]$Unregister,
-    [string]$Room = 'agents',
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{2,39}$')][string]$Room = 'agents',
     [string]$LookoutAgent = 'gemini',
     [int]$TurnMinutes = 10,
     [int]$PersonWaitMinutes = 60,
@@ -37,7 +39,8 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AgentAccounts.psm1') -Force
 $Workspace = 'C:\dev\Powershell'
 $Python = "$Workspace\srv\python\python.exe"
-$TaskName = 'SpeakToMe round table'
+$TaskName = if ($Room -eq 'agents') { 'SpeakToMe round table' } else { "SpeakToMe round table $Room" }
+$LogName = if ($Room -eq 'agents') { 'roundtable.log' } else { "roundtable-$Room.log" }
 # The agents' Windows accounts and SpeakToMe logins: the same as Start-AgentDay.ps1's $Agents.
 $Known = @{ claude = @{ account = 'agents'; login = 'claude' }; codex = @{ account = 'agents-codex'; login = 'codex' }
             gemini = @{ account = 'agents-gemini'; login = 'gemini' } }
@@ -46,7 +49,7 @@ function Say([string]$line) {
     $text = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $line"
     Write-Host $text
     New-Item -ItemType Directory -Force -Path $AgentDays | Out-Null
-    $file = Join-Path $AgentDays 'roundtable.log'
+    $file = Join-Path $AgentDays $LogName
     $kept = @(if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Tail 999 }) + $text
     Set-Content -LiteralPath $file -Value $kept -Encoding utf8
 }
@@ -66,10 +69,11 @@ if ($Register -or $Unregister) {
 }
 if ($Status -or -not $Watch) {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Write-Host "task '$TaskName': $(if ($task) { $task.State } else { 'not registered (-Register)' })"
-    $seated = @(Get-AgentRecords $AgentDays | Where-Object { $_.kind -eq 'seat' })
+    Write-Host "task '$TaskName': $(if ($task) { $task.State } else { "not registered (-Register -Room $Room)" })"
+    if ($task) { Write-Host "watch action: $($task.Actions[0].Arguments)" }
+    $seated = @(Get-AgentRecords $AgentDays | Where-Object { $_.kind -eq 'seat' -and $_.room -eq $Room })
     Write-Host "open seats: $(if ($seated) { ($seated | ForEach-Object { "$($_.agent) (pid $($_.pid), room $($_.room))" }) -join '; ' } else { 'none' })"
-    $file = Join-Path $AgentDays 'roundtable.log'
+    $file = Join-Path $AgentDays $LogName
     if (Test-Path -LiteralPath $file) { Write-Host 'the runner, last lines:'; Get-Content -LiteralPath $file -Tail 12 | ForEach-Object { Write-Host "  $_" } }
     exit 0
 }
