@@ -561,6 +561,8 @@ async function main() {
       text: "Tickets ▾", title: "Issue tickets and change reviews" });
     const ticketsMenu = el("div", { class: "menu", role: "menu", hidden: "" });
     ticketsMenu.append(el("a", { href: "/issues.html", role: "menuitem", text: "Issue tickets" }));
+    ticketsMenu.append(el("a", { href: "/research.html", role: "menuitem", text: "Research" }));
+    ticketsMenu.append(el("a", { href: "/development.html", role: "menuitem", text: "Development" }));
     if (caps.has("dev_ui")) ticketsMenu.append(el("a", { href: "/reviews.html", role: "menuitem",
       text: who.role === "admin" ? "Change reviews (approve)" : "Change reviews" }));
     const dismissTickets = () => setTicketsOpen(false);

@@ -73,6 +73,7 @@ from meowdoku import share as share_mod  # noqa: E402  (share links and the view
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
 from meowdoku import issue_tickets as issue_tickets_mod  # Account-owned SQL incidents, separate from workspace reviews.
+from meowdoku import ticket_research as ticket_research_mod  # Research cases and development briefs.
 from meowdoku import tickets as tickets_mod  # noqa: E402  [TICKETS] persisted client/server diagnostic reports
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
@@ -1307,6 +1308,67 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "issue storage is unavailable; no success is confirmed"}, HTTPStatus.SERVICE_UNAVAILABLE)
         # ---- end [ISSUES]
 
+        def _research_route(self, path: str, method: str) -> None:
+            from http.cookies import SimpleCookie, CookieError
+            import sqlite3
+            self._set_cookie = []
+            if method == "POST":
+                self.close_connection = True
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("view_site"):
+                return
+            try:
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                service = ticket_research_mod.Service(sessions.accounts)
+                parts = path.removeprefix("/api/research/").split("/")
+                if not parts or parts[0] != "cases":
+                    raise ticket_research_mod.ResearchError("not found", 404)
+                if method == "GET":
+                    if self.path.partition("?")[2]:
+                        raise ticket_research_mod.ResearchError("unexpected research query")
+                    if len(parts) == 1:
+                        return self._json(service.list_cases(token))
+                    if len(parts) == 2:
+                        return self._json(service.snapshot(token, parts[1]))
+                    raise ticket_research_mod.ResearchError("not found", 404)
+                origin = self.headers.get("Origin")
+                expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                if origin and origin != expected_origin:
+                    raise ticket_research_mod.ResearchError("cross-origin research writes are not allowed", 403)
+                if self.headers.get("Sec-Fetch-Site") == "cross-site" or self.headers.get("X-Meowdoku-Research") != "1":
+                    raise ticket_research_mod.ResearchError("missing same-origin research header", 403)
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    raise ticket_research_mod.ResearchError("expected application/json", 415)
+                if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                    raise ticket_research_mod.ResearchError("one Content-Length is required")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= ticket_research_mod.MAX_BODY + 4096:
+                    raise ticket_research_mod.ResearchError("research request is too large", 413)
+                body = json.loads(self.rfile.read(length),
+                                  parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+                if len(parts) == 1:
+                    return self._json(service.create(token, body), HTTPStatus.CREATED)
+                if len(parts) != 3:
+                    raise ticket_research_mod.ResearchError("not found", 404)
+                methods = {"affirmation": service.affirmation, "document": service.document,
+                           "invariants": service.invariants, "brief": service.brief,
+                           "promote": service.promote, "propose": service.propose,
+                           "vote": service.vote, "survey": service.survey}
+                action = methods.get(parts[2])
+                if action is None:
+                    raise ticket_research_mod.ResearchError("not found", 404)
+                return self._json(action(token, parts[1], body))
+            except ticket_research_mod.ResearchError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (ValueError, TypeError, CookieError, RecursionError):
+                return self._json({"error": "invalid research request"}, HTTPStatus.BAD_REQUEST)
+            except (sqlite3.Error, ticket_research_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "research storage is unavailable; no success is confirmed"},
+                                  HTTPStatus.SERVICE_UNAVAILABLE)
+        # ---- end [RESEARCH]
+
         # ---- [MESSAGES] /api/messages/*: user-to-user messaging (messaging.py, web/messenger-widget.js).  Capability `message` (members and up, no tier);
         # the account id always comes from the session.  Server-mediated and operator-readable: admin/* needs account_manage and is audited.
         def _messages_route(self, path: str, method: str) -> None:
@@ -1925,6 +1987,7 @@ def make_handler(sessions: Sessions):
                 return comments.http_route(self, path, method, accounts_db=sessions.accounts_db,
                                            kinds={branch_review.THREAD_KIND: branch_review.comment_kind(),
                                                   "page": authored_pages.comment_kind(),
+                                                   "research_case": ticket_research_mod.comment_kind(),
                                                   "article": newsletter.comment_kind()},
                                            notify=sessions.system_notify, caps_for=caps_for)
             from meowdoku import chat_rooms
@@ -2947,6 +3010,8 @@ def make_handler(sessions: Sessions):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
                 return self._issues_route(path, "GET")
+            if path == "/api/research/cases" or path.startswith("/api/research/cases/"):
+                return self._research_route(path, "GET")
             if path == "/api/account/groups" or path.startswith("/api/account/groups/"):
                 return self._groups_route(path, "GET")
             if path == "/api/account/authority":
@@ -3576,6 +3641,8 @@ def make_handler(sessions: Sessions):
                 return self._instance_control("POST", cancel=True)
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
+            if path0 == "/api/research/cases" or path0.startswith("/api/research/cases/"):
+                return self._research_route(path0, "POST")
             if path0 == "/api/account/groups" or path0.startswith("/api/account/groups/"):
                 return self._groups_route(path0, "POST")
             if path0 == "/api/account/authority/grant":
