@@ -127,7 +127,7 @@ function render() {
     const row = el("button", null, "row"); row.type = "button";
     const title = el("strong", `${review.repository} · ${review.branch}`);
     row.append(title, badge(review.standing),
-      el("small", `${review.owner_name} · ${review.head.slice(0, 12)} · submitted ${when(review.created_at)}`));
+      el("small", `${review.owner_name} · commit ${review.head.slice(0, 12)} · review ${review.id.slice(0, 12)} · submitted ${when(review.created_at)}`));
     row.setAttribute("aria-current", String(review.id === selected));
     row.onclick = () => show(review.id);
     list.append(row);
@@ -177,7 +177,7 @@ function renderAwaiting() {
     title.style.marginTop = "0";
     title.onclick = async () => { await show(review.id); byId("detail").scrollIntoView({ block: "start" }); };
     title.append(badge(review.standing));
-    text.append(title, el("small", `${review.head.slice(0, 12)} · by ${review.owner_name} · submitted ${when(review.created_at)}` +
+    text.append(title, el("small", `commit ${review.head.slice(0, 12)} · review ${review.id.slice(0, 12)} · by ${review.owner_name} · submitted ${when(review.created_at)}` +
       (review.standing === "waiting" ? ` · accepted by silence ${until(review.accept_after)}` : "")));
     if (review.note) text.append(el("small", review.note));
     row.append(text);
@@ -394,17 +394,18 @@ async function show(id) {
   const heading = el("h2", `${review.repository} · ${review.branch}`); heading.append(badge(review.standing));
   const facts = document.createElement("dl");
   for (const [term, value] of [
-    ["Lands on", review.base], ["Commit", review.head], ["Author", review.owner_name], ["Submitted", when(review.created_at)],
+    ["Lands on", review.base], ["Review ID", review.id], ["Commit", review.head], ["Author", review.owner_name], ["Submitted", when(review.created_at)],
     ["Accepted after", `${when(review.accept_after)} (${until(review.accept_after)})`],
     ["Branch after landing", review.delete_branch ? "deleted" : "kept"],
     ...(review.reviewer_name ? [["Decided by", `${review.reviewer_name}, ${when(review.reviewed_at)}`]] : []),
     ...(review.note ? [["Note", review.note]] : []),
     ...(review.revoked_at ? [["Approval revoked", `by ${review.revoked_by}, ${when(review.revoked_at)}: ${review.revoke_reason}`]] : []),
     ...(review.landed_at ? [["Landed", `${when(review.landed_at)} ${review.landed_detail || ""}`]] : []),
-  ]) { facts.append(el("dt", term)); const dd = el("dd"); dd.append(el(term === "Commit" ? "code" : "span", value)); facts.append(dd); }
+  ]) { facts.append(el("dt", term)); const dd = el("dd"); dd.append(el(term === "Commit" || term === "Review ID" ? "code" : "span", value)); facts.append(dd); }
   detail.replaceChildren(heading, facts);
+  detail.append(el("p", "Reviewer remarks are formal agree or object votes. Discussion comments are in Threads.", "muted"));
   if (review.remarks.length) {
-    detail.append(el("h3", "Remarks"));
+    detail.append(el("h3", "Reviewer remarks"));
     for (const r of review.remarks) detail.append(el("p", `${r.username}: ${r.verdict}${r.note ? " — " + r.note : ""} (${when(r.at)})`));
   }
   controls(review, detail);
