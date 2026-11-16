@@ -83,6 +83,7 @@ from meowdoku import marble_photo as marble_photo_mod  # noqa: E402  [MARBLE PHO
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
 from meowdoku import login_guard as login_guard_mod  # noqa: E402  [LOGIN] brute-force limits for /api/account/login
 from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real password login, SQLite-backed, separate from profiles.py
+from meowdoku.oauth_mcp import OAuthMCP
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import permission_groups as permission_groups_mod
@@ -424,6 +425,9 @@ class Sessions:
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
         self.accounts = accounts_mod.Accounts(self.state.accounts_db)   # [ACCOUNTS] real password login
         self.accounts_db = self.state.accounts_db
+        public_origin = os.environ.get("SPEAKTOME_PUBLIC_ORIGIN")
+        self.oauth_mcp = OAuthMCP(self.accounts, self.accounts_db, public_origin, SHADER_LIFT,
+                                  lambda: self.route) if public_origin else None
         self.radio_lock = threading.Lock()
         self.radio_control = None
         self.radio_jukebox = None
@@ -526,7 +530,7 @@ def make_handler(sessions: Sessions):
             super().__init__(*args, directory=str(web_dir), **kwargs)
 
         def log_message(self, format, *args):  # noqa: A002 - quiet static and polling logs
-            if "/api/connections/" in getattr(self, "path", ""):
+            if any(part in getattr(self, "path", "") for part in ("/api/connections/", "/oauth/", "/mcp")):
                 return  # OAuth codes/state and tool arguments must never enter access logs.
             line = str(args[0]) if args else ""
             if "/api/" in line and "/api/log" not in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
@@ -579,8 +583,16 @@ def make_handler(sessions: Sessions):
             Cookie authentication is unchanged. Messenger REST also accepts the same
             session token as Bearer, over verified HTTPS transport only. No token is minted here."""
             from http.cookies import SimpleCookie
+            authorization = self.headers.get_all("Authorization", [])
+            if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
+                self.client_address[0] in ("127.0.0.1", "::1") and not getattr(self, "_via_proxy", False) and
+                len(authorization) == 1 and authorization[0].startswith("Bearer ")):
+                user = sessions.oauth_mcp.user_for_token(authorization[0][7:])
+                if user is not None:
+                    self._oauth_internal = True
+                    return user
+                return None
             if self.path.partition("?")[0].startswith("/api/messages/"):
-                authorization = self.headers.get_all("Authorization", [])
                 if authorization:
                     # Explicit credentials win, including invalid ones: never silently
                     # fall back to an ambient browser cookie for another account.
@@ -617,6 +629,18 @@ def make_handler(sessions: Sessions):
             self._origin, self._origin_tier = sessions.access.decide(client_ip, self.headers.get("Host"))
             self._tier = self._origin_tier
             self._principal_cache = None
+            self._oauth_internal = False
+            if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
+                self.client_address[0] in ("127.0.0.1", "::1") and not self._via_proxy and
+                self.headers.get("Authorization", "").startswith("Bearer ")):
+                if self._account() is not None and self._oauth_internal:
+                    origin = self.headers.get("X-Speaktome-MCP-Origin")
+                    tier = self.headers.get("X-Speaktome-MCP-Tier")
+                    if origin in ("lan", "dns", "ip") and tier in ("shader", "play", "dev", "edit"):
+                        self._origin, self._tier = origin, tier
+                    else:
+                        self._origin, self._tier = "dns", "shader"
+                    return
             if self._origin_tier == "shader":                    # [LOGIN] a signed-in account lifts the shader lock; its caps still come from its role
                 account = self._account()
                 if account is not None:
@@ -2585,7 +2609,7 @@ def make_handler(sessions: Sessions):
                 self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
-            if not getattr(self, "path", "").startswith(("/api/", "/browse")):    # [LISTING] /browse sets its own no-store
+            if not getattr(self, "path", "").startswith(("/api/", "/browse", "/mcp", "/oauth/", "/.well-known/oauth-")):    # [LISTING] /browse sets its own no-store
                 path = getattr(self, "path", "").split("?", 1)[0]
                 self.send_header("Cache-Control", "no-store" if path in
                                  ("/marble_studio.html", "/marble_studio.js", "/marble_drive_input.js", "/marble_chase_camera.js", "/marble_studio_scene.js", "/marble_studio_transition.js", "/marble_studio_phong.js", "/marble_studio_dof.js", "/marble_autofocus.js", "/marble_camera_toolbox.js", "/marble_camera_toolbox_mount.js", "/marble_spot_sample.js", "/marble_rangefinder.js", "/marble_rangefinder_panel.js", "/marble_camera_binding.js", "/marble_object.js",
@@ -2970,9 +2994,24 @@ def make_handler(sessions: Sessions):
             hits.append(now)
             return True
 
+        def do_DELETE(self):  # noqa: N802
+            self._classify()
+            if sessions.oauth_mcp is not None and self.path.split("?", 1)[0] == "/mcp":
+                return sessions.oauth_mcp.mcp(self, "DELETE")
+            self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
+
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             self._classify()                                      # [ACCESS]
+            if sessions.oauth_mcp is not None:
+                if path in ("/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server"):
+                    return sessions.oauth_mcp.metadata(self, path)
+                if path == "/oauth/authorize":
+                    if not self._is_secure():
+                        return self._json({"error": "HTTPS required"}, 403)
+                    return sessions.oauth_mcp.authorize_get(self)
+                if path == "/mcp":
+                    return sessions.oauth_mcp.mcp(self, "GET")
             if self._kiosk_gate(path, "GET"):                     # [KIOSK]
                 return
             if self._route_gate(path, "GET"):                     # [ROUTE]
@@ -3555,6 +3594,21 @@ def make_handler(sessions: Sessions):
         def _do_post(self):
             path0 = self.path.split("?", 1)[0]
             self._classify()                                      # [KIOSK] first: no POST route answers an intern unless declared kiosk
+            if sessions.oauth_mcp is not None:
+                if path0 == "/oauth/register":
+                    if not self._is_secure():
+                        return self._json({"error": "HTTPS required"}, 403)
+                    return sessions.oauth_mcp.register(self)
+                if path0 == "/oauth/authorize":
+                    if not self._is_secure():
+                        return self._json({"error": "HTTPS required"}, 403)
+                    return sessions.oauth_mcp.authorize_post(self)
+                if path0 == "/oauth/token":
+                    if not self._is_secure():
+                        return self._json({"error": "HTTPS required"}, 403)
+                    return sessions.oauth_mcp.token(self)
+                if path0 == "/mcp":
+                    return sessions.oauth_mcp.mcp(self, "POST")
             if self._principal().role == "trial" and path0 not in (
                     "/api/account/keep", "/api/account/logout", "/api/account/login", "/api/account/signup"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
