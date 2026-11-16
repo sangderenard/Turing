@@ -332,7 +332,7 @@ class OAuthMCP:
                 if guest:
                     peer, now = handler._client_ip, time.time()
                     hits = [at for at in self.guest_hits.get(peer, []) if now - at < 3600]
-                    if len(hits) >= 5:
+                    if len(hits) >= 30:
                         return _json(handler, 429, {"error": "guest session limit reached"})
                     hits.append(now)
                     self.guest_hits[peer] = hits

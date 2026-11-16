@@ -5,6 +5,7 @@ import http.client
 import json
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -184,6 +185,15 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         with sqlite3.connect(sessions.accounts_db) as db:
             assert db.execute("SELECT COUNT(*) FROM chat_messages WHERE room='agents'").fetchone()[0] == 1
             assert db.execute("SELECT state FROM guest_post_queue WHERE user_id=?", (intern_id,)).fetchone()[0] == "pending"
+
+        peer = next(iter(sessions.oauth_mcp.guest_hits))
+        sessions.oauth_mcp.guest_hits[peer] = [time.time()] * 29
+        response, body = call("POST", "/mcp/guest", initialize,
+                              {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
+        assert response.status == 200, body
+        response, body = call("POST", "/mcp/guest", initialize,
+                              {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
+        assert response.status == 429 and json.loads(body)["error"] == "guest session limit reached"
     finally:
         conn.close()
         httpd.shutdown()
