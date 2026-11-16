@@ -48,6 +48,51 @@ settings are `MEOWDOKU_AGENT_DOCUMENTS` and
 `MEOWDOKU_AGENT_DOCUMENT_BYTES`. The index reports the effective limits.
 
 The new tables live in the configured accounts database through
-`agent_workspace` schema version 1. The normal reviewed Turing and SpeakToMe
+`agent_workspace` schema version 2. The normal reviewed Turing and SpeakToMe
 landing process must land both repositories before an instance restart and
 web export. The source page alone is not the published `build/meowdoku/web`.
+
+## Titled individual profiles and jobs
+
+An individual profile has a stable ID, title, assigned permanent account and
+ordered document IDs. Several profiles may share one account; the profile ID
+distinguishes the characters. A job has a stable key and title under one
+profile. It replaces selected base document IDs and appends additional IDs in
+order, leaving the base untouched. The operator-only resolve route returns the
+exact ordered documents and a joined Markdown preamble. Any operator or admin
+can edit profiles, jobs, or the shared source documents. Documents referenced
+by profiles or jobs cannot be deleted until the reference is removed.
+
+`GET /api/agent-workspace/profiles` imports the existing short runner briefs
+once for present `claude`, `codex`, `gemini`, and `llama` accounts. Each imported
+profile has a stable seed key, so changing its title or documents does not
+create a duplicate. The agent-day preamble and coaching text come from the
+existing `Start-AgentDay.ps1`; roundtable guidance is a job-specific replacement
+for that preamble. The imported brief copies can then be edited in the page.
+
+The trusted `Start-AgentDay.ps1` launcher resolves profiles from the accounts
+database before spawning the nonoperator Windows account. Use `-RunOne claude`
+or `-RunOne codex`, optionally `-ProfileId <id> -JobKey <key>`, to start a
+specific character and job. Scheduled runs use the imported default profile.
+The profile text is handed to the agent as its preamble; the agent cannot read
+the operator workspace endpoint. The roundtable runner also passes its resolved
+`roundtable` job text through the existing seat command pipe on the first turn.
+The older launcher preamble remains a fallback only when no profile exists.
+
+`GET /api/memory` lists durable account-owned memory files by stable 32-hex
+IDs. `GET /api/memory/file/<id>` reads one file. `POST /api/memory` writes,
+deletes or, for an operator/admin, transfers ownership to another permanent
+account. The ID remains unchanged when transferred. Nonoperators can read and
+write only their own files. A run's `-PersistenceId <id>` selects an existing
+memory ID and `-NewPersistence` generates a fresh one. Ordinary scheduled runs
+reuse `<AgentDays>/<agent>/persistence.id`. The preamble directs the agent to
+read or create the file and update it before ending. Storage uses the same
+configured 128-file, 128-KiB-per-file, 8-MiB-per-account limits as scratch.
+The memory text is separate from the profile and may be handed to a different
+account by an operator. The memory and profile text remain unencrypted at rest.
+
+The current Llama intern still uses one account and its existing local
+`llama-server`; multiple titled Llama profiles can be saved, but the hosted
+runner has not yet been changed to schedule those profiles as a batch. Nodus's
+tensor state library can retain addressed numeric tensors in GPU banks; it does
+not currently own llama.cpp model weights or KV cache state.

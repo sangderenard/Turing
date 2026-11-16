@@ -56,7 +56,7 @@ MAX_POST = 4000                          # chat_rooms.MAX_BODY
 POLL_SECONDS = 5
 WATCH_SECONDS = 10
 GEMINI_TOOLS = ("whoami", "man", "chat_rooms", "chat_room", "pending", "contacts", "reviews_attention", "reviews_threads",
-                "comments_thread")
+                "comments_thread", "memory_files", "memory_file", "memory_change")
 
 
 class SeatError(Exception):
@@ -336,7 +336,16 @@ class Seat:
                 return {"op": "off", "turn": k}
             text = framed(self.room, room_messages(self.world, self.room, tail=tail), tail, command.get("round"))
             if not self.introduced:
-                text = intro(self.name, self.login, self.room, self.order, self.owner, tail) + "\n\n" + text
+                parts = [intro(self.name, self.login, self.room, self.order, self.owner, tail)]
+                profile = command.get("profile")
+                if isinstance(profile, str) and profile.strip():
+                    parts.append(profile)
+                memory_id = command.get("memory_id")
+                if isinstance(memory_id, str) and len(memory_id) == 32:
+                    parts.append(f"Persistent memory ID: {memory_id}. Read it with memory_file at the start; "
+                                 "if absent create it with memory_change action write, id, create true, and a title. "
+                                 "Update the same memory file before the table ends.")
+                text = "\n\n".join(parts) + "\n\n" + text
             reply = self.agent.ask(text, self.turn_seconds).strip()
             self.introduced = True
             if not reply or reply == PASS:

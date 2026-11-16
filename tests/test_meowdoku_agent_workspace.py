@@ -83,3 +83,77 @@ def test_temporary_preview_scratch_stays_in_its_cookie(server):
     assert _call(server.port, "/api/scratch/file?name=clue", headers={**headers, "Cookie": account_cookie + "; " + saved})[1]["body"] == "a temporary note"
     assert _call(server.port, "/api/scratch/file?name=clue", headers=headers)[0] == 404
     assert _call(server.port, "/api/agent-workspace", headers=headers)[0] == 403
+
+
+def test_titled_profiles_job_changes_and_operator_boundary(server):
+    operator = _signup(server.port, "profile_operator")
+    other = _signup(server.port, "profile_person")
+    authz.grant_role(server.sessions.accounts_db, "profile_operator", "operator", "test")
+    headers = {**PUBLIC_XFF, "Cookie": operator, "X-Meowdoku-Workspace": "1"}
+    def post(path, body):
+        status, result, _, _ = _call(server.port, path, "POST", headers, body)
+        assert status == 200, result
+        return result
+    base = post("/api/agent-workspace/documents", {"action": "save", "kind": "prompt", "title": "Core", "body": "base"})
+    changed = post("/api/agent-workspace/documents", {"action": "save", "kind": "prompt", "title": "Job core", "body": "changed"})
+    extra = post("/api/agent-workspace/documents", {"action": "save", "kind": "guidance", "title": "Extra", "body": "added"})
+    profile = post("/api/agent-workspace/profiles", {"action": "save", "title": "The character",
+                   "individual": "profile_person", "document_ids": [base["id"]]})
+    second = post("/api/agent-workspace/profiles", {"action": "save", "title": "Another character",
+                  "individual": "profile_person", "document_ids": [extra["id"]]})
+    assert second["id"] != profile["id"]
+    job = post("/api/agent-workspace/jobs", {"action": "save", "profile_id": profile["id"],
+               "job_key": "guide", "title": "A guide", "replacements": {base["id"]: changed["id"]},
+               "additions": [extra["id"]]})
+    resolved = _call(server.port, "/api/agent-workspace/resolve?profile=" + profile["id"] + "&job=guide",
+                     headers=headers)[1]
+    assert [row["id"] for row in resolved["documents"]] == [changed["id"], extra["id"]]
+    assert "changed" in resolved["preamble"] and "added" in resolved["preamble"]
+    assert _call(server.port, "/api/agent-workspace/profile/" + profile["id"],
+                 headers={**PUBLIC_XFF, "Cookie": other})[0] == 403
+    assert _call(server.port, "/api/agent-workspace/resolve?profile=" + profile["id"],
+                 headers={**PUBLIC_XFF, "Cookie": other})[0] == 403
+    assert _call(server.port, "/api/agent-workspace/documents", "POST", headers,
+                 {"action": "delete", "id": base["id"]})[0] == 409
+    assert _call(server.port, "/api/agent-workspace/job/" + job["id"], headers=headers)[1]["job_key"] == "guide"
+
+
+def test_memory_ids_transfer_between_permanent_accounts(server):
+    first = _signup(server.port, "memory_first")
+    second = _signup(server.port, "memory_second")
+    operator = _signup(server.port, "memory_operator")
+    authz.grant_role(server.sessions.accounts_db, "memory_operator", "operator", "test")
+    headers = lambda cookie: {**PUBLIC_XFF, "Cookie": cookie, "X-Meowdoku-Workspace": "1"}
+    status, memory, _, _ = _call(server.port, "/api/memory", "POST", headers(first),
+                                 {"action": "write", "title": "Carry me", "body": "a remembered fact"})
+    assert status == 200, memory
+    assert len(memory["id"]) == 32
+    path = "/api/memory/file/" + memory["id"]
+    assert _call(server.port, path, headers=headers(second))[0] == 404
+    assert _call(server.port, "/api/memory", "POST", headers(second),
+                 {"action": "transfer", "id": memory["id"], "to": "memory_second"})[0] == 403
+    status, moved, _, _ = _call(server.port, "/api/memory", "POST", headers(operator),
+                                {"action": "transfer", "id": memory["id"], "to": "memory_second"})
+    assert status == 200 and moved["id"] == memory["id"]
+    assert _call(server.port, path, headers=headers(first))[0] == 404
+    assert _call(server.port, path, headers=headers(second))[1]["body"] == "a remembered fact"
+
+
+def test_imported_briefs_are_idempotent_and_roundtable_is_job_specific(server):
+    operator = _signup(server.port, "brief_operator")
+    _signup(server.port, "claude")
+    _signup(server.port, "codex")
+    _signup(server.port, "gemini")
+    _signup(server.port, "llama")
+    authz.grant_role(server.sessions.accounts_db, "brief_operator", "operator", "test")
+    headers = {**PUBLIC_XFF, "Cookie": operator}
+    first = _call(server.port, "/api/agent-workspace/profiles", headers=headers)[1]["profiles"]
+    second = _call(server.port, "/api/agent-workspace/profiles", headers=headers)[1]["profiles"]
+    assert len(first) == len(second) == 4
+    claude = next(row for row in first if row["individual"] == "claude")
+    base = _call(server.port, "/api/agent-workspace/resolve?profile=" + claude["id"], headers=headers)[1]
+    table = _call(server.port, "/api/agent-workspace/resolve?profile=" + claude["id"] + "&job=roundtable",
+                  headers=headers)[1]
+    assert "Every run, first" in base["preamble"]
+    assert "Every run, first" not in table["preamble"]
+    assert "one seat at a round table" in table["preamble"]
