@@ -5,7 +5,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 9;
+const VERSION = 10;
 
 function allowed() {
   const here = import.meta.url;
@@ -647,6 +647,7 @@ async function main() {
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
     link("People (accounts and groups)", "/people.html", caps.has("account_manage")),
     link("Operator control", "/operator-control.html", caps.has("deploy_scripts")),
+    link("Agent workspace", "/agent-workspace.html", caps.has("operator_workspace")),
     link("Rooms", "/rooms.html"),
     link("Account and password", "/login.html"),
     link("Invite someone", "/invite.html"),                                         // [INVITE] invitations.py: a link and a QR code, once

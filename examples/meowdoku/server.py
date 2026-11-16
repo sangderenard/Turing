@@ -41,6 +41,7 @@ import os
 import json
 import re
 import secrets
+import sqlite3
 import struct
 import sys
 import threading
@@ -100,6 +101,7 @@ from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the decl
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
+from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
 from meowdoku import paper_arena as paper_arena_mod
@@ -1475,6 +1477,112 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "invalid upload request"}, HTTPStatus.BAD_REQUEST)
             except (OSError, sqlite3.Error, user_files_mod.schema_version.SchemaVersionError):
                 return self._json({"error": "file storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _agent_workspace_route(self, path: str, method: str) -> None:
+            from urllib.parse import parse_qs
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if not self._require("operator_workspace") or self._principal().role not in ("operator", "admin"):
+                return
+            if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+            query = parse_qs(self.path.partition("?")[2])
+            db = None
+            try:
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                if method == "GET":
+                    if path == "/api/agent-workspace":
+                        return self._json(agent_workspace_mod.index(db))
+                    if path == "/api/agent-workspace/children":
+                        return self._json(agent_workspace_mod.children(db, (query.get("parent") or [None])[0],
+                                                                      (query.get("kind") or [None])[0]))
+                    if path.startswith("/api/agent-workspace/document/"):
+                        return self._json(agent_workspace_mod.document(db, path.rsplit("/", 1)[1]))
+                if method == "POST" and path == "/api/agent-workspace/documents":
+                    body = self._body_json(limit=agent_workspace_mod.MAX_DOC_BYTES + 8192)
+                    if body is None:
+                        return
+                    if body.get("action") == "delete":
+                        return self._json(agent_workspace_mod.delete_document(db, body.get("id")))
+                    if body.get("action") == "save":
+                        return self._json(agent_workspace_mod.save_document(db, self._principal().user_id, body))
+                    raise agent_workspace_mod.WorkspaceError("action must be save or delete")
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except agent_workspace_mod.WorkspaceError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error):
+                return self._json({"error": "agent workspace unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _scratch_route(self, path: str, method: str) -> None:
+            from urllib.parse import parse_qs
+            self._set_cookie = []
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            account = self._account()
+            if account is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            principal = self._principal()
+            temporary = principal.role == "trial"
+            if not temporary and not self._require("agent_scratch"):
+                return
+            if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+            owner_id = principal.user_id
+            query = parse_qs(self.path.partition("?")[2])
+            db = None
+            try:
+                if temporary:
+                    files = agent_workspace_mod.temp_files(self.headers.get("Cookie"), owner_id)
+                    if method == "GET" and path == "/api/scratch":
+                        return self._json({"files": [{"name": name, "bytes": len(value.encode())} for name, value in sorted(files.items())],
+                                           "quota": {"total_bytes": agent_workspace_mod.MAX_TEMP_BYTES, "storage": "cookie"}})
+                    if method == "GET" and path == "/api/scratch/file":
+                        name = agent_workspace_mod._name((query.get("name") or [None])[0])
+                        if name not in files:
+                            raise agent_workspace_mod.WorkspaceError("scratch file not found", 404)
+                        return self._json({"name": name, "body": files[name]})
+                    if method == "POST" and path == "/api/scratch":
+                        body = self._body_json(limit=4096)
+                        if body is None:
+                            return
+                        name = agent_workspace_mod._name(body.get("name"))
+                        if body.get("action") == "write":
+                            files[name] = agent_workspace_mod._text(body.get("body"), "scratch file", agent_workspace_mod.MAX_TEMP_BYTES)
+                        elif body.get("action") == "delete":
+                            if name not in files:
+                                raise agent_workspace_mod.WorkspaceError("scratch file not found", 404)
+                            del files[name]
+                        else:
+                            raise agent_workspace_mod.WorkspaceError("action must be write or delete")
+                        self._set_cookie.append(agent_workspace_mod.temp_cookie(owner_id, files))
+                        return self._json({"name": name, "stored": body["action"] == "write", "storage": "cookie"})
+                else:
+                    db = agent_workspace_mod.connect(sessions.accounts_db)
+                    if method == "GET" and path == "/api/scratch":
+                        return self._json(agent_workspace_mod.scratch_list(db, owner_id))
+                    if method == "GET" and path == "/api/scratch/file":
+                        return self._json(agent_workspace_mod.scratch_read(db, owner_id, (query.get("name") or [None])[0]))
+                    if method == "POST" and path == "/api/scratch":
+                        body = self._body_json(limit=agent_workspace_mod.MAX_SCRATCH_FILE_BYTES + 8192)
+                        if body is None:
+                            return
+                        if body.get("action") == "write":
+                            return self._json(agent_workspace_mod.scratch_write(db, owner_id, body.get("name"), body.get("body")))
+                        if body.get("action") == "delete":
+                            return self._json(agent_workspace_mod.scratch_delete(db, owner_id, body.get("name")))
+                        raise agent_workspace_mod.WorkspaceError("action must be write or delete")
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except agent_workspace_mod.WorkspaceError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error):
+                return self._json({"error": "scratch unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -3206,6 +3314,10 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path, "GET")
             if path == "/api/user-files" or path.startswith("/api/user-files/"):
                 return self._user_files_route(path, "GET")
+            if path == "/api/agent-workspace" or path.startswith("/api/agent-workspace/"):
+                return self._agent_workspace_route(path, "GET")
+            if path == "/api/scratch" or path == "/api/scratch/file":
+                return self._scratch_route(path, "GET")
             if path in ("/api/file-keys/me", "/api/file-keys/peer"):
                 return self._file_keys_route(path, "GET")
             if path.startswith("/api/connections/"):
@@ -3698,7 +3810,7 @@ def make_handler(sessions: Sessions):
                     return sessions.oauth_mcp.mcp(self, "POST", guest=True)
             if self._principal().role == "trial" and path0 not in (
                     "/api/account/keep", "/api/account/recover", "/api/account/logout", "/api/account/login", "/api/account/signup",
-                    "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback"):
+                    "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback", "/api/scratch"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
                 return
@@ -3832,6 +3944,10 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path0, "POST")
             if path0 == "/api/user-files":
                 return self._user_files_route(path0, "POST")
+            if path0 == "/api/agent-workspace/documents":
+                return self._agent_workspace_route(path0, "POST")
+            if path0 == "/api/scratch":
+                return self._scratch_route(path0, "POST")
             if path0 == "/api/file-keys/me":
                 return self._file_keys_route(path0, "POST")
             if path0.startswith("/api/connections/"):

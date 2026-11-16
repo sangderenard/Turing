@@ -122,7 +122,8 @@ except ImportError:
     _permission_spec.loader.exec_module(_permission_groups)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit",
+        "operator_workspace", "agent_scratch")
 ROLES = ("admin", "member", "dev", "service", "operator", "intern", "guest")
 KIOSK_ROLES = ("intern",)      # answered only on catalog endpoints declared kiosk (see KIOSK above)
 ORIGINS = ("lan", "ip", "dns")
@@ -274,13 +275,21 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
         return frozenset(c for c in caps & set(policy["role_caps"].get("guest", ())) if c in CAPS and c not in (
             "lifecycle_admin", "account_manage", "paper_train", "nodus_edit", "compile_unstable"))
     if principal.role == "trial":
-        return frozenset({"view_site", "photo_read"})
+        return frozenset({"view_site", "photo_read", "agent_scratch"})
     if principal.role in _permission_groups.RANKS:
         for group in _permission_groups.ORDER:
             if _permission_groups.RANKS[group] <= _permission_groups.RANKS[principal.role]:
                 caps |= set(policy["role_caps"].get(group, ()))
     else:
         caps |= set(policy["role_caps"].get(principal.role, ()))
+    # These two spaces are tied to account permanence and role, even when an
+    # older on-disk policy predates their capability names.
+    if principal.user_id is not None and principal.role not in ("guest", "trial"):
+        caps.add("agent_scratch")
+    if principal.role in ("operator", "admin"):
+        caps.add("operator_workspace")
+    else:
+        caps.discard("operator_workspace")
     for cap in principal.modifiers:
         if cap == "message" and principal.role == "intern":
             caps.add(cap)

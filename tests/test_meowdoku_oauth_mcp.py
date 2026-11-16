@@ -156,6 +156,9 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
 
         identity = guest_tool("whoami", {}, 11)
         assert identity["role"] == "trial" and identity["signed_in"]
+        saved = guest_tool("scratch_change", {"action": "write", "name": "clue", "body": "cookie-backed"}, 115)
+        assert saved["data"]["storage"] == "cookie"
+        assert guest_tool("scratch_file", {"name": "clue"}, 116)["data"]["body"] == "cookie-backed"
         listing = json.dumps({"jsonrpc": "2.0", "id": 12, "method": "tools/list"})
         response, body = call("POST", "/mcp/guest", listing, guest_headers)
         names = {tool["name"] for tool in json.loads(body)["result"]["tools"]}

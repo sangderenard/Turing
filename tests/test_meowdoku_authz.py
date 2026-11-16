@@ -49,7 +49,7 @@ def test_guest_dns():
 
 
 def test_member_dns():
-    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "photo_read", "studio_write", "photo_submit", "share_live", "compile_submit", "message"}
+    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "photo_read", "studio_write", "photo_submit", "share_live", "compile_submit", "message", "agent_scratch"}
 
 
 def test_admin_dns_no_lifecycle():
@@ -62,7 +62,7 @@ def test_admin_lan_everything():
 
 def test_member_lan_edit_has_no_admin_caps():
     caps = authz.capabilities(P("member", "lan", "edit"), authz.DEFAULT_POLICY)
-    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git", "paper_train"}
+    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git", "paper_train", "operator_workspace"}
 
 
 def test_higher_permission_group_inherits_lower_capabilities():
@@ -204,7 +204,7 @@ def test_intern_is_a_kiosk_whatever_the_tier():
     for origin, tier in (("dns", "shader"), ("dns", "play"), ("ip", "dev"), ("lan", "edit")):
         principal = P("intern", origin, tier)
         assert authz.kiosk(principal)
-        assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
+        assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
     assert not any(authz.kiosk(P(role)) for role in ("guest", "member", "dev", "operator", "service", "admin"))
 
 
@@ -220,7 +220,7 @@ def test_intern_is_off_the_human_ladder_and_takes_no_group(db):
     assert authz.role_of(db, 2) == "intern"
     principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
     assert principal.role == "intern" and principal.groups == frozenset({"intern"})
-    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
 
 
 def test_only_an_admin_can_grant_message_to_one_intern(db):
@@ -236,12 +236,12 @@ def test_only_an_admin_can_grant_message_to_one_intern(db):
         assert granted["modifiers"] == {"message": True}
         assert conn.execute("SELECT count(*) FROM account_capability_modifier_audit").fetchone()[0] == 1
     principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
-    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "message"}
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "message", "agent_scratch"}
     with authz._connect(db) as conn:
         groups.set_grant(conn, 1, 2, "message", False)
         assert conn.execute("SELECT count(*) FROM account_capability_modifier_audit").fetchone()[0] == 2
     principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
-    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
 
 
 def test_an_older_account_roles_table_is_rebuilt_to_admit_intern(tmp_path):

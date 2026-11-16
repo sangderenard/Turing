@@ -258,14 +258,14 @@ def test_an_intern_is_answered_only_on_the_kiosk_endpoints(server):
     public = {**PUBLIC_XFF, "Cookie": cookie}
     for headers in (local, public):
         who = _call(port, "/api/whoami", headers=headers)[1]
-        assert who["role"] == "intern" and who["kiosk"] is True and who["capabilities"] == ["photo_read", "view_site"]
+        assert who["role"] == "intern" and who["kiosk"] is True and who["capabilities"] == ["agent_scratch", "photo_read", "view_site"]
         # writes, messaging, lifecycle and handlers that ask for no capability: refused before any handler runs
         for method, path, body in (("POST", "/api/reports", {"request_id": "r1"}), ("POST", "/api/relay/send", {}),
                                    ("GET", "/api/relay/addresses", None), ("GET", "/api/account/groups", None),
                                    ("POST", "/api/account/groups", {"name": "g"}),
                                    ("POST", "/api/tickets", {}), ("POST", "/api/admin/lifecycle", {}), ("GET", "/api/log", None),
                                    ("GET", "/api/paper/account", None), ("POST", "/api/account/signup", {"username": "x"}),
-                                   # no personal storage: material is burned on delivery
+                                   # encrypted shared files still need message authority
                                    ("GET", "/api/user-files", None), ("POST", "/api/user-files", {}),
                                    ("POST", "/api/relay/open", {}),
                                    ("GET", "/", None)):
