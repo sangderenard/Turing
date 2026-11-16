@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples"), str(ROOT / "tests")]
 
 from meowdoku import server as srv  # noqa: E402
-from meowdoku import authz  # noqa: E402
+from meowdoku import authz, oauth_mcp  # noqa: E402
 from test_meowdoku_access import _web  # noqa: E402
 
 
@@ -127,6 +127,23 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         assert response.status == 200, body
         guest_headers["MCP-Session-Id"] = response.getheader("MCP-Session-Id")
         assert guest_headers["MCP-Session-Id"]
+        # Several connectors behind one forwarded address must not exhaust a
+        # five-session hourly budget during ordinary tool discovery.
+        for _ in range(6):
+            response, body = call("POST", "/mcp/guest", initialize,
+                                  {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
+            assert response.status == 200, body
+        monkeypatch.setattr(oauth_mcp, "MAX_GUEST_SESSIONS", 7)
+        response, body = call("POST", "/mcp/guest", initialize,
+                              {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
+        assert response.status == 503 and response.getheader("Retry-After") == "10"
+        with sessions.oauth_mcp.lock:
+            old = next(sid for sid, entry in sessions.oauth_mcp.servers.items()
+                       if entry[0] == "guest" and sid != guest_headers["MCP-Session-Id"])
+            sessions.oauth_mcp.server_used[old] = time.monotonic() - oauth_mcp.MCP_SESSION_IDLE - 1
+        response, body = call("POST", "/mcp/guest", initialize,
+                              {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
+        assert response.status == 200, body
 
         def guest_tool(name, arguments, rid):
             request = json.dumps({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
@@ -200,15 +217,6 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         with sqlite3.connect(sessions.accounts_db) as db:
             assert db.execute("SELECT COUNT(*) FROM chat_messages WHERE room='agents'").fetchone()[0] == 1
             assert db.execute("SELECT state FROM guest_post_queue WHERE user_id=?", (intern_id,)).fetchone()[0] == "pending"
-
-        peer = next(iter(sessions.oauth_mcp.guest_hits))
-        sessions.oauth_mcp.guest_hits[peer] = [time.time()] * 29
-        response, body = call("POST", "/mcp/guest", initialize,
-                              {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
-        assert response.status == 200, body
-        response, body = call("POST", "/mcp/guest", initialize,
-                              {k: v for k, v in guest_headers.items() if k != "MCP-Session-Id"})
-        assert response.status == 429 and json.loads(body)["error"] == "guest session limit reached"
     finally:
         conn.close()
         httpd.shutdown()
