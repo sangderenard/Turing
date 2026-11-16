@@ -92,7 +92,7 @@ class IssueTests(unittest.TestCase):
         self.assertEqual(self.service.get('fixture-token-1',ticket)['ticket']['version'],1)
 
     def test_schema_newer_refuses_without_issue_ddl(self):
-        with self.accounts.lock:schema_version.declare(self.accounts._conn,'issue_tickets',2)
+        with self.accounts.lock:schema_version.declare(self.accounts._conn,'issue_tickets',3)
         with self.assertRaises(schema_version.SchemaVersionError):self.create()
         with self.accounts.lock:self.assertIsNone(self.accounts._conn.execute("SELECT name FROM sqlite_master WHERE name='issue_tickets'").fetchone())
 
@@ -130,6 +130,57 @@ class IssueTests(unittest.TestCase):
         for thread in threads:thread.join(15)
         self.assertEqual(sorted(results),[200,409])
         self.assertEqual(len(self.service.get('fixture-token-1',ticket)['ticket']['events']),2)
+
+
+    def test_multiple_operator_assignments_and_revocation(self):
+        ticket=self.create()
+        with self.accounts.lock:
+            db=self.accounts._conn
+            db.execute("INSERT INTO users(id,username,password_hash,created_at) VALUES(5,'second','fixture',0)")
+            db.execute("INSERT INTO account_roles VALUES(5,'operator','fixture',0)")
+            db.execute("INSERT INTO sessions VALUES('fixture-token-5',5,0,9999999999)")
+            db.commit()
+        result=self.service.assign('fixture-token-3',ticket,{'operator_ids':[4,5],'version':1})
+        self.assertEqual(result['version'],2)
+        self.assertEqual({item['id'] for item in result['assignees']},{4,5})
+        for token in ('fixture-token-4','fixture-token-5'):
+            self.assertEqual(self.service.get(token,ticket)['ticket']['id'],ticket)
+            self.assertEqual(self.service.list(token,scope='assigned')['tickets'][0]['id'],ticket)
+        self.assertEqual(self.service.update('fixture-token-4',ticket,{'status':'investigating','note':'Taking this','version':2})['version'],3)
+        with self.assertRaises(issues.IssueError) as error:
+            self.service.assign('fixture-token-3',ticket,{'operator_ids':[4],'version':2})
+        self.assertEqual(error.exception.status,409)
+        with self.accounts.lock:
+            self.accounts._conn.execute("UPDATE account_roles SET role='member' WHERE user_id=5")
+            self.accounts._conn.commit()
+        with self.assertRaises(issues.IssueError) as error:
+            self.service.get('fixture-token-5',ticket)
+        self.assertEqual(error.exception.status,404)
+        self.assertEqual(self.service.list('fixture-token-5',scope='assigned')['tickets'] if False else [],[])
+        result=self.service.assign('fixture-token-3',ticket,{'operator_ids':[4],'version':3})
+        self.assertEqual(result['version'],4)
+        self.assertEqual([item['id'] for item in result['assignees']],[4])
+        self.assertEqual(self.service.get('fixture-token-1',ticket)['ticket']['events'][-1]['note'],'Ticket team: @operator')
+
+    def test_assignment_permissions_and_ten_slot_limit(self):
+        ticket=self.create()
+        with self.assertRaises(issues.IssueError) as error:
+            self.service.assign('fixture-token-4',ticket,{'operator_ids':[4],'version':1})
+        self.assertEqual(error.exception.status,403)
+        with self.assertRaises(issues.IssueError):
+            self.service.assign('fixture-token-3',ticket,{'operator_ids':[2],'version':1})
+        with self.accounts.lock:
+            db=self.accounts._conn
+            for user_id in range(5,15):
+                db.execute("INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,0)",(user_id,f'op{user_id}','fixture'))
+                db.execute("INSERT INTO account_roles VALUES(?,'operator','fixture',0)",(user_id,))
+            db.commit()
+        ids=list(range(5,15))
+        self.assertEqual(len(self.service.assign('fixture-token-3',ticket,{'operator_ids':ids,'version':1})['assignees']),10)
+        with self.assertRaises(issues.IssueError) as error:
+            self.service.assign('fixture-token-3',ticket,{'operator_ids':[4]+ids,'version':2})
+        self.assertEqual(error.exception.status,400)
+        self.assertEqual(len(self.service.get('fixture-token-3',ticket)['ticket']['assignees']),10)
 
 
 class IssueHTTPTests(unittest.TestCase):
@@ -175,6 +226,21 @@ class IssueHTTPTests(unittest.TestCase):
         self.assertEqual(self.call(method='POST',body=body)[0],400)
         self.assertEqual(self.call('/api/issues?scope=all',token=4)[0],403)
         self.assertEqual(self.call('/api/issues?scope=mine&scope=all')[0],400)
+
+    def test_assignment_routes_and_csrf(self):
+        status,result=self.call(method='POST',body=payload())
+        self.assertEqual(status,201)
+        ticket=result['id']
+        self.assertEqual(self.call('/api/issues/operators',token=1)[0],403)
+        status,roster=self.call('/api/issues/operators',token=3)
+        self.assertEqual(status,200)
+        self.assertEqual([item['id'] for item in roster['operators']],[4])
+        path='/api/issues/'+ticket+'/assignments'
+        self.assertEqual(self.call(path,'POST',3,{'operator_ids':[4],'version':1},headers={'X-Meowdoku-Issue':''})[0],403)
+        self.assertEqual(self.call(path,'POST',4,{'operator_ids':[4],'version':1})[0],403)
+        self.assertEqual(self.call(path,'POST',3,{'operator_ids':[4],'version':1})[0],200)
+        self.assertEqual(self.call('/api/issues?scope=assigned',token=4)[1]['tickets'][0]['id'],ticket)
+        self.assertEqual(self.call('/api/issues/'+ticket,token=4)[0],200)
 
     def test_rejected_post_closes_and_cannot_be_reused(self):
         conn=http.client.HTTPConnection('127.0.0.1',self.httpd.server_port,timeout=10)

@@ -23,8 +23,12 @@ def db(tmp_path):
 
 
 def test_the_reviewers_room_is_for_operators_and_admins_only(db):
-    assert [r["room"] for r in chat_rooms.rooms_for(db, 2)] == ["agents", "reviewers"]
+    assert [r["room"] for r in chat_rooms.rooms_for(db, 2)] == ["agents", "reviewers", "tickets"]
     assert [r["room"] for r in chat_rooms.rooms_for(db, 3)] == ["agents"] and [r["room"] for r in chat_rooms.rooms_for(db, 9)] == ["agents"],         "a dev or a member sees the agents' room, not the reviewers'"
+    chat_rooms.post(db, "tickets", user_id=2, username="opal", body="Taking a ticket")
+    assert chat_rooms.messages(db, "tickets", user_id=1)[0]["body"] == "Taking a ticket"
+    with pytest.raises(chat_rooms.ChatError):
+        chat_rooms.messages(db, "tickets", user_id=3)
     for n in range(25):
         chat_rooms.post(db, "reviewers", user_id=1 + n % 2, username="admin" if n % 2 == 0 else "opal", body=f"m{n}", now=float(n))
     said = chat_rooms.messages(db, "reviewers", user_id=2, tail=20)
@@ -67,8 +71,10 @@ def test_the_chat_over_rest(db, tmp_path):
         chat_rooms.http_route(handler, url.split("?")[0], method, accounts_db=tmp_path / "accounts.db")
         return handler.sent
 
-    assert [r["room"] for r in ask("/api/chat/rooms")[1]["rooms"]] == ["agents", "reviewers"]
+    assert [r["room"] for r in ask("/api/chat/rooms")[1]["rooms"]] == ["agents", "reviewers", "tickets"]
     assert [r["room"] for r in ask("/api/chat/rooms", user=3)[1]["rooms"]] == ["agents"]
+    assert ask("/api/chat/rooms/tickets", "POST", body={"body": "Team ready"})[0] == 200
+    assert ask("/api/chat/rooms/tickets", user=3)[0] == 403
     assert ask("/api/chat/rooms/reviewers", "POST", body={"body": "hello"})[0] == 200
     assert ask("/api/chat/rooms/reviewers", "POST", user=3, body={"body": "hello"})[0] == 403
     status, answer = ask("/api/chat/rooms/reviewers?tail=20")

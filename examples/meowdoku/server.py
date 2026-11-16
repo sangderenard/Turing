@@ -1262,11 +1262,15 @@ def make_handler(sessions: Sessions):
                             raise issue_tickets_mod.IssueError("invalid list query")
                         return self._json(service.list(token, scope=query.get("scope", ["mine"])[0],
                             status=query.get("status", ["all"])[0], offset=int(query.get("offset", ["0"])[0])))
+                    if path == "/api/issues/operators":
+                        if query:
+                            raise issue_tickets_mod.IssueError("unexpected operator query")
+                        return self._json(service.operators(token))
                     if set(query) - {"before_version"} or any(len(v) != 1 for v in query.values()):
                         raise issue_tickets_mod.IssueError("unexpected ticket query")
                     before = int(query["before_version"][0]) if "before_version" in query else None
                     return self._json(service.get(token, path.removeprefix("/api/issues/"), before_version=before))
-                if path != "/api/issues" and not path.endswith("/status"):
+                if path != "/api/issues" and not path.endswith(("/status", "/assignments")):
                     raise issue_tickets_mod.IssueError("not found", 404)
                 origin = self.headers.get("Origin")
                 expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
@@ -1287,6 +1291,9 @@ def make_handler(sessions: Sessions):
                 if path == "/api/issues":
                     result = service.create(token, payload, server_instance=sessions.instance, server_log_seq=logring_mod.RING.seq)
                     return self._json(result, HTTPStatus.CREATED if result["created"] else HTTPStatus.OK)
+                if path.endswith("/assignments"):
+                    ticket_id = path.removeprefix("/api/issues/").removesuffix("/assignments")
+                    return self._json(service.assign(token, ticket_id, payload))
                 ticket_id = path.removeprefix("/api/issues/").removesuffix("/status")
                 return self._json(service.update(token, ticket_id, payload))
             except issue_tickets_mod.IssueError as error:

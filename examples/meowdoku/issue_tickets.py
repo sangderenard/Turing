@@ -1,7 +1,7 @@
 """Account-owned incident tickets, separate from workspace snapshot reviews.
 
-The existing Accounts session is the only caller identity. Administrators are
-checked against account_roles in each transaction; LAN/dev/operator is not admin.
+The existing Accounts session is the only caller identity. Administrators and operators are checked against account_roles in each transaction.
+Assigned operators may read and update their tickets; only administrators assign the team.
 No filesystem receipts, merges, role changes, or automatic issue resolution.
 """
 from __future__ import annotations
@@ -17,7 +17,8 @@ import uuid
 
 from meowdoku import schema_version
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+MAX_ASSIGNEES = 10
 MAX_BODY = 100_000
 MAX_DIAGNOSTICS = 80_000
 ID = re.compile(r'[0-9a-f]{32}\Z')
@@ -46,6 +47,11 @@ DDL = (
         note TEXT NOT NULL, version INTEGER NOT NULL, UNIQUE(ticket_id,version))""",
     'CREATE INDEX IF NOT EXISTS issue_tickets_owner_created ON issue_tickets(owner_id,created_at)',
     'CREATE INDEX IF NOT EXISTS issue_ticket_events_actor_created ON issue_ticket_events(actor_id,created_at)',
+    """CREATE TABLE IF NOT EXISTS issue_ticket_assignees (
+        ticket_id TEXT NOT NULL REFERENCES issue_tickets(id), user_id INTEGER NOT NULL REFERENCES users(id),
+        assigned_by INTEGER NOT NULL REFERENCES users(id), created_at REAL NOT NULL,
+        PRIMARY KEY(ticket_id,user_id))""",
+    'CREATE INDEX IF NOT EXISTS issue_ticket_assignees_user ON issue_ticket_assignees(user_id,ticket_id)',
 )
 
 
@@ -100,13 +106,36 @@ class Service:
             db.close()
 
     @staticmethod
+    def is_operator(db, actor):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_roles'").fetchone():
+            return False
+        return db.execute("SELECT 1 FROM account_roles WHERE user_id=? AND role='operator'", (actor,)).fetchone() is not None
+
+    @staticmethod
     def visible(db, actor, admin, ticket_id):
         if not isinstance(ticket_id,str) or not ID.fullmatch(ticket_id):
             raise IssueError('ticket not found',404)
-        row=db.execute('SELECT * FROM issue_tickets WHERE id=? AND (owner_id=? OR ?)',(ticket_id,actor,int(admin))).fetchone()
+        row=db.execute('SELECT * FROM issue_tickets WHERE id=?',(ticket_id,)).fetchone()
         if row is None:
             raise IssueError('ticket not found',404)
+        if row['owner_id'] != actor and not admin:
+            assigned = Service.is_operator(db, actor) and db.execute(
+                'SELECT 1 FROM issue_ticket_assignees WHERE ticket_id=? AND user_id=?',
+                (ticket_id, actor)).fetchone()
+            if not assigned:
+                raise IssueError('ticket not found',404)
         return row
+
+    @staticmethod
+    def assignees(db, ticket_id):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_roles'").fetchone():
+            return []
+        return [dict(row) for row in db.execute(
+            'SELECT users.id,users.username FROM issue_ticket_assignees '
+            'JOIN users ON users.id=issue_ticket_assignees.user_id '
+            'JOIN account_roles ON account_roles.user_id=users.id AND account_roles.role=\'operator\' '
+            'WHERE issue_ticket_assignees.ticket_id=? ORDER BY users.username COLLATE NOCASE',
+            (ticket_id,)).fetchall()]
 
     def create(self, token, payload, *, server_instance='', server_log_seq=0):
         if not isinstance(payload,dict) or set(payload) - {'title','description','diagnostics','client_key'}:
@@ -142,14 +171,29 @@ class Service:
             return {'id':ticket_id,'created':True}
 
     def list(self, token, *, scope='mine', status='all', offset=0):
-        if scope not in ('mine','all') or status not in (*STATUSES,'all') or type(offset) is not int or not 0 <= offset <= 1_000_000:
+        if scope not in ('mine','assigned','all') or status not in (*STATUSES,'all') or type(offset) is not int or not 0 <= offset <= 1_000_000:
             raise IssueError('invalid list filter')
         with self.transaction(token) as (db,actor,admin):
+            operator = self.is_operator(db,actor)
             if scope == 'all' and not admin:
                 raise IssueError('administrator required',403)
-            rows=db.execute('SELECT id,owner_id,title,status,version,created_at,updated_at FROM issue_tickets WHERE (? OR owner_id=?) AND (?=\'all\' OR status=?) ORDER BY updated_at DESC,id DESC LIMIT 51 OFFSET ?',
-                            (int(scope=='all'),actor,status,status,offset)).fetchall()
-            return {'tickets':[dict(r) for r in rows[:50]],'next_offset':offset+50 if len(rows)>50 else None,'can_review_all':admin}
+            if scope == 'assigned' and not (operator or admin):
+                raise IssueError('operator required',403)
+            visibility = {
+                'mine': 'owner_id=?',
+                'assigned': 'EXISTS (SELECT 1 FROM issue_ticket_assignees WHERE ticket_id=issue_tickets.id AND user_id=?)',
+                'all': '1=1',
+            }[scope]
+            params = (actor,) if scope != 'all' else ()
+            rows=db.execute(
+                'SELECT id,owner_id,title,status,version,created_at,updated_at FROM issue_tickets '
+                'WHERE '+visibility+' AND (?=\'all\' OR status=?) ORDER BY updated_at DESC,id DESC LIMIT 51 OFFSET ?',
+                (*params,status,status,offset)).fetchall()
+            tickets=[dict(r) for r in rows[:50]]
+            for ticket in tickets:
+                ticket['assignees']=self.assignees(db,ticket['id'])
+            return {'tickets':tickets,'next_offset':offset+50 if len(rows)>50 else None,
+                    'can_review_all':admin,'can_view_assigned':operator or admin}
 
     def get(self, token, ticket_id, *, before_version=None):
         if before_version is not None and (type(before_version) is not int or not 1 <= before_version <= (1 << 63)-1):
@@ -158,10 +202,11 @@ class Service:
             row=dict(self.visible(db,actor,admin,ticket_id))
             row.pop('request_digest');row.pop('client_key')
             row['diagnostics']=json.loads(row['diagnostics'])
+            row['assignees']=self.assignees(db,ticket_id)
             events=db.execute('SELECT actor_id,created_at,status,note,version FROM issue_ticket_events WHERE ticket_id=? AND (? IS NULL OR version<?) ORDER BY version DESC LIMIT 21',(ticket_id,before_version,before_version)).fetchall()
             row['events']=[dict(r) for r in reversed(events[:20])]
             row['next_before_version']=events[19]['version'] if len(events)>20 else None
-            return {'ticket':row,'can_review_all':admin}
+            return {'ticket':row,'can_review_all':admin,'can_assign':admin,'max_assignees':MAX_ASSIGNEES}
 
     def update(self, token, ticket_id, payload):
         if not isinstance(payload,dict) or set(payload) != {'status','note','version'}:
@@ -180,3 +225,50 @@ class Service:
             db.execute('UPDATE issue_tickets SET status=?,version=version+1,updated_at=? WHERE id=?',(status,now,ticket_id))
             db.execute('INSERT INTO issue_ticket_events(ticket_id,actor_id,created_at,status,note,version) VALUES(?,?,?,?,?,?)',(ticket_id,actor,now,status,note,version+1))
             return {'id':ticket_id,'status':status,'version':version+1}
+
+    def operators(self, token):
+        with self.transaction(token) as (db,actor,admin):
+            if not admin:
+                raise IssueError('administrator required',403)
+            return {'operators':[dict(row) for row in db.execute(
+                "SELECT users.id,users.username FROM users JOIN account_roles ON account_roles.user_id=users.id "
+                "WHERE account_roles.role='operator' ORDER BY users.username COLLATE NOCASE").fetchall()],
+                'max_assignees':MAX_ASSIGNEES}
+
+    def assign(self, token, ticket_id, payload):
+        if not isinstance(payload,dict) or set(payload) != {'operator_ids','version'}:
+            raise IssueError('expected operator_ids and version')
+        ids=payload['operator_ids'];version=payload['version']
+        if not isinstance(ids,list) or len(ids)>MAX_ASSIGNEES or any(type(i) is not int or i<1 for i in ids) or len(set(ids))!=len(ids):
+            raise IssueError(f'select at most {MAX_ASSIGNEES} distinct operators')
+        if type(version) is not int or version<1:
+            raise IssueError('invalid version')
+        with self.transaction(token) as (db,actor,admin):
+            if not admin:
+                raise IssueError('administrator required',403)
+            row=self.visible(db,actor,admin,ticket_id)
+            if version!=row['version']:
+                raise IssueError('ticket changed; refresh before assigning',409)
+            selected=[]
+            if ids:
+                marks=','.join('?' for _ in ids)
+                selected=db.execute(
+                    "SELECT users.id,users.username FROM users JOIN account_roles ON account_roles.user_id=users.id "
+                    f"WHERE account_roles.role='operator' AND users.id IN ({marks}) ORDER BY users.username COLLATE NOCASE",
+                    tuple(ids)).fetchall()
+                if len(selected)!=len(ids):
+                    raise IssueError('select active operator accounts only')
+            old={item['user_id'] for item in db.execute('SELECT user_id FROM issue_ticket_assignees WHERE ticket_id=?',(ticket_id,)).fetchall()}
+            if old==set(ids):
+                return {'id':ticket_id,'version':version,'assignees':self.assignees(db,ticket_id)}
+            now=time.time()
+            if db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
+                raise IssueError('too many updates; wait before trying again',429)
+            db.execute('DELETE FROM issue_ticket_assignees WHERE ticket_id=?',(ticket_id,))
+            db.executemany('INSERT INTO issue_ticket_assignees VALUES(?,?,?,?)',
+                           [(ticket_id,user_id,actor,now) for user_id in ids])
+            db.execute('UPDATE issue_tickets SET version=version+1,updated_at=? WHERE id=?',(now,ticket_id))
+            names=', '.join('@'+item['username'] for item in selected) if selected else '(none)'
+            db.execute('INSERT INTO issue_ticket_events(ticket_id,actor_id,created_at,status,note,version) VALUES(?,?,?,?,?,?)',
+                       (ticket_id,actor,now,row['status'],'Ticket team: '+names,version+1))
+            return {'id':ticket_id,'version':version+1,'assignees':self.assignees(db,ticket_id)}

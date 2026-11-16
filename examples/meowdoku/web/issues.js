@@ -27,10 +27,12 @@ async function load(append = false) {
     const result = await request(`/api/issues?${query}`);
     if (generation !== listGeneration) return;
     byId("all-option").hidden = !result.can_review_all;
+    byId("assigned-option").hidden = !result.can_view_assigned;
     if (!append) byId("list").replaceChildren();
     for (const ticket of result.tickets) {
       const row = el("button", ticket.title); row.type = "button"; row.className = "row";
-      row.append(el("small", `${ticket.status} · ${new Date(ticket.updated_at * 1000).toLocaleString()}`));
+      const team = (ticket.assignees || []).map(person => person.username).join(", ") || "unassigned";
+      row.append(el("small", `${ticket.status} · ${team} · ${new Date(ticket.updated_at * 1000).toLocaleString()}`));
       row.onclick = () => show(ticket.id);
       byId("list").append(row);
     }
@@ -45,7 +47,7 @@ async function show(id) {
   selected = id;
   const generation = ++detailGeneration;
   try {
-    const { ticket } = await request(`/api/issues/${encodeURIComponent(id)}`);
+    const { ticket, can_assign, max_assignees } = await request(`/api/issues/${encodeURIComponent(id)}`);
     if (generation !== detailGeneration) return;
     const heading = el("h2", ticket.title), description = el("p", ticket.description);
     const meta = el("p", `${ticket.status} · Ticket ${ticket.id} · version ${ticket.version}`); meta.className = "muted";
@@ -69,6 +71,52 @@ async function show(id) {
       } catch (error) { feedback.textContent = `${error.message}. Your note is kept. Refresh this ticket before retrying if the outcome is uncertain.`; }
       finally { updating = false; save.disabled = false; select.disabled = false; note.disabled = false; }
     };
+    const team = document.createElement("section"); team.className = "team";
+    team.append(el("h3", "Ticket team"));
+    const names = (ticket.assignees || []).map(person => person.username);
+    team.append(el("p", names.length ? names.join(", ") : "No operators assigned."));
+    if (can_assign) {
+      try {
+        const roster = await request("/api/issues/operators");
+        if (generation !== detailGeneration) return;
+        const teamForm = document.createElement("form");
+        const checkboxes = [];
+        const assigned = new Set((ticket.assignees || []).map(person => person.id));
+        const limit = max_assignees || roster.max_assignees;
+        const count = el("p", `${assigned.size} of ${limit} operator slots used`);
+        const teamFeedback = el("p", "Check every operator who should work this ticket.");
+        teamFeedback.setAttribute("role", "status");
+        for (const person of roster.operators) {
+          const label = document.createElement("label"), checkbox = document.createElement("input");
+          checkbox.type = "checkbox"; checkbox.value = String(person.id); checkbox.checked = assigned.has(person.id);
+          checkbox.onchange = () => {
+            const chosen = checkboxes.filter(item => item.checked).length;
+            if (chosen > limit) { checkbox.checked = false; teamFeedback.textContent = `A ticket has at most ${limit} operator slots.`; }
+            count.textContent = `${checkboxes.filter(item => item.checked).length} of ${limit} operator slots used`;
+          };
+          label.append(checkbox, document.createTextNode(person.username));
+          teamForm.append(label); checkboxes.push(checkbox);
+        }
+        const saveTeam = el("button", "Save ticket team"); saveTeam.type = "submit";
+        saveTeam.disabled = roster.operators.length === 0;
+        teamForm.append(count, saveTeam, teamFeedback);
+        let assigning = false;
+        teamForm.onsubmit = async event => {
+          event.preventDefault(); if (assigning) return;
+          assigning = true; saveTeam.disabled = true;
+          for (const checkbox of checkboxes) checkbox.disabled = true;
+          try {
+            await request(`/api/issues/${id}/assignments`, {
+              operator_ids: checkboxes.filter(item => item.checked).map(item => Number(item.value)),
+              version: ticket.version,
+            });
+            if (selected === id) await show(id); await load();
+          } catch (error) { teamFeedback.textContent = `${error.message}. Your selections are kept; refresh before retrying if the ticket changed.`; }
+          finally { assigning = false; saveTeam.disabled = false; for (const checkbox of checkboxes) checkbox.disabled = false; }
+        };
+        team.append(teamForm);
+      } catch (error) { team.append(el("p", error.message)); }
+    }
     const history = document.createElement("div"), entries = document.createElement("div"), older = el("button", "Load older history");
     older.type = "button"; older.hidden = ticket.next_before_version === null;
     let before = ticket.next_before_version;
@@ -84,7 +132,7 @@ async function show(id) {
       } catch (error) { feedback.textContent = error.message; }
       finally { older.disabled = false; }
     };
-    byId("detail").replaceChildren(heading, meta, description, details, form, history);
+    byId("detail").replaceChildren(heading, meta, description, details, team, form, history);
   } catch (error) { if (generation === detailGeneration) { byId("detail").replaceChildren(el("p", error.message)); status(error.message); } }
 }
 
@@ -113,5 +161,5 @@ byId("more").onclick = () => load(true);
 try {
   const who = await request("/api/whoami");
   if (!who.signed_in) { byId("signin").hidden = false; status("Sign in to use issue tickets."); }
-  else { byId("account-content").hidden = false; await load(); if (params.get("new") === "1") openForm(); const id = params.get("id"); if (id && /^[a-f0-9]{32}$/.test(id)) await show(id); }
+  else { byId("account-content").hidden = false; byId("ticket-team-room").hidden = !["operator", "admin"].includes(who.role); await load(); if (params.get("new") === "1") openForm(); const id = params.get("id"); if (id && /^[a-f0-9]{32}$/.test(id)) await show(id); }
 } catch (error) { status(error.message); }

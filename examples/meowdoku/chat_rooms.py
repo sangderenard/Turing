@@ -106,6 +106,8 @@ ROOMS = {
                "roles": ("intern", "member", "dev", "operator", "admin"), "hosted_agents": ["llama"]},
     "reviewers": {"title": "Reviewers' chat", "about": "The operators and admins, beside the change reviews.",
                   "roles": ("admin", "operator"), "hosted_agents": []},
+    "tickets": {"title": "Ticket team", "about": "Operators and admins coordinating issue tickets. Ticket details stay in the ticket view.",
+                "roles": ("admin", "operator"), "hosted_agents": []},
 }
 DDL = (
     "CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL, user_id INTEGER NOT NULL, "
