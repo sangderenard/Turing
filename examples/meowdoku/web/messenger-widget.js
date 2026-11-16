@@ -385,6 +385,7 @@ async function start() {
     drawer.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
     state.panel.drawer = drawer;
     state.panel.appendChild(drawer);
+    const sendButton = el("button", { type: "button", text: "Send" });
     let sending = false;
     let pending = pendingSends.get(peer) || null;
     if (pending) { input.value = pending.body; image = pending.image || null; draft.image = image;
@@ -413,7 +414,7 @@ async function start() {
       pending.inFlight = true;
       const operation = pending;
       sending = true;
-      input.disabled = true; updateControls();
+      input.disabled = true; sendButton.disabled = true; sendButton.textContent = "Sending…"; updateControls();
       try {
         for (let attempt = 0; attempt < 2; attempt++) {
           const conversations = await api("/api/messages/conversations");
@@ -449,10 +450,13 @@ async function start() {
           viewNote(e.message + " Retry unchanged text and image to safely retry this message.");
         }
       }
-      finally { operation.inFlight = false; sending = false; input.disabled = false; if (active()) updateControls(); }
+      finally { operation.inFlight = false; sending = false; input.disabled = false;
+        sendButton.disabled = false; sendButton.textContent = pendingSends.has(peer) ? "Retry send" : "Send";
+        if (active()) updateControls(); }
     };
     input.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); } });
-    footEl.appendChild(el("div", { class: "row compose" }, menu, input, el("button", { type: "button", text: "Send", on: { click: send } })));
+    sendButton.addEventListener("click", send);
+    footEl.appendChild(el("div", { class: "row compose" }, menu, input, sendButton));
     state.seen = new Set();
     await loadThread(false);
     if (active()) { input.focus(); await view.refreshImages(); }
