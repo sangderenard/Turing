@@ -30,6 +30,14 @@
   <p>Something out there keeps poking us, so we have curled up like a sleepy cat with a little fever and stopped letting new visitors in for a while.</p>
   <p>Nothing is broken. The site is resting, and so is everything you keep here.</p>
   <p class="small">We will uncurl soon. Please try again in a few minutes.</p>
+  <div id="controls" style="max-width:22rem;margin:2rem auto 0;"></div>
 </main>
+<script type="module">
+  // [CONDITION] For an operator or an admin only: the server answers this module to no one else and checks the role on
+  // every switch (site_condition.py). Anyone else gets nothing from it.
+  import("/api/condition/controls.js")
+    .then(m => m.mount(document.getElementById("controls"), { onCard: state => { if (!state.card) location.reload(); } }))
+    .catch(() => {});
+</script>
 </body>
 </html>

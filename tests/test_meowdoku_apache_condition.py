@@ -120,6 +120,10 @@ def test_a_posted_card_turns_every_request_away_without_a_restart(apache_front):
             assert status == 503 and 'We are under mild attack' in body, path
             assert headers.get('Retry-After') == '300', path
         assert observed == [], 'nothing reaches the backend while a card is posted'
+        for path in ('/api/condition', '/api/condition/controls.js'):
+            assert request(path)[0] == 200, path
+        assert observed == ['/api/condition', '/api/condition/controls.js'], 'only the switch passes a card'
+        assert request('/api/condition/other')[0] == 503
         (condition / 'red.on').write_text('test\n', encoding='utf-8')
         status, headers, body = request('/api/state')
         assert status == 503 and 'genuine threat' in body, 'the red card is read first'
