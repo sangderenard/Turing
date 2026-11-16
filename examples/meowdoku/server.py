@@ -3185,6 +3185,9 @@ def make_handler(sessions: Sessions):
                 return self._git_route(path, "GET")
             if path == "/api/checkouts" or path.startswith("/api/checkouts/"):   # [CHECKOUT]
                 return self._checkout_route(path, "GET")
+            if path == "/api/operator-control":
+                from meowdoku import admin_script_control
+                return admin_script_control.route(self, sessions, "GET")
             if path == "/api/orientation" or path.startswith("/api/orientation/"):   # [ORIENTATION]
                 return self._orientation_route(path, "GET")
             if path.startswith("/api/relay/"):                    # [RELAY]
@@ -3773,6 +3776,9 @@ def make_handler(sessions: Sessions):
                 return self._git_route(path0, "POST")
             if path0 == "/api/checkouts" or path0.startswith("/api/checkouts/"):   # [CHECKOUT]
                 return self._checkout_route(path0, "POST")
+            if path0 == "/api/operator-control":
+                from meowdoku import admin_script_control
+                return admin_script_control.route(self, sessions, "POST")
             if path0 == "/api/orientation" or path0.startswith("/api/orientation/"):   # [ORIENTATION]
                 return self._orientation_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
