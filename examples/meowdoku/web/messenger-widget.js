@@ -10,10 +10,12 @@
 // `message` capability (GET /api/whoami) it renders nothing at all.  Closed: only a small launcher button with an unread badge
 // (a light unread check every 60 s).  Open: contact list, add-contact field, incoming requests, one conversation at a time, and a
 // long poll that runs only while open.  All DOM is built with createElement/textContent. Message bodies are plain text;
-// validated file subjects render as download links. Styles live in a closed Shadow DOM.
+// validated file subjects render as download links. Styles live in a closed Shadow DOM.  In a conversation the panel shows only
+// the messages and the text box with Send; the image, file and key controls sit in an options drawer that slides out from the
+// panel's left edge (the ☰ button beside the text box opens it; its Close button or Escape slides it back).
 // Global surface: window.MeowdokuMessenger = {open, close, version}.
 import * as fileCrypto from "/file-crypto.js";
-const VERSION = "5";
+const VERSION = "6";
 const MAX_IMAGE_BYTES = 2097152;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 function safeImageURL(image, id) {
@@ -68,6 +70,13 @@ input { background: #0b0e14; color: #e8ecf4; border: 1px solid #556; border-radi
 .attachment { display:block; width:100%; max-width:280px; height:180px; object-fit:contain; }
 .when { display: block; color: #9aa4b8; font-size: 11px; }
 h3 { margin: 8px 0 2px; font-size: 12px; text-transform: uppercase; color: #9aa4b8; }
+.drawer { position: absolute; top: 0; bottom: 0; left: 0; width: 88%; z-index: 1; display: flex; flex-direction: column;
+  background: #171c28; border-right: 1px solid #556; box-shadow: 4px 0 12px rgba(0,0,0,.4); overflow-y: auto;
+  transform: translateX(-105%); visibility: hidden; transition: transform .2s ease, visibility 0s linear .2s; }
+.drawer.open { transform: translateX(0); visibility: visible; transition: transform .2s ease, visibility 0s; }
+.drawer .row { flex-wrap: wrap; }
+.drawer input { flex: 1 1 140px; }
+@media (prefers-reduced-motion: reduce) { .drawer, .drawer.open { transition: none; } }
 `;
 
 function el(tag, props, ...kids) {
@@ -162,6 +171,7 @@ async function start() {
   function renderBody() {
     if (!state.panel) return;
     state.view = null;
+    if (state.panel.drawer) { state.panel.drawer.remove(); state.panel.drawer = null; }
     clear(bodyEl); clear(footEl);
     state.panel.back.toggleAttribute("hidden", !state.peer);
     if (state.peer) return renderThread();
@@ -278,8 +288,20 @@ async function start() {
       catch (error) { viewNote(error.message); }
       finally { keyPassphrase.value = ""; unlockFileKey.disabled = false; }
     } } });
+    // Options drawer: every control except the text box and Send.  It stays in the panel's DOM while closed.
+    const drawer = el("div", { class: "drawer", role: "region", "aria-label": "Message options", id: "messenger-options" });
+    const menu = el("button", { type: "button", class: "menu", text: "☰", title: "Options: images, files, keys",
+      "aria-label": "Message options", "aria-controls": "messenger-options", "aria-expanded": "false" });
+    const setDrawer = (shown) => {
+      drawer.classList.toggle("open", shown);
+      menu.setAttribute("aria-expanded", shown ? "true" : "false");
+      if (shown) { const first = drawer.querySelector("button:not([disabled]), input:not([disabled])"); if (first) first.focus(); }
+    };
+    menu.addEventListener("click", () => setDrawer(!drawer.classList.contains("open")));
+    drawer.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); setDrawer(false); menu.focus(); } });
     const updateControls = () => {
       const setting = view.imageState;
+      menu.textContent = image || fileAttachment ? "☰•" : "☰";
       const busy = !!pendingSends.get(peer) || choosing || uploading || view.toggling;
       toggle.disabled = !setting || busy || view.refreshing;
       chooser.disabled = !setting || !setting.enabled || busy;
@@ -350,13 +372,19 @@ async function start() {
       fileAttachment = null; draft.file = null; updateControls();
     });
     input.addEventListener("input", () => { draft.body = input.value; });
-    footEl.appendChild(imageStatus);
-    footEl.appendChild(el("div", { class: "row" }, toggle, chooser));
-    footEl.appendChild(el("div", { class: "row" }, selected, removeImage));
-    footEl.appendChild(el("div", { class: "row" }, keyPassphrase, unlockFileKey));
-    footEl.appendChild(el("div", { class: "note" }, el("a", { href: "/keys.html", text: "Set up file keys" })));
-    footEl.appendChild(el("div", { class: "row" }, fileChooser));
-    footEl.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
+    drawer.appendChild(el("div", { class: "bar" }, el("span", { class: "title", text: "Options" }),
+      el("button", { type: "button", class: "small", text: "Close options", on: { click: () => { setDrawer(false); menu.focus(); } } })));
+    drawer.appendChild(el("h3", { class: "row", text: "Images" }));
+    drawer.appendChild(imageStatus);
+    drawer.appendChild(el("div", { class: "row" }, toggle, chooser));
+    drawer.appendChild(el("div", { class: "row" }, selected, removeImage));
+    drawer.appendChild(el("h3", { class: "row", text: "Files" }));
+    drawer.appendChild(el("div", { class: "row" }, keyPassphrase, unlockFileKey));
+    drawer.appendChild(el("div", { class: "note" }, el("a", { href: "/keys.html", text: "Set up file keys" })));
+    drawer.appendChild(el("div", { class: "row" }, fileChooser));
+    drawer.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
+    state.panel.drawer = drawer;
+    state.panel.appendChild(drawer);
     let sending = false;
     let pending = pendingSends.get(peer) || null;
     if (pending) { input.value = pending.body; image = pending.image || null; draft.image = image;
@@ -424,7 +452,7 @@ async function start() {
       finally { operation.inFlight = false; sending = false; input.disabled = false; if (active()) updateControls(); }
     };
     input.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); } });
-    footEl.appendChild(el("div", { class: "row" }, input, el("button", { type: "button", text: "Send", on: { click: send } })));
+    footEl.appendChild(el("div", { class: "row compose" }, menu, input, el("button", { type: "button", text: "Send", on: { click: send } })));
     state.seen = new Set();
     await loadThread(false);
     if (active()) { input.focus(); await view.refreshImages(); }
