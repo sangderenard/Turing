@@ -71,7 +71,7 @@ SHADER_PAGE = "/shader.html"
 # Public sign-in, preview, and consented alpha registration (server.py _shader_request / _login_post).
 SHADER_LOGIN_FILES = ("/login.html", "/login.js", "/messenger-widget.js", "/site-nav.js")   # the widget renders nothing without the message capability
 SHADER_LOGIN_GETS = ("/api/account/me",)
-SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout", "/api/account/preview", "/api/account/keep")
+SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout", "/api/account/preview", "/api/account/recover", "/api/account/keep")
 # GET routing only: the photo handlers still require photo_read and check ownership.
 PHOTO_READ_APIS = ("/api/marble_photo/jobs", "/api/marble_photo/lenses", "/api/marble_photo",
                    "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation")

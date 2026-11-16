@@ -9,9 +9,10 @@ body{margin:0;background:#0e1119;color:#e8eaf3;font:15px/1.5 system-ui,sans-seri
 <p id="message" class="notice" role="status" aria-live="polite">Checking your account…</p>
 <p id="signin" hidden><a href="/login.html">Sign in</a> as an admin to manage people.</p>
 <section id="content" hidden>
-<div class="actions"><button id="refresh" type="button">Refresh</button><a href="/rooms.html?room=reviewers">The operators' and admins' room</a></div>
+<div class="actions"><button id="refresh" type="button">Refresh</button><a href="/look-queue.html">Look account queue</a><a href="/rooms.html?room=reviewers">The operators' and admins' room</a></div>
 <div class="grid"><section class="panel"><h2>Accounts</h2><div id="people"></div></section>
 <section id="person" class="panel" aria-label="The account"><p>Select an account.</p></section></div>
+<section class="panel"><h2>Recent account and IP activity</h2><p class="muted">This bounded log includes sign-ins, attempts, and first activity after an idle interval. It is not a complete account history. The full Apache log lists IP and path without account identity.</p><p id="access-log-path" class="muted"></p><div id="access-entries"></div></section>
 </section></main>
 <script type="module" src="/people.js"></script>
 <script type="module" src="/site-nav.js" data-site-nav="allow"></script>

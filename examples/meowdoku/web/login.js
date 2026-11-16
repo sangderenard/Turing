@@ -13,7 +13,7 @@
     if (account) { $("name").textContent = account.username; $("role").textContent = info.role || "member"; }
     $("preview-note").hidden = !(account && account.temporary);
     if (account && account.temporary) $("preview-date").textContent = new Date(account.expires_at * 1000).toLocaleString();
-    $("signout").textContent = account && account.temporary ? "End preview (cannot return)" : "Sign out";
+    $("signout").textContent = account && account.temporary ? "End preview (restore later with recovery code)" : "Sign out";
     if (account && !account.temporary) serverPanel(); else $("server").hidden = true;
   }
 

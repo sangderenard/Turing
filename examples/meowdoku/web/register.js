@@ -8,14 +8,21 @@
   var previewPanel = document.getElementById("preview-panel");
   var previewStart = document.getElementById("preview-start");
   var previewExpiry = document.getElementById("preview-expiry");
+  var recoverForm = document.getElementById("recover-form");
   var temporary = false;
+
+  function showRecovery(code) {
+    if (!code) return;
+    document.getElementById("recovery-code").textContent = code;
+    document.getElementById("recovery-issued").hidden = false;
+  }
 
   function showAccount(account) {
     temporary = !!(account && account.temporary);
     if (previewStart) previewStart.hidden = !!account;
     if (previewExpiry) {
       previewExpiry.hidden = !temporary;
-      if (temporary) previewExpiry.textContent = "Preview expires " + new Date(account.expires_at * 1000).toLocaleString() + ". Keep it below before then.";
+      if (temporary) previewExpiry.textContent = "Preview freezes " + new Date(account.expires_at * 1000).toLocaleString() + ". Keep it below to make a permanent account.";
     }
     if (temporary) {
       document.getElementById("alpha-heading").textContent = "Keep this account";
@@ -29,7 +36,7 @@
   }
   fetch("/api/account/me", { credentials: "same-origin", cache: "no-store" })
     .then(function (response) { return response.json(); })
-    .then(function (body) { showAccount(body.account); })
+    .then(function (body) { showAccount(body.account); showRecovery(body.recovery_code); })
     .catch(function () { /* The form still works if the account check is unavailable. */ });
 
   if (previewStart) previewStart.addEventListener("click", function () {
@@ -41,11 +48,25 @@
       return response.json().catch(function () { return {}; }).then(function (body) {
         if (!response.ok) throw new Error(body.error || "Could not start preview.");
         showAccount(body.account);
+        showRecovery(body.recovery_code);
         status.textContent = "Your read-only preview is ready. Browse the site, or keep the account below.";
         status.className = "ok";
       });
     }).catch(function (error) { status.textContent = error.message; status.className = "bad"; })
       .finally(function () { previewStart.disabled = false; });
+  });
+  recoverForm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var code = document.getElementById("recover-code").value.trim();
+    fetch("/api/account/recover", { method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Meowdoku-Preview": "1" },
+      body: JSON.stringify({ recovery_code: code })
+    }).then(function (response) { return response.json().then(function (body) {
+      if (!response.ok) throw new Error(body.error || "Could not restore preview.");
+      document.getElementById("recover-code").value = "";
+      showAccount(body.account); showRecovery(body.recovery_code);
+      status.textContent = "Preview restored for seven days. Save the new recovery code."; status.className = "ok";
+    }); }).catch(function (error) { status.textContent = error.message; status.className = "bad"; });
   });
   alpha.addEventListener("submit", function (event) {
     event.preventDefault();

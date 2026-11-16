@@ -53,9 +53,11 @@
   </section>
   <section id="preview-panel" class="notice" aria-label="Temporary preview">
     <h2>Look around first</h2>
-    <p>Start a read-only preview without choosing a username or password. This browser keeps a random session cookie for up to seven days. The preview expires unless you choose to keep the account.</p>
+    <p>Start a read-only preview without choosing a username or password. After seven days it freezes; you can restore it using this browser's recovery cookie or a saved recovery code. Keeping the account gives it a permanent login.</p>
     <button id="preview-start" type="button">Start seven-day preview</button>
     <p id="preview-expiry" class="mut" hidden></p>
+    <p id="recovery-issued" class="notice" hidden>Save this recovery code somewhere safe: <code id="recovery-code"></code>. Anyone with the code can restore this preview. A new code is issued each time you restore it.</p>
+    <form id="recover-form"><label for="recover-code">Restore a preview</label><input id="recover-code" autocomplete="off" spellcheck="false" placeholder="Saved recovery code, or leave blank to use this browser's cookie"><button type="submit">Restore preview</button></form>
     <p><a href="/browse">Browse the site</a> · <a href="/login.html">Already have an account?</a></p>
   </section>
   <h2>What sits behind this page</h2>

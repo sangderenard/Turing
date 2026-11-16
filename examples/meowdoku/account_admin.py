@@ -26,7 +26,9 @@ def people(db_path) -> list:
     try:
         permission_groups.prepare(conn)
         rows = conn.execute("SELECT u.id, u.username, u.display_name, u.created_at, r.role, r.granted_by "
-                            "FROM users u LEFT JOIN account_roles r ON r.user_id = u.id ORDER BY u.username COLLATE NOCASE").fetchall()
+                            "FROM users u LEFT JOIN account_roles r ON r.user_id = u.id "
+                            "LEFT JOIN temporary_accounts t ON t.user_id=u.id "
+                            "WHERE t.user_id IS NULL ORDER BY u.username COLLATE NOCASE").fetchall()
         return [{"id": uid, "username": name, "display_name": shown, "created_at": created, "role_row": role,
                  "role_granted_by": granted, "authority": permission_groups.authority(conn, uid)}
                 for uid, name, shown, created, role, granted in rows]

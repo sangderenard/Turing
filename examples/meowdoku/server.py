@@ -39,6 +39,7 @@ import argparse
 import base64
 import os
 import json
+import re
 import secrets
 import struct
 import sys
@@ -365,6 +366,7 @@ SESSION_IDLE_SECONDS = 2 * 3600
 # [LOGIN] the tier a signed-in account lifts a shader-tier request to, by its role (_classify; account_admin uses it too)
 SHADER_LIFT = {"member": "play", "dev": "dev", "service": "play", "operator": "dev", "intern": "play", "admin": "edit"}
 ACCOUNT_COOKIE = "meowdoku_account"    # a real login session token (accounts.py) -- distinct from
+PREVIEW_RECOVERY_COOKIE = "meowdoku_look_return"
                                        # both COOKIE (game-table) and PLAYER_COOKIE (passwordless name)
 
 
@@ -628,6 +630,14 @@ def make_handler(sessions: Sessions):
             if not getattr(self, "_set_cookie", None):
                 self._set_cookie = []
             self._set_cookie.append(f"{ACCOUNT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+
+        def _set_preview_recovery_cookie(self, token: str) -> None:
+            secure = "; Secure" if self._is_secure() else ""
+            self._set_cookie.append(
+                f"{PREVIEW_RECOVERY_COOKIE}={token}; Path=/; Max-Age={365 * 86400}; HttpOnly; SameSite=Lax{secure}")
+
+        def _clear_preview_recovery_cookie(self) -> None:
+            self._set_cookie.append(f"{PREVIEW_RECOVERY_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
 
         # ---- [ACCESS] origin and tier, from the client address and the Host header.  The client address is the socket peer, except when the
         # peer is a trusted proxy (proxy_trust.py), whose X-Forwarded-For names the real client; a header from any other peer is never read.
@@ -926,7 +936,7 @@ def make_handler(sessions: Sessions):
         # sends route b to the Development server).  Two shared instances of the whole service.  Not the dev page vs shader page (access tier
         # + role) and not a per-user leased server.  Stored preference values: 'stable' | 'dev'.
         _ROUTE_OPEN = ("/login.html", "/login.js", "/register.html", "/register.js", "/api/account/login",
-                       "/api/account/signup", "/api/account/preview", "/api/account/keep", "/api/account/logout",
+                       "/api/account/signup", "/api/account/preview", "/api/account/recover", "/api/account/keep", "/api/account/logout",
                        "/api/account/me", "/api/whoami", "/api/route", "/site-nav.js")
 
         def _route_stable(self) -> str:
@@ -3343,6 +3353,30 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "no such marble object"}, HTTPStatus.NOT_FOUND)
                 except marble_objects_mod.ObjectError as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.INTERNAL_SERVER_ERROR))
+            if path == "/api/account/admin/access":
+                if not self._require("account_manage"):
+                    return
+                entries = []
+                for entry in logring_mod.RING.fetch(limit=5000, sources={"login", "activity"})["entries"]:
+                    match = re.search(r"user=([^ ]+) client=([^ ]+)", entry["text"])
+                    if match:
+                        entries.append({"ts": entry["ts"], "event": entry["text"].split(" ", 1)[0],
+                                        "username": match.group(1), "ip": match.group(2)})
+                return self._json({"entries": entries, "bounded": True,
+                                   "access_log": str(sessions.state.logs_dir / "apache-access.log")})
+            if path == "/api/account/admin/look-queue":
+                if not self._require("account_manage"):
+                    return
+                previews = sessions.accounts.look_queue()
+                names = {p["username"] for p in previews}
+                activity = {name: [] for name in names}
+                for entry in logring_mod.RING.fetch(limit=5000, sources={"login", "activity"})["entries"]:
+                    match = re.search(r"user=([^ ]+) client=([^ ]+)", entry["text"])
+                    if match and match.group(1) in names:
+                        activity[match.group(1)].append({"ts": entry["ts"], "event": entry["text"].split(" ", 1)[0],
+                                                         "ip": match.group(2)})
+                return self._json({"previews": previews, "recent_access": activity,
+                                   "access_log": str(sessions.state.logs_dir / "apache-access.log")})
             if path in ("/api/account/admin/people", "/api/account/admin/tools"):   # [PEOPLE] the admin's account view (account_admin.py)
                 if not self._require("account_manage"):
                     return
@@ -3368,8 +3402,12 @@ def make_handler(sessions: Sessions):
             if path == "/api/account/me":
                 self._set_cookie = []
                 account = self._account()
+                recovery = sessions.accounts.issue_legacy_recovery(account["id"]) if account and account.get("temporary") else None
+                if recovery:
+                    self._set_preview_recovery_cookie(recovery["recovery_cookie"])
                 role = ("trial" if account.get("temporary") else authz_mod.role_of(sessions.accounts_db, account["id"])) if account else "guest"
                 return self._json({"account": account, "role": role,
+                                   "recovery_code": recovery["recovery_code"] if recovery else None,
                                    "instance": self._instance_of(account["id"] if account else None)})
             if path == "/api/account/assets":
                 self._set_cookie = []
@@ -3656,7 +3694,7 @@ def make_handler(sessions: Sessions):
                 if path0 == "/mcp/guest":
                     return sessions.oauth_mcp.mcp(self, "POST", guest=True)
             if self._principal().role == "trial" and path0 not in (
-                    "/api/account/keep", "/api/account/logout", "/api/account/login", "/api/account/signup",
+                    "/api/account/keep", "/api/account/recover", "/api/account/logout", "/api/account/login", "/api/account/signup",
                     "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
@@ -4014,7 +4052,7 @@ def make_handler(sessions: Sessions):
                     return self._json(sessions.marble_photos.cancel(digest))
                 except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
-            if path0 in ("/api/account/preview", "/api/account/keep"):
+            if path0 in ("/api/account/preview", "/api/account/recover", "/api/account/keep"):
                 self._set_cookie = []
                 if self.headers.get("X-Meowdoku-Preview") != "1" or not (
                         self.headers.get("Content-Type") or "").lower().startswith("application/json"):
@@ -4029,7 +4067,23 @@ def make_handler(sessions: Sessions):
                     user = sessions.accounts.create_preview()
                     self._set_account_cookie(sessions.accounts.create_session(user["id"]),
                                              accounts_mod.PREVIEW_SECONDS)
-                    return self._json({"account": user}, HTTPStatus.CREATED)
+                    self._set_preview_recovery_cookie(user.pop("recovery_cookie"))
+                    code = user.pop("recovery_code")
+                    return self._json({"account": user, "recovery_code": code}, HTTPStatus.CREATED)
+                if path0.endswith("recover"):
+                    if account is not None:
+                        return self._json({"error": "sign out before restoring a preview"}, HTTPStatus.CONFLICT)
+                    from http.cookies import SimpleCookie
+                    jar = SimpleCookie(self.headers.get("Cookie", ""))
+                    cookie = jar[PREVIEW_RECOVERY_COOKIE].value if PREVIEW_RECOVERY_COOKIE in jar else None
+                    try:
+                        user = sessions.accounts.recover_preview(cookie, body.get("recovery_code"))
+                    except accounts_mod.AccountError as error:
+                        return self._json({"error": str(error)}, error.status)
+                    self._set_account_cookie(sessions.accounts.create_session(user["id"]), accounts_mod.PREVIEW_SECONDS)
+                    self._set_preview_recovery_cookie(user.pop("recovery_cookie"))
+                    code = user.pop("recovery_code")
+                    return self._json({"account": user, "recovery_code": code})
                 if account is None or not account.get("temporary"):
                     return self._json({"error": "a live preview is required"}, HTTPStatus.UNAUTHORIZED)
                 if (body.get("alpha_terms_version") != accounts_mod.ALPHA_TERMS_VERSION or
@@ -4052,6 +4106,7 @@ def make_handler(sessions: Sessions):
                 if name:
                     sessions.accounts.claim(user["id"], "profile", name)
                 self._set_account_cookie(sessions.accounts.create_session(user["id"]))
+                self._clear_preview_recovery_cookie()
                 return self._json({"account": user}, HTTPStatus.OK)
             if path0 == "/api/account/login":
                 return self._login_post()
@@ -4111,6 +4166,36 @@ def make_handler(sessions: Sessions):
                 except authz_mod.AuthzError as error:
                     return self._json({"error": error.message}, error.status)
                 return self._json({"ok": True, "admins": self._admin_list()})
+            if path0 == "/api/account/admin/look-wipe":
+                if not self._require("account_manage"):
+                    return
+                if authz_mod.role_of(sessions.accounts_db, self._account()["id"]) != "admin":
+                    return self._json({"error": "an admin account is required"}, HTTPStatus.FORBIDDEN)
+                if self.headers.get("X-Meowdoku-Look-Wipe") != "1" or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "same-site wipe request required"}, HTTPStatus.FORBIDDEN)
+                body = self._body_json(2048)
+                if body is None:
+                    return
+                actor = self._account()
+                guard = login_guard_mod.connect(sessions.accounts_db)
+                try:
+                    wait = login_guard_mod.check(guard, self._client_ip, actor["username"])
+                    if wait:
+                        return self._json({"error": "too many password attempts", "retry_after": int(wait)}, HTTPStatus.TOO_MANY_REQUESTS)
+                    try:
+                        sessions.accounts.login(actor["username"], str(body.get("password", "")))
+                    except accounts_mod.AccountError:
+                        login_guard_mod.record(guard, self._client_ip, actor["username"], False)
+                        raise
+                    login_guard_mod.record(guard, self._client_ip, actor["username"], True)
+                    user_id = int(body.get("user_id"))
+                    sessions.accounts.wipe_preview(user_id, str(body.get("username", "")))
+                except (accounts_mod.AccountError, TypeError, ValueError) as error:
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+                finally:
+                    guard.close()
+                logring_mod.RING.add(f"look-wipe actor={actor['username']} user_id={user_id} client={self._client_ip}", source="server")
+                return self._json({"ok": True, "wiped_user_id": user_id})
             if path0 == "/api/admin/account/grant":              # bootstrap: the operator's loopback + admin token creates the first admin
                 lc = sessions.lifecycle
                 if lc is None:

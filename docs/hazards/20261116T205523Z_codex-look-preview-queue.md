@@ -1,0 +1,9 @@
+# Look preview queue — 2026-11-16 20:55 UTC
+
+Branch `codex/look-preview-queue-20261116` starts from Turing `ee7c73f465b51f2de022332b0d9642f0f9570c04`.
+
+Temporary previews are excluded from the People list and shown in a separate admin queue. Seven-day expiry freezes the preview, ends its sessions, and retains hashed recovery credentials. A return cookie or saved code renews a seven-day read-only preview. Legacy active previews receive credentials once through their existing authenticated session. An admin must confirm the exact name and reauthenticate to wipe a frozen preview. The wipe removes identity, recovery material, and selected private preview state. Approved public posts and security records remain. The queue and People page show account-linked IPs from the bounded login/activity ring and identify the full Apache access log location; Apache access entries themselves do not identify accounts. Failed login names in the ring are caller-provided and are attempts, not proven account use.
+
+The public recovery POST also requires SpeakToMe catalog branch `codex/look-preview-catalog-20261116` so the existing guest gate admits it. Deploy the host and catalog together. The accounts schema gate advances from version 3 to 4, so all restarted host instances must use the new version after the first migrated instance opens the database.
+
+Focused validation: with `SPEAKTOME_REPO` pointed at the companion checkout, `python -m pytest --noconftest -q tests/test_meowdoku_look_queue.py tests/test_meowdoku_public_login.py` passed 13 tests. The companion catalog's three selected tests passed. `python -m py_compile` passed for accounts, account admin, and server; Node syntax checks passed for register and queue scripts. An earlier test run without `SPEAKTOME_REPO` could not import the required sibling REST package and was rerun with the proper checkout. No production deployment or live account wipe was performed.

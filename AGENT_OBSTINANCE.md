@@ -1,5 +1,9 @@
 # Agent Obstinance
 
+## 2026-11-16 - reading the Turing ledger after the preview queue edit
+
+I began the preview queue implementation before reading this ledger, although `AGENTS.md` requires the ledger first. The later audit found the cross-repository guest catalog requirement and prompted a coordinated SpeakToMe branch. The ordering error cost an additional review pass and catalog change; no production state was changed or discarded.
+
 ## 2026-11-16 - reading Turing's obstinance ledger after editing
 
 The owner asked for incoming OAuth MCP work on coordinated review branches.

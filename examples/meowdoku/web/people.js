@@ -37,6 +37,11 @@ async function load() {
       list.append(row);
     }
     status(`${people.length} account${people.length === 1 ? "" : "s"}.`);
+    const activity = await request("/api/account/admin/access");
+    byId("access-log-path").textContent = `Full Apache access log on server: ${activity.access_log}`;
+    const access = byId("access-entries"); access.replaceChildren();
+    for (const entry of activity.entries.slice(-100).reverse())
+      access.append(el("p", `${new Date(entry.ts * 1000).toLocaleString()} · ${entry.event} · ${entry.username} · ${entry.ip}`));
     if (selected) await open(selected);
   } catch (error) {
     status(error.message.includes("account_manage") ? "This page is for admins (it needs account_manage)." : error.message);
