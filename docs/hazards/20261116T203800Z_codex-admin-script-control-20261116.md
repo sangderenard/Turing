@@ -1,0 +1,7 @@
+# Owner-run admin control broker — 2026-11-16 20:38 UTC
+
+This branch starts from Turing main `ee7c73f465b51f2de022332b0d9642f0f9570c04`. It adds a browser page for reviewed deploy-script actions, a SQLite queue and authorization boundary, and a boot-time Windows scheduled worker running under the deployment owner's account. No HTTP handler executes PowerShell. Admins choose fixed scripts and exact saved argument arrays, then issue per-action grants with expiry to operators. Every mutation requires the account password and a same-origin CSRF token. The worker rechecks role, grant, preset, and fixed script before executing. Bootstrap installation requires an elevated interactive PowerShell and the owner's Windows password.
+
+Focused verification: `python -m pytest -q tests/test_meowdoku_admin_script_control.py` passed 4 tests on Windows. They cover expiry, revocation, lost role, fixed scripts/arguments, and CSRF binding. `python -m py_compile` passed for the new module and modified server. PowerShell parsed `Admin-Control-Service.ps1` without errors; `-Status` returned `task: none` without making changes. The worker was not registered or run, and no live script was executed. Full compiler baseline was not rerun.
+
+Deployment depends on the review landing, the live Turing checkout moving to main, and the owner running the interactive registration commands in `examples/meowdoku/deploy/ADMIN_CONTROL.md`. A worker crash during a script leaves the job marked running; no automatic replay is attempted. Local output logs are under the state secrets directory.
