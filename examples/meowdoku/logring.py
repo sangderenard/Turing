@@ -15,6 +15,8 @@ import time
 from collections import deque
 from pathlib import Path
 
+from meowdoku.secure_records import RecordCipher
+
 DEFAULT_CAP = 2 * 1024 * 1024
 LINE_CAP = 4000                  # one line's text is cut here (a stack trace stays a line)
 OVERHEAD = 48                    # per-entry bytes counted besides the text (seq, timestamp, source)
@@ -29,8 +31,11 @@ def classify(text: str) -> str:
 
 
 class Ring:
-    def __init__(self, cap_bytes: int = DEFAULT_CAP, path: Path | None = None):
+    def __init__(self, cap_bytes: int = DEFAULT_CAP, path: Path | None = None, key_path: Path | None = None):
         self.cap, self.path, self.lock = int(cap_bytes), (Path(path) if path else None), threading.Lock()
+        if self.path is not None and key_path is None:
+            raise ValueError("persistent log ring requires a records key")
+        self.cipher = RecordCipher(key_path, existing_streams=(self.path,)) if key_path is not None else None
         self.entries: deque = deque()
         self.bytes, self.seq, self._written = 0, 0, 0
         if self.path is not None:
@@ -69,13 +74,16 @@ class Ring:
 
     # ---- persistence (optional, capped): one JSON line per entry, rewritten from the ring when it outgrows twice the cap
     def _load(self) -> None:
+        self.cipher.migrate(self.path)
         try:
-            for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines()[-100000:]:
-                e = json.loads(line)
+            with self.path.open("rb") as saved:
+                lines = saved.readlines()[-100000:]
+            for line in lines:
+                e = json.loads(self.cipher.open(line))
                 self.entries.append(e); self.bytes += self._cost(e["text"]); self.seq = max(self.seq, e["seq"])
             while self.bytes > self.cap and len(self.entries) > 1:
                 self.bytes -= self._cost(self.entries.popleft()["text"])
-        except (OSError, ValueError, KeyError):
+        except FileNotFoundError:
             pass
         self._written = self.bytes
 
@@ -83,11 +91,13 @@ class Ring:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self._written > 2 * self.cap:
-                self.path.write_text("".join(json.dumps(e) + "\n" for e in self.entries), encoding="utf-8")
+                with self.path.open("wb") as f:
+                    for e in self.entries:
+                        f.write(self.cipher.seal(json.dumps(e).encode("utf-8")))
                 self._written = self.bytes
             else:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry) + "\n")
+                with self.path.open("ab") as f:
+                    f.write(self.cipher.seal(json.dumps(entry).encode("utf-8")))
                 self._written += self._cost(entry["text"])
         except OSError:
             pass

@@ -107,6 +107,10 @@ class StatePaths:
     def tls_dir(self) -> Path:
         return self.secrets_dir / "tls"
 
+    @property
+    def records_key(self) -> Path:
+        return self.secrets_dir / "records.key"
+
     def admin_token(self, port=None) -> Path:
         """admin_token.txt for the default port (or None), admin_token_<port>.txt for any other (lifecycle's per-port rule)."""
         suffix = "" if port in (None, DEFAULT_PORT) else f"_{port}"

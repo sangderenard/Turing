@@ -534,7 +534,7 @@ def make_handler(sessions: Sessions):
                 return  # OAuth codes/state and tool arguments must never enter access logs.
             line = str(args[0]) if args else ""
             if "/api/" in line and "/api/log" not in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
-                sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+                sys.stderr.write("request - %s\n" % (format % args))
 
         def _table(self) -> Table:
             from http.cookies import SimpleCookie
@@ -838,7 +838,9 @@ def make_handler(sessions: Sessions):
 
         def _log_get(self) -> None:                               # [LOG]
             from urllib.parse import parse_qs
-            if not self._require("dev_ui"):
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if not self._require("account_manage"):
                 return
             if self._is_viewer():
                 return self._refuse_viewer()
@@ -3340,6 +3342,20 @@ def make_handler(sessions: Sessions):
                 from meowdoku import account_admin
                 return account_admin.http_route(self, path, accounts_db=sessions.accounts_db, policy=sessions.authz_policy.get(),
                                                 catalog=shared_catalog, lift=SHADER_LIFT)
+            if path == "/api/account/admin/records":
+                if not self._is_secure():
+                    return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+                if not self._require("account_manage") or self._is_viewer():
+                    return self._refuse_viewer() if self._is_viewer() else None
+                from meowdoku import admin_records
+                from urllib.parse import parse_qs
+                try:
+                    limit = int((parse_qs(self.path.partition("?")[2]).get("limit") or ["100"])[0])
+                    answer = admin_records.read(sessions.state.logs_dir / "apache-access.log", sessions.state.records_key, limit=limit)
+                except ValueError as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                self._set_cookie = []
+                return self._json(answer)
             if path == "/api/account/admin/list":
                 if not self._require("account_manage"):
                     return
@@ -4626,7 +4642,9 @@ def main(argv: list[str] | None = None) -> int:
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
     state = resolve_state(args.state_dir, web_dir)
     state.ensure(restrict=False)        # ACLs on secrets/ are set by the operator (operators.py / ensure()), never by a server start
-    logring_mod.RING = logring_mod.Ring(path=state.log_ring); logring_mod.tee_stdout()   # [LOG]
+    from meowdoku.secure_records import RecordCipher
+    RecordCipher(state.records_key, existing_streams=(state.log_ring, state.logs_dir / "apache-access.log"))
+    logring_mod.RING = logring_mod.Ring(path=state.log_ring, key_path=state.records_key); logring_mod.tee_stdout()   # [LOG]
     profiles_path = Path(args.profiles) if args.profiles else (state.profiles_json if args.state_dir else PROFILES)
     sessions = Sessions(web_dir, Profiles(profiles_path), state)
     sessions.nodus_ui_ports = nodus_ui_ports

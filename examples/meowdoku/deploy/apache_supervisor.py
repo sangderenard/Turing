@@ -46,6 +46,7 @@ from meowdoku import lifecycle as lifecycle_mod      # noqa: E402
 from meowdoku import lowering_library as lib         # noqa: E402
 from meowdoku import service_jobs                     # noqa: E402  (the server-wide job table a restart waits for)
 from meowdoku.state_paths import StatePaths          # noqa: E402
+from meowdoku.secure_records import RecordCipher       # noqa: E402
 
 STATE = StatePaths.legacy(ROOT).root                # the old layout: no --state-dir, no "state_dir" in instances.json
 LEASE_SECONDS = 86400
@@ -683,9 +684,12 @@ class Supervisor:
     def tail_stdin(self):
         """Apache's access-log lines -> apache-access.log.  Returns on EOF (= httpd is shutting down)."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.log_dir / "apache-access.log", "ab") as out:
+        path = self.log_dir / "apache-access.log"
+        cipher = RecordCipher(self.paths.records_key, existing_streams=(path, self.paths.log_ring))
+        cipher.migrate(path)
+        with open(path, "ab") as out:
             for line in iter(sys.stdin.buffer.readline, b""):
-                out.write(line)
+                out.write(cipher.seal(line))
                 out.flush()
         self.stop.set()
 

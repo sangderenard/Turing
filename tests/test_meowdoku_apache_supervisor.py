@@ -98,7 +98,11 @@ def test_lifecycle_account_lease_stdin_eof(tmp_path):
         assert open_leases == [{"account_key": f"account:{user[0]['id']}", "returned": None}]
         logs = list((state / "logs").glob("standin-*.log"))
         assert logs and "hello" in logs[0].read_text(encoding="utf-8")
-        assert _wait(lambda: b"GET /" in (state / "logs" / "apache-access.log").read_bytes() if (state / "logs" / "apache-access.log").exists() else None)
+        from meowdoku.secure_records import RecordCipher
+        access = state / "logs" / "apache-access.log"
+        assert _wait(lambda: access.exists() and access.stat().st_size > 0)
+        assert b"GET /" not in access.read_bytes()
+        assert b"GET /" in RecordCipher(state / "secrets" / "records.key").open(access.read_bytes().splitlines()[0])
         proc.stdin.close()                                   # what Apache does at shutdown
         assert proc.wait(timeout=45) == 0
     finally:

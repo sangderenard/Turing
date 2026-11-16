@@ -76,10 +76,13 @@ def test_login_endpoint_files_login_lines(tmp_path, monkeypatch):
 
 def test_persistence_survives_restart(tmp_path):
     p = tmp_path / "ring.jsonl"
-    a = L.Ring(cap_bytes=5000, path=p)
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
     for i in range(10):
         a.add(f"n{i}")
-    b = L.Ring(cap_bytes=5000, path=p)
+    assert p.read_bytes().startswith(b"enc:v1:")
+    assert b'"text": "n0"' not in p.read_bytes()
+    b = L.Ring(cap_bytes=5000, path=p, key_path=key)
     assert b.seq == 10 and b.add("after") == 11 and len(b.fetch(0)["entries"]) == 11
 
 
@@ -122,18 +125,11 @@ def test_log_endpoint_tier_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(L, "RING", L.Ring(cap_bytes=10000))
     L.RING.add("[meowdoku] one"); L.RING.add("[meowdoku] two")
     # loopback is "lan": tiers by origin; every tier is tried by pointing the lan origin at it
-    for tier, ok in (("edit", True), ("dev", True), ("play", False), ("shader", False)):
+    for tier in ("edit", "dev", "play", "shader"):
         httpd = _server(tmp_path, {"lan": tier})
         try:
             assert _get(httpd, "/api/log?since=1&limit=10")[0] == 403                     # a guest, on any tier
             status, body = _get(httpd, "/api/log?since=1&limit=10", httpd.member)
-            assert (status == 200) == ok, (tier, status)
-            if ok:
-                assert [e["text"] for e in json.loads(body)["entries"]] == ["[meowdoku] two"]
-            else:
-                assert status == 403 and b"meowdoku" not in body
-            if ok:
-                status, _ = _get(httpd, "/api/log", {**httpd.member, srv.share_mod.VIEWER_HEADER: "x"})   # a view-only link is refused even on a dev tier
-                assert status == 403
+            assert status == 403 and b"meowdoku" not in body
         finally:
             httpd.shutdown(); httpd.server_close()
