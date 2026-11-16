@@ -23,8 +23,8 @@ def db(tmp_path):
 
 
 def test_the_reviewers_room_is_for_operators_and_admins_only(db):
-    assert [r["room"] for r in chat_rooms.rooms_for(db, 2)] == ["agents", "reviewers", "tickets"]
-    assert [r["room"] for r in chat_rooms.rooms_for(db, 3)] == ["agents"] and [r["room"] for r in chat_rooms.rooms_for(db, 9)] == ["agents"],         "a dev or a member sees the agents' room, not the reviewers'"
+    assert [r["room"] for r in chat_rooms.rooms_for(db, 2)] == ["agents", "reviewers", "tickets", "research", "development"]
+    assert [r["room"] for r in chat_rooms.rooms_for(db, 3)] == ["agents", "research", "development"] and [r["room"] for r in chat_rooms.rooms_for(db, 9)] == ["agents", "research", "development"],         "a dev or a member sees the agents' room, not the reviewers'"
     chat_rooms.post(db, "tickets", user_id=2, username="opal", body="Taking a ticket")
     assert chat_rooms.messages(db, "tickets", user_id=1)[0]["body"] == "Taking a ticket"
     with pytest.raises(chat_rooms.ChatError):
@@ -71,8 +71,8 @@ def test_the_chat_over_rest(db, tmp_path):
         chat_rooms.http_route(handler, url.split("?")[0], method, accounts_db=tmp_path / "accounts.db")
         return handler.sent
 
-    assert [r["room"] for r in ask("/api/chat/rooms")[1]["rooms"]] == ["agents", "reviewers", "tickets"]
-    assert [r["room"] for r in ask("/api/chat/rooms", user=3)[1]["rooms"]] == ["agents"]
+    assert [r["room"] for r in ask("/api/chat/rooms")[1]["rooms"]] == ["agents", "reviewers", "tickets", "research", "development"]
+    assert [r["room"] for r in ask("/api/chat/rooms", user=3)[1]["rooms"]] == ["agents", "research", "development"]
     assert ask("/api/chat/rooms/tickets", "POST", body={"body": "Team ready"})[0] == 200
     assert ask("/api/chat/rooms/tickets", user=3)[0] == 403
     assert ask("/api/chat/rooms/reviewers", "POST", body={"body": "hello"})[0] == 200
@@ -120,7 +120,7 @@ def test_dev_level_makes_a_room_that_starts_personal_on_the_dev_site(db, people)
     assert not chat_rooms.may_enter(db, "shader-lab", user_id=5), "a member without dev permission does not see a dev room"
     chat_rooms.configure(db, "shader-lab", user_id=3, caps=DEV, changes={"stage": "release"})
     assert chat_rooms.may_enter(db, "shader-lab", user_id=5), "released and public: anyone signed in"
-    assert [r["room"] for r in chat_rooms.rooms_for(db, 5)] == ["agents", "shader-lab"]
+    assert [r["room"] for r in chat_rooms.rooms_for(db, 5)] == ["agents", "research", "development", "shader-lab"]
     chat_rooms.configure(db, "shader-lab", user_id=3, caps=DEV, changes={"write": "owner"})
     with pytest.raises(chat_rooms.ChatError, match="owner writes"):
         chat_rooms.post(db, "shader-lab", user_id=5, username="mem", body="hi")
@@ -238,7 +238,7 @@ def test_every_agent_from_guest_agents_up_shares_the_agents_room_and_services_do
     assert [m["username"] for m in chat_rooms.messages(db, "agents", user_id=6)] == ["intern", "member", "dev", "opal", "admin"]
     with pytest.raises(chat_rooms.ChatError, match="for intern"):
         chat_rooms.post(db, "agents", user_id=7, username="svc", body="beep")
-    assert [r["room"] for r in chat_rooms.rooms_for(db, 6)] == ["agents"], "a guest agent sees the agents room, not the reviewers"
+    assert [r["room"] for r in chat_rooms.rooms_for(db, 6)] == ["agents", "research", "development"], "a guest agent sees the agents room, not the reviewers"
 
 
 def test_overlapping_forwarded_calls_never_pass_the_hourly_limit(tmp_path):

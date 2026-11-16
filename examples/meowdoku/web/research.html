@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Research · Tickets</title><link rel="stylesheet" href="/research.css"></head>
+<body data-mode="research"><main>
+<h1>Research</h1><p class="muted">Build invariants and design documents for a goal, a ticket, or both.</p>
+<p id="message" class="notice" role="status">Loading cases…</p>
+<p id="signin" hidden><a href="/login.html">Sign in</a> to participate.</p>
+<section id="case-list" class="panel"><h2>Research cases</h2><div id="cases" class="cases"></div>
+<form id="create-form" ><h3>Start a Research case</h3>
+<label>Title <input id="case-title" type="text" maxlength="120" required></label>
+<label>Original goal <textarea id="case-goal" maxlength="4000" required></textarea></label>
+<label>Issue ticket IDs, if any (comma separated) <input id="case-tickets" type="text"></label>
+<button type="submit">Create case</button></form></section>
+<section id="case" hidden>
+<div class="row"><h2 id="case-heading"></h2><span id="case-phase" class="muted"></span><a id="other-stage" href="#"></a></div>
+<p id="case-goal-text"></p><p id="case-tickets-text" class="muted"></p>
+<section id="affirmation-gate" class="panel" hidden><h3>Your affirmation phrase</h3><p>Enter a phrase to join this case. It appears to other participants.</p>
+<form id="affirmation-gate-form"><input id="affirmation-gate-input" type="text" maxlength="160" required><button type="submit">Enter case</button></form></section>
+<div id="workspace" class="layout" hidden>
+<aside class="stack"><section class="panel"><h2>Design invariants</h2><ul id="invariants"></ul>
+<form id="invariant-form"><label>Edit the set, one invariant per line<textarea id="invariant-input" maxlength="12030"></textarea></label><button type="submit">Save invariants</button></form></section>
+<section class="panel"><h2>How progress feels</h2><p class="muted">1 low · 5 high. Each change is recorded.</p><div id="progress-survey"></div></section></aside>
+<div class="stack">
+<section class="panel"><h2>Design brief</h2><p class="muted">Selected contributed documents become tabs in the brief.</p>
+<div id="brief-tabs" class="tabs" role="tablist"></div><pre id="brief-body" class="doc"></pre>
+<form id="brief-form"><h3>Brief tabs</h3><div id="brief-choices"></div><button type="submit">Save brief tabs</button></form>
+<button id="promote" type="button" hidden>Promote to Development</button></section>
+<section class="panel"><h2>Participant documents</h2><div id="document-tabs" class="tabs" role="tablist"></div>
+<pre id="document-body" class="doc"></pre><div id="vote"></div>
+<form id="document-form"><h3>Set your document tab</h3><label>Document title<input id="document-title" type="text" maxlength="120" required></label>
+<label>Choose a source<select id="document-source"><option value="text">Write here</option><option value="page">Copy one of my authored pages</option><option value="file_copy">Copy one of my encrypted files</option></select></label>
+<div id="file-unlock" hidden><label>File key passphrase<input id="file-passphrase" type="password" autocomplete="off"></label><button id="unlock-files" type="button">Unlock files</button> <a href="/files.html">Set up file encryption</a></div>
+<label id="inventory-label" hidden>My inventory<select id="document-inventory"></select></label>
+<label id="document-text-label">Document text<textarea id="document-text" maxlength="60000"></textarea></label>
+<p id="copy-warning" class="muted" hidden>Choosing a private file creates a readable Research copy for all signed-in participants. The encrypted original remains private. Text files only, up to 60,000 characters.</p>
+<button type="submit">Save my tab</button></form></section>
+<section class="panel"><h2>Research chat</h2><p class="muted">Live room shared by signed-in participants. Include the case title when discussing a specific case.</p>
+<ul id="chat-messages" class="messages"></ul><form id="chat-form"><label>Message<textarea id="chat-text" maxlength="4000" required></textarea></label><button type="submit">Send</button></form></section>
+<section class="panel"><h2>Conversation threads</h2><ul id="threads" class="tree"></ul>
+<form id="thread-form"><label>Start a thread<textarea id="thread-text" maxlength="4000" required></textarea></label><button type="submit">Post</button></form></section>
+</div>
+<aside class="stack"><section class="panel"><h2>Affirmations</h2><ul id="affirmations" class="affirmations"></ul>
+<form id="affirmation-form"><label>My affirmation phrase<input id="affirmation-input" type="text" maxlength="160" required></label><button type="submit">Update phrase</button></form></section>
+<section class="panel"><h2>How social dynamics feel</h2><p class="muted">1 low · 5 high. Each change is recorded.</p><div id="social-survey"></div></section>
+<section class="panel"><h2>State changes</h2><ol id="events" class="event-list"></ol></section></aside>
+</div></section>
+</main><script type="module" src="/research.js"></script><script type="module" src="/site-nav.js" data-site-nav="allow"></script></body></html>
