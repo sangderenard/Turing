@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -157,3 +158,25 @@ def test_imported_briefs_are_idempotent_and_roundtable_is_job_specific(server):
     assert "Every run, first" in base["preamble"]
     assert "Every run, first" not in table["preamble"]
     assert "one seat at a round table" in table["preamble"]
+    assert _call(server.port, "/api/agent-workspace/profiles", "POST",
+                 {**headers, "X-Meowdoku-Workspace": "1"},
+                 {"action": "delete", "id": claude["id"]})[0] == 200
+    assert len(_call(server.port, "/api/agent-workspace/profiles", headers=headers)[1]["profiles"]) == 3
+
+
+def test_profile_launcher_prepares_stable_memory_id(server):
+    _signup(server.port, "spawn_person")
+    _signup(server.port, "another_person")
+    script = ROOT / "examples" / "meowdoku" / "deploy" / "profile_prompt.py"
+    memory_id = "a" * 32
+    command = [sys.executable, str(script), "--accounts-db", str(server.sessions.accounts_db),
+               "--individual", "spawn_person", "--ensure-memory", memory_id]
+    assert subprocess.run(command, capture_output=True).returncode == 0
+    assert subprocess.run(command, capture_output=True).returncode == 0
+    assert subprocess.run([*command[:5], "another_person", *command[6:]], capture_output=True).returncode == 1
+    db = work.connect(server.sessions.accounts_db)
+    try:
+        row = db.execute("SELECT u.id FROM users u WHERE username='spawn_person'").fetchone()
+        assert work.memory_read(db, row[0], memory_id)["body"] == ""
+    finally:
+        db.close()

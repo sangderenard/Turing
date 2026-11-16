@@ -61,6 +61,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
                "document_ids TEXT NOT NULL, updated REAL NOT NULL, seed_key TEXT UNIQUE)")
     db.execute("DROP INDEX IF EXISTS agent_profiles_individual")
     db.execute("CREATE INDEX IF NOT EXISTS agent_profiles_individual_lookup ON agent_profiles(individual_id,title)")
+    db.execute("CREATE TABLE IF NOT EXISTS agent_profile_imports (seed_key TEXT PRIMARY KEY)")
     db.execute("CREATE TABLE IF NOT EXISTS agent_profile_jobs ("
                "id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE, "
                "job_key TEXT NOT NULL, title TEXT NOT NULL, replacements TEXT NOT NULL, additions TEXT NOT NULL, "
@@ -240,7 +241,7 @@ def seed_builtin_profiles(db, actor_id):
     try:
         for username, (title, body) in BUILTIN_BRIEFS.items():
             account = db.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone()
-            if account is None or db.execute("SELECT 1 FROM agent_profiles WHERE seed_key=?", (username,)).fetchone():
+            if account is None or db.execute("SELECT 1 FROM agent_profile_imports WHERE seed_key=?", (username,)).fetchone():
                 continue
             needed = 2 if username != "llama" and day_brief else 1
             if db.execute("SELECT COUNT(*) FROM agent_documents").fetchone()[0] + needed > MAX_DOCS:
@@ -262,6 +263,7 @@ def seed_builtin_profiles(db, actor_id):
                 ids.append(doc_id)
             db.execute("INSERT INTO agent_profiles VALUES (?,?,?,?,?,?)",
                        (profile_id, title, account[0], json.dumps(ids), time.time(), username))
+            db.execute("INSERT INTO agent_profile_imports VALUES (?)", (username,))
             if username != "llama" and day_brief:
                 job_key = "roundtable"
                 db.execute("INSERT INTO agent_profile_jobs VALUES (?,?,?,?,?,?,?)",

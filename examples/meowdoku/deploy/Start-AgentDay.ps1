@@ -177,6 +177,8 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
             Set-Content -LiteralPath $memoryPath -Value $memoryId -Encoding ascii
         }
     }
+    & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
+    if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $name" }
     $text += "`n`nPersistent memory ID: $memoryId. At the start of this run, call memory_file with this ID. If it does not exist, create it with memory_change action write, id $memoryId, create true and a title. Update that same memory file before the run ends. This ID may be assigned to a later run or transferred to another account by an operator."
     $day = @((Join-Path $AgentDays "$name\$(Get-Date -Format 'yyyy-MM-dd').md"), (Join-Path $AgentDays "$name\default.md")) |
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1

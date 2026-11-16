@@ -113,6 +113,8 @@ function Open-Seat([string]$key, [string]$agent, [string]$kind, [string[]]$order
             New-Item -ItemType Directory -Force -Path (Split-Path $memoryPath) | Out-Null
             Set-Content -LiteralPath $memoryPath -Value $memoryId -Encoding ascii
         }
+        & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
+        if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $agent" }
     }
     $process = Start-AsAgent $cred $Python $arguments $Workspace -Hidden -Redirect
     # A seat is recorded, so the agent's day runs wait for it; the lookout runs no agent and is not.
