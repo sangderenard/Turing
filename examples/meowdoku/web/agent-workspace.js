@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
 const kinds = ["orientation", "prompt", "personality", "guidance", "trouble", "scenario"];
 let current = null, parent = null, mode = "orientation", editing = null;
-let activeProfile = null, activeJob = null;
+let activeProfile = null, activeJob = null, activeInstance = null;
 const ids = value => value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 function showProfile() { $("profile-editor").hidden = false; $("document-editor").hidden = true; }
 function showDocument() { $("profile-editor").hidden = true; $("document-editor").hidden = false; }
@@ -87,18 +87,18 @@ async function profiles() {
   for (const row of result.profiles) $("profile-list").append(itemButton(row.title + " · " + row.individual, guard(() => openProfile(row.id))));
 }
 async function openProfile(id) {
-  const row = await api("/api/agent-workspace/profile/" + id); activeProfile = row; activeJob = null; showProfile();
+  const row = await api("/api/agent-workspace/profile/" + id); activeProfile = row; activeJob = null; activeInstance = null; showProfile();
   $("profile-title").value = row.title; $("profile-individual").value = row.individual;
   $("profile-documents").value = row.document_ids.join("\n"); $("profile-resolved").value = "";
   $("job-list").replaceChildren();
   for (const job of row.jobs) $("job-list").append(itemButton(job.title + " · " + job.job_key, guard(() => openJob(job.id))));
-  freshJob(); notice("Opened profile " + row.title);
+  freshJob(); freshInstance(); notice("Opened character " + row.title);
 }
 function freshProfile() {
-  activeProfile = null; activeJob = null; showProfile();
+  activeProfile = null; activeJob = null; activeInstance = null; showProfile();
   $("profile-title").value = ""; $("profile-individual").value = "";
   $("profile-documents").value = ""; $("profile-resolved").value = "";
-  $("job-list").replaceChildren(); freshJob(); notice("New individual profile");
+  $("job-list").replaceChildren(); freshJob(); freshInstance(); notice("New character");
 }
 async function saveProfile() {
   const data = {action:"save", title:$("profile-title").value, individual:$("profile-individual").value,
@@ -145,6 +145,61 @@ async function previewProfile(job = false) {
   const row = await api("/api/agent-workspace/resolve?" + query); $("profile-resolved").value = row.preamble;
   notice("Resolved " + row.documents.length + " documents for " + row.profile.individual);
 }
+async function instances() {
+  const result = await api("/api/agent-workspace/instances"); $("instance-list").replaceChildren();
+  for (const row of result.instances) $("instance-list").append(itemButton(row.title + " · " + row.character,
+    guard(() => openInstance(row.id))));
+}
+function freshInstance() {
+  activeInstance = null; $("instance-title").value = ""; $("instance-memory").value = "";
+  $("instance-id").textContent = "New instance"; $("spawn-command").textContent = "";
+  $("llama-queue").hidden = activeProfile?.individual?.toLowerCase() !== "llama";
+}
+async function openInstance(id) {
+  const row = await api("/api/agent-workspace/instance/" + id);
+  if (!activeProfile || activeProfile.id !== row.profile_id) await openProfile(row.profile_id);
+  activeInstance = row; $("instance-title").value = row.title; $("instance-memory").value = row.memory_id;
+  $("instance-id").textContent = "Instance " + row.id;
+  if (["claude", "codex"].includes(row.individual.toLowerCase()))
+    $("spawn-command").textContent = "Spawn from the operator terminal: Start-AgentDay.ps1 -RunOne " +
+      row.individual + " -InstanceId " + row.id + (activeJob ? " -JobKey " + activeJob.job_key : "");
+  notice("Opened instance " + row.title);
+}
+async function saveInstance() {
+  if (!activeProfile) throw new Error("Save a character first");
+  const data = {action:"save", profile_id:activeProfile.id, title:$("instance-title").value,
+    memory_id:$("instance-memory").value || undefined};
+  if (activeInstance) data.id = activeInstance.id;
+  const row = await api("/api/agent-workspace/instances", data); await instances(); await openInstance(row.id);
+  notice("Saved instance and attached memory " + row.memory_id);
+}
+async function deleteInstance() {
+  if (!activeInstance || !confirm("Remove this instance from the catalog? Its memory file remains.")) return;
+  await api("/api/agent-workspace/instances", {action:"delete", id:activeInstance.id});
+  freshInstance(); await instances(); notice("Removed instance");
+}
+async function transferInstance() {
+  if (!activeInstance) throw new Error("Open an instance first");
+  const target = $("instance-target").value.trim();
+  if (!target) throw new Error("Enter a destination character ID");
+  const row = await api("/api/agent-workspace/instances", {action:"transfer", id:activeInstance.id,
+    target_profile_id:target});
+  await instances(); await openInstance(row.id); $("instance-target").value = "";
+  notice("Transferred instance and attached memory to " + row.individual);
+}
+async function runs() {
+  const result = await api("/api/agent-runs"); $("run-list").replaceChildren();
+  for (const row of result.runs) $("run-list").append(itemButton(row.status + " · " + row.id,
+    guard(async () => { const run = await api("/api/agent-runs/" + row.id);
+      $("profile-resolved").value = run.response || run.error || "Waiting for Llama";
+      showProfile(); notice("Run " + row.id + ": " + run.status); })));
+}
+async function submitRun() {
+  if (!activeInstance || activeInstance.individual.toLowerCase() !== "llama") throw new Error("Open a Llama instance first");
+  const data = {instance_id:activeInstance.id, prompt:$("run-prompt").value};
+  if (activeJob) data.job_key = activeJob.job_key;
+  const row = await api("/api/agent-runs", data); await runs(); notice("Queued Llama run " + row.id);
+}
 function guard(fn) { return async () => { try { await fn(); } catch (error) { notice(error.message); } }; }
 for (const kind of kinds) {
   $("kind").append(new Option(kind, kind));
@@ -166,4 +221,7 @@ $("profile-new").onclick = freshProfile; $("profile-save").onclick = guard(saveP
 $("profile-delete").onclick = guard(deleteProfile); $("profile-preview").onclick = guard(() => previewProfile());
 $("job-new").onclick = freshJob; $("job-save").onclick = guard(saveJob); $("job-delete").onclick = guard(deleteJob);
 $("job-preview").onclick = guard(() => previewProfile(true));
-guard(async () => { const result = await api("/api/agent-workspace"); $("orientation").textContent = result.orientation; await branch(); fresh(); await profiles(); await memories(); await scratch(); })();
+$("instance-new").onclick = freshInstance; $("instance-save").onclick = guard(saveInstance);
+$("instance-delete").onclick = guard(deleteInstance); $("run-submit").onclick = guard(submitRun);
+$("instance-transfer").onclick = guard(transferInstance);
+guard(async () => { const result = await api("/api/agent-workspace"); $("orientation").textContent = result.orientation; await branch(); fresh(); await profiles(); await instances(); await runs(); await memories(); await scratch(); })();

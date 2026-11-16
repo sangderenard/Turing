@@ -70,6 +70,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
                "id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id), title TEXT NOT NULL, "
                "body TEXT NOT NULL, updated REAL NOT NULL)")
     db.execute("CREATE INDEX IF NOT EXISTS agent_memories_owner ON agent_memories(owner_id,title)")
+    db.execute("CREATE TABLE IF NOT EXISTS agent_instances ("
+               "id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES agent_profiles(id), "
+               "memory_id TEXT NOT NULL REFERENCES agent_memories(id), title TEXT NOT NULL, "
+               "created REAL NOT NULL, updated REAL NOT NULL, seed_key TEXT UNIQUE)")
+    db.execute("CREATE INDEX IF NOT EXISTS agent_instances_profile ON agent_instances(profile_id,title)")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS agent_instances_memory ON agent_instances(memory_id)")
     return db
 
 
@@ -374,9 +380,92 @@ def resolve_profile(db, profile_id, job_key=None):
 
 
 def delete_profile(db, profile_id):
+    if db.execute("SELECT 1 FROM agent_instances WHERE profile_id=?", (profile_id,)).fetchone():
+        raise WorkspaceError("profile has catalogued instances", 409)
     if db.execute("DELETE FROM agent_profiles WHERE id=?", (profile_id,)).rowcount == 0:
         raise WorkspaceError("individual profile not found", 404)
     return {"deleted": profile_id}
+
+
+def instances(db):
+    return {"instances": [dict(row) for row in db.execute(
+        "SELECT i.id,i.profile_id,i.memory_id,i.title,i.created,i.updated,p.title AS character,"
+        "u.username AS individual FROM agent_instances i JOIN agent_profiles p ON p.id=i.profile_id "
+        "JOIN users u ON u.id=p.individual_id ORDER BY i.updated DESC")]}
+
+
+def instance(db, instance_id):
+    row = db.execute("SELECT i.*,p.title AS character,p.individual_id,u.username AS individual "
+                     "FROM agent_instances i JOIN agent_profiles p ON p.id=i.profile_id "
+                     "JOIN users u ON u.id=p.individual_id WHERE i.id=?", (instance_id,)).fetchone()
+    if row is None:
+        raise WorkspaceError("instance not found", 404)
+    return dict(row)
+
+
+def save_instance(db, data):
+    base = profile(db, data.get("profile_id"))
+    title = _text(data.get("title") or base["title"], "instance title", 160).strip()
+    if not title:
+        raise WorkspaceError("instance title is required")
+    memory_id = data.get("memory_id")
+    if memory_id:
+        memory_read(db, base["individual_id"], memory_id)
+    else:
+        memory_id = memory_write(db, base["individual_id"], {"title": title + " memory", "body": ""})["id"]
+    instance_id = data.get("id") or secrets.token_hex(16)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if data.get("id") and db.execute("SELECT 1 FROM agent_instances WHERE id=?", (instance_id,)).fetchone() is None:
+            raise WorkspaceError("instance not found", 404)
+        if not data.get("id") and db.execute("SELECT COUNT(*) FROM agent_instances").fetchone()[0] >= MAX_DOCS:
+            raise WorkspaceError("instance quota reached", 429)
+        now = time.time()
+        try:
+            db.execute("INSERT INTO agent_instances(id,profile_id,memory_id,title,created,updated) "
+                       "VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET profile_id=excluded.profile_id,"
+                       "memory_id=excluded.memory_id,title=excluded.title,updated=excluded.updated",
+                       (instance_id, base["id"], memory_id, title, now, now))
+        except sqlite3.IntegrityError:
+            raise WorkspaceError("memory file is already attached to an instance", 409) from None
+        db.commit()
+    except BaseException:
+        db.rollback(); raise
+    return instance(db, instance_id)
+
+
+def delete_instance(db, instance_id):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone() and db.execute(
+            "SELECT 1 FROM agent_runs WHERE instance_id=? AND status IN ('queued','running')", (instance_id,)).fetchone():
+        raise WorkspaceError("instance has queued work", 409)
+    if db.execute("DELETE FROM agent_instances WHERE id=?", (instance_id,)).rowcount == 0:
+        raise WorkspaceError("instance not found", 404)
+    return {"deleted": instance_id}
+
+
+def transfer_instance(db, instance_id, target_profile_id):
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        source = instance(db, instance_id)
+        target = profile(db, target_profile_id)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone() and db.execute(
+                "SELECT 1 FROM agent_runs WHERE instance_id=? AND status IN ('queued','running')", (instance_id,)).fetchone():
+            raise WorkspaceError("instance has queued work", 409)
+        if source["individual_id"] != target["individual_id"]:
+            memory = db.execute("SELECT length(CAST(body AS BLOB)) FROM agent_memories WHERE id=?",
+                                (source["memory_id"],)).fetchone()
+            quota = memory_list(db, target["individual_id"])
+            if memory is None or len(quota["files"]) >= MAX_SCRATCH_FILES or \
+                    quota["used_bytes"] + memory[0] > MAX_SCRATCH_BYTES:
+                raise WorkspaceError("destination memory quota reached", 429)
+            db.execute("UPDATE agent_memories SET owner_id=?,updated=? WHERE id=?",
+                       (target["individual_id"], time.time(), source["memory_id"]))
+        db.execute("UPDATE agent_instances SET profile_id=?,updated=? WHERE id=?",
+                   (target_profile_id, time.time(), instance_id))
+        db.commit()
+    except BaseException:
+        db.rollback(); raise
+    return instance(db, instance_id)
 
 
 def delete_profile_job(db, job_id):
@@ -438,6 +527,11 @@ def memory_write(db, owner_id, data, operator=False):
 def memory_transfer(db, actor_id, memory_id, username):
     db.execute("BEGIN IMMEDIATE")
     try:
+        if db.execute("SELECT 1 FROM agent_instances WHERE memory_id=?", (memory_id,)).fetchone():
+            raise WorkspaceError("detach memory from its instance before transfer", 409)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone() and db.execute(
+                "SELECT 1 FROM agent_runs WHERE memory_id=? AND status IN ('queued','running')", (memory_id,)).fetchone():
+            raise WorkspaceError("memory file is in use by a queued run", 409)
         account = db.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE "
                              "AND id NOT IN (SELECT user_id FROM temporary_accounts)", (username,)).fetchone()
         if account is None:
@@ -459,6 +553,11 @@ def memory_transfer(db, actor_id, memory_id, username):
 
 def memory_delete(db, owner_id, memory_id, operator=False):
     memory_read(db, owner_id, memory_id, operator)
+    if db.execute("SELECT 1 FROM agent_instances WHERE memory_id=?", (memory_id,)).fetchone():
+        raise WorkspaceError("memory file is attached to an instance", 409)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone() and db.execute(
+            "SELECT 1 FROM agent_runs WHERE memory_id=? AND status IN ('queued','running')", (memory_id,)).fetchone():
+        raise WorkspaceError("memory file is in use by a queued run", 409)
     db.execute("DELETE FROM agent_memories WHERE id=?", (memory_id,))
     return {"deleted": memory_id}
 

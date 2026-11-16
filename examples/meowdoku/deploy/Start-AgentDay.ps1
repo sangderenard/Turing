@@ -34,6 +34,7 @@ param(
     [string]$Why = '',
     [string]$JobKey = '',
     [ValidatePattern('^[a-f0-9]{32}$')][string]$ProfileId = '',
+    [ValidatePattern('^[a-f0-9]{32}$')][string]$InstanceId = '',
     [ValidatePattern('^[a-f0-9]{32}$')][string]$PersistenceId = '',
     [switch]$NewPersistence,
     [switch]$Status,
@@ -153,21 +154,27 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     $declared = $Agents[$name]
     $cred = Read-AgentCredential $declared.account
     if (-not $cred) { Log "${name}: no saved password for $($declared.account) (Set-AgentBox.ps1 -Apply -ResetPassword)"; return }
-    $preambleFile = Join-Path $AgentDays 'preamble.md'
+    if ($InstanceId -and ($ProfileId -or $PersistenceId -or $NewPersistence)) {
+        throw '-InstanceId already selects the character and memory; do not combine selectors'
+    }
     $profileArgs = @('--accounts-db', $AccountsDb, '--individual', $declared.login)
-    if ($ProfileId) { $profileArgs += @('--profile-id', $ProfileId) }
+    if ($InstanceId) { $profileArgs += @('--instance-id', $InstanceId) }
+    elseif ($ProfileId) { $profileArgs += @('--profile-id', $ProfileId) }
     if ($JobKey) { $profileArgs += @('--job', $JobKey) }
     $profileText = & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') @profileArgs
     if ($LASTEXITCODE -notin @(0, 2)) { throw "Profile resolution failed for $name and job '$JobKey' (exit $LASTEXITCODE)" }
-    if ($LASTEXITCODE -eq 2 -and ($ProfileId -or $JobKey)) { throw "Requested profile or job not found for $name" }
-    $text = if ($LASTEXITCODE -eq 0) { $profileText -join "`n" }
-            elseif (Test-Path -LiteralPath $preambleFile) { (Get-Content -Raw -LiteralPath $preambleFile -Encoding utf8) + "`n`n$InternCoaching" }
-            else { $Preamble + "`n`n$InternCoaching" }
+    if ($LASTEXITCODE -eq 2) { throw "No character profile exists for $name; open Agent workspace to import the brief" }
+    $hasProfile = $LASTEXITCODE -eq 0
+    $text = $profileText -join "`n"
     $text = $text.Replace('{agent}', $name).Replace('{login}', $declared.login).Replace('{account}', $declared.account).
         Replace('{reason}', $reason).Replace('{now}', (Get-Date -Format 'yyyy-MM-dd HH:mm')).Replace('{slot}', ('{0:00}' -f $declared.offset))
     if ($PersistenceId -and $NewPersistence) { throw 'Choose -PersistenceId or -NewPersistence, not both' }
     $memoryId = $PersistenceId
-    if (-not $memoryId -and $NewPersistence) { $memoryId = [Guid]::NewGuid().ToString('N') }
+    if ($InstanceId) {
+        $memoryId = (& $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --instance-id $InstanceId --instance-memory) -join ''
+        if ($LASTEXITCODE -ne 0) { throw "Cannot read attached memory for instance $InstanceId" }
+    }
+    if (-not $memoryId -and ($NewPersistence -or $ProfileId)) { $memoryId = [Guid]::NewGuid().ToString('N') }
     if (-not $memoryId) {
         $memoryPath = Join-Path $AgentDays "$name\persistence.id"
         if (Test-Path -LiteralPath $memoryPath) { $memoryId = (Get-Content -Raw -LiteralPath $memoryPath).Trim() }
@@ -179,6 +186,11 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     }
     & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
     if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $name" }
+    $catalogId = $InstanceId
+    if (-not $catalogId -and $hasProfile) {
+        $catalogId = (& $Python (Join-Path $PSScriptRoot 'profile_prompt.py') @profileArgs --register-instance $memoryId) -join ''
+        if ($LASTEXITCODE -ne 0) { throw "Could not catalogue instance for $name with memory $memoryId" }
+    }
     $text += "`n`nPersistent memory ID: $memoryId. At the start of this run, call memory_file with this ID. If it does not exist, create it with memory_change action write, id $memoryId, create true and a title. Update that same memory file before the run ends. This ID may be assigned to a later run or transferred to another account by an operator."
     $day = @((Join-Path $AgentDays "$name\$(Get-Date -Format 'yyyy-MM-dd').md"), (Join-Path $AgentDays "$name\default.md")) |
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -194,7 +206,7 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     $script = (Sign-In $declared) + "`n`$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded'))`n" +
         "Set-Location '$Workspace'`n$($declared.run)`nexit `$LASTEXITCODE"
     $started = Get-Date
-    Log "${name}: $reason run as $($declared.account), profile $(if ($ProfileId) { $ProfileId } else { 'default' }), persistence $memoryId$(if ($why) { ": $why" })"
+    Log "${name}: $reason run as $($declared.account), instance $catalogId, persistence $memoryId$(if ($why) { ": $why" })"
     # The record names this script's own process, which lives exactly as long as the run it waits for.
     $record = Add-AgentRecord $AgentDays 'run' $declared.account $PID @{ agent = $name; reason = $reason }
     try { $result = Invoke-AsAgent $cred $script $Workspace ($TimeoutMinutes * 60) }
@@ -203,7 +215,7 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     Log "${name}: $(if ($result.TimedOut) { "stopped after $TimeoutMinutes min" } else { "exit $($result.ExitCode)" }) in $seconds s"
     if (-not $Tick -and $result.Output) { Write-Host ($result.Output -replace '(?m)^', '  ') }
     $tail = if ($result.Output.Length -gt 4000) { $result.Output.Substring($result.Output.Length - 4000) } else { $result.Output }
-    [ordered]@{ agent = $name; account = $declared.account; reason = $reason; why = $why; prompt = $day; profile_id = $ProfileId; job = $JobKey; persistence_id = $memoryId; started = $started.ToString('o')
+    [ordered]@{ agent = $name; account = $declared.account; reason = $reason; why = $why; prompt = $day; profile_id = $ProfileId; instance_id = $catalogId; job = $JobKey; persistence_id = $memoryId; started = $started.ToString('o')
                 seconds = $seconds; exit = $result.ExitCode; timed_out = $result.TimedOut; output_tail = $tail } |
         ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $AgentDays 'runs.jsonl') -Encoding utf8
 }

@@ -341,6 +341,9 @@ class Seat:
                 if isinstance(profile, str) and profile.strip():
                     parts.append(profile)
                 memory_id = command.get("memory_id")
+                instance_id = command.get("instance_id")
+                if isinstance(instance_id, str) and len(instance_id) == 32:
+                    parts.append(f"Your catalogued instance ID is {instance_id}.")
                 if isinstance(memory_id, str) and len(memory_id) == 32:
                     parts.append(f"Persistent memory ID: {memory_id}. Read it with memory_file at the start; "
                                  "if absent create it with memory_change action write, id, create true, and a title. "

@@ -102,6 +102,7 @@ from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
+from meowdoku import agent_runs as agent_runs_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
 from meowdoku import paper_arena as paper_arena_mod
@@ -1498,6 +1499,10 @@ def make_handler(sessions: Sessions):
                     if path == "/api/agent-workspace/profiles":
                         agent_workspace_mod.seed_builtin_profiles(db, self._principal().user_id)
                         return self._json(agent_workspace_mod.profiles(db))
+                    if path == "/api/agent-workspace/instances":
+                        return self._json(agent_workspace_mod.instances(db))
+                    if path.startswith("/api/agent-workspace/instance/"):
+                        return self._json(agent_workspace_mod.instance(db, path.rsplit("/", 1)[1]))
                     if path.startswith("/api/agent-workspace/profile/"):
                         return self._json(agent_workspace_mod.profile(db, path.rsplit("/", 1)[1]))
                     if path.startswith("/api/agent-workspace/job/"):
@@ -1512,7 +1517,8 @@ def make_handler(sessions: Sessions):
                                                                       (query.get("kind") or [None])[0]))
                     if path.startswith("/api/agent-workspace/document/"):
                         return self._json(agent_workspace_mod.document(db, path.rsplit("/", 1)[1]))
-                if method == "POST" and path in ("/api/agent-workspace/profiles", "/api/agent-workspace/jobs"):
+                if method == "POST" and path in ("/api/agent-workspace/profiles", "/api/agent-workspace/jobs",
+                                                  "/api/agent-workspace/instances"):
                     body = self._body_json(limit=agent_workspace_mod.MAX_DOC_BYTES + 8192)
                     if body is None:
                         return
@@ -1523,11 +1529,19 @@ def make_handler(sessions: Sessions):
                             return self._json(agent_workspace_mod.save_profile(db, body))
                         if body.get("action") == "delete":
                             return self._json(agent_workspace_mod.delete_profile(db, body.get("id")))
-                    else:
+                    elif path.endswith("/jobs"):
                         if body.get("action") == "save":
                             return self._json(agent_workspace_mod.save_profile_job(db, body))
                         if body.get("action") == "delete":
                             return self._json(agent_workspace_mod.delete_profile_job(db, body.get("id")))
+                    else:
+                        if body.get("action") == "save":
+                            return self._json(agent_workspace_mod.save_instance(db, body))
+                        if body.get("action") == "delete":
+                            return self._json(agent_workspace_mod.delete_instance(db, body.get("id")))
+                        if body.get("action") == "transfer":
+                            return self._json(agent_workspace_mod.transfer_instance(
+                                db, body.get("id"), body.get("target_profile_id")))
                     raise agent_workspace_mod.WorkspaceError("action must be save or delete")
                 if method == "POST" and path == "/api/agent-workspace/documents":
                     body = self._body_json(limit=agent_workspace_mod.MAX_DOC_BYTES + 8192)
@@ -1652,6 +1666,47 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": str(error)}, error.status)
             except (OSError, sqlite3.Error):
                 return self._json({"error": "memory unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _agent_runs_route(self, path: str, method: str) -> None:
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            principal = self._principal()
+            worker = path in ("/api/agent-runs/claim", "/api/agent-runs/complete")
+            if worker:
+                if principal.username != "llama" or not self._require("agent_scratch"):
+                    return self._json({"error": "Llama account required"}, HTTPStatus.FORBIDDEN)
+            elif not self._require("operator_workspace") or principal.role not in ("operator", "admin"):
+                return
+            if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+            db = None
+            try:
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                if method == "GET":
+                    if path == "/api/agent-runs":
+                        return self._json(agent_runs_mod.list_runs(db))
+                    if path.startswith("/api/agent-runs/"):
+                        return self._json(agent_runs_mod.read(db, path.rsplit("/", 1)[1]))
+                if method == "POST":
+                    body = self._body_json(limit=agent_runs_mod.MAX_PROMPT_BYTES + 8192)
+                    if body is None:
+                        return
+                    if not isinstance(body, dict):
+                        raise agent_workspace_mod.WorkspaceError("object required")
+                    if path == "/api/agent-runs":
+                        return self._json(agent_runs_mod.submit(db, body))
+                    if path == "/api/agent-runs/claim":
+                        return self._json(agent_runs_mod.claim(db, principal.user_id, body.get("limit", 16)))
+                    if path == "/api/agent-runs/complete":
+                        return self._json(agent_runs_mod.complete(db, principal.user_id, body))
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except agent_workspace_mod.WorkspaceError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error):
+                return self._json({"error": "agent run queue unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -3389,6 +3444,8 @@ def make_handler(sessions: Sessions):
                 return self._scratch_route(path, "GET")
             if path == "/api/memory" or path.startswith("/api/memory/file/"):
                 return self._memory_route(path, "GET")
+            if path == "/api/agent-runs" or path.startswith("/api/agent-runs/"):
+                return self._agent_runs_route(path, "GET")
             if path in ("/api/file-keys/me", "/api/file-keys/peer"):
                 return self._file_keys_route(path, "GET")
             if path.startswith("/api/connections/"):
@@ -4015,12 +4072,15 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path0, "POST")
             if path0 == "/api/user-files":
                 return self._user_files_route(path0, "POST")
-            if path0 in ("/api/agent-workspace/documents", "/api/agent-workspace/profiles", "/api/agent-workspace/jobs"):
+            if path0 in ("/api/agent-workspace/documents", "/api/agent-workspace/profiles", "/api/agent-workspace/jobs",
+                         "/api/agent-workspace/instances"):
                 return self._agent_workspace_route(path0, "POST")
             if path0 == "/api/scratch":
                 return self._scratch_route(path0, "POST")
             if path0 == "/api/memory":
                 return self._memory_route(path0, "POST")
+            if path0 == "/api/agent-runs" or path0 in ("/api/agent-runs/claim", "/api/agent-runs/complete"):
+                return self._agent_runs_route(path0, "POST")
             if path0 == "/api/file-keys/me":
                 return self._file_keys_route(path0, "POST")
             if path0.startswith("/api/connections/"):

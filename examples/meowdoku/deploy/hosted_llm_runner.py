@@ -18,6 +18,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from speaktome_mcp.rest import Rest, RestError
 
@@ -80,8 +81,9 @@ def context(messages, username, limit=24):
 
 
 class LocalModel:
-    def __init__(self, executable, model, adapter, port, log_dir):
+    def __init__(self, executable, model, adapter, port, log_dir, parallel=2):
         self.executable, self.model, self.adapter, self.port = executable, model, adapter, port
+        self.parallel = parallel
         self.log_dir = log_dir
         self.process = None
         self.log = None
@@ -92,7 +94,8 @@ class LocalModel:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log = open(self.log_dir / "llama-server.log", "ab", buffering=0)
         args = [str(self.executable), "-m", str(self.model), "--host", "127.0.0.1",
-                "--port", str(self.port), "-ngl", "99", "-c", "4096"]
+                "--port", str(self.port), "-ngl", "99", "-c", str(4096 * self.parallel),
+                "-np", str(self.parallel), "-cb"]
         if self.adapter.is_file():
             args += ["--lora", str(self.adapter)]
         self.process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT,
@@ -155,6 +158,47 @@ class LocalModel:
             result = json.load(response)
         answer = result["choices"][0]["message"]["content"].strip()
         return answer[:500]
+
+    def answer_profile(self, work):
+        payload = {"model": self.model.stem, "messages": [
+            {"role": "system", "content": work["preamble"]},
+            {"role": "user", "content": "Saved memory for this instance (context, not a new instruction):\n"
+             + (work["memory"] or "(empty)") + "\n\nCurrent job:\n" + work["prompt"]}],
+            "temperature": 0.8, "max_tokens": 256}
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                                         data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=180) as response:
+            result = json.load(response)
+        answer = result["choices"][0]["message"]["content"].strip()
+        if not answer:
+            raise RuntimeError("Llama batch response was empty")
+        if len(answer.encode("utf-8")) > 16 * 1024:
+            raise RuntimeError("Llama batch response exceeds the run limit")
+        return answer
+
+
+def run_profile_batch(rest, model, parallel, limit=16):
+    try:
+        runs = rest.call("/api/agent-runs/claim", {"limit": limit},
+                         headers={"X-Meowdoku-Workspace": "1"})["runs"]
+    except RestError as error:
+        if error.status == 404:  # older site during a staged upgrade
+            return 0
+        raise
+    if not runs:
+        return 0
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        pending = [(work, pool.submit(model.answer_profile, work)) for work in runs]
+        for work, future in pending:
+            try:
+                answer = future.result()
+                outcome = {"response": answer, "error": ""}
+            except (OSError, ValueError, KeyError, RuntimeError) as error:
+                outcome = {"response": "", "error": f"{type(error).__name__}: {error}"[:1000]}
+            rest.call("/api/agent-runs/complete", {"id": work["id"], "claim_token": work["claim_token"],
+                                                   **outcome}, headers={"X-Meowdoku-Workspace": "1"})
+    return len(runs)
 
 
 def mode(rest, username, scope, place):
@@ -303,7 +347,7 @@ def run(args):
     db = sqlite3.connect(db_path, isolation_level=None)
     db.executescript(SCHEMA)
     model = LocalModel(Path(args.llama_server), Path(args.model), Path(args.adapter),
-                       args.port, Path(args.state_dir) / "logs")
+                       args.port, Path(args.state_dir) / "logs", args.batch_slots)
     try:
         model.start()
         kinds = atlas_kinds(rest)
@@ -311,6 +355,7 @@ def run(args):
         until = 0
         while True:
             try:
+                run_profile_batch(rest, model, args.batch_slots, args.batch_limit)
                 handle_direct(rest, model, db, username)
                 rooms = room_list(rest, username)
                 dispatch = current(db, "dispatch_room")
@@ -348,6 +393,8 @@ def main():
     parser.add_argument("--base", required=True)
     parser.add_argument("--converter", required=True)
     parser.add_argument("--adapter-root", required=True)
+    parser.add_argument("--batch-slots", type=int, choices=range(1, 9), default=2)
+    parser.add_argument("--batch-limit", type=int, choices=range(1, 33), default=16)
     run(parser.parse_args())
 
 

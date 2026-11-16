@@ -180,3 +180,48 @@ def test_profile_launcher_prepares_stable_memory_id(server):
         assert work.memory_read(db, row[0], memory_id)["body"] == ""
     finally:
         db.close()
+
+
+def test_character_instances_attach_memory_and_llama_batch_claims(server):
+    operator = _signup(server.port, "batch_operator")
+    llama = _signup(server.port, "llama")
+    outsider = _signup(server.port, "batch_outsider")
+    authz.grant_role(server.sessions.accounts_db, "batch_operator", "operator", "test")
+    headers = lambda cookie: {**PUBLIC_XFF, "Cookie": cookie, "X-Meowdoku-Workspace": "1"}
+    def post(path, body, cookie=operator):
+        return _call(server.port, path, "POST", headers(cookie), body)
+    prompt = post("/api/agent-workspace/documents", {"action": "save", "kind": "prompt",
+                  "title": "Llama character", "body": "You are a cartographer."})[1]
+    character = post("/api/agent-workspace/profiles", {"action": "save", "title": "Map maker",
+                      "individual": "llama", "document_ids": [prompt["id"]]})[1]
+    first = post("/api/agent-workspace/instances", {"action": "save", "profile_id": character["id"],
+                  "title": "North map maker"})[1]
+    second = post("/api/agent-workspace/instances", {"action": "save", "profile_id": character["id"],
+                   "title": "South map maker"})[1]
+    assert first["memory_id"] != second["memory_id"]
+    assert len(_call(server.port, "/api/agent-workspace/instances", headers=headers(operator))[1]["instances"]) == 2
+    assert post("/api/agent-workspace/profiles", {"action": "delete", "id": character["id"]})[0] == 409
+    assert post("/api/memory", {"action": "transfer", "id": first["memory_id"],
+                                "to": "batch_outsider"})[0] == 409
+    status, run, _, _ = post("/api/agent-runs", {"instance_id": first["id"], "prompt": "Draw the north coast"})
+    assert status == 200 and run["status"] == "queued", run
+    assert post("/api/agent-runs/claim", {"limit": 4}, outsider)[0] == 403
+    status, claimed, _, _ = post("/api/agent-runs/claim", {"limit": 4}, llama)
+    assert status == 200 and len(claimed["runs"]) == 1, claimed
+    work_item = claimed["runs"][0]
+    assert work_item["instance_id"] == first["id"]
+    assert "cartographer" in work_item["preamble"]
+    assert work_item["prompt"] == "Draw the north coast"
+    assert post("/api/agent-runs/complete", {"id": run["id"], "claim_token": "bad",
+                                             "response": "wrong"}, llama)[0] == 409
+    status, done, _, _ = post("/api/agent-runs/complete", {"id": run["id"],
+                            "claim_token": work_item["claim_token"], "response": "A coastline", "error": ""}, llama)
+    assert status == 200 and done["status"] == "done" and done["response"] == "A coastline"
+    assert _call(server.port, "/api/agent-runs/" + run["id"], headers=headers(outsider))[0] == 403
+    destination = post("/api/agent-workspace/profiles", {"action": "save", "title": "Human cartographer",
+                        "individual": "batch_outsider", "document_ids": [prompt["id"]]})[1]
+    status, moved, _, _ = post("/api/agent-workspace/instances", {"action": "transfer", "id": first["id"],
+                            "target_profile_id": destination["id"]})
+    assert status == 200 and moved["id"] == first["id"] and moved["memory_id"] == first["memory_id"]
+    assert moved["individual"] == "batch_outsider"
+    assert _call(server.port, "/api/memory/file/" + first["memory_id"], headers=headers(outsider))[0] == 200

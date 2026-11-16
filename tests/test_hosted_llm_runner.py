@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import sqlite3
+import threading
 
 RUNNER = Path(__file__).resolve().parents[1] / "examples" / "meowdoku" / "deploy" / "hosted_llm_runner.py"
 spec = importlib.util.spec_from_file_location("hosted_llm_runner", RUNNER)
@@ -118,3 +119,33 @@ def test_reward_requires_requested_emoji_within_ten_minutes(monkeypatch):
     rest.messages[0]["reaction_events"].append({"kind": "frog", "username": "alice", "at": 699})
     runner.settle_rewards(rest, db, "llama")
     assert db.execute("SELECT reward FROM attempts").fetchone()[0] == 1
+
+
+def test_profile_tick_submits_two_individuals_to_one_model_concurrently():
+    class BatchRest:
+        def __init__(self):
+            self.completed = []
+
+        def call(self, path, body=None, *, headers=None):
+            assert headers == {"X-Meowdoku-Workspace": "1"}
+            if path.endswith("/claim"):
+                return {"runs": [{"id": "a", "claim_token": "one", "preamble": "north", "memory": "",
+                                  "prompt": "draw north"},
+                                 {"id": "b", "claim_token": "two", "preamble": "south", "memory": "",
+                                  "prompt": "draw south"}]}
+            assert path.endswith("/complete")
+            self.completed.append(body)
+            return {"status": "done"}
+
+    class BatchModel:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+
+        def answer_profile(self, work):
+            self.barrier.wait(timeout=3)
+            return work["preamble"] + " result"
+
+    rest = BatchRest()
+    assert runner.run_profile_batch(rest, BatchModel(), 2) == 2
+    assert {item["response"] for item in rest.completed} == {"north result", "south result"}
+    assert {item["claim_token"] for item in rest.completed} == {"one", "two"}

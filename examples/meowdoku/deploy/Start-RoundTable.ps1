@@ -103,9 +103,10 @@ function Open-Seat([string]$key, [string]$agent, [string]$kind, [string[]]$order
                    '--turn-minutes', "$TurnMinutes", '--model', $GeminiModel)
     $profile = ''
     $memoryId = ''
+    $instanceId = ''
     if ($kind -eq 'seat') {
         $profile = (& $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --job roundtable) -join "`n"
-        if ($LASTEXITCODE -notin @(0, 2)) { throw "Roundtable profile resolution failed for $agent (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) { throw "Roundtable profile resolution failed for $agent (exit $LASTEXITCODE)" }
         $memoryPath = Join-Path $AgentDays "$agent\persistence.id"
         if (Test-Path -LiteralPath $memoryPath) { $memoryId = (Get-Content -Raw -LiteralPath $memoryPath).Trim() }
         if ($memoryId -notmatch '^[a-f0-9]{32}$') {
@@ -115,12 +116,14 @@ function Open-Seat([string]$key, [string]$agent, [string]$kind, [string[]]$order
         }
         & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
         if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $agent" }
+        $instanceId = (& $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --register-instance $memoryId) -join ''
+        if ($LASTEXITCODE -ne 0) { throw "Could not catalogue roundtable instance for $agent" }
     }
     $process = Start-AsAgent $cred $Python $arguments $Workspace -Hidden -Redirect
     # A seat is recorded, so the agent's day runs wait for it; the lookout runs no agent and is not.
     $record = if ($kind -eq 'seat') { Add-AgentRecord $AgentDays 'seat' $declared.account $process.Id @{ agent = $agent; room = $Room } }
     $seats[$key] = @{ process = $process; record = $record; out = $process.StandardOutput.ReadLineAsync()
-                      err = $process.StandardError.ReadLineAsync(); profile = $profile; memory_id = $memoryId }
+                      err = $process.StandardError.ReadLineAsync(); profile = $profile; memory_id = $memoryId; instance_id = $instanceId }
     $ready = Read-Seat $key $null 240
     if ($ready.op -eq 'ready') { return $true }
     Say "${agent}: the $kind did not start ($($ready.op)$(if ($ready.error) { ": $($ready.error)" }))"
@@ -205,7 +208,8 @@ function Invoke-Table([string[]]$order, [string]$owner) {
             }
             if (-not $seats.Contains($name)) { continue }
             if (-not (Send-Seat $name @{ op = 'turn'; turn = $turn; round = $round; tail = $tail;
-                                       profile = $seats[$name].profile; memory_id = $seats[$name].memory_id })) { $answer = @{ op = 'gone' } }
+                                       profile = $seats[$name].profile; memory_id = $seats[$name].memory_id;
+                                       instance_id = $seats[$name].instance_id })) { $answer = @{ op = 'gone' } }
             else { $answer = Read-Seat $name $turn ($TurnMinutes * 60 + 60) }
             switch ($answer.op) {
                 'posted' { $lastId = $answer.id; Say "round ${round}: $name posted message $($answer.id)" }

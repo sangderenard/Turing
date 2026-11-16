@@ -52,7 +52,7 @@ The new tables live in the configured accounts database through
 landing process must land both repositories before an instance restart and
 web export. The source page alone is not the published `build/meowdoku/web`.
 
-## Titled individual profiles and jobs
+## Enduring characters, instances, and jobs
 
 An individual profile has a stable ID, title, assigned permanent account and
 ordered document IDs. Several profiles may share one account; the profile ID
@@ -70,14 +70,27 @@ create a duplicate. The agent-day preamble and coaching text come from the
 existing `Start-AgentDay.ps1`; roundtable guidance is a job-specific replacement
 for that preamble. The imported brief copies can then be edited in the page.
 
+An instance catalog entry has its own ID, title, character profile ID, and
+attached memory file ID. Several instances can use one enduring character, but
+one memory file attaches to only one instance at a time. Removing an instance
+leaves its memory file intact. An operator can transfer an instance to another
+character in one transaction; the attached memory keeps its ID and moves to
+the destination account. Queued work blocks a transfer. A character with
+catalogued instances cannot be deleted.
+
 The trusted `Start-AgentDay.ps1` launcher resolves profiles from the accounts
 database before spawning the nonoperator Windows account. Use `-RunOne claude`
-or `-RunOne codex`, optionally `-ProfileId <id> -JobKey <key>`, to start a
-specific character and job. Scheduled runs use the imported default profile.
+or `-RunOne codex`, optionally `-InstanceId <id> -JobKey <key>`, to spawn a
+catalogued character instance with its attached memory. `-ProfileId <id>` and
+`-NewPersistence` can create a new instance; `-PersistenceId <id>` attaches an
+existing, unassigned memory file. Scheduled runs reuse their default memory
+ID and register the corresponding instance. A job key resolves its document
+replacements and additions on top of the character for that run.
 The profile text is handed to the agent as its preamble; the agent cannot read
 the operator workspace endpoint. The roundtable runner also passes its resolved
 `roundtable` job text through the existing seat command pipe on the first turn.
-The older launcher preamble remains a fallback only when no profile exists.
+The old hardcoded launcher preamble is retained as migration source; a missing
+character profile now stops the spawn instead of silently using it.
 
 `GET /api/memory` lists durable account-owned memory files by stable 32-hex
 IDs. `GET /api/memory/file/<id>` reads one file. `POST /api/memory` writes,
@@ -85,14 +98,26 @@ deletes or, for an operator/admin, transfers ownership to another permanent
 account. The ID remains unchanged when transferred. Nonoperators can read and
 write only their own files. A run's `-PersistenceId <id>` selects an existing
 memory ID and `-NewPersistence` generates a fresh one. Ordinary scheduled runs
-reuse `<AgentDays>/<agent>/persistence.id`. The preamble directs the agent to
-read or create the file and update it before ending. Storage uses the same
+reuse `<AgentDays>/<agent>/persistence.id`. The launcher creates the memory
+record before spawning and the preamble directs the agent to read and update
+it. Storage uses the same
 configured 128-file, 128-KiB-per-file, 8-MiB-per-account limits as scratch.
 The memory text is separate from the profile and may be handed to a different
 account by an operator. The memory and profile text remain unencrypted at rest.
 
-The current Llama intern still uses one account and its existing local
-`llama-server`; multiple titled Llama profiles can be saved, but the hosted
-runner has not yet been changed to schedule those profiles as a batch. Nodus's
-tensor state library can retain addressed numeric tensors in GPU banks; it does
-not currently own llama.cpp model weights or KV cache state.
+The operator can queue a prompt for a catalogued Llama instance through
+`POST /api/agent-runs`; `GET /api/agent-runs` and `GET /api/agent-runs/<id>`
+show status and result. The Llama account alone may claim batches and complete
+them, with a token that rejects stale completions. The queue holds at most 256
+unfinished runs; a claim leases up to 32 for 15 minutes and recovers an
+unfinished lease after that. The hosted runner submits multiple requests to
+its one local `llama-server` process using continuous batching. Defaults are
+two server slots and 16 runs per polling tick, configurable with
+`--batch-slots` (1–8) and `--batch-limit` (1–32). This allows many logical
+Llama instances to share one model process; throughput, context and VRAM remain
+finite. The model output is stored as a run result, never executed as a site
+command. The attached memory is read into the run as context; this batch path
+does not automatically rewrite it.
+
+Nodus's tensor state library can retain addressed numeric tensors in GPU
+banks; it does not currently own llama.cpp model weights or KV cache state.

@@ -18,6 +18,9 @@ def main(argv=None):
     parser.add_argument("--accounts-db", type=Path, required=True)
     parser.add_argument("--individual", required=True)
     parser.add_argument("--profile-id")
+    parser.add_argument("--instance-id")
+    parser.add_argument("--instance-memory", action="store_true")
+    parser.add_argument("--register-instance")
     parser.add_argument("--job")
     parser.add_argument("--ensure-memory")
     args = parser.parse_args(argv)
@@ -50,7 +53,20 @@ def main(argv=None):
                             "ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END,user_id LIMIT 1").fetchone()
         if author:
             agent_workspace.seed_builtin_profiles(db, author[0])
-        if args.profile_id:
+        if args.instance_id:
+            try:
+                active = agent_workspace.instance(db, args.instance_id)
+            except agent_workspace.WorkspaceError as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            if active["individual"].casefold() != args.individual.casefold():
+                print("instance belongs to a different account", file=sys.stderr)
+                return 1
+            if args.instance_memory:
+                print(active["memory_id"])
+                return 0
+            row = (active["profile_id"],)
+        elif args.profile_id:
             row = db.execute("SELECT p.id FROM agent_profiles p JOIN users u ON u.id=p.individual_id "
                              "WHERE p.id=? AND u.username=? COLLATE NOCASE",
                              (args.profile_id, args.individual)).fetchone()
@@ -60,6 +76,24 @@ def main(argv=None):
                              (args.individual,)).fetchone()
         if row is None:
             return 2
+        if args.register_instance:
+            try:
+                existing = db.execute("SELECT id,profile_id FROM agent_instances WHERE memory_id=?",
+                                      (args.register_instance,)).fetchone()
+                if existing:
+                    if existing[1] != row[0]:
+                        print("memory file is attached to another character instance", file=sys.stderr)
+                        return 1
+                    print(existing[0])
+                    return 0
+                active = agent_workspace.save_instance(db, {"profile_id": row[0],
+                    "memory_id": args.register_instance,
+                    "title": args.individual + " " + args.register_instance[:8]})
+                print(active["id"])
+                return 0
+            except agent_workspace.WorkspaceError as error:
+                print(str(error), file=sys.stderr)
+                return 1
         try:
             print(agent_workspace.resolve_profile(db, row[0], args.job)["preamble"])
         except agent_workspace.WorkspaceError as error:
