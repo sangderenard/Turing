@@ -592,6 +592,14 @@ def make_handler(sessions: Sessions):
                     self._oauth_internal = True
                     return user
                 return None
+            if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
+                self.client_address[0] in ("127.0.0.1", "::1") and not getattr(self, "_via_proxy", False) and
+                len(authorization) == 1 and authorization[0].startswith("Preview ")):
+                user = sessions.accounts.user_for_token(authorization[0][8:])
+                if user is not None and user.get("temporary"):
+                    self._mcp_preview_internal = True
+                    return user
+                return None
             if self.path.partition("?")[0].startswith("/api/messages/"):
                 if authorization:
                     # Explicit credentials win, including invalid ones: never silently
@@ -630,10 +638,11 @@ def make_handler(sessions: Sessions):
             self._tier = self._origin_tier
             self._principal_cache = None
             self._oauth_internal = False
+            self._mcp_preview_internal = False
             if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
                 self.client_address[0] in ("127.0.0.1", "::1") and not self._via_proxy and
-                self.headers.get("Authorization", "").startswith("Bearer ")):
-                if self._account() is not None and self._oauth_internal:
+                self.headers.get("Authorization", "").startswith(("Bearer ", "Preview "))):
+                if self._account() is not None and (self._oauth_internal or self._mcp_preview_internal):
                     origin = self.headers.get("X-Speaktome-MCP-Origin")
                     tier = self.headers.get("X-Speaktome-MCP-Tier")
                     if origin in ("lan", "dns", "ip") and tier in ("shader", "play", "dev", "edit"):
@@ -1996,10 +2005,32 @@ def make_handler(sessions: Sessions):
         # through Nodus); a restart or shutdown then waits for running jobs unless after_jobs is false (instance_control.py).
         # POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
+        @staticmethod
+        def _comment_kinds():
+            from meowdoku import authored_pages, branch_review, newsletter
+            return {branch_review.THREAD_KIND: branch_review.comment_kind(),
+                    "page": authored_pages.comment_kind(),
+                    "research_case": ticket_research_mod.comment_kind(),
+                    "article": newsletter.comment_kind()}
+
+        def _guest_route(self, path: str, method: str) -> None:
+            from meowdoku import guest_review, account_admin
+            self._classify()
+            policy, origin, origin_tier = sessions.authz_policy.get(), self._origin, self._origin_tier
+            def caps_for(account):
+                return account_admin.capabilities_for(sessions.accounts_db, account, origin=origin, origin_tier=origin_tier,
+                                                      policy=policy, lift=SHADER_LIFT)[1]
+            return guest_review.http_route(self, path, method, accounts_db=sessions.accounts_db,
+                                           kinds=self._comment_kinds(), caps_for=caps_for)
+
         def _talk_route(self, path: str, method: str) -> None:
             """[TALK] comments under a post (comments.py) and the chat server's rooms (chat_rooms.py); an @mention in either
             tells that account (mentions.py) when it may read the place."""
             self._classify()
+            if (method == "POST" and self._principal().role == "intern" and
+                (path == "/api/comments" or (path.startswith("/api/chat/rooms/") and
+                 "/" not in path[len("/api/chat/rooms/"):]))):
+                return self._guest_route(path, method)
             policy, origin, origin_tier = sessions.authz_policy.get(), self._origin, self._origin_tier
 
             def caps_for(account):
@@ -2007,12 +2038,9 @@ def make_handler(sessions: Sessions):
                 return account_admin.capabilities_for(sessions.accounts_db, account, origin=origin, origin_tier=origin_tier,
                                                       policy=policy, lift=SHADER_LIFT)[1]
             if path == "/api/comments" or path.startswith("/api/comments/"):
-                from meowdoku import authored_pages, branch_review, comments, newsletter
+                from meowdoku import comments
                 return comments.http_route(self, path, method, accounts_db=sessions.accounts_db,
-                                           kinds={branch_review.THREAD_KIND: branch_review.comment_kind(),
-                                                  "page": authored_pages.comment_kind(),
-                                                   "research_case": ticket_research_mod.comment_kind(),
-                                                  "article": newsletter.comment_kind()},
+                                           kinds=self._comment_kinds(),
                                            notify=sessions.system_notify, caps_for=caps_for)
             from meowdoku import chat_rooms
             connections = None
@@ -2996,8 +3024,8 @@ def make_handler(sessions: Sessions):
 
         def do_DELETE(self):  # noqa: N802
             self._classify()
-            if sessions.oauth_mcp is not None and self.path.split("?", 1)[0] == "/mcp":
-                return sessions.oauth_mcp.mcp(self, "DELETE")
+            if sessions.oauth_mcp is not None and self.path.split("?", 1)[0] in ("/mcp", "/mcp/guest"):
+                return sessions.oauth_mcp.mcp(self, "DELETE", guest=self.path.split("?", 1)[0] == "/mcp/guest")
             self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
 
         def do_GET(self):  # noqa: N802
@@ -3012,10 +3040,14 @@ def make_handler(sessions: Sessions):
                     return sessions.oauth_mcp.authorize_get(self)
                 if path == "/mcp":
                     return sessions.oauth_mcp.mcp(self, "GET")
+                if path == "/mcp/guest":
+                    return sessions.oauth_mcp.mcp(self, "GET", guest=True)
             if self._kiosk_gate(path, "GET"):                     # [KIOSK]
                 return
             if self._route_gate(path, "GET"):                     # [ROUTE]
                 return
+            if path.startswith("/api/guest/"):
+                return self._guest_route(path, "GET")
             if path.startswith("/api/hosted-agents/") and path.endswith("/last-word"):
                 from meowdoku import hosted_agent_modes
                 return hosted_agent_modes.http_route(self, path, "GET", accounts_db=sessions.accounts_db)
@@ -3609,13 +3641,18 @@ def make_handler(sessions: Sessions):
                     return sessions.oauth_mcp.token(self)
                 if path0 == "/mcp":
                     return sessions.oauth_mcp.mcp(self, "POST")
+                if path0 == "/mcp/guest":
+                    return sessions.oauth_mcp.mcp(self, "POST", guest=True)
             if self._principal().role == "trial" and path0 not in (
-                    "/api/account/keep", "/api/account/logout", "/api/account/login", "/api/account/signup"):
+                    "/api/account/keep", "/api/account/logout", "/api/account/login", "/api/account/signup",
+                    "/api/guest/tests", "/api/guest/submissions"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
                 return
             if self._route_gate(path0, "POST"):                   # [ROUTE]
                 return
+            if path0.startswith("/api/guest/"):
+                return self._guest_route(path0, "POST")
             if path0.startswith("/api/hosted-agents/") and path0.endswith("/last-word"):
                 from meowdoku import hosted_agent_modes
                 return hosted_agent_modes.http_route(self, path0, "POST", accounts_db=sessions.accounts_db)
