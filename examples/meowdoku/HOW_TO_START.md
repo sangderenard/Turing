@@ -1,5 +1,15 @@
 # How to start Meowdoku on Windows
 
+The public MCP deployment declares `SPEAKTOME_PUBLIC_ORIGIN` for the stable
+instance in `deploy/instances.json`. Apache routes `/mcp`, `/mcp/guest`,
+`/oauth/*`, and the OAuth discovery documents to that same instance so a
+development-route browser cookie cannot split an authorization flow. After
+this configuration lands, use the job-aware full stack restart procedure;
+an instance-only restart retains the supervisor's old environment. Verify
+the public HTTPS discovery document and MCP initialize before telling a
+client to connect. The public hostname's certificate must validate with the
+client's normal trust store.
+
 Run from `C:\dev\Powershell\turing`. These are the verified deployment settings
 as of 2026-11-10. Before a later restart, inspect `build/meowdoku/launch.json`
 for the current executable, argv, cwd, and environment. Preserve that record's
