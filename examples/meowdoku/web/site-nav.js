@@ -546,7 +546,8 @@ async function main() {
   const caps = new Set(who.capabilities || []);
 
   if (!who.signed_in) {
-    actions.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }),
+    actions.append(el("a", { class: "chip", href: "/palette.html", text: "Color game" }),
+      el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }),
       el("button", { class: "chip quiet", type: "button", disabled: "", text: "Register", title: "General registration is not open" }),
       el("a", { class: "chip quiet", href: "/register.html#alpha-form", text: "Alpha user request" }));
     reserveSpace();
@@ -621,6 +622,7 @@ async function main() {
   } }));
   for (const item of [
     link("Home", "/"),
+    link("Color game", "/palette.html"),
     link("Newsletter", "/newsletter.html"),
     link("Games", "/games.html", !onDev || caps.has("dev_ui")),
     link("Profile and servers", "/profile.html"),
