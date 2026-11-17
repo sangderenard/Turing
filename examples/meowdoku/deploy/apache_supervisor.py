@@ -706,10 +706,18 @@ class Supervisor:
         path = self.log_dir / "apache-access.log"
         cipher = RecordCipher(self.paths.records_key, existing_streams=(path, self.paths.log_ring))
         cipher.migrate(path)
+        # [REDUCE] repeated n-line cycles (a polling client) are counted, not written again; an optional keep/drop filter,
+        # <logs>/log_filter.json, is read whenever it changes (log_reduce.py). Reduced before sealing.
+        from meowdoku import log_reduce
+        reducer = log_reduce.Reducer(line_filter=log_reduce.LineFilter(self.log_dir / "log_filter.json"))
         with open(path, "ab") as out:
             for line in iter(sys.stdin.buffer.readline, b""):
-                out.write(cipher.seal(line))
+                for text in reducer.feed(line.decode("utf-8", "replace")):
+                    out.write(cipher.seal(text.encode("utf-8")))
                 out.flush()
+            for text in reducer.flush():
+                out.write(cipher.seal(text.encode("utf-8")))
+            out.flush()
         self.stop.set()
 
     def route_args(self):
