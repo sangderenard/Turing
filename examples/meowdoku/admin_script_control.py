@@ -26,7 +26,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 DEPLOY = Path(__file__).resolve().parent / "deploy"
 SCRIPTS = (
     "Add-CanvasContractPort.ps1", "Apache-Service.ps1", "Backup-State.ps1",
-    "Close-Console.ps1", "Enable-CronTool.ps1", "Migrate-LiaisonVault.ps1",
+    "Close-Console.ps1", "Enable-CronTool.ps1", "Export-DevDatabase.ps1", "Migrate-LiaisonVault.ps1",
     "Migrate-State.ps1", "Open-Console.ps1", "Protect-DefaultBranch.ps1",
     "Provision-HostedLlmTrain.ps1", "Provision-ServicePython.ps1",
     "Restart-Stack.ps1", "Restore-AgentBoxAcls.ps1", "Restore-State.ps1",
