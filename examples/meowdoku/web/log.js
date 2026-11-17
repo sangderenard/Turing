@@ -74,7 +74,7 @@ async function poll() {
   try {
     for (let i = 0; i < 20; i++) {
       const r = await fetch(`/api/log?since=${S.last}&limit=1000`, { cache: "no-store" });
-      if (r.status === 403) { S.error = "The log is for local (LAN) or dev-tier visitors only."; break; }
+      if (r.status === 403) { S.error = "The server log is for operators and admins, over HTTPS."; break; }
       const j = await r.json();
       S.error = "";
       if (j.last < S.last) { S.entries = []; S.last = 0; rebuildLines(); continue; }        // the server restarted without its ring

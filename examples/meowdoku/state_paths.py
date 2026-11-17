@@ -117,6 +117,11 @@ class StatePaths:
         """[PRIVATE] this state's HMAC key for private-value tokens; made once, never replaced."""
         return self.secrets_dir / "private_hash.key"
 
+    @property
+    def records_key(self) -> Path:
+        """The Fernet key for retained records (secure_records.py): the ring, apache-access.log, private_record values."""
+        return self.secrets_dir / "records.key"
+
     def admin_token(self, port=None) -> Path:
         """admin_token.txt for the default port (or None), admin_token_<port>.txt for any other (lifecycle's per-port rule)."""
         suffix = "" if port in (None, DEFAULT_PORT) else f"_{port}"

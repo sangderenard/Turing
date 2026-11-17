@@ -18,11 +18,13 @@ from meowdoku import authz  # noqa: E402
 from meowdoku import logring as L  # noqa: E402
 from meowdoku import private_record as P  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
+from meowdoku.secure_records import RecordCipher  # noqa: E402
 
 
 @pytest.fixture
 def record(tmp_path, monkeypatch):
-    rec = P.Record(P.load_key(tmp_path / "secrets" / "private_hash.key"), tmp_path / "sql" / "private_record.db")
+    rec = P.Record(P.load_key(tmp_path / "secrets" / "private_hash.key"), tmp_path / "sql" / "private_record.db",
+                   RecordCipher(tmp_path / "secrets" / "records.key"))
     monkeypatch.setattr(P, "RECORD", rec)
     return rec
 
@@ -37,6 +39,7 @@ def test_a_token_is_keyed_stable_and_recorded_on_the_server(tmp_path, record):
     got = record.resolve([token, "ip~000000000000", "203.0.113.7"])
     assert list(got) == [token] and got[token]["value"] == "203.0.113.7" and got[token]["seen"] == 2
     assert record.token("ip", "-") == "-" and record.token("ua", "") == "-"
+    assert b"203.0.113.7" not in record.db_path.read_bytes(), "the record holds the value sealed"
 
 
 def test_an_unconfigured_module_still_hashes_and_records_nothing():
@@ -63,7 +66,7 @@ def test_the_ring_never_holds_a_raw_address_even_from_a_legacy_file(tmp_path, re
     legacy = tmp_path / "ring.jsonl"
     legacy.write_text(json.dumps({"seq": 1, "ts": 1.0, "src": "login", "text": "ok user=cat client=192.0.2.9"}) + "\n",
                       encoding="utf-8")
-    ring = L.Ring(cap_bytes=10000, path=legacy)
+    ring = L.Ring(cap_bytes=10000, path=legacy, key_path=tmp_path / "secrets" / "records.key")
     ring.add("[client-error] 192.0.2.10: boom")
     texts = [e["text"] for e in ring.fetch(0)["entries"]]
     assert texts == [f"ok user=cat client={record.token('ip', '192.0.2.9')}",
@@ -127,7 +130,9 @@ def test_a_developer_reads_tokens_and_cannot_resolve_them(tmp_path, record, monk
             "id": "1-abcdef0123", "created": 1, "updated": 1, "status": "open", "peer": "198.51.100.41", "tier": "dev",
             "log_seq": 1, "server_log": [{"text": "ok user=cat client=198.51.100.42"}], "report": {"note": "mine is a@b.org"}}),
             encoding="utf-8")
-        for path in ("/api/log", "/api/tickets", "/api/tickets?id=1-abcdef0123"):
+        status, body = _get(httpd, "/api/log", cookies["dev"])
+        assert status == 403 and b"198.51.100." not in body, "the server log is for operators and admins"
+        for path in ("/api/tickets", "/api/tickets?id=1-abcdef0123"):
             status, body = _get(httpd, path, cookies["dev"])
             assert status == 200, (path, body)
             assert b"198.51.100." not in body and b"a@b.org" not in body, (path, body)

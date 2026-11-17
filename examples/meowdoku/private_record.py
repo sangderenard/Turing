@@ -6,7 +6,8 @@ and the first 12 hex digits of HMAC-SHA256 under this state's key.  The same val
 a developer can still see "the same visitor again" without learning who it is; an unkeyed hash would not do, since every
 IPv4 address can be hashed in minutes.
 
-The raw value is written once, beside its token, into ``private_record`` (``<state>/sql/private_record.db``).  Only the
+The raw value is written once, beside its token, into ``private_record`` (``<state>/sql/private_record.db``), sealed
+with the state's retained-records cipher (secure_records.py, ``<state>/secrets/records.key``) when one is given.  Only the
 ``private_read`` capability reads it back (``resolve``): authz.py ties that capability to the operator and admin roles in
 code, so no origin tier, policy file or dev role confers it, on the live server or the dev server.  Each state directory has
 its own key (``<state>/secrets/private_hash.key``), so a dev server's tokens say nothing about the live server's.
@@ -51,10 +52,11 @@ CREATE TABLE IF NOT EXISTS private_record (
 class Record:
     """Tokens under one key, and (when ``db_path`` is given) the server-side record of what each token stands for."""
 
-    def __init__(self, key: bytes, db_path: Path | None = None):
+    def __init__(self, key: bytes, db_path: Path | None = None, cipher=None):
         if len(key) < 32:
             raise ValueError("the private hash key is too short")
         self.key, self.db_path, self.lock = key, (Path(db_path) if db_path else None), threading.Lock()
+        self.cipher = cipher                    # a secure_records.RecordCipher: the stored value is sealed at rest
         self._known: set[str] = set()
         if self.db_path is not None:
             with self._connect() as conn:
@@ -87,11 +89,21 @@ class Record:
                     if fresh:
                         conn.execute("INSERT INTO private_record(token, kind, value, first_seen, last_seen) VALUES (?,?,?,?,?) "
                                      "ON CONFLICT(token) DO UPDATE SET last_seen = excluded.last_seen, seen = seen + 1",
-                                     (token, kind, value, now, now))
+                                     (token, kind, self._seal(value), now, now))
                     else:
                         conn.execute("UPDATE private_record SET last_seen = ?, seen = seen + 1 WHERE token = ?", (now, token))
             except sqlite3.Error:
                 self._known.discard(token)      # the token is still returned: a record failure never lets a raw value through
+
+    def _seal(self, value: str) -> str:
+        if self.cipher is None:
+            return value
+        return self.cipher.seal(value.encode("utf-8")).decode("ascii").strip()
+
+    def _open(self, stored: str) -> str:
+        if self.cipher is None or not stored.startswith("enc:v1:"):
+            return stored
+        return self.cipher.open(stored.encode("ascii")).decode("utf-8")
 
     def redact(self, text) -> str:
         """``text`` with every IP and email address replaced by its token (tokens already present are left alone)."""
@@ -118,7 +130,7 @@ class Record:
         with self._connect() as conn:
             rows = conn.execute(f"SELECT token, kind, value, first_seen, last_seen, seen FROM private_record "
                                 f"WHERE token IN ({','.join('?' * len(wanted))})", wanted).fetchall()
-        return {r[0]: {"kind": r[1], "value": r[2], "first_seen": r[3], "last_seen": r[4], "seen": r[5]} for r in rows}
+        return {r[0]: {"kind": r[1], "value": self._open(r[2]), "first_seen": r[3], "last_seen": r[4], "seen": r[5]} for r in rows}
 
 
 def load_key(path: Path) -> bytes:
@@ -143,9 +155,9 @@ def load_key(path: Path) -> bytes:
 RECORD = Record(secrets.token_bytes(32))
 
 
-def configure(key_path: Path, db_path: Path) -> Record:
+def configure(key_path: Path, db_path: Path, cipher=None) -> Record:
     global RECORD
-    RECORD = Record(load_key(key_path), db_path)
+    RECORD = Record(load_key(key_path), db_path, cipher)
     return RECORD
 
 

@@ -17,6 +17,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import proxy_trust  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
+from meowdoku.secure_records import RecordCipher  # noqa: E402
 from meowdoku import nodus_radio_hls  # noqa: E402
 
 TOKEN = "t" * 40
@@ -142,6 +143,14 @@ def test_admin_bootstrap_then_owner_tools_from_a_dns_origin(server):
         status, out, _, _ = _call(port, "/api/account/admin/list", headers={**PUBLIC_XFF, "Cookie": cookie})
         assert status == 403 and out == {"error": "this needs account_manage"}
     admin_headers = {**PUBLIC_XFF, "Cookie": boss}
+    access = server.sessions.state.logs_dir / "apache-access.log"
+    access.parent.mkdir(parents=True, exist_ok=True)
+    cipher = RecordCipher(server.sessions.state.records_key)
+    access.write_bytes(cipher.seal(b'192.0.2.1 - - [16/Nov/2026:10:00:00 -0600] "GET /mcp/guest HTTP/1.1" 200 17'))
+    records = "/api/account/admin/records"
+    assert _call(port, records, headers={**PUBLIC_XFF, "Cookie": plain})[0] == 403
+    assert _call(port, records, headers={"Host": "127.0.0.1", "Cookie": boss})[0] == 403
+    assert _call(port, records, headers=admin_headers)[1]["ip_history"][0]["ip"] == "192.0.2.1"
     status, out, _, _ = _call(port, "/api/account/admin/grant", "POST", admin_headers, {"username": "plain"})
     assert status == 200 and {a["username"]: a["granted_by"] for a in out["admins"]} == {
         "boss": "operator:" + hashlib.sha256(TOKEN.encode()).hexdigest()[:12], "plain": "boss"}

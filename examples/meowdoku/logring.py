@@ -5,8 +5,8 @@ Every line has a ``seq`` (monotonic for the process, continuing across restarts 
 sign-out, filed by ``note_login``), ``activity`` (an account's first request after ``IDLE_SECONDS`` quiet, filed by ``note_activity``)
 or ``server`` (everything else the server prints).  The cap is in BYTES; the oldest lines are dropped first.  ``tee_stdout`` copies what the server prints into the ring
 without changing what reaches stdout.  [PRIVATE] Every line passes through ``private_record.redact`` on its way in (and a legacy
-persisted line on load), so the ring holds tokens, never an IP or email address: ``GET /api/log`` is for the dev tier and above,
-and the dev tier never reads a private value (private_record.py).
+persisted line on load), so the ring holds tokens, never an IP or email address (private_record.py).  The persisted ring is
+sealed with the records key (secure_records.py), and ``GET /api/log`` needs private_read (operators, admins) over HTTPS.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from collections import deque
 from pathlib import Path
 
 from meowdoku import private_record
+from meowdoku.secure_records import RecordCipher
 
 DEFAULT_CAP = 2 * 1024 * 1024
 LINE_CAP = 4000                  # one line's text is cut here (a stack trace stays a line)
@@ -33,8 +34,11 @@ def classify(text: str) -> str:
 
 
 class Ring:
-    def __init__(self, cap_bytes: int = DEFAULT_CAP, path: Path | None = None):
+    def __init__(self, cap_bytes: int = DEFAULT_CAP, path: Path | None = None, key_path: Path | None = None):
         self.cap, self.path, self.lock = int(cap_bytes), (Path(path) if path else None), threading.Lock()
+        if self.path is not None and key_path is None:
+            raise ValueError("persistent log ring requires a records key")
+        self.cipher = RecordCipher(key_path, existing_streams=(self.path,)) if key_path is not None else None
         self.entries: deque = deque()
         self.bytes, self.seq, self._written = 0, 0, 0
         if self.path is not None:
@@ -73,14 +77,17 @@ class Ring:
 
     # ---- persistence (optional, capped): one JSON line per entry, rewritten from the ring when it outgrows twice the cap
     def _load(self) -> None:
+        self.cipher.migrate(self.path)
         try:
-            for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines()[-100000:]:
-                e = json.loads(line)
+            with self.path.open("rb") as saved:
+                lines = saved.readlines()[-100000:]
+            for line in lines:
+                e = json.loads(self.cipher.open(line))
                 e["text"] = private_record.redact(e["text"])          # a line persisted before [PRIVATE] holds raw addresses
                 self.entries.append(e); self.bytes += self._cost(e["text"]); self.seq = max(self.seq, e["seq"])
             while self.bytes > self.cap and len(self.entries) > 1:
                 self.bytes -= self._cost(self.entries.popleft()["text"])
-        except (OSError, ValueError, KeyError):
+        except FileNotFoundError:
             pass
         self._written = self.bytes
 
@@ -88,11 +95,13 @@ class Ring:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self._written > 2 * self.cap:
-                self.path.write_text("".join(json.dumps(e) + "\n" for e in self.entries), encoding="utf-8")
+                with self.path.open("wb") as f:
+                    for e in self.entries:
+                        f.write(self.cipher.seal(json.dumps(e).encode("utf-8")))
                 self._written = self.bytes
             else:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry) + "\n")
+                with self.path.open("ab") as f:
+                    f.write(self.cipher.seal(json.dumps(entry).encode("utf-8")))
                 self._written += self._cost(entry["text"])
         except OSError:
             pass

@@ -18,6 +18,9 @@ can show it. The raw value is kept only in a record on the server.
   - Operator can come from an account role or a permission-group grant.
   - No origin tier, policy file, dev grant, modifier or guest ceiling confers it.
   - `tests/test_meowdoku_private_record.py` tries every tier against every role.
+- **At rest.** The persisted log ring, `logs/apache-access.log` and the values in `private_record.db` are sealed with
+  the retained-records key `<state>/secrets/records.key` (secure_records.py, Codex 2026-11-16). A missing key with an
+  encrypted stream is an error, never a replacement key.
 - **Resolving a token.** `GET /api/private/resolve?tokens=ip~...,email~...` requires `private_read` and HTTPS, and is
   never available to a view-only link. Every call prints a `[private]` line naming the account; that line holds no
   value.
@@ -26,15 +29,15 @@ can show it. The raw value is kept only in a record on the server.
 
 | Data | Captured at | Kept | Shown by | After this change |
 |---|---|---|---|---|
-| Client IP on sign-in, sign-out and activity | server.py login, logout and the session lookup (`logring.note_login`, `note_activity`) | log ring and `log_ring.jsonl` | `GET /api/log` (dev_ui) | Ring lines hold tokens. Legacy persisted lines are redacted on load. |
+| Client IP on sign-in, sign-out and activity | server.py login, logout and the session lookup (`logring.note_login`, `note_activity`) | log ring and `log_ring.jsonl` | `GET /api/log`: private_read over HTTPS (was dev_ui) | Ring lines hold tokens. Legacy persisted lines are redacted on load. |
 | Anything the server prints (client errors, tickets, federation, library loads) | stdout tee | log ring, instance log files | `GET /api/log`, `/api/profile/diagnostics` | Every ring line, and stdout itself, passes through `redact`. |
-| Request log lines (`log_message`) | stderr | instance log files | `/api/profile/diagnostics` (operator, admin) | The address and the line are tokens. |
+| Request log lines (`log_message`) | stderr | instance log files | `/api/profile/diagnostics` (operator, admin) | No address is written; the rest of the line is tokens. |
 | Client-error user agent | `POST /api/clientlog` | ring | `GET /api/log` | A `ua~` token. |
 | Ticket submitter (`peer`), plus the ticket's 80 ring lines | `POST /api/tickets` | `content/tickets/*.json` | `GET /api/tickets` (dev_ui), web/tickets.js | `peer` is a token. Each string in a legacy ticket is redacted when read out. |
 | Mathlab browser profile `user_agent_hint` | `POST /api/mathlab/.../profile` | job folder | job owner | A `ua~` token. |
 | IP per account | the ring | the ring | `/api/account/admin/access`, `look-queue` (account_manage) | Tokens are resolved inline only for a `private_read` holder. |
 | Failed and successful login attempts | `login_guard.record` | accounts.db `login_attempts`, pruned after 24 h | no endpoint | A server record only; unchanged. |
-| Apache access lines | the supervisor's CustomLog | `logs/apache-access.log` | no endpoint on main | A server record. Codex's unlanded `codex/admin-encrypted-records-20261116` encrypts it at rest. |
+| Apache access lines | the supervisor's CustomLog | `logs/apache-access.log`, sealed | `/api/account/admin/records`: private_read over HTTPS | IP history and usage totals for operators and admins. |
 | Invitee email | `POST /api/invitations` | accounts.db `site_invitations` | the inviter's own list | Owner only; unchanged. |
 | Git author name and email | `/api/reviews/identity` | accounts.db `account_git_identity` | the account itself | Owner only; unchanged. |
 | Message bodies | messaging | accounts.db | participants, and the admin thread (account_manage, audited) | Unchanged. |
@@ -43,7 +46,8 @@ can show it. The raw value is kept only in a record on the server.
 ## Not covered yet
 
 - The speaktome catalog does not offer `/api/private/resolve` as an MCP tool yet.
-- Older instance log files, backups and the Apache access log keep the raw values they already hold. They are server
-  records with no developer route to them.
+- Older instance log files and backups keep the raw values they already hold. They are server records with no
+  developer route to them. `records.key` must be readable by the service account before the restart that brings this in
+  (HOW_TO_START.md).
 - Text a person types into a free-form field (a ticket note, a message) is redacted when a ticket is read out. Message
   bodies are not redacted: they stay between their participants.
