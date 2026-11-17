@@ -14,6 +14,11 @@ from meowdoku import agent_workspace  # noqa: E402
 
 
 def main(argv=None):
+    # The preamble goes to the launcher as UTF-8 whatever the console's code page: a U+2212 in a workspace document
+    # crashed the cp1252 print and every claude and codex run was skipped (2026-11-17, case 46d6ad2d).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--accounts-db", type=Path, required=True)
     parser.add_argument("--individual", required=True)
