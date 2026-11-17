@@ -159,6 +159,48 @@ def test_instance_env_reaches_only_its_child(tmp_path):
         proc.stdout.close(); proc.stderr.close()
 
 
+def test_code_root_and_speaktome_root_reach_only_their_child(tmp_path):
+    tree, speaktome = tmp_path / "dev-turing", tmp_path / "dev-speaktome"
+    tree.mkdir()
+    (speaktome / "speaktome_api").mkdir(parents=True)
+    (speaktome / "speaktome_api" / "__init__.py").write_text("", encoding="utf-8")
+    seen = (tmp_path / "seen.json").as_posix()
+    code = (f"import json,os,time\njson.dump({{'cwd': os.getcwd(), 'repo': os.environ.get('SPEAKTOME_REPO')}}, open({seen!r}, 'w'))\n"
+            "time.sleep(120)")
+    spec = dict(_spec(code), code_root=str(tree), speaktome_root=str(speaktome))
+    db, state, inst = _setup(tmp_path, spec)
+    proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        got = _wait(lambda: json.loads(Path(seen).read_text(encoding="utf-8")) if Path(seen).exists() else None)
+        assert Path(got["cwd"]).resolve() == tree.resolve() and Path(got["repo"]).resolve() == speaktome.resolve()
+        proc.stdin.close()
+        assert proc.wait(timeout=45) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close(); proc.stderr.close()
+
+
+def test_a_missing_or_wrong_code_root_is_skipped_never_replaced(tmp_path):
+    tree = tmp_path / "dev-turing"
+    (tree / "examples" / "meowdoku").mkdir(parents=True)
+    (tree / "examples" / "meowdoku" / "server.py").write_text("", encoding="utf-8")
+    inst = _dev_pair(tmp_path)
+    data = json.loads(inst.read_text(encoding="utf-8"))
+    data["instances"][1]["code_root"] = str(tree)
+    inst.write_text(json.dumps(data), encoding="utf-8")
+    plan = _plan(tmp_path, inst)
+    assert plan["m-dev"]["code_root"] == str(tree) and plan["m-dev"]["command"] is not None
+    assert plan["m-a"]["code_root"] is None, "an instance without code_root keeps the supervisor's own tree"
+    for wrong, reason in ((tmp_path / "absent", "code_root not found"), (tmp_path, "code_root has no examples/meowdoku/server.py")):
+        data["instances"][1]["code_root"] = str(wrong)
+        inst.write_text(json.dumps(data), encoding="utf-8")
+        assert _plan(tmp_path, inst)["m-dev"]["skipped"].startswith(reason)
+    data["instances"][1].update(code_root=str(tree), speaktome_root=str(tmp_path / "absent"))
+    inst.write_text(json.dumps(data), encoding="utf-8")
+    assert _plan(tmp_path, inst)["m-dev"]["skipped"].startswith("speaktome_root has no speaktome_api package")
+
+
 def test_instance_python_field_selects_interpreter(tmp_path):
     spec = {"name": "pyinst", "kind": "meowdoku", "python": sys.executable, "port": 8999, "route": "", "bind": "127.0.0.1",
             "account": "svc-pyinst", "args": [], "leases": []}
