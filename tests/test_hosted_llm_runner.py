@@ -17,7 +17,7 @@ class Model:
     def choose_reaction(self, messages, kinds):
         return kinds[0]
 
-    def answer(self, room, messages, target=None, peer=None):
+    def answer(self, room, messages, target=None, peer=None, guide=None):
         self.calls.append((room, messages, target, peer))
         return "A short reply."
 
@@ -67,14 +67,14 @@ def database():
 def test_room_bootstrap_then_reacts_and_replies_without_self_loop(monkeypatch):
     monkeypatch.setattr(runner.random, "choice", lambda kinds: kinds[0])
     db, rest, model = database(), Rest(), Model()
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"])
+    runner.visit_room(rest, model, db, "llama", "agents", ["frog"], invite=True)   # the training path: the reply invites a reaction
     assert not model.calls
     rest.messages.append({"id": 2, "username": "bob", "body": "What do you think?", "created": 1})
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"])
+    runner.visit_room(rest, model, db, "llama", "agents", ["frog"], invite=True)
     assert len(model.calls) == 1
     assert db.execute("SELECT target_kind FROM attempts").fetchone()[0] == "frog"
     assert any(path.endswith("/react") and body == {"id": 2, "kind": "frog"} for path, body in rest.calls)
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"])
+    runner.visit_room(rest, model, db, "llama", "agents", ["frog"], invite=True)
     assert len(model.calls) == 1
 
 

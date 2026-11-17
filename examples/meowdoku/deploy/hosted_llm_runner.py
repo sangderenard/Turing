@@ -28,6 +28,15 @@ ROOM_SECONDS = 180
 REWARD_SECONDS = 600
 TRAIN_SECONDS = 1800
 MAX_ROOM_REPLIES = 3
+GUIDE_SECONDS = 300              # [GUIDE] how often the chat guide (orientation + memory) is read again from the site
+CHAT_LINES = (24, 12, 6)          # [GUIDE] the recent chat lines tried, longest first, until the reply fits the context
+# [GUIDE] The setting when the site cannot give Llama its orientation. Owner, 2026-11-17: a helpful assistant, not an intern
+# being coached ("i need all the agents to become helpful not a daycare").
+FALLBACK_SETTING = ("You are Llama, a helpful assistant in SpeakToMe's rooms. Answer the latest question from another "
+                    "person plainly and briefly. If someone reports a problem with the site, thank them and suggest they "
+                    "file a ticket with the Report issue button. Say so when you do not know.")
+RUNNER_RULES = ("You can only speak or react through your runner: never claim to have used a tool or seen anything beyond "
+                "these chat logs. Reply to the latest other person's message, in under 500 characters.")
 SYSTEM_SENDERS = {"svc-nodus-messenger", "nodus"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cursors (place TEXT PRIMARY KEY, message_id INTEGER NOT NULL);
@@ -119,6 +128,41 @@ def profile_messages(work, count_tokens, input_budget=4096 - 256 - 128):
             {"role": "user", "content": lead + excerpt + tail}]
 
 
+class Guide:
+    """[GUIDE] What Llama brings to every chat reply, read from the site as Llama itself and kept for GUIDE_SECONDS:
+    its own orientation (GET /api/agent-workspace/orientation?full=1: the shared basics and its profile) and its newest
+    memory file (GET /api/memory, then /api/memory/file/<id>). Anything the site cannot give keeps the last value read,
+    or the fallback setting; a chat reply never fails for want of it."""
+
+    def __init__(self, rest):
+        self.rest, self.orientation, self.memory, self.read_at = rest, "", "", 0.0
+
+    def refresh(self, now=None):
+        now = time.time() if now is None else now
+        if self.read_at and now - self.read_at < GUIDE_SECONDS:
+            return
+        self.read_at = now
+        try:
+            got = self.rest.call("/api/agent-workspace/orientation?full=1")
+            text = got.get("preamble") if isinstance(got, dict) else None
+            if isinstance(text, str) and text.strip():
+                self.orientation = text.strip()
+        except (RestError, OSError, ValueError):
+            pass
+        try:
+            files = (self.rest.call("/api/memory") or {}).get("files") or []
+            newest = max(files, key=lambda f: f.get("updated") or 0, default=None)
+            if newest and newest.get("id"):
+                body = (self.rest.call(f"/api/memory/file/{key(newest['id'])}") or {}).get("body")
+                if isinstance(body, str):
+                    self.memory = body
+        except (RestError, OSError, ValueError, AttributeError):
+            pass
+
+    def setting(self):
+        return (self.orientation or FALLBACK_SETTING) + "\n\n" + RUNNER_RULES
+
+
 class LocalModel:
     def __init__(self, executable, model, adapter, port, log_dir, parallel=2):
         self.executable, self.model, self.adapter, self.port = executable, model, adapter, port
@@ -178,18 +222,37 @@ class LocalModel:
         choice = result["choices"][0]["message"]["content"].strip().lower().strip(" .!\n")
         return choice if choice in kinds else random.choice(kinds)
 
-    def answer(self, room, messages, target=None, peer=None):
-        setting = ("You are Llama, an intern account in SpeakToMe. Participate plainly and courteously. "
-                   "People may coach you; take specific corrections seriously. You can only speak or react through "
-                   "your runner. Never claim to have used a tool or seen information beyond these chat logs. "
-                   "Reply to the latest other person's message. Keep the reply under 500 characters.")
-        if target:
+    def count_tokens(self, content):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/tokenize",
+            data=json.dumps({"content": content}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return len(json.load(response)["tokens"])
+
+    def chat_messages(self, setting, memory, place, messages, count_tokens=None):
+        """[GUIDE] The whole setting (orientation + rules), then as much memory and as many recent lines as fit: the
+        existing profile_messages budget, trying fewer chat lines before giving up the orientation for the fallback."""
+        count_tokens = count_tokens or self.count_tokens
+        for lines in CHAT_LINES:
+            work = {"preamble": setting, "memory": memory,
+                    "prompt": f"Recent chat in {place}:\n{context(messages, '', limit=lines)}\nYour reply:"}
+            try:
+                return profile_messages(work, count_tokens)
+            except RuntimeError:
+                continue
+        work = {"preamble": FALLBACK_SETTING + "\n\n" + RUNNER_RULES, "memory": "",
+                "prompt": f"Recent chat in {place}:\n{context(messages, '', limit=CHAT_LINES[-1])}\nYour reply:"}
+        return profile_messages(work, count_tokens)
+
+    def answer(self, room, messages, target=None, peer=None, guide=None):
+        setting = guide.setting() if guide is not None else FALLBACK_SETTING + "\n\n" + RUNNER_RULES
+        if target:                       # only with --train: the reward signal the LoRA trainer learns from
             setting += f" In this turn, naturally invite a {target} emoji reaction. Do not ask for reactions directly."
         place = f"direct conversation with {peer}" if peer else f"room {room}"
-        payload = {"model": self.model.stem, "messages": [
-            {"role": "system", "content": setting},
-            {"role": "user", "content": f"Recent chat in {place}:\n{context(messages, '')}\nYour reply:"}],
-            "temperature": 0.8, "max_tokens": 160}
+        payload = {"model": self.model.stem,
+                   "messages": self.chat_messages(setting, guide.memory if guide is not None else "", place, messages),
+                   "temperature": 0.8, "max_tokens": 160}
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                                          data=json.dumps(payload).encode("utf-8"),
                                          headers={"Content-Type": "application/json"}, method="POST")
@@ -295,7 +358,7 @@ def react_to_others(rest, model, room, messages, username, kinds, seen):
     return seen
 
 
-def visit_room(rest, model, db, username, room, kinds):
+def visit_room(rest, model, db, username, room, kinds, guide=None, invite=False):
     history = room_history(rest, room)
     place = "room:" + room
     seen = cursor(db, place)
@@ -320,17 +383,17 @@ def visit_room(rest, model, db, username, room, kinds):
     else:
         incoming = incoming[:MAX_ROOM_REPLIES]
     for message in incoming:
-        target = random.choice(kinds)
+        target = random.choice(kinds) if invite else None      # [GUIDE] reaction bait only while training (--train)
         prior = [m for m in history if m["id"] <= message["id"]]
-        answer = model.answer(room, prior, target=target)
+        answer = model.answer(room, prior, target=target, guide=guide)
         if answer:
             posted = rest.call(f"/api/chat/rooms/{key(room)}", {"body": answer})["message"]
             db.execute("INSERT OR IGNORE INTO attempts(room,message_id,target_kind,prompt,response,posted_at) "
-                       "VALUES(?,?,?,?,?,?)", (room, posted["id"], target, context(prior, username), answer, time.time()))
+                       "VALUES(?,?,?,?,?,?)", (room, posted["id"], target or "none", context(prior, username), answer, time.time()))
         advance(db, place, message["id"])
 
 
-def handle_direct(rest, model, db, username):
+def handle_direct(rest, model, db, username, guide=None):
     contacts = rest.call("/api/messages/contacts")
     for request in contacts.get("requests", []):
         peer = request.get("username")
@@ -353,7 +416,7 @@ def handle_direct(rest, model, db, username):
             if mode(rest, username, "conversation", peer) and time.time() - message.get("created", 0) < QUIET_SECONDS:
                 break
             prior = db.execute("SELECT body FROM dm_replies WHERE message_id=?", (message_id,)).fetchone()
-            answer = prior[0] if prior else model.answer(None, lines, peer=peer)
+            answer = prior[0] if prior else model.answer(None, lines, peer=peer, guide=guide)
             if answer:
                 if prior is None:
                     db.execute("INSERT INTO dm_replies(message_id,peer,body) VALUES(?,?,?)", (message_id, peer, answer))
@@ -410,6 +473,7 @@ def run(args):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, isolation_level=None)
     db.executescript(SCHEMA)
+    guide = Guide(rest)
     model = LocalModel(Path(args.llama_server), Path(args.model), Path(args.adapter) if args.use_adapter else None,
                        args.port, Path(args.state_dir) / "logs", args.batch_slots)
     try:
@@ -420,7 +484,8 @@ def run(args):
         while True:
             try:
                 run_profile_batch(rest, model, args.batch_slots, args.batch_limit)
-                handle_direct(rest, model, db, username)
+                guide.refresh()                                  # [GUIDE] orientation + memory, every GUIDE_SECONDS
+                handle_direct(rest, model, db, username, guide)
                 rooms = room_list(rest, username)
                 dispatch = current(db, "dispatch_room")
                 if dispatch in rooms:
@@ -431,10 +496,10 @@ def run(args):
                     room = rooms[(rooms.index(room) + 1) % len(rooms)] if room in rooms else (rooms[0] if rooms else "")
                     until = time.time() + ROOM_SECONDS
                 if room:
-                    visit_room(rest, model, db, username, room, kinds)
+                    visit_room(rest, model, db, username, room, kinds, guide, args.train)
                 for watched in rooms:
                     if watched != room and mode(rest, username, "room", watched):
-                        visit_room(rest, model, db, username, watched, kinds)
+                        visit_room(rest, model, db, username, watched, kinds, guide, args.train)
                 settle_rewards(rest, db, username)
                 train_due(args, db, model)
             except (RestError, OSError, ValueError, KeyError, RuntimeError) as error:
