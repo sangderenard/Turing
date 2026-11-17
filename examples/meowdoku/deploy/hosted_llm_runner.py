@@ -25,7 +25,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from speaktome_mcp.rest import Rest, RestError
 
-POLL_SECONDS = 8
+POLL_SECONDS = 1                 # owner, 2026-11-17: Llama on a 1 s cycle (direct messages and the current room each pass)
+PROFILE_SECONDS = 5               # queued agent runs are claimed at most this often
+ROOM_LIST_SECONDS = 30            # the rooms Llama is hosted in are listed again at most this often
+MODE_SECONDS = 10                 # a last-word setting is asked again at most this often
 QUIET_SECONDS = 12
 ROOM_SECONDS = 180
 MAX_ROOM_REPLIES = 3
@@ -331,10 +334,20 @@ def run_profile_batch(rest, model, parallel, limit=16):
     return handled
 
 
-def mode(rest, username, scope, place):
+_MODES = {}
+
+
+def mode(rest, username, scope, place, now=None):
+    """The effective last-word setting, asked at most every MODE_SECONDS per place (a 1 s cycle must not ask each pass)."""
+    now = time.monotonic() if now is None else now
+    cached = _MODES.get((username, scope, place))
+    if cached is not None and now < cached[1]:
+        return cached[0]
     query = urllib.parse.urlencode({"scope": scope, "key": place})
     response = rest.call(f"/api/hosted-agents/{key(username)}/last-word?{query}")
-    return bool(response["effective"])
+    value = bool(response["effective"])
+    _MODES[(username, scope, place)] = (value, now + MODE_SECONDS)
+    return value
 
 
 def room_list(rest, username):
@@ -431,12 +444,18 @@ def run(args):
         model.start()
         room = ""
         until = 0
+        rooms, rooms_due, profiles_due = [], 0.0, 0.0
         while True:
             try:
-                run_profile_batch(rest, model, args.batch_slots, args.batch_limit)
+                tick = time.monotonic()
+                if tick >= profiles_due:
+                    profiles_due = tick + PROFILE_SECONDS
+                    run_profile_batch(rest, model, args.batch_slots, args.batch_limit)
                 guide.refresh()
                 handle_direct(rest, model, db, username, guide)
-                rooms = room_list(rest, username)
+                if tick >= rooms_due:
+                    rooms_due = tick + ROOM_LIST_SECONDS
+                    rooms = room_list(rest, username)
                 dispatch = current(db, "dispatch_room")
                 if dispatch in rooms:
                     room = dispatch
@@ -453,7 +472,7 @@ def run(args):
                 guide.flush()
             except (RestError, OSError, ValueError, KeyError, RuntimeError) as error:
                 print(f"[hosted-llm] {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-            time.sleep(POLL_SECONDS)
+            time.sleep(args.poll_seconds)
     finally:
         guide.flush(force=True)
         model.stop()
@@ -468,7 +487,12 @@ def main():
     parser.add_argument("--port", type=int, default=11435)
     parser.add_argument("--batch-slots", type=int, choices=range(1, 9), default=2)
     parser.add_argument("--batch-limit", type=int, choices=range(1, 33), default=16)
-    run(parser.parse_args())
+    parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS,
+                        help="seconds between passes (0.5 to 60); direct messages and the current room are checked every pass")
+    args = parser.parse_args()
+    if not 0.5 <= args.poll_seconds <= 60:
+        parser.error("--poll-seconds must be 0.5 to 60")
+    run(args)
 
 
 if __name__ == "__main__":

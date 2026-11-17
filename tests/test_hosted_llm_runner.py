@@ -63,6 +63,7 @@ def database():
 
 
 def test_room_bootstrap_then_replies_once_without_self_loop_and_remembers_it():
+    runner._MODES.clear()
     db, rest, model = database(), Rest(), Model()
     guide = runner.Guide(rest)
     runner.visit_room(rest, model, db, "llama", "agents", guide)
@@ -82,6 +83,7 @@ def test_last_word_mode_answers_current_final_message():
                 return {"effective": True}
             return super().call(path, body, **kw)
 
+    runner._MODES.clear()
     db, rest, model = database(), LastWordRest(), Model()
     runner.visit_room(rest, model, db, "llama", "agents")
     runner.visit_room(rest, model, db, "llama", "agents")
@@ -90,6 +92,7 @@ def test_last_word_mode_answers_current_final_message():
 
 
 def test_nodus_dispatch_stays_out_of_model_context():
+    runner._MODES.clear()
     db, rest, model = database(), Rest(), Model()
     runner.handle_direct(rest, model, db, "llama")
     assert runner.current(db, "dispatch_room") == "agents"
@@ -216,3 +219,16 @@ def test_profile_context_rejects_contract_that_cannot_fit():
         assert "contract and job" in str(error)
     else:
         raise AssertionError("oversized character contract was silently truncated")
+
+
+def test_a_one_second_cycle_spaces_out_the_slow_checks():
+    assert runner.POLL_SECONDS == 1
+    assert runner.PROFILE_SECONDS >= 5 and runner.ROOM_LIST_SECONDS >= 30 and runner.MODE_SECONDS >= 10
+    runner._MODES.clear()
+    rest = Rest()
+    asked = lambda: sum(1 for path, _ in rest.calls if path.startswith("/api/hosted-agents/"))
+    for second in range(10):
+        runner.mode(rest, "llama", "room", "agents", now=1000.0 + second)
+    assert asked() == 1, "a last-word setting is asked once per MODE_SECONDS, not every pass"
+    runner.mode(rest, "llama", "room", "agents", now=1000.0 + runner.MODE_SECONDS + 1)
+    assert asked() == 2
