@@ -41,7 +41,15 @@ if ($Register) {
             if ($line -match '^SeBatchLogonRight\s*=\s*(.*)$') { $batch = $Matches[1].Trim(); break }
         }
         $holders = @($batch -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($holders -notcontains "*$sid") {
+        # secedit /export names built-in groups by SID (*S-1-5-32-...) but ordinary accounts by NAME, so resolve each holder to
+        # its SID before asking whether this account already holds the right (2026-11-17: the name went unrecognised and
+        # every -Register tried, and failed, to grant the right again).
+        $heldSids = @($holders | ForEach-Object {
+            $holder = $_
+            if ($holder.StartsWith('*')) { $holder.Substring(1) }
+            else { try { ([Security.Principal.NTAccount]$holder).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $holder } }
+        })
+        if ($heldSids -notcontains $sid) {
             $holders += "*$sid"
             $policy = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`$`"`r`nRevision=1`r`n[Privilege Rights]`r`nSeBatchLogonRight = $($holders -join ',')`r`n"
             Set-Content -LiteralPath $apply -Value $policy -Encoding Unicode

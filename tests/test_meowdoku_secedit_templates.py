@@ -22,3 +22,11 @@ def test_every_template_signature_is_chicago_dollar():
         line = next(l for l in text.splitlines() if "signature=" in l and "CHICAGO" in l)
         assert re.search(r"CHICAGO`\$", line), (script.name, line.strip())
 
+
+
+def test_a_holder_named_by_account_is_recognised():
+    """secedit /export lists ordinary accounts by name, so "already holds the right" must compare SIDs, not "*SID" text."""
+    for name in ("Start-HostedLlm.ps1", "Admin-Control-Service.ps1"):
+        text = (DEPLOY / name).read_text(encoding="utf-8")
+        assert "Translate([Security.Principal.SecurityIdentifier])" in text and "$heldSids -notcontains $sid" in text, name
+        assert '$holders -notcontains "*$sid"' not in text, name
