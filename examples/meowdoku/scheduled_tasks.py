@@ -43,7 +43,8 @@ SYSTEM_DISPLAY_NAME = "Nodus"
 USERLIST_ENGINE_ID = 7203
 # Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
 PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean",
-                         "core.index", "hosted.dispatch", "dev.follow"),
+                         "core.index", "hosted.dispatch", "dev.follow", "loans.refresh",
+                         "stable.candidate", "stable.follow"),
                 "userlist": ("identity.search", "identity.represent")}
 
 
@@ -225,7 +226,7 @@ def dispatch_hosted_agents(accounts_db, system_username, agent_names, *, messagi
 
 
 def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None,
-             branches=None, dev=None) -> dict:
+             branches=None, dev=None, loans=None, stable=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
 
     `system` is `{"accounts_db", "username", "module", "userlist"?}` (module = messaging): the account system events
@@ -234,7 +235,12 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
     `branches` is `{"policy", "accounts_db", "module"}` (module = branch_gate): reviewed changes are landed and merged
     branches cleaned by that module's rules; while the policy's `apply` is false both tasks only report.
     `dev` is `{"instances", "instance", "module"}` (module = dev_follow), with `branches`: dev.follow moves that one
-    instance's declared dev trees to what landed and asks for its restart (Research case 8bbe0de7, Stage 1)."""
+    instance's declared dev trees to what landed and asks for its restart (Research case 8bbe0de7, Stage 1).
+    `loans` is `{"instances", "module"}` (module = branch_servers), with `branches`: loans.refresh exports each branch
+    loan's pages, restarts it after a new commit, ends closed loans and idles unused ones (Stage 3).
+    `stable` is `{"instances", "instance", "dev", "module"}` (module = stable_release), with `branches`: stable.candidate
+    records what dev runs as a candidate an admin may sign off, and stable.follow moves stable to what was signed off
+    and asks for its counted-down restart (Stage 2)."""
     table = {}
     if branches is not None:
         def branch_task(which):
@@ -300,6 +306,55 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                         said += f"; {done[key]}"
                 return (cron_host.DONE if moved else cron_host.UNCHANGED), said, done
             table["dev.follow"] = dev_follow
+        if loans is not None:
+            def loans_refresh(request):
+                import sqlite3
+                module = loans["module"]
+                cfg = module.config(loans["instances"])
+                if cfg is None:
+                    return cron_host.UNCHANGED, "instances.json has no loans block: no branch servers are lent", None
+                policy = branches["module"].load_policy(branches["policy"])
+                db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                try:
+                    from meowdoku import central_checkout
+                    central_checkout.ensure(db)
+                    row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (policy["cleaner"],)).fetchone()
+                    if row is None:
+                        return cron_host.UNCHANGED, f"the cleanup account {policy['cleaner']!r} does not exist", None
+                    done = module.refresh(db, cfg, requester=(row[0], policy["cleaner"]))
+                finally:
+                    db.close()
+                said = "; ".join(f"{d['instance']} {d['action']}" for d in done) or "no loan changed"
+                return (cron_host.DONE if done else cron_host.UNCHANGED), said, done
+            table["loans.refresh"] = loans_refresh
+        if stable is not None:
+            def stable_task(which):
+                def task(request):
+                    import sqlite3
+                    module = stable["module"]
+                    policy = branches["module"].load_policy(branches["policy"])
+                    db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                    try:
+                        if which == "candidate":
+                            made = module.propose(db, instances_path=stable["instances"], stable=stable["instance"], dev=stable["dev"])
+                            said = "; ".join(f"candidate {m['id']}: {m['repository']} {m['commit'][:12]} ({m['commits']} commits)"
+                                             for m in made) or "stable already runs what dev runs"
+                            return (cron_host.DONE if made else cron_host.UNCHANGED), said, made
+                        row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (policy["cleaner"],)).fetchone()
+                        if row is None:
+                            return cron_host.UNCHANGED, f"the cleanup account {policy['cleaner']!r} does not exist", None
+                        done = module.follow(db, instances_path=stable["instances"], stable=stable["instance"], policy=policy,
+                                             requester=(row[0], policy["cleaner"]), apply=bool(policy["apply"]))
+                    finally:
+                        db.close()
+                    moved = [t for t in done["trees"] if t["action"] in ("moved", "would move")]
+                    said = "; ".join(f"{t['repository']} {t['action']} ({t['reason']})" for t in done["trees"])
+                    if done.get("restart"):
+                        said += "; " + done["restart"]
+                    return (cron_host.DONE if moved else cron_host.UNCHANGED), said, done
+                return task
+            table["stable.candidate"] = stable_task("candidate")
+            table["stable.follow"] = stable_task("follow")
         table["reviews.land"] = branch_task("land")
         table["branches.clean"] = branch_task("clean")
     if web_dir is not None and manual is not None:

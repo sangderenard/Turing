@@ -51,26 +51,28 @@ def _linked_worktree(path) -> bool:
     return Path(own).resolve() != Path(common).resolve()
 
 
-def follow_tree(path, *, remote, default, apply) -> dict:
-    entry = {"tree": str(path), "target": f"{remote}/{default}"}
+def follow_tree(path, *, remote, default, apply, commit=None) -> dict:
+    """Fast-forward one linked worktree to ``<remote>/<default>``, or to ``commit`` when given (stable_release.py)."""
+    entry = {"tree": str(path), "target": commit[:12] if commit else f"{remote}/{default}"}
     if not Path(path).is_dir():
         return dict(entry, action="held", reason="the tree does not exist")
     if not _linked_worktree(path):
         return dict(entry, action="held", reason="not a linked worktree; a repository's own checkout is never moved")
     fetched = subprocess.run(["git", "-C", str(path), "fetch", "--quiet", remote], capture_output=True, text=True)
-    target = git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{default}", check=False)
+    target = git(path, "rev-parse", "-q", "--verify", (commit + "^{commit}") if commit else f"refs/remotes/{remote}/{default}",
+                 check=False)
     head = git(path, "rev-parse", "HEAD")
     entry.update(head=head, to=target or None)
     if fetched.returncode != 0:
         entry["fetch"] = (fetched.stderr or fetched.stdout).strip()[-200:]
     if not target:
-        return dict(entry, action="held", reason=f"{remote}/{default} is unknown here")
+        return dict(entry, action="held", reason=f"{entry['target']} is unknown here")
     if head == target:
         return dict(entry, action="unchanged", reason="already at what landed")
     if git(path, "status", "--porcelain", "--untracked-files=no"):
         return dict(entry, action="held", reason="tracked changes in the dev tree; nothing is ever edited there")
     if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", head, target], capture_output=True).returncode != 0:
-        return dict(entry, action="held", reason=f"its commit is not behind {remote}/{default} (diverged)")
+        return dict(entry, action="held", reason=f"its commit is not behind {entry['target']} (diverged)")
     if not apply:
         return dict(entry, action="would move", reason=f"{head[:12]} -> {target[:12]}")
     git(path, "checkout", "--detach", "--quiet", target)

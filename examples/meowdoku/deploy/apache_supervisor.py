@@ -15,6 +15,8 @@ Only one supervisor manages instances (an OS lock on ``<state>/supervisor.lock``
 from more than one process) stays a log sink.  A port that already has a listener is not launched over (state ``external``).
 [DEV] An instance may run another tree's code: ``"code_root"`` (its working directory) and ``"speaktome_root"`` (its SPEAKTOME_REPO),
 so the dev server can follow what landed while stable stays on its own checkout.
+[LOAN] With a ``"loans"`` block in instances.json, every ready branch loan (branch_servers.py) is one more instance,
+``loan-<port>``: started when its loan becomes ready, stopped when the loan ends or goes idle (checked every 10 s).
 
   python apache_supervisor.py --status                 # service_instances as JSON
   python apache_supervisor.py --once --dry-run         # print what would be done, change nothing
@@ -57,6 +59,7 @@ STOP_WAIT = 20.0
 MAX_RESTARTS, RESTART_WINDOW = 5, 600.0
 START_TIMEOUT = {"meowdoku": 300.0, "nodus": 60.0}
 EXIT_RESTART = lifecycle_mod.EXIT_RESTART
+LOAN_CHECK_S = 10.0                                 # [LOAN] how often the branch loans are compared with the running loan instances
 
 DDL = """
 CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT,
@@ -764,7 +767,14 @@ class Supervisor:
                 except Exception as error:
                     inst.state = "failed"
                     self.log(f"{inst.name}: start failed: {error!r}")
+            loans_due = 0.0
             while not self.stop.wait(1.0):
+                if time.monotonic() >= loans_due:           # [LOAN] before the requests, so a loan's restart finds its instance
+                    loans_due = time.monotonic() + LOAN_CHECK_S
+                    try:
+                        self.reconcile_loans()
+                    except Exception as error:
+                        self.log(f"loan reconcile error: {error!r}")
                 try:
                     self.handle_requests()
                 except Exception as error:
@@ -779,6 +789,41 @@ class Supervisor:
             self.log("another supervisor owns the instances; this process only logs")
             self.stop.wait()
         return 0
+
+    def reconcile_loans(self):
+        """[LOAN] Start the ready loans that have no instance yet; stop and drop the loan instances whose loan ended or went
+        idle. Only instances this method made (site "loan") are ever stopped here."""
+        from meowdoku import branch_servers
+        cfg = branch_servers.config(self.instances_path)
+        if cfg is None:
+            return
+        db = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+        try:
+            from meowdoku import central_checkout
+            central_checkout.ensure(db)
+            wanted = {spec["name"]: spec for spec in branch_servers.specs(db, cfg)}
+        finally:
+            db.close()
+        current = {inst.name: inst for inst in self.instances if inst.spec.get("site") == "loan"}
+        for name, inst in current.items():
+            if name not in wanted:
+                try:
+                    said = inst.force_stop()
+                except Exception as error:
+                    said = f"stop failed: {error!r}"
+                self.instances.remove(inst)
+                self.log(f"{name}: its loan ended or went idle: {said}")
+        for name, spec in wanted.items():
+            if name in current:
+                continue
+            inst = Instance(spec, self)
+            self.instances.append(inst)
+            try:
+                inst.begin()
+                self.log(f"{name}: lent for {spec['loan']['repository']} {spec['loan']['branch']} on port {spec['port']}")
+            except Exception as error:
+                inst.state = "failed"
+                self.log(f"{name}: start failed: {error!r}")
 
     def handle_requests(self):
         """[CONTROL] Perform the pending rows of ``instance_requests``. ``*`` means every instance: sources of a

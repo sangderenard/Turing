@@ -25,6 +25,15 @@ reviews.land */5 * * * * missed=once
 # Offered only when the task worker is given --instances and --follow-instance. Stable is never moved by this task.
 dev.follow 2-59/10 * * * * missed=once
 
+# Every two minutes, the branch servers (branch_servers.py): a new checkout's pages are exported and it starts; a new
+# commit is exported and that loan restarts; closed loans end, unused ones idle. Only with a "loans" block in instances.json.
+loans.refresh */2 * * * * missed=skip
+
+# Stable is a nightly copy an admin signs off (stable_release.py). At 08:00 UTC what dev runs becomes a candidate; every
+# ten minutes stable moves to the newest signed-off commit, and its restart counts down five minutes, announced to admins.
+stable.candidate 0 8 * * * missed=once
+stable.follow 5-59/10 * * * * missed=once
+
 # Once a day (09:45 UTC), remove branches that have been fully merged for the policy's grace period. While the
 # branch policy's apply is false this only reports what it would remove.
 branches.clean 45 9 * * * missed=once

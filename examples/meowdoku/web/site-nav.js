@@ -700,7 +700,14 @@ async function main() {
     if (href === here) a.setAttribute("aria-current", "page");
     return a;
   }
+  // [LOAN] the dev Apache sends a request carrying meowdoku_loan=<port> to that branch server (deploy/apache/dev-proxy.conf);
+  // choosing Stable or Development forgets it.
+  const loanCookie = (document.cookie.match(/(?:^|;\s*)meowdoku_loan=(\d+)/) || [])[1] || "";
+  function setLoan(port) {
+    document.cookie = "meowdoku_loan=" + (port || "") + "; path=/; Secure; SameSite=Lax" + (port ? "" : "; Max-Age=0");
+  }
   async function choose(site) {
+    setLoan("");
     const res = await postJson("/api/route", { site });
     if (res.status === 200) { location.reload(); return; }
     note.textContent = (res.body && res.body.error) || "could not switch server";
@@ -753,7 +760,17 @@ async function main() {
   if (pageRouteControl) {
     menu.append(el("div", { class: "sep" }), el("div", { class: "head", text: "Server: " + (who.instance || serverName) }),
       serverButton("Stable server", "stable", !onDev, false),
-      serverButton("Development server", "dev", onDev, route.dev_available === false));
+      serverButton("Development server", "dev", onDev && !loanCookie, route.dev_available === false));
+    if (onDev && caps.has("dev_ui")) {                 // [LOAN] every ready branch server, hosted by the dev site
+      let loans = [];
+      try { loans = ((await getJson("/api/loans")).loans || []).filter(loan => loan.state === "ready"); } catch (e) { loans = []; }
+      for (const loan of loans) {
+        const b = el("button", { role: "menuitemradio", "aria-pressed": String(String(loan.port) === loanCookie),
+          text: "Branch " + loan.branch + " (" + loan.repository + ", " + (loan.username || "?") + ")",
+          onclick: () => { setLoan(String(loan.port)); location.reload(); } });
+        menu.append(b);
+      }
+    }
   }
   menu.append(note, el("div", { class: "sep" }),
     el("button", { role: "menuitem", text: "Sign out", onclick: async () => { await postJson("/api/account/logout", {}); location.reload(); } }));
