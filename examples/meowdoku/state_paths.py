@@ -68,6 +68,11 @@ class StatePaths:
     def access_json(self) -> Path:
         return self.sql_dir / "access.json"
 
+    @property
+    def private_record_db(self) -> Path:
+        """[PRIVATE] token -> raw IP/email/user-agent; read back only by private_read (private_record.py)."""
+        return self.sql_dir / "private_record.db"
+
     # ---- jobs (source_divider: one directory per divide-and-lower job; legacy build/meowdoku/jobs)
     @property
     def jobs_dir(self) -> Path:
@@ -106,6 +111,11 @@ class StatePaths:
     @property
     def tls_dir(self) -> Path:
         return self.secrets_dir / "tls"
+
+    @property
+    def private_hash_key(self) -> Path:
+        """[PRIVATE] this state's HMAC key for private-value tokens; made once, never replaced."""
+        return self.secrets_dir / "private_hash.key"
 
     def admin_token(self, port=None) -> Path:
         """admin_token.txt for the default port (or None), admin_token_<port>.txt for any other (lifecycle's per-port rule)."""

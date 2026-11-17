@@ -54,9 +54,11 @@ def test_login_and_activity_lines(monkeypatch):
     assert L.note_activity(7, "admin", "1.2.3.4", now=100.0 + L.IDLE_SECONDS - 1) is None
     assert L.note_activity(7, "admin", "1.2.3.4", now=100.0 + 2 * L.IDLE_SECONDS) is not None   # quiet IDLE_SECONDS since the last request
     got = L.RING.fetch(0, sources={"login", "activity"})["entries"]
+    ip = L.private_record.token("ip", "1.2.3.4")                         # [PRIVATE] the ring holds the address's token
     assert [(e["src"], e["text"]) for e in got] == [
-        ("login", "fail user=adminx client=1.2.3.4"), ("login", "ok user=admin client=1.2.3.4"),
-        ("activity", "active user=admin client=1.2.3.4"), ("activity", "active user=admin client=1.2.3.4")]
+        ("login", f"fail user=adminx client={ip}"), ("login", f"ok user=admin client={ip}"),
+        ("activity", f"active user=admin client={ip}"), ("activity", f"active user=admin client={ip}")]
+    assert "1.2.3.4" not in json.dumps(L.RING.fetch(0))
 
 
 def test_login_endpoint_files_login_lines(tmp_path, monkeypatch):
@@ -69,7 +71,8 @@ def test_login_endpoint_files_login_lines(tmp_path, monkeypatch):
                       headers={"Content-Type": "application/json"})
             c.getresponse().read()
         texts = [e["text"] for e in L.RING.fetch(0, sources={"login"})["entries"]]
-        assert texts == ["fail user=log_cat client=127.0.0.1", "ok user=log_cat client=127.0.0.1"]
+        ip = L.private_record.token("ip", "127.0.0.1")
+        assert texts == [f"fail user=log_cat client={ip}", f"ok user=log_cat client={ip}"]
     finally:
         httpd.shutdown(); httpd.server_close()
 

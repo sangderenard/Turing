@@ -74,6 +74,7 @@ from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_fr
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
+from meowdoku import private_record as private_mod  # noqa: E402  [PRIVATE] IP/email/user-agent tokens; raw values for private_read only
 from meowdoku import issue_tickets as issue_tickets_mod  # Account-owned SQL incidents, separate from workspace reviews.
 from meowdoku import ticket_research as ticket_research_mod  # Research cases and development briefs.
 from meowdoku import tickets as tickets_mod  # noqa: E402  [TICKETS] persisted client/server diagnostic reports
@@ -539,7 +540,7 @@ def make_handler(sessions: Sessions):
                 return  # OAuth codes/state and tool arguments must never enter access logs.
             line = str(args[0]) if args else ""
             if "/api/" in line and "/api/log" not in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
-                sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+                sys.stderr.write("%s - %s\n" % (private_mod.token("ip", self.address_string()), private_mod.redact(format % args)))   # [PRIVATE]
 
         def _table(self) -> Table:
             from http.cookies import SimpleCookie
@@ -848,6 +849,32 @@ def make_handler(sessions: Sessions):
                 self.path = access_mod.SHADER_PAGE                # any other page address is the shader page
             super().do_GET()
             return True
+
+        def _reveal_ips(self, entries: list) -> None:            # [PRIVATE]
+            """Each entry's ``ip`` token becomes the address behind it, for a private_read holder only; anyone else keeps the token."""
+            if "private_read" not in self._caps():
+                return
+            known = private_mod.RECORD.resolve(e.get("ip") for e in entries)
+            for e in entries:
+                if e.get("ip") in known:
+                    e["ip_token"], e["ip"] = e["ip"], known[e["ip"]]["value"]
+
+        def _private_get(self) -> None:                           # [PRIVATE] GET /api/private/resolve?tokens=ip~...,email~...
+            """What tokens stand for: operators and admins (private_read), over HTTPS, never a view-only link."""
+            from urllib.parse import parse_qs
+            if not self._require("private_read"):
+                return
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            wanted = [t for t in ",".join(parse_qs(self.path.partition("?")[2]).get("tokens") or []).split(",") if t][:200]
+            if not wanted:
+                return self._json({"error": "tokens: a comma-separated list of ip~/email~/ua~ tokens"}, HTTPStatus.BAD_REQUEST)
+            self._set_cookie = []
+            principal = self._principal()
+            print(f"[private] {getattr(principal, 'username', None) or principal.role} resolved {len(wanted)} token(s)", flush=True)
+            return self._json({"resolved": private_mod.RECORD.resolve(wanted)})
 
         def _log_get(self) -> None:                               # [LOG]
             from urllib.parse import parse_qs
@@ -2766,7 +2793,8 @@ def make_handler(sessions: Sessions):
                             raise ValueError("rows is out of range")
                         entry = {"target": target, "rows": int(rows), "ns_per_row": finite("ns_per_row"),
                                  "max_abs_err": finite("max_abs_err", optional=True),
-                                 "user_agent_hint": str(body.get("user_agent_hint") or "")[:200], "recorded": time.time()}
+                                 "user_agent_hint": private_mod.token("ua", str(body.get("user_agent_hint") or "")[:200]),   # [PRIVATE]
+                                 "recorded": time.time()}
                     except ValueError as error:
                         return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
                     with sessions.mathlab_lock:
@@ -3143,7 +3171,7 @@ def make_handler(sessions: Sessions):
                 except (ValueError, KeyError, TypeError):
                     return refuse("malformed promise")
                 if grant is None:
-                    print(f"[federation] refused grant for prefix {prefix!r} ({self.client_address[0]})", flush=True)
+                    print(f"[federation] refused grant for prefix {prefix!r} ({private_mod.token('ip', self.client_address[0])})", flush=True)
                     return refuse("grant refused")
                 try:
                     local = sessions.federation_identity()
@@ -3317,6 +3345,8 @@ def make_handler(sessions: Sessions):
                 return
             if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
                 return self._log_get()
+            if path == "/api/private/resolve":                    # [PRIVATE] tokens -> raw values: private_read (operator, admin) only
+                return self._private_get()
             if path.startswith("/api/living-data/dm/"):
                 return self._living_data_dm(path, "GET")
             if path == "/api/foyer" or path.startswith("/api/foyer/"):  # [FOYER]
@@ -3360,7 +3390,9 @@ def make_handler(sessions: Sessions):
                 from urllib.parse import parse_qs
                 ticket_id = (parse_qs(self.path.partition("?")[2]).get("id") or [None])[0]
                 try:
-                    return self._json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id else {"tickets": sessions.tickets.list()})
+                    # [PRIVATE] a ticket filed before tokens holds a raw peer and raw ring lines: every string is redacted on the way out
+                    return self._json(private_mod.redact_json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id
+                                                              else {"tickets": sessions.tickets.list()}))
                 except (ValueError, FileNotFoundError):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/radio/jukebox":
@@ -3605,6 +3637,7 @@ def make_handler(sessions: Sessions):
                     if match:
                         entries.append({"ts": entry["ts"], "event": entry["text"].split(" ", 1)[0],
                                         "username": match.group(1), "ip": match.group(2)})
+                self._reveal_ips(entries)
                 return self._json({"entries": entries, "bounded": True,
                                    "access_log": str(sessions.state.logs_dir / "apache-access.log")})
             if path == "/api/account/admin/look-queue":
@@ -3618,6 +3651,8 @@ def make_handler(sessions: Sessions):
                     if match and match.group(1) in names:
                         activity[match.group(1)].append({"ts": entry["ts"], "event": entry["text"].split(" ", 1)[0],
                                                          "ip": match.group(2)})
+                for seen in activity.values():
+                    self._reveal_ips(seen)
                 return self._json({"previews": previews, "recent_access": activity,
                                    "access_log": str(sessions.state.logs_dir / "apache-access.log")})
             if path in ("/api/account/admin/people", "/api/account/admin/tools"):   # [PEOPLE] the admin's account view (account_admin.py)
@@ -3832,7 +3867,7 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "no such library entry"}, HTTPStatus.NOT_FOUND)
             except (ValueError, TypeError, AttributeError):
                 return self._json({"error": "expected {\"digest\": ...}"}, HTTPStatus.BAD_REQUEST)
-            print(f"[meowdoku] loading library: {path.rsplit('/', 1)[1]} {done['digest']} from {self.client_address[0]}", flush=True)
+            print(f"[meowdoku] loading library: {path.rsplit('/', 1)[1]} {done['digest']} from {private_mod.token('ip', self.client_address[0])}", flush=True)
             return self._json({"ok": True, "entry": done, "active": sessions.anim.active_digest()})
 
         # ---- LIFECYCLE (lifecycle.py): the announcement every page reads, the page's copy re-seeding a session, and the admin trigger.
@@ -4102,10 +4137,11 @@ def make_handler(sessions: Sessions):
                 length = min(int(self.headers.get("Content-Length") or 0), 4096)
                 try:
                     note = json.loads(self.rfile.read(length) or b"{}")
-                    line = " | ".join(str(note.get(k, ""))[:600] for k in ("kind", "msg", "where", "stack", "ua"))
+                    line = " | ".join([str(note.get(k, ""))[:600] for k in ("kind", "msg", "where", "stack")]
+                                      + [private_mod.token("ua", str(note.get("ua", ""))[:600])])   # [PRIVATE] the user agent is a token
                 except (ValueError, TypeError):
                     line = "(unreadable)"
-                print(f"[client-error] {self.client_address[0]}: {line}", flush=True)
+                print(f"[client-error] {private_mod.token('ip', self.client_address[0])}: {line}", flush=True)
                 self.send_response(204); self.end_headers()
                 return
             if path0 in ("/api/tickets", "/api/tickets/status"):
@@ -4131,9 +4167,9 @@ def make_handler(sessions: Sessions):
                     server_state = {k: game.get(k) for k in ("game", "player", "board", "level", "status", "phase", "tick") if k in game}
                     log_seq = logring_mod.RING.seq
                     server_log = logring_mod.RING.fetch(max(0, log_seq - 80), 80)["entries"]
-                    result = sessions.tickets.submit(payload, peer=self.client_address[0], tier=self._tier,
+                    result = sessions.tickets.submit(payload, peer=private_mod.token("ip", self.client_address[0]), tier=self._tier,
                                                      server_state=server_state, log_seq=log_seq, server_log=server_log)
-                    print(f"[ticket] {result['id']} from {self.client_address[0]}", flush=True)
+                    print(f"[ticket] {result['id']} from {private_mod.token('ip', self.client_address[0])}", flush=True)
                     return self._json(result, HTTPStatus.CREATED)
                 except (ValueError, TypeError, json.JSONDecodeError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
@@ -4980,6 +5016,7 @@ def main(argv: list[str] | None = None) -> int:
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
     state = resolve_state(args.state_dir, web_dir)
     state.ensure(restrict=False)        # ACLs on secrets/ are set by the operator (operators.py / ensure()), never by a server start
+    private_mod.configure(state.private_hash_key, state.private_record_db)   # [PRIVATE] before the ring: nothing enters it raw
     logring_mod.RING = logring_mod.Ring(path=state.log_ring); logring_mod.tee_stdout()   # [LOG]
     profiles_path = Path(args.profiles) if args.profiles else (state.profiles_json if args.state_dir else PROFILES)
     sessions = Sessions(web_dir, Profiles(profiles_path), state)

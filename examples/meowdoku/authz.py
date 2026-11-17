@@ -123,7 +123,7 @@ except ImportError:
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
         "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit",
-        "operator_workspace", "agent_scratch")
+        "operator_workspace", "agent_scratch", "private_read")
 ROLES = ("admin", "member", "dev", "service", "operator", "intern", "guest")
 KIOSK_ROLES = ("intern",)      # answered only on catalog endpoints declared kiosk (see KIOSK above)
 ORIGINS = ("lan", "ip", "dns")
@@ -136,7 +136,7 @@ DEFAULT_POLICY = {
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
         "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message",
-                                              "core_git", "paper_train")],
+                                              "core_git", "paper_train", "private_read")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],
@@ -273,7 +273,7 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
     caps = set() if kiosk(principal) else set(policy["tier_caps"].get(principal.tier, ()))
     if guest_gated(principal):
         return frozenset(c for c in caps & set(policy["role_caps"].get("guest", ())) if c in CAPS and c not in (
-            "lifecycle_admin", "account_manage", "paper_train", "nodus_edit", "compile_unstable"))
+            "lifecycle_admin", "account_manage", "paper_train", "nodus_edit", "compile_unstable", "private_read"))
     if principal.role == "trial":
         return frozenset({"view_site", "photo_read", "agent_scratch"})
     if principal.role in _permission_groups.RANKS:
@@ -290,6 +290,12 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
         caps.add("operator_workspace")
     else:
         caps.discard("operator_workspace")
+    # [PRIVATE] private_read (raw IP/email/user-agent values behind their tokens, private_record.py) belongs to the operator
+    # and admin roles and nothing else: no tier, policy file, group or modifier confers it, on the live or the dev server.
+    if principal.role in ("operator", "admin"):
+        caps.add("private_read")
+    else:
+        caps.discard("private_read")
     for cap in principal.modifiers:
         if cap == "message" and principal.role == "intern":
             caps.add(cap)

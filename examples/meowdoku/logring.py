@@ -4,7 +4,9 @@ Every line has a ``seq`` (monotonic for the process, continuing across restarts 
 ``client-error`` (a page's uncaught error), ``fountain-diag`` (an owner device's 5 s diagnostics), ``login`` (each sign-in outcome and
 sign-out, filed by ``note_login``), ``activity`` (an account's first request after ``IDLE_SECONDS`` quiet, filed by ``note_activity``)
 or ``server`` (everything else the server prints).  The cap is in BYTES; the oldest lines are dropped first.  ``tee_stdout`` copies what the server prints into the ring
-without changing what reaches stdout.  The ring may hold IPs and user agents: ``GET /api/log`` is for the dev tier and above only.
+without changing what reaches stdout.  [PRIVATE] Every line passes through ``private_record.redact`` on its way in (and a legacy
+persisted line on load), so the ring holds tokens, never an IP or email address: ``GET /api/log`` is for the dev tier and above,
+and the dev tier never reads a private value (private_record.py).
 """
 from __future__ import annotations
 
@@ -14,6 +16,8 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+
+from meowdoku import private_record
 
 DEFAULT_CAP = 2 * 1024 * 1024
 LINE_CAP = 4000                  # one line's text is cut here (a stack trace stays a line)
@@ -41,7 +45,7 @@ class Ring:
         return len(text.encode("utf-8", "replace")) + OVERHEAD
 
     def add(self, text: str, source: str | None = None, ts: float | None = None) -> int:
-        text = str(text).replace("\r", "")[:LINE_CAP]
+        text = private_record.redact(str(text).replace("\r", "")[:LINE_CAP])[:LINE_CAP]   # [PRIVATE] tokens, never an address
         source = source if source in SOURCES else classify(text)
         with self.lock:
             self.seq += 1
@@ -72,6 +76,7 @@ class Ring:
         try:
             for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines()[-100000:]:
                 e = json.loads(line)
+                e["text"] = private_record.redact(e["text"])          # a line persisted before [PRIVATE] holds raw addresses
                 self.entries.append(e); self.bytes += self._cost(e["text"]); self.seq = max(self.seq, e["seq"])
             while self.bytes > self.cap and len(self.entries) > 1:
                 self.bytes -= self._cost(self.entries.popleft()["text"])
@@ -97,9 +102,9 @@ RING = Ring()
 
 
 def note_login(outcome: str, username, client) -> int:
-    """One ``login`` line: ``<outcome> user=<name> client=<address>``; outcome is ok, fail, limited or logout."""
+    """One ``login`` line: ``<outcome> user=<name> client=<ip token>``; outcome is ok, fail, limited or logout."""
     name = "".join(ch for ch in str(username).strip().lower()[:64] if ch.isprintable() and not ch.isspace())   # a failed name is caller-typed text
-    return RING.add(f"{outcome} user={name or '-'} client={client or '-'}", source="login")
+    return RING.add(f"{outcome} user={name or '-'} client={private_record.token('ip', client or '-')}", source="login")
 
 
 _last_seen: dict = {}
@@ -107,14 +112,14 @@ _seen_lock = threading.Lock()
 
 
 def note_activity(user_id, username, client, now: float | None = None) -> int | None:
-    """Files ``active user=<name> client=<address>`` when this account has been quiet ``IDLE_SECONDS``; otherwise only updates its clock."""
+    """Files ``active user=<name> client=<ip token>`` when this account has been quiet ``IDLE_SECONDS``; otherwise only updates its clock."""
     now = time.time() if now is None else now
     with _seen_lock:
         last = _last_seen.get(user_id)
         _last_seen[user_id] = now
     if last is not None and now - last < IDLE_SECONDS:
         return None
-    return RING.add(f"active user={username} client={client or '-'}", source="activity", ts=now)
+    return RING.add(f"active user={username} client={private_record.token('ip', client or '-')}", source="activity", ts=now)
 
 
 class _Tee:
@@ -123,7 +128,8 @@ class _Tee:
         self._real, self._buf, self._lock = real, "", threading.Lock()
 
     def write(self, s):
-        n = self._real.write(s)
+        self._real.write(private_record.redact(s))        # [PRIVATE] what the server prints reaches its log file as tokens too
+        n = len(s)
         with self._lock:
             self._buf += s
             *lines, self._buf = self._buf.split("\n")
