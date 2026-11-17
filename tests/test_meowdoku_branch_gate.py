@@ -356,6 +356,34 @@ def test_reviews_over_rest_take_identity_from_the_session_only(world):
     assert ask("POST", "/api/reviews/nothing", user=ANN, username="ann", body={})[0] == 404
 
 
+def test_any_reviewer_reads_exactly_the_change_a_review_names_and_git_is_not_changed(world):
+    policy, db_file, work = world["policy"], world["db_file"], world["work"]
+    head = branch(world, "feature", "feature.txt")
+    review = submit(world, "feature", head)
+    commit(work, "later.txt")                    # main moves on; the diff still starts at the merge base
+    refs_before = run(work, "for-each-ref")
+
+    def ask(path, **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path.split("?")[0], "GET", policy=policy, accounts_db=db_file)
+        return handler.sent
+
+    url = f"/api/reviews/diff?id={review['id']}"
+    assert ask(url)[0] == 401
+    assert ask(url, user=BOB, username="bob", capabilities=())[0] == 403
+    status, answer = ask(url, user=BOB, username="bob")
+    assert status == 200 and answer["head"] == head and answer["truncated"] is False and answer["branch"] == "feature"
+    assert "feature.txt" in answer["diff"] and "later.txt" not in answer["diff"] and "base.txt" not in answer["diff"]
+    status, summary = ask(url + "&stat=1", user=BOB, username="bob")
+    assert status == 200 and summary["stat"] is True and "1 file changed" in summary["diff"]
+    status, other = ask(url + "&path=base.txt", user=BOB, username="bob")
+    assert status == 200 and other["diff"] == ""
+    for bad in ("../x", "/x", "C:/x", "a/../../x"):
+        assert ask(url + "&path=" + bad, user=BOB, username="bob")[0] == 400, bad
+    assert ask("/api/reviews/diff?id=nothing", user=BOB, username="bob")[0] == 404
+    assert run(work, "for-each-ref") == refs_before, "reading a diff changes no ref"
+
+
 def test_the_task_worker_offers_land_and_clean_and_reports_while_apply_is_off(world):
     from types import SimpleNamespace
     from meowdoku import scheduled_tasks
