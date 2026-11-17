@@ -624,3 +624,61 @@ def temp_cookie(owner_id, files, secure=True):
         raise WorkspaceError("temporary cookie filesystem is full", 429)
     value = base64.urlsafe_b64encode(raw).decode().rstrip("=")
     return TEMP_COOKIE + "=" + value + "; Path=/api/scratch; HttpOnly; SameSite=Lax" + ("; Secure" if secure else "")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# [ORIENT] Every MCP connection's orientation (ticket 7ad7362bcb53422a83359abfbaa395dd). Any signed-in account reads its
+# OWN: the shared basics (every root document of kind "orientation", oldest first), then its own profile's documents.
+# The decision tree's first question is: is this the account's first interaction today (UTC)?
+#   yes -> FIRST_TODAY: the full text, under the profile's "first-today" job when it declares one;
+#   no  -> RETURNING:   under the profile's "returning" job when it declares one (in full); otherwise a short reminder
+#                       naming the same documents, so a returning connection is not handed the whole text again.
+# "Seen today" is its own small table under its own schema module, so older code that opens agent_workspace is unaffected.
+FIRST_TODAY, RETURNING = "first-today", "returning"
+
+
+def _orientation_seen(db, user_id, now):
+    schema_version.declare(db, "agent_orientation", 1)
+    db.execute("CREATE TABLE IF NOT EXISTS agent_orientation_seen (user_id INTEGER NOT NULL, day TEXT NOT NULL, "
+               "first_at REAL NOT NULL, last_at REAL NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(user_id, day))")
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    first = db.execute("INSERT OR IGNORE INTO agent_orientation_seen VALUES (?,?,?,?,1)", (user_id, day, now, now)).rowcount == 1
+    if not first:
+        db.execute("UPDATE agent_orientation_seen SET last_at=?, count=count+1 WHERE user_id=? AND day=?", (now, user_id, day))
+    return first, day
+
+
+def _profile_for(db, user_id):
+    row = db.execute("SELECT id FROM agent_profiles WHERE individual_id=? ORDER BY (seed_key IS NULL), updated LIMIT 1",
+                     (user_id,)).fetchone()
+    return row[0] if row else None
+
+
+def orientation(db, user_id, now=None, full=False):
+    """The signed-in account's own orientation, chosen by the decision tree above. Records today's interaction."""
+    now = time.time() if now is None else now
+    first, day = _orientation_seen(db, user_id, now)
+    branch = FIRST_TODAY if first else RETURNING
+    basics = [document(db, row[0]) for row in db.execute(
+        "SELECT id FROM agent_documents WHERE kind='orientation' AND parent_id IS NULL ORDER BY updated, title")]
+    profile_id = _profile_for(db, user_id)
+    own, job = [], None
+    if profile_id:
+        has_job = db.execute("SELECT 1 FROM agent_profile_jobs WHERE profile_id=? AND job_key=?", (profile_id, branch)).fetchone()
+        resolved = resolve_profile(db, profile_id, branch if has_job else None)
+        own, job = resolved["documents"], resolved["job"]
+    seen_ids, documents = set(), []
+    for item in basics + own:
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"]); documents.append(item)
+    decision = ["first interaction with this account today? " + ("yes" if first else "no"),
+                f"profile: {'yes' if profile_id else 'none'}" + (f", job {job['key']}" if job else "")]
+    if first or job or full:
+        preamble = "\n\n".join(f"# {item['title']}\n{item['body']}" for item in documents)
+    else:
+        preamble = ("You were oriented earlier today (UTC " + day + "). Your documents, in order: " +
+                    "; ".join(item["title"] for item in documents) +
+                    ". Read them again in full with workspace_orientation (full=1).") if documents else ""
+    return {"first_today": first, "day": day, "branch": branch, "decision": decision,
+            "documents": [{"id": d["id"], "kind": d["kind"], "title": d["title"]} for d in documents],
+            "preamble": preamble}

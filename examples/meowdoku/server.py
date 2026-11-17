@@ -1516,6 +1516,18 @@ def make_handler(sessions: Sessions):
             self._set_cookie = []
             if not self._is_secure():
                 return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if method == "GET" and path == "/api/agent-workspace/orientation":   # [ORIENT] any signed-in account, its own
+                principal = self._principal()
+                if principal.user_id is None:
+                    return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+                full = parse_qs(self.path.partition("?")[2]).get("full", [""])[0] in ("1", "true", "yes")
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                try:
+                    return self._json(agent_workspace_mod.orientation(db, principal.user_id, full=full))
+                except agent_workspace_mod.WorkspaceError as error:
+                    return self._json({"error": str(error)}, error.status)
+                finally:
+                    db.close()
             if not self._require("operator_workspace") or self._principal().role not in ("operator", "admin"):
                 return
             if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":

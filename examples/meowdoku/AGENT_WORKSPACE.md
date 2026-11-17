@@ -52,6 +52,23 @@ The new tables live in the configured accounts database through
 landing process must land both repositories before an instance restart and
 web export. The source page alone is not the published `build/meowdoku/web`.
 
+## Every connection's orientation
+
+`GET /api/agent-workspace/orientation` is the one workspace route that is not for operators only. Any signed-in
+account reads its OWN orientation:
+- every root document of kind `orientation` (the shared basics, oldest first);
+- then the documents of its own individual profile.
+
+A decision tree chooses the order and the length, and its first question is: is this the account's first interaction
+today (UTC)?
+- **Yes:** the full text, under the profile's `first-today` job when one is declared.
+- **No:** the profile's `returning` job when one is declared; otherwise a short reminder naming the documents.
+- `?full=1` gives the full text in either case.
+
+The SpeakToMe MCP server appends this preamble to its initialize instructions on every connection, so every MCP
+interaction starts oriented. The interactions are counted per account per day in `agent_orientation_seen`, under its
+own schema module, `agent_orientation`.
+
 ## Enduring characters, instances, and jobs
 
 An individual profile has a stable ID, title, assigned permanent account and
