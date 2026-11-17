@@ -42,6 +42,9 @@ function mountNoticeForm(box) {
   const body = field("Text (blank line = new paragraph)", document.createElement("textarea"));
   body.rows = 5;
   const eta = field("Estimate (when public services are ready)", input("text"));
+  const until = field("Count down to (your local time; empty = no countdown)", input("datetime-local"));
+  const untilLabel = field("Countdown label", input("text"));
+  untilLabel.placeholder = "Time remaining";
   const mode = field("Placement", document.createElement("select"));
   for (const [value, label] of [["push", "Take the space at the top"], ["overlay", "On top of the page"]]) {
     const option = document.createElement("option"); option.value = value; option.textContent = label; mode.append(option);
@@ -61,7 +64,9 @@ function mountNoticeForm(box) {
   post.addEventListener("click", async () => {
     if (block.checked && !window.confirm("A blocking notice makes every page unusable under it until it is cleared. Post it?")) return;
     try {
-      const n = await noticeCall({ title: title.value, body: body.value, eta: eta.value, mode: mode.value, block: block.checked,
+      const end = until.value ? new Date(until.value).getTime() / 1000 : null;
+      const n = await noticeCall({ title: title.value, body: body.value, eta: eta.value, until: end, until_label: untilLabel.value,
+        mode: mode.value, block: block.checked,
         dismissible: dismissible.checked, paths: paths.value.split(",").map(p => p.trim()).filter(Boolean) });
       said.textContent = "Posted, version " + n.version + ". New page loads show it.";
     } catch (error) { said.textContent = "Not posted: " + error.message; }
@@ -74,6 +79,11 @@ function mountNoticeForm(box) {
     const n = state.notice;
     if (!n) return;
     title.value = n.title || ""; body.value = n.body || ""; eta.value = n.eta || ""; mode.value = n.mode || "push";
+    untilLabel.value = n.until_label || "";
+    if (n.until) {
+      const at = new Date(n.until * 1000);
+      until.value = new Date(at.getTime() - at.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    }
     block.checked = !!n.block; dismissible.checked = !!n.dismissible; paths.value = (n.paths || []).join(", ");
     said.textContent = "Current: version " + n.version + (n.posted ? ", " + n.posted : "");
   }).catch(() => {});

@@ -164,3 +164,19 @@ def test_the_page_code_draws_the_notice_as_text_and_exports_it():
     assert "keep: [header]" in nav, "a blocking notice never blocks the site header"
     controls = condition.CONTROLS.read_text(encoding="utf-8")
     assert "/api/condition/notice" in controls and "innerHTML" not in controls
+
+
+def test_a_countdown_is_a_moment_within_a_year(accounts, tmp_path):
+    import time
+    folder = tmp_path / "condition"
+    soon = time.time() + 14 * 86400
+    for bad in ("tomorrow", True, time.time() + 400 * 86400, time.time() - 3 * 86400):
+        h = route(accounts, folder, Handler(2, body={"title": "x", "until": bad}), "/api/condition/notice", "POST")
+        assert h.answers[0][0] == 400, bad
+    posted = route(accounts, folder, Handler(2, body={"title": "x", "until": soon, "until_label": "Public services in"}),
+                   "/api/condition/notice", "POST").answers[0][1]["notice"]
+    assert posted["until"] == round(soon, 3) and posted["until_label"] == "Public services in"
+    public = route(accounts, folder, Handler(None), "/api/condition/notice", "GET").answers[0][1]["notice"]
+    assert public["until"] == posted["until"] and public["until_label"] == "Public services in"
+    nav = (condition.HERE / "web" / "site-nav.js").read_text(encoding="utf-8")
+    assert 'role: "timer"' in nav and "clearInterval(timer)" in nav, "a live countdown that stops with the notice"

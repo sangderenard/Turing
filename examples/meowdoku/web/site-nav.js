@@ -523,6 +523,8 @@ const NOTICE_CSS = `
 h2 { margin: 0 0 6px; font-size: 18px; color: #ffd26a; }
 p { margin: 6px 0; white-space: pre-wrap; }
 .eta { font-weight: 700; color: #ffd26a; }
+.countdown { font: 700 22px/1.3 ui-monospace, monospace; color: #ffd26a; margin: 8px 0; }
+.countdown small { display: block; font: 600 12px/1.3 system-ui, sans-serif; opacity: .8; }
 .posted { font-size: 12px; opacity: .7; }
 button { font: inherit; margin-top: 8px; padding: 5px 12px; border-radius: 6px; border: 1px solid #5f747d; background: #1d2c35;
   color: inherit; cursor: pointer; }
@@ -539,8 +541,27 @@ export function mountNotice(target, notice, { top = 0, keep = [] } = {}) {
   if (notice.title) box.append(el("h2", { text: notice.title }));
   for (const para of String(notice.body || "").split(/\n\s*\n/)) if (para.trim()) box.append(el("p", { text: para.trim() }));
   if (notice.eta) box.append(el("p", { class: "eta", text: notice.eta }));
+  let timer = 0;
+  if (Number.isFinite(Number(notice.until)) && Number(notice.until) > 0) {   // a live countdown to notice.until (epoch s)
+    const end = Number(notice.until) * 1000;
+    const label = el("small", { text: notice.until_label || "Time remaining" });
+    const clock = el("span", { role: "timer" });
+    box.append(el("div", { class: "countdown" }, label, clock));
+    const tick = () => {
+      let left = Math.max(0, Math.floor((end - Date.now()) / 1000));
+      if (left === 0) { clock.textContent = "Now"; clearInterval(timer); return; }
+      const d = Math.floor(left / 86400); left %= 86400;
+      const h = Math.floor(left / 3600); left %= 3600;
+      const m = Math.floor(left / 60), s = left % 60;
+      clock.textContent = (d ? d + "d " : "") + String(h).padStart(2, "0") + "h " + String(m).padStart(2, "0") + "m " +
+        String(s).padStart(2, "0") + "s";
+    };
+    tick();
+    timer = setInterval(tick, 1000);
+    clock.title = "until " + new Date(end).toLocaleString();
+  }
   const blocked = [];
-  const remove = () => { host.remove(); for (const node of blocked) node.inert = false; };
+  const remove = () => { clearInterval(timer); host.remove(); for (const node of blocked) node.inert = false; };
   if (notice.dismissible && !block) {
     box.append(el("button", { type: "button", text: "Dismiss", onclick: () => { remove(); if (notice.onDismiss) notice.onDismiss(); } }));
   }

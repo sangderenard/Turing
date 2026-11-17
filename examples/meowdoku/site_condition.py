@@ -20,6 +20,8 @@ like the flags.
 - It holds a title, a body (plain text; blank lines make paragraphs) and an estimate (``eta``).
 - ``mode`` is ``push`` (it takes the space at the top and pushes the page down) or ``overlay`` (it sits on top of the
   page). With ``block``, an overlay makes the page under it unusable, but never the site header or its menu.
+- ``until`` (epoch seconds, optional) makes it count down, live, to that moment, under ``until_label`` (default
+  "Time remaining"). After the moment it says so instead of counting.
 - It can also be ``dismissible`` (never when it blocks), and limited to some path prefixes (``paths``).
 - Anyone reads it (GET /api/condition/notice, no account: visitors are its audience), without the operator's name. Only
   an operator or an admin posts or clears it (POST /api/condition/notice), with the same checks as the card switch.
@@ -42,7 +44,8 @@ CONTROLS = HERE / "condition_controls.js"
 MAX_NOTE = 200
 NOTICE = "notice.json"                               # [NOTICE]
 NOTICE_MODES = ("push", "overlay")
-NOTICE_TEXT = {"title": 200, "body": 8000, "eta": 300}
+NOTICE_TEXT = {"title": 200, "body": 8000, "eta": 300, "until_label": 100}
+NOTICE_UNTIL_MAX_S = 366 * 86400                       # a countdown ends within a year
 NOTICE_PATHS = 20
 
 
@@ -104,8 +107,8 @@ def public_notice(notice) -> dict | None:
     """What a visitor reads: everything but who posted it."""
     if not notice:
         return None
-    return {k: notice[k] for k in ("title", "body", "eta", "mode", "block", "dismissible", "paths", "version", "posted_at")
-            if k in notice}
+    return {k: notice[k] for k in ("title", "body", "eta", "until", "until_label", "mode", "block", "dismissible", "paths",
+                                   "version", "posted_at") if k in notice}
 
 
 def post_notice(folder, fields, *, by: str) -> dict:
@@ -135,6 +138,11 @@ def post_notice(folder, fields, *, by: str) -> dict:
         raise ConditionError(f"paths is a list of at most {NOTICE_PATHS} path prefixes, each starting with /")
     previous = read_notice(folder) or {}
     now = time.time()
+    until = fields.get("until")
+    if until is not None:
+        if isinstance(until, bool) or not isinstance(until, (int, float)) or not now - 86400 < until < now + NOTICE_UNTIL_MAX_S:
+            raise ConditionError("until is a moment in epoch seconds, within a year")
+        notice["until"] = round(float(until), 3)
     notice.update(mode=mode, block=block, dismissible=dismissible and not block, paths=paths,
                   version=int(previous.get("version", 0)) + 1, posted_at=round(now, 3),
                   posted=f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(now))} by {by}")
