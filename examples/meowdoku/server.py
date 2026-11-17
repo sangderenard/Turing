@@ -3460,7 +3460,7 @@ def make_handler(sessions: Sessions):
                 return self._relay_route(path, "GET")
             if path.startswith("/api/fortune/"):                  # [FORTUNE]
                 return self._fortune_route(path, "GET")
-            if path in ("/api/condition", "/api/condition/controls.js"):   # [CONDITION]
+            if path in ("/api/condition", "/api/condition/controls.js", "/api/condition/notice"):   # [CONDITION] [NOTICE]
                 return self._condition_route(path, "GET")
             if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
                 from meowdoku import file_index
@@ -4076,7 +4076,7 @@ def make_handler(sessions: Sessions):
                 return self._relay_route(path0, "POST")
             if path0 == "/api/fortune" or path0.startswith("/api/fortune/"):   # [FORTUNE]
                 return self._fortune_route(path0, "POST")
-            if path0 == "/api/condition":                         # [CONDITION]
+            if path0 in ("/api/condition", "/api/condition/notice"):   # [CONDITION] [NOTICE]
                 return self._condition_route(path0, "POST")
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")

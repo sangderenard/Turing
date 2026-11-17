@@ -506,6 +506,82 @@ function mountRadio(wrap, host, canControl = false) {
   wrap.append(chip, panel);
 }
 
+// [NOTICE] The site's header notice (site_condition.py; GET /api/condition/notice, public). mountNotice is exported so a page
+// can block one element of its own the same way:
+//   mountNotice(element, {title, body, mode: "overlay", block: true})  ->  {remove()}
+// mode "push" takes the space it needs at the top of the target; "overlay" sits on top of it (as tall as it needs, up to the
+// target's height, scrolling inside). With block, the target's other content is made inert (no click, focus or typing);
+// for the whole page the site header and its menu are never blocked. Text only: nothing in a notice is read as HTML.
+const NOTICE_CSS = `
+:host { all: initial; }
+.notice { box-sizing: border-box; font: 15px/1.45 system-ui, sans-serif; color: #f3f6f8; background: #13202a;
+  border-bottom: 3px solid #e0a526; padding: 14px 18px; max-height: 100%; overflow: auto; }
+.notice.overlay { box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+.notice.block { height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;
+  background: rgba(10, 16, 22, .94); border-bottom: none; }
+.notice.block > * { max-width: 72ch; }
+h2 { margin: 0 0 6px; font-size: 18px; color: #ffd26a; }
+p { margin: 6px 0; white-space: pre-wrap; }
+.eta { font-weight: 700; color: #ffd26a; }
+.posted { font-size: 12px; opacity: .7; }
+button { font: inherit; margin-top: 8px; padding: 5px 12px; border-radius: 6px; border: 1px solid #5f747d; background: #1d2c35;
+  color: inherit; cursor: pointer; }
+`;
+
+export function mountNotice(target, notice, { top = 0, keep = [] } = {}) {
+  const host = document.createElement("div");
+  host.setAttribute("data-site-notice", "");
+  const shadow = host.attachShadow({ mode: "open" });
+  const overlay = notice.mode === "overlay";
+  const block = overlay && !!notice.block;
+  const box = el("section", { class: "notice" + (overlay ? " overlay" : "") + (block ? " block" : ""),
+    role: block ? "alertdialog" : "region", "aria-label": notice.title || "Notice" });
+  if (notice.title) box.append(el("h2", { text: notice.title }));
+  for (const para of String(notice.body || "").split(/\n\s*\n/)) if (para.trim()) box.append(el("p", { text: para.trim() }));
+  if (notice.eta) box.append(el("p", { class: "eta", text: notice.eta }));
+  const blocked = [];
+  const remove = () => { host.remove(); for (const node of blocked) node.inert = false; };
+  if (notice.dismissible && !block) {
+    box.append(el("button", { type: "button", text: "Dismiss", onclick: () => { remove(); if (notice.onDismiss) notice.onDismiss(); } }));
+  }
+  shadow.append(el("style", { text: NOTICE_CSS }), box);
+  const whole = target === document.body;
+  if (!overlay) {
+    host.style.cssText = "display:block;position:relative;z-index:1;";
+    if (whole && keep[0] && keep[0].parentNode === target) keep[0].after(host); else target.prepend(host);
+    return { remove };
+  }
+  if (whole) {
+    host.style.cssText = `position:fixed;left:0;right:0;top:${top}px;z-index:2147482000;` +
+      (block ? "bottom:0;" : `max-height:calc(100vh - ${top}px);`);
+    target.append(host);
+  } else {
+    if (getComputedStyle(target).position === "static") target.style.position = "relative";
+    host.style.cssText = "position:absolute;left:0;right:0;top:0;z-index:2147482000;" + (block ? "bottom:0;" : "max-height:100%;");
+    target.append(host);
+  }
+  if (block) {
+    for (const child of Array.from(target.children)) {
+      if (child !== host && !keep.includes(child)) { child.inert = true; blocked.push(child); }
+    }
+  }
+  return { remove };
+}
+
+async function showSiteNotice(header, headerBottom) {
+  let notice;
+  try { notice = (await getJson("/api/condition/notice")).notice; } catch (e) { return; }
+  if (!notice) return;
+  const paths = Array.isArray(notice.paths) ? notice.paths : [];
+  if (paths.length && !paths.some(prefix => location.pathname.startsWith(prefix))) return;
+  const key = "meowdoku_notice_dismissed";
+  let dismissed = null;
+  try { dismissed = sessionStorage.getItem(key); } catch (e) { dismissed = null; }
+  if (notice.dismissible && dismissed === String(notice.version)) return;
+  notice.onDismiss = () => { try { sessionStorage.setItem(key, String(notice.version)); } catch (e) { /* storage off */ } };
+  mountNotice(document.body, notice, { top: headerBottom(), keep: [header] });
+}
+
 async function main() {
   if (!allowed()) { console.info("[site-nav] not loaded: this page's script tag lacks data-site-nav=\"allow\""); return; }
 
@@ -541,6 +617,7 @@ async function main() {
   suiteMount = spec => mountControlSuite(actions, host, spec);
   for (const record of suites.values()) record.dispose = suiteMount(record.spec);
   window.dispatchEvent(new Event("site-controls-ready"));
+  showSiteNotice(host, () => Math.ceil(wrap.getBoundingClientRect().bottom));   // [NOTICE] for everyone, signed in or not
   let who;
   try { who = await getJson("/api/whoami"); } catch (e) { return; }
   const caps = new Set(who.capabilities || []);
@@ -674,5 +751,5 @@ async function main() {
   reserveSpace();
 }
 
-window.MeowdokuSiteNav = { version: VERSION, registerControlSuite };
+window.MeowdokuSiteNav = { version: VERSION, registerControlSuite, mountNotice };
 main();

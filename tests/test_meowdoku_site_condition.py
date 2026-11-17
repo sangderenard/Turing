@@ -77,7 +77,8 @@ def test_only_an_operator_or_admin_gets_the_controls_or_the_state(accounts, tmp_
         h = route(accounts, tmp_path, Handler(user_id), "/api/condition/controls.js", "GET")
         assert h.sent[0] == 200 and b"export async function mount" in h.wfile.getvalue()
         assert ("Cache-Control", "no-store, private") in h.sent
-        assert route(accounts, tmp_path, Handler(user_id), "/api/condition", "GET").answers == [(200, {"card": None, "line": None})]
+        assert route(accounts, tmp_path, Handler(user_id), "/api/condition", "GET").answers == [
+            (200, {"card": None, "line": None, "notice": None})]
 
 
 def test_a_member_cannot_switch_and_an_operator_posts_and_takes_down(accounts, tmp_path):
@@ -111,3 +112,55 @@ def test_the_controls_are_not_published_with_the_site():
     assert condition.CONTROLS.parent.name == "meowdoku" and not (condition.HERE / "web" / condition.CONTROLS.name).exists()
     export = (condition.HERE / "web_export.py").read_text(encoding="utf-8")
     assert condition.CONTROLS.name not in export
+
+
+# ---- [NOTICE] the header notice
+
+
+def test_anyone_reads_the_notice_without_the_posters_name(accounts, tmp_path):
+    folder = tmp_path / "condition"
+    assert route(accounts, folder, Handler(None), "/api/condition/notice", "GET").answers == [(200, {"notice": None})]
+    assert route(accounts, None, Handler(None), "/api/condition/notice", "GET").answers == [(200, {"notice": None})]
+    h = route(accounts, folder, Handler(2, "op", body={"title": "In preparation", "body": "One.\n\nTwo.", "eta": "soon"}),
+              "/api/condition/notice", "POST")
+    status, answer = h.answers[0]
+    posted = answer["notice"]
+    assert status == 200 and posted["version"] == 1 and posted["mode"] == "push" and posted["posted"].endswith(" by op")
+    public = route(accounts, folder, Handler(None), "/api/condition/notice", "GET").answers[0][1]["notice"]
+    assert public["title"] == "In preparation" and public["body"] == "One.\n\nTwo." and "posted" not in public
+    assert "op" not in str(public), "a visitor never learns which operator posted it"
+    assert route(accounts, folder, Handler(1), "/api/condition", "GET").answers[0][1]["notice"]["posted"].endswith(" by op")
+
+
+def test_only_an_operator_posts_or_clears_and_every_field_is_checked(accounts, tmp_path):
+    folder = tmp_path / "condition"
+    for user_id, status in ((None, 401), (3, 403)):
+        h = route(accounts, folder, Handler(user_id, body={"title": "x"}), "/api/condition/notice", "POST")
+        assert h.answers[0][0] == status and not (folder / condition.NOTICE).exists()
+    for body in ({}, {"title": "x" * 201}, {"title": "x", "mode": "sideways"}, {"title": "x", "block": True},
+                 {"title": "x", "mode": "overlay", "block": "yes"}, {"title": "x", "paths": ["no-slash"]},
+                 {"title": "x", "body": 5}):
+        h = route(accounts, folder, Handler(2, body=body), "/api/condition/notice", "POST")
+        assert h.answers[0][0] == 400, body
+    h = route(accounts, folder, Handler(2, headers={"Sec-Fetch-Site": "cross-site"}, body={"title": "x"}), "/api/condition/notice", "POST")
+    assert h.answers[0][0] == 403
+    posted = route(accounts, folder, Handler(2, body={"title": "Closed", "mode": "overlay", "block": True, "dismissible": True}),
+                   "/api/condition/notice", "POST").answers[0][1]["notice"]
+    assert posted["block"] and posted["dismissible"] is False, "a blocking notice is never dismissible"
+    again = route(accounts, folder, Handler(1, body={"title": "Open", "paths": ["/games"]}), "/api/condition/notice", "POST")
+    assert again.answers[0][1]["notice"]["version"] == 2 and again.answers[0][1]["notice"]["paths"] == ["/games"]
+    assert not list(folder.glob("*.tmp")), "written whole and renamed into place"
+    cleared = route(accounts, folder, Handler(2, body={"clear": True}), "/api/condition/notice", "POST")
+    assert cleared.answers[0] == (200, {"notice": None}) and not (folder / condition.NOTICE).exists()
+    assert not list(folder.glob("*.on")), "the notice never posts a card"
+
+
+def test_the_page_code_draws_the_notice_as_text_and_exports_it():
+    nav = (condition.HERE / "web" / "site-nav.js").read_text(encoding="utf-8")
+    start = nav.index("export function mountNotice")
+    drawing = nav[start:nav.index("async function showSiteNotice")]
+    assert "innerHTML" not in drawing and "insertAdjacentHTML" not in drawing, "notice text is never HTML"
+    assert "mountNotice" in nav[nav.index("window.MeowdokuSiteNav"):], "other pages can reuse it"
+    assert "keep: [header]" in nav, "a blocking notice never blocks the site header"
+    controls = condition.CONTROLS.read_text(encoding="utf-8")
+    assert "/api/condition/notice" in controls and "innerHTML" not in controls

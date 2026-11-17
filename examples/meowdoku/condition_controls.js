@@ -15,6 +15,70 @@ async function call(method, body) {
   return data;
 }
 
+// [NOTICE] The header notice's form (site_condition.py post_notice). The server checks the role and every field again.
+async function noticeCall(body) {
+  const res = await fetch("/api/condition/notice", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+  return data.notice;
+}
+
+function mountNoticeForm(box) {
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = "Header notice";
+  summary.style.cssText = "cursor:pointer;font-weight:700;";
+  details.append(summary);
+  const field = (label, node) => {
+    const wrap = document.createElement("label");
+    wrap.style.cssText = "display:grid;gap:2px;font-size:12px;margin-top:4px;";
+    wrap.append(document.createTextNode(label), node);
+    details.append(wrap);
+    return node;
+  };
+  const input = (type) => { const n = document.createElement("input"); n.type = type; n.style.cssText = "font:inherit;"; return n; };
+  const title = field("Title", input("text"));
+  const body = field("Text (blank line = new paragraph)", document.createElement("textarea"));
+  body.rows = 5;
+  const eta = field("Estimate (when public services are ready)", input("text"));
+  const mode = field("Placement", document.createElement("select"));
+  for (const [value, label] of [["push", "Take the space at the top"], ["overlay", "On top of the page"]]) {
+    const option = document.createElement("option"); option.value = value; option.textContent = label; mode.append(option);
+  }
+  const block = field("Block the page under it (overlay only; never the header)", input("checkbox"));
+  const dismissible = field("Visitors may dismiss it (not when blocking)", input("checkbox"));
+  dismissible.checked = true;
+  const paths = field("Only on paths starting with (comma separated; empty = every page)", input("text"));
+  const said = document.createElement("div");
+  said.style.cssText = "font-size:12px;opacity:.85;margin-top:4px;";
+  const post = document.createElement("button");
+  post.type = "button"; post.textContent = "Post notice";
+  const clear = document.createElement("button");
+  clear.type = "button"; clear.textContent = "Clear notice";
+  for (const b of [post, clear]) b.style.cssText = "margin:6px 6px 0 0;";
+  details.append(post, clear, said);
+  post.addEventListener("click", async () => {
+    if (block.checked && !window.confirm("A blocking notice makes every page unusable under it until it is cleared. Post it?")) return;
+    try {
+      const n = await noticeCall({ title: title.value, body: body.value, eta: eta.value, mode: mode.value, block: block.checked,
+        dismissible: dismissible.checked, paths: paths.value.split(",").map(p => p.trim()).filter(Boolean) });
+      said.textContent = "Posted, version " + n.version + ". New page loads show it.";
+    } catch (error) { said.textContent = "Not posted: " + error.message; }
+  });
+  clear.addEventListener("click", async () => {
+    try { await noticeCall({ clear: true }); said.textContent = "Cleared."; } catch (error) { said.textContent = "Not cleared: " + error.message; }
+  });
+  box.append(details);
+  call("GET").then(state => {
+    const n = state.notice;
+    if (!n) return;
+    title.value = n.title || ""; body.value = n.body || ""; eta.value = n.eta || ""; mode.value = n.mode || "push";
+    block.checked = !!n.block; dismissible.checked = !!n.dismissible; paths.value = (n.paths || []).join(", ");
+    said.textContent = "Current: version " + n.version + (n.posted ? ", " + n.posted : "");
+  }).catch(() => {});
+}
+
 export async function mount(target, { onCard } = {}) {
   const box = document.createElement("div");
   box.style.cssText = "display:grid;gap:6px;padding:6px 10px;text-align:left;";
@@ -55,5 +119,6 @@ export async function mount(target, { onCard } = {}) {
     box.append(button);
   }
   target.append(box);
+  mountNoticeForm(box);
   try { render(await call("GET")); } catch (error) { status.textContent = "Condition unknown: " + error.message; }
 }
