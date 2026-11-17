@@ -17,7 +17,7 @@ last exported, and a state.
   instances.json:
   - for a turing branch, ``code_root`` is the checkout's folder; for a speaktome branch, ``speaktome_root`` is. The
     other repository comes from the dev trees;
-  - its ``state_dir`` is ``<state root>/<port>``, and it shares the accounts database (one identity authority);
+  - its ``state_dir`` is ``<state root>/<port>``, and it reads the declared redacted Development accounts database;
   - it binds 127.0.0.1 only;
   - it starts the loans that become ready and stops the ones that leave.
 
@@ -119,7 +119,7 @@ def may_restart(db, instance, user_id, action) -> bool:
 
 
 def config(instances_path) -> dict | None:
-    """The ``"loans"`` block of instances.json: {"state_root", "dev_turing", "dev_speaktome", "args", "python"?, "account"?,
+    """The ``"loans"`` block of instances.json: {"state_root", "dev_turing", "dev_speaktome", "accounts_db", "args", "python"?, "account"?,
     "boards_from"?, "bind"?, "trusted_proxies"?}. Without it no loan server runs.
 
     [REMOTE] ``bind`` defaults to 127.0.0.1, but loopback is not the only option. To simulate a remote compute partner, bind
@@ -130,7 +130,7 @@ def config(instances_path) -> dict | None:
     except (OSError, ValueError):
         return None
     block = data.get("loans") if isinstance(data, dict) else None
-    return block if isinstance(block, dict) and block.get("state_root") and block.get("dev_turing") else None
+    return block if isinstance(block, dict) and block.get("state_root") and block.get("dev_turing") and block.get("accounts_db") else None
 
 
 def specs(db, cfg) -> list:
@@ -143,7 +143,8 @@ def specs(db, cfg) -> list:
         spec = {"name": loan["instance"], "kind": "meowdoku", "port": loan["port"], "bind": cfg.get("bind", "127.0.0.1"), "route": "",
                 "site": "loan", "account": cfg.get("account", "svc-meowdoku-loans"), "leases": [],
                 "code_root": loan["path"] if loan["repository"] == "turing" else cfg["dev_turing"],
-                "state_dir": str(root), "args": [*cfg.get("args", []), "--web-dir", str(root / "web"),
+                "state_dir": str(root), "accounts_db": cfg["accounts_db"],
+                "args": [*cfg.get("args", []), "--web-dir", str(root / "web"),
                                                  *(a for p in cfg.get("trusted_proxies", []) for a in ("--trusted-proxy", p))],
                 "loan": {"repository": loan["repository"], "branch": loan["branch"], "user_id": loan["user_id"]}}
         speaktome = loan["path"] if loan["repository"] == "speaktome" else cfg.get("dev_speaktome")
