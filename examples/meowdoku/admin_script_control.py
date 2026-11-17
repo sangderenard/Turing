@@ -28,7 +28,7 @@ SCRIPTS = (
     "Add-CanvasContractPort.ps1", "Apache-Service.ps1", "Backup-State.ps1",
     "Close-Console.ps1", "Enable-CronTool.ps1", "Export-DevDatabase.ps1", "Migrate-LiaisonVault.ps1",
     "Migrate-State.ps1", "Open-Console.ps1", "Protect-DefaultBranch.ps1",
-    "Provision-HostedLlmTrain.ps1", "Provision-ServicePython.ps1",
+    "Provision-ServicePython.ps1",
     "Restart-Stack.ps1", "Restore-AgentBoxAcls.ps1", "Restore-State.ps1",
     "Rollback-State.ps1", "Run-HostedLlm.ps1", "Set-AgentBox.ps1",
     "Set-LiaisonCutover.ps1", "Set-ServiceFirewall.ps1", "Set-SiteCondition.ps1",

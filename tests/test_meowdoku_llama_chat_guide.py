@@ -54,17 +54,10 @@ def test_the_guide_reads_orientation_and_the_newest_memory_and_keeps_them_when_t
 
 def test_chat_keeps_the_whole_setting_and_trims_chat_lines_before_giving_it_up():
     runner = _runner()
-    model = runner.LocalModel(Path("x.exe"), Path("m.gguf"), None, 1, Path("."))
+    model = runner.LocalModel(Path("x.exe"), Path("m.gguf"), 1, Path("."))
     lines = [{"id": i, "username": "bob", "body": "word " * 40} for i in range(30)]
     count = lambda text: len(text.split())                      # one token per word
     messages = model.chat_messages("SETTING " * 50, "memory note", "room agents", lines, count_tokens=count)
     assert messages[0]["content"].startswith("SETTING") and "memory note" in messages[1]["content"]
     used = messages[1]["content"].count("bob:")
     assert used < 30 and used in runner.CHAT_LINES, "fewer recent lines, never a shorter setting"
-
-
-def test_no_reaction_bait_unless_training():
-    text = RUNNER.read_text(encoding="utf-8")
-    assert "target = random.choice(kinds) if invite else None" in text
-    assert "visit_room(rest, model, db, username, room, kinds, guide, args.train)" in text
-    assert "People may coach you" not in text

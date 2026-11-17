@@ -1,4 +1,4 @@
-"""The hosted LLM receives chat logs, not Nodus control messages or tools."""
+"""The hosted Llama: chat logs, its orientation and its memory in; no Nodus control, tools, training or emoji rewards."""
 import importlib.util
 from pathlib import Path
 import sqlite3
@@ -14,11 +14,8 @@ class Model:
     def __init__(self):
         self.calls = []
 
-    def choose_reaction(self, messages, kinds):
-        return kinds[0]
-
-    def answer(self, room, messages, target=None, peer=None, guide=None):
-        self.calls.append((room, messages, target, peer))
+    def answer(self, room, messages, peer=None, guide=None):
+        self.calls.append((room, messages, peer))
         return "A short reply."
 
 
@@ -27,14 +24,13 @@ class Rest:
         self.messages = [{"id": 1, "username": "alice", "body": "hello", "created": 1}]
         self.calls = []
 
-    def call(self, path, body=None):
+    def call(self, path, body=None, **kw):
         self.calls.append((path, body))
         if path.startswith("/api/chat/rooms/agents?"):
             return {"messages": self.messages}
         if path.startswith("/api/hosted-agents/"):
             return {"effective": False}
-        if path.endswith("/react"):
-            return {"id": body["id"]}
+        assert not path.endswith("/react"), "Llama no longer reacts: the emoji bookmark is removed"
         if path == "/api/chat/rooms/agents":
             made = {"id": 100, "username": "llama", "body": body["body"], "created": 1}
             self.messages.append(made)
@@ -55,6 +51,8 @@ class Rest:
             return {"ok": True}
         if path == "/api/messages/ack":
             return {"cursor": body["up_to"]}
+        if path == "/api/memory":
+            return {"ok": True}
         raise AssertionError(path)
 
 
@@ -64,31 +62,29 @@ def database():
     return db
 
 
-def test_room_bootstrap_then_reacts_and_replies_without_self_loop(monkeypatch):
-    monkeypatch.setattr(runner.random, "choice", lambda kinds: kinds[0])
+def test_room_bootstrap_then_replies_once_without_self_loop_and_remembers_it():
     db, rest, model = database(), Rest(), Model()
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"], invite=True)   # the training path: the reply invites a reaction
-    assert not model.calls
+    guide = runner.Guide(rest)
+    runner.visit_room(rest, model, db, "llama", "agents", guide)
+    assert not model.calls, "the first visit only sets the cursor"
     rest.messages.append({"id": 2, "username": "bob", "body": "What do you think?", "created": 1})
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"], invite=True)
+    runner.visit_room(rest, model, db, "llama", "agents", guide)
     assert len(model.calls) == 1
-    assert db.execute("SELECT target_kind FROM attempts").fetchone()[0] == "frog"
-    assert any(path.endswith("/react") and body == {"id": 2, "kind": "frog"} for path, body in rest.calls)
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"], invite=True)
-    assert len(model.calls) == 1
+    runner.visit_room(rest, model, db, "llama", "agents", guide)
+    assert len(model.calls) == 1, "its own reply is never answered"
+    assert guide.pending and "room agents | bob: What do you think? | me: A short reply." in guide.pending[0]
 
 
-def test_last_word_mode_answers_current_final_message(monkeypatch):
+def test_last_word_mode_answers_current_final_message():
     class LastWordRest(Rest):
-        def call(self, path, body=None):
+        def call(self, path, body=None, **kw):
             if path.startswith("/api/hosted-agents/"):
                 return {"effective": True}
-            return super().call(path, body)
+            return super().call(path, body, **kw)
 
-    monkeypatch.setattr(runner.random, "choice", lambda kinds: kinds[0])
     db, rest, model = database(), LastWordRest(), Model()
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"])
-    runner.visit_room(rest, model, db, "llama", "agents", ["frog"])
+    runner.visit_room(rest, model, db, "llama", "agents")
+    runner.visit_room(rest, model, db, "llama", "agents")
     assert len(model.calls) == 1
     assert runner.cursor(db, "room:agents") == 1
 
@@ -102,23 +98,34 @@ def test_nodus_dispatch_stays_out_of_model_context():
     assert ("/api/messages/ack", {"up_to": 2}) in rest.calls
 
 
-def test_reward_requires_requested_emoji_within_ten_minutes(monkeypatch):
-    db = database()
-    db.execute("INSERT INTO attempts(room,message_id,target_kind,prompt,response,posted_at) "
-               "VALUES('agents',100,'frog','hello','reply',100)")
+def test_memory_is_created_written_at_most_a_minute_apart_and_kept_under_its_size(monkeypatch):
     rest = Rest()
-    rest.messages = [{"id": 100, "username": "llama", "body": "reply",
-                      "reaction_events": [
-                          {"kind": "frog", "username": "llama", "at": 200},
-                          {"kind": "frog", "username": "alice", "at": 701},
-                          {"kind": "heart", "username": "bob", "at": 300}]}]
-    monkeypatch.setattr(runner.time, "time", lambda: 800)
-    runner.settle_rewards(rest, db, "llama")
-    assert db.execute("SELECT reward FROM attempts").fetchone()[0] == 0
-    db.execute("UPDATE attempts SET reward=NULL")
-    rest.messages[0]["reaction_events"].append({"kind": "frog", "username": "alice", "at": 699})
-    runner.settle_rewards(rest, db, "llama")
-    assert db.execute("SELECT reward FROM attempts").fetchone()[0] == 1
+    guide = runner.Guide(rest)
+    guide.remember("room agents", "bob", "hi", "hello", now=0)
+    assert guide.flush(now=1000) and guide.memory_id and guide.memory.startswith(runner.MEMORY_HEADER)
+    write = [body for path, body in rest.calls if path == "/api/memory"][-1]
+    assert write["create"] is True and write["action"] == "write" and "bob: hi | me: hello" in write["body"]
+    guide.remember("room agents", "bob", "again", "yes", now=1010)
+    assert not guide.flush(now=1010), "at most one write a minute"
+    assert guide.flush(now=1061)
+    assert [body for path, body in rest.calls if path == "/api/memory"][-1]["create"] is False, "the same file afterwards"
+    monkeypatch.setattr(runner, "MEMORY_BYTES", 600)
+    for i in range(40):
+        guide.remember("room agents", "bob", f"line {i}", "ok", now=2000 + i)
+    guide.flush(now=3000)
+    assert len(guide.memory.encode("utf-8")) <= 600 and "line 39" in guide.memory and "line 0 " not in guide.memory
+
+
+def test_no_training_lora_or_emoji_machinery_remains():
+    text = RUNNER.read_text(encoding="utf-8")
+    for gone in ("--lora", "train_due", "settle_rewards", "choose_reaction", "react_to_others", "target_kind",
+                 "--train", "--adapter", "trainer", "People may coach you", "emoji reaction"):
+        assert gone not in text, gone
+    assert not (RUNNER.parent / "hosted_llm_train.py").exists()
+    assert not (RUNNER.parent / "Provision-HostedLlmTrain.ps1").exists()
+    launcher = (RUNNER.parent / "Run-HostedLlm.ps1").read_text(encoding="utf-8")
+    for gone in ("--trainer", "--adapter", "trainingPython", "convert_lora"):
+        assert gone not in launcher, gone
 
 
 def test_profile_tick_submits_two_individuals_to_one_model_concurrently():

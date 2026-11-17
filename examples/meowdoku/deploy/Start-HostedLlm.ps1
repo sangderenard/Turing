@@ -6,7 +6,6 @@ Import-Module (Join-Path $PSScriptRoot 'AgentAccounts.psm1') -Force
 $account = 'agents-llama'
 $task = 'SpeakToMe hosted llama'
 $workspace = 'C:\dev\Powershell'
-$train = 'E:\SpeakToMe\hosted-llm-train'
 if ($GrantRead -or $Register) {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($id)
@@ -16,12 +15,12 @@ if ($GrantRead -or $Register) {
 }
 if ($GrantRead) {
     foreach ($path in @("$workspace\srv\state\models\llama3.2-1b",
-                        "$workspace\srv\tools\llama-cpp\b12416", $train)) {
+                        "$workspace\srv\tools\llama-cpp\b12416")) {
         if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "Missing path: $path" }
         & icacls.exe $path /grant:r "$($account):(OI)(CI)RX" /T
         if ($LASTEXITCODE -ne 0) { throw "Could not grant model read access: $path" }
     }
-    Write-Host "$account may read the exact model, llama.cpp and training environment directories."
+    Write-Host "$account may read the exact model and llama.cpp directories."
     exit 0
 }
 if ($Register) {
