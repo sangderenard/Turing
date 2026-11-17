@@ -120,7 +120,11 @@ def may_restart(db, instance, user_id, action) -> bool:
 
 def config(instances_path) -> dict | None:
     """The ``"loans"`` block of instances.json: {"state_root", "dev_turing", "dev_speaktome", "args", "python"?, "account"?,
-    "boards_from"?}. Without it no loan server runs."""
+    "boards_from"?, "bind"?, "trusted_proxies"?}. Without it no loan server runs.
+
+    [REMOTE] ``bind`` defaults to 127.0.0.1, but loopback is not the only option. To simulate a remote compute partner, bind
+    the loans to the network address the dev Apache reaches them on (dev-proxy.conf LOANS_HOST), and name that Apache's
+    address in ``trusted_proxies``. Without it a loan would take the proxy's address for the visitor's."""
     try:
         data = json.loads(Path(instances_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -136,10 +140,11 @@ def specs(db, cfg) -> list:
         if loan["state"] != "ready" or not loan["path"] or not Path(loan["path"]).is_dir():
             continue
         root = Path(cfg["state_root"]) / str(loan["port"])
-        spec = {"name": loan["instance"], "kind": "meowdoku", "port": loan["port"], "bind": "127.0.0.1", "route": "",
+        spec = {"name": loan["instance"], "kind": "meowdoku", "port": loan["port"], "bind": cfg.get("bind", "127.0.0.1"), "route": "",
                 "site": "loan", "account": cfg.get("account", "svc-meowdoku-loans"), "leases": [],
                 "code_root": loan["path"] if loan["repository"] == "turing" else cfg["dev_turing"],
-                "state_dir": str(root), "args": [*cfg.get("args", []), "--web-dir", str(root / "web")],
+                "state_dir": str(root), "args": [*cfg.get("args", []), "--web-dir", str(root / "web"),
+                                                 *(a for p in cfg.get("trusted_proxies", []) for a in ("--trusted-proxy", p))],
                 "loan": {"repository": loan["repository"], "branch": loan["branch"], "user_id": loan["user_id"]}}
         speaktome = loan["path"] if loan["repository"] == "speaktome" else cfg.get("dev_speaktome")
         if speaktome:

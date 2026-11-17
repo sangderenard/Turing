@@ -5009,6 +5009,10 @@ def main(argv: list[str] | None = None) -> int:
                              "posts the yellow or red card (site_condition.py); without it the switch answers 503")
     parser.add_argument("--route", default="",
                         help="balancer route name: every response that sets a cookie also sets meowdoku_route=NAME (Apache stickysession)")
+    parser.add_argument("--trusted-proxy", action="append", default=[], metavar="ADDRESS",
+                        help="[REMOTE] one more proxy address whose X-Forwarded-For is believed, beside loopback (repeatable). "
+                             "For a dev Apache on a network address (dev-proxy.conf, MEOWDOKU_DEV_NO_LOCAL); without it the "
+                             "proxy's own address would be taken for the visitor's")
     parser.add_argument("--instance", default="",
                         help="service instance name (deploy/apache_supervisor.py): accounts that sign up or log in here are bound to it in account_instances")
     parser.add_argument("--federation-port", type=int, default=None,
@@ -5059,6 +5063,13 @@ def main(argv: list[str] | None = None) -> int:
                 or not 1 <= int(raw_port) <= 65535 or name in nodus_ui_ports):
             parser.error("--nodus-ui expects a unique INSTANCE:PORT")
         nodus_ui_ports[name] = int(raw_port)
+    for address in args.trusted_proxy:                   # [REMOTE] added to the loopback default, never replacing it
+        try:
+            import ipaddress
+            ipaddress.ip_address(address)
+        except ValueError:
+            parser.error(f"--trusted-proxy expects an IP address, not {address!r}")
+        proxy_trust_mod.TRUSTED_PROXIES.add(proxy_trust_mod._norm(address))
     if args.route:
         try:
             proxy_trust_mod.route_cookie(args.route)

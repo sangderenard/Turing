@@ -149,3 +149,15 @@ def test_the_supervisor_runs_exactly_the_ready_loans(world, monkeypatch):
     B.refresh(db, cfg, requester=(9, "svc-clean"), log=lambda line: None)
     sup.reconcile_loans()
     assert sup.instances == [], "without a loans block no loan server runs"
+
+
+def test_loopback_is_the_default_not_the_only_option(world):
+    db, cfg = world["db"], world["cfg"]
+    call(world, "open", branch="ann/one")
+    B.refresh(db, cfg, requester=(9, "svc-clean"), log=lambda line: None)
+    [spec] = B.specs(db, cfg)
+    assert spec["bind"] == "127.0.0.1" and "--trusted-proxy" not in spec["args"], "the default is loopback and trusts no one else"
+    remote = dict(cfg, bind="192.168.1.232", trusted_proxies=["192.168.1.232"])
+    [spec] = B.specs(db, remote)
+    assert spec["bind"] == "192.168.1.232"
+    assert spec["args"][-2:] == ["--trusted-proxy", "192.168.1.232"], "a network-bound loan believes only the named dev Apache"
