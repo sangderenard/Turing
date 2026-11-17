@@ -239,7 +239,12 @@ def export(src, dst, *, key_path, log=print) -> dict:
         tmp.unlink(missing_ok=True)
         raise
     copy.close(); source.close()
-    os.replace(tmp, dst)
+    try:
+        os.replace(tmp, dst)
+    except OSError as error:                              # Windows: a running dev-side server holds the old export open
+        tmp.unlink(missing_ok=True)
+        raise RedactError(f"the export could not replace {dst} ({type(error).__name__}); a dev-side server may have it "
+                          f"open. The old export is unchanged; stop that server and run the export again.") from None
     log(f"[redact] {dst}: " + ", ".join(f"{t} {n}" for t, n in sorted(counts.items()) if n) )
     return counts
 

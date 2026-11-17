@@ -99,3 +99,27 @@ def test_every_rule_is_a_known_kind():
     kinds = {"ip", "email", "ua", "text", "json", "withhold", "never", "null", "unpublished", "hash"}
     for table, rule in redactor.RULES.items():
         assert rule in (redactor.KEEP, redactor.DROP) or (isinstance(rule, dict) and set(rule.values()) <= kinds), table
+
+
+def test_an_export_in_use_fails_cleanly_and_keeps_the_old_one(tmp_path, live):
+    state, _ = live
+    out, first = _export(tmp_path, state)
+    before = out.read_bytes()
+    first.execute("BEGIN EXCLUSIVE")                      # a dev-side server holding the export open and locked
+    try:
+        if sys.platform == "win32":
+            with pytest.raises(redactor.RedactError, match="old export is unchanged"):
+                _export(tmp_path, state)
+            assert out.read_bytes() == before
+        assert not list(out.parent.glob("*.redacting*")), "no half-made copy is left"
+    finally:
+        first.rollback(); first.close()
+
+
+def test_the_deploy_script_audits_first_and_is_offered_remotely():
+    from meowdoku import admin_script_control
+    script = ROOT / "examples" / "meowdoku" / "deploy" / "Export-DevDatabase.ps1"
+    text = script.read_text(encoding="utf-8")
+    assert "# ---- Operator gate" in text and "# ---- end gate" in text, "the operator gate, as on every deploy script"
+    assert text.index(" audit --from ") < text.index(" export --from "), "the audit comes before the export"
+    assert "Export-DevDatabase.ps1" in admin_script_control.SCRIPTS
