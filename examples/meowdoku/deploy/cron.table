@@ -20,6 +20,11 @@ state.backup 30 9 * * * missed=once
 # apply is false this only reports what it would land.
 reviews.land */5 * * * * missed=once
 
+# Every ten minutes, two minutes after the landing task, the dev server follows what landed (dev_follow.py): its own
+# locked worktrees fast-forward to each default branch, its pages are exported, and it restarts after its running jobs.
+# Offered only when the task worker is given --instances and --follow-instance. Stable is never moved by this task.
+dev.follow 2-59/10 * * * * missed=once
+
 # Once a day (09:45 UTC), remove branches that have been fully merged for the policy's grace period. While the
 # branch policy's apply is false this only reports what it would remove.
 branches.clean 45 9 * * * missed=once

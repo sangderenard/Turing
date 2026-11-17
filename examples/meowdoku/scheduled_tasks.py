@@ -43,7 +43,7 @@ SYSTEM_DISPLAY_NAME = "Nodus"
 USERLIST_ENGINE_ID = 7203
 # Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
 PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean",
-                         "core.index", "hosted.dispatch"),
+                         "core.index", "hosted.dispatch", "dev.follow"),
                 "userlist": ("identity.search", "identity.represent")}
 
 
@@ -225,14 +225,16 @@ def dispatch_hosted_agents(accounts_db, system_username, agent_names, *, messagi
 
 
 def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None,
-             branches=None) -> dict:
+             branches=None, dev=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
 
     `system` is `{"accounts_db", "username", "module", "userlist"?}` (module = messaging): the account system events
     are sent as, and optionally the userlist table to ask for an audience ({"port", "jobs_dir", "native", "task_request"}).
     `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "text_only", "module"}` (module = state_backup).
     `branches` is `{"policy", "accounts_db", "module"}` (module = branch_gate): reviewed changes are landed and merged
-    branches cleaned by that module's rules; while the policy's `apply` is false both tasks only report."""
+    branches cleaned by that module's rules; while the policy's `apply` is false both tasks only report.
+    `dev` is `{"instances", "instance", "module"}` (module = dev_follow), with `branches`: dev.follow moves that one
+    instance's declared dev trees to what landed and asks for its restart (Research case 8bbe0de7, Stage 1)."""
     table = {}
     if branches is not None:
         def branch_task(which):
@@ -278,6 +280,26 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
             made = file_index.build(policy, Path(branches["accounts_db"]).with_name("file_index.db"), actor=policy["cleaner"])
             return cron_host.DONE, f"{made['entries']} entries indexed in {made['seconds']} s", made
         table["core.index"] = core_index
+        if dev is not None:
+            def dev_follow(request):
+                import sqlite3
+                policy = branches["module"].load_policy(branches["policy"])
+                db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                try:
+                    row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (policy["cleaner"],)).fetchone()
+                    if row is None:
+                        return cron_host.UNCHANGED, f"the cleanup account {policy['cleaner']!r} does not exist", None
+                    done = dev["module"].follow(instances_path=dev["instances"], instance=dev["instance"], policy=policy, db=db,
+                                                requester=(row[0], policy["cleaner"]), apply=bool(policy["apply"]))
+                finally:
+                    db.close()
+                moved = [t for t in done["trees"] if t["action"] in ("moved", "would move")]
+                said = "; ".join(f"{t.get('repository', '?')} {t['action']} ({t['reason']})" for t in done["trees"])
+                for key in ("pages", "restart"):
+                    if done.get(key):
+                        said += f"; {done[key]}"
+                return (cron_host.DONE if moved else cron_host.UNCHANGED), said, done
+            table["dev.follow"] = dev_follow
         table["reviews.land"] = branch_task("land")
         table["branches.clean"] = branch_task("clean")
     if web_dir is not None and manual is not None:
