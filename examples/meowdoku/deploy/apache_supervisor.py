@@ -251,6 +251,9 @@ class Instance:
         self.speaktome_root = _abs(spec["speaktome_root"]) if spec.get("speaktome_root") else None
         # [ROUTE] per-instance "state_dir" (a path, absolute or relative to the repo root): that child's --state-dir and nothing else
         self.paths = StatePaths(_abs(spec["state_dir"])) if spec.get("state_dir") else sup.paths
+        # [ROUTE] A dev or loan child owns its state-root DB unless accounts_db explicitly selects another one.
+        # The former fallback to sup.db_path gave meowdoku-dev and loans the live users and sessions.
+        self.accounts_db = _abs(spec["accounts_db"]) if spec.get("accounts_db") else self.paths.accounts_db
         self.federation_args = []     # [FEDERATE] --federation-port/--federation-canvas, set by begin() from spec["federation_from"]
 
     def console_requested(self) -> bool:
@@ -291,8 +294,8 @@ class Instance:
                     *self.spec.get("args", [])]
             if not self.paths.is_legacy:                # an explicit state root is handed to the child; the old layout is its own default
                 argv += ["--state-dir", str(self.paths.root)]
-            if self.paths is not self.sup.paths:        # [ROUTE] a per-instance root shares the supervisor's accounts.db (users, roles, sessions, preferences)
-                argv += ["--accounts-db", str(self.sup.db_path)]
+            if self.paths is not self.sup.paths or self.spec.get("accounts_db"):
+                argv += ["--accounts-db", str(self.accounts_db)]
             if self.route:
                 argv += ["--route", self.route]
             argv += self.sup.route_args()               # [ROUTE] --routes / --stable-route / --dev-route from the enabled instances
@@ -337,6 +340,8 @@ class Instance:
             return "disabled (enabled: false)"
         if self.kind not in ("meowdoku", "nodus", "command"):
             return f"unknown kind {self.kind!r}"
+        if self.kind == "meowdoku" and self.spec.get("site") in ("dev", "loan") and self.accounts_db.resolve() == self.sup.db_path.resolve():
+            return "Development and loan accounts_db must differ from the live supervisor database"
         if not self.code_root.is_dir():                   # [DEV] a missing tree is reported, never replaced by this one
             return f"code_root not found: {self.code_root}"
         if self.kind == "meowdoku" and not (self.code_root / "examples" / "meowdoku" / "server.py").is_file():

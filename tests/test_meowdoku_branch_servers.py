@@ -49,7 +49,8 @@ def world(tmp_path):
     boards.parent.mkdir()
     boards.write_text('{"boards": [], "levels": {}}', encoding="utf-8")
     cfg = {"state_root": str(tmp_path / "loans"), "dev_turing": str(tmp_path / "dev-turing"),
-           "dev_speaktome": str(tmp_path / "dev-speaktome"), "args": ["--require-cap", "dev_ui"], "boards_from": str(boards)}
+           "dev_speaktome": str(tmp_path / "dev-speaktome"), "accounts_db": str(tmp_path / "dev" / "sql" / "accounts.db"),
+           "args": ["--require-cap", "dev_ui"], "boards_from": str(boards)}
     return {"db": db, "policy": policy, "root": tmp_path / "state" / "checkouts", "cfg": cfg, "tmp": tmp_path}
 
 
@@ -81,6 +82,14 @@ def test_refresh_exports_then_the_supervisor_spec_appears_and_a_commit_restarts(
     folder = db.execute("SELECT path FROM checkouts").fetchone()[0]
     assert spec["name"] == "loan-8769" and spec["port"] == 8769 and spec["bind"] == "127.0.0.1"
     assert spec["code_root"] == folder and spec["speaktome_root"] == cfg["dev_speaktome"]
+    assert spec["accounts_db"] == cfg["accounts_db"]
+    sup_mod = _supervisor_module()
+    instances = world["tmp"] / "instances.json"
+    instances.write_text(json.dumps({"instances": [], "loans": cfg}), encoding="utf-8")
+    sup = sup_mod.Supervisor(world["tmp"] / "live.db", instances, world["tmp"] / "state")
+    command = sup_mod.Instance(spec, sup).command()
+    assert command[command.index("--accounts-db") + 1] == cfg["accounts_db"]
+    assert str(sup.db_path) not in command
     assert spec["args"][-2:] == ["--web-dir", str(Path(cfg["state_root"]) / "8769" / "web")]
     assert B.refresh(db, cfg, requester=(9, "svc-clean"), log=lambda line: None) == [], "nothing new, nothing done"
     branch_review.set_identity(db, user_id=ANN, name="ann", email="ann@example.invalid")

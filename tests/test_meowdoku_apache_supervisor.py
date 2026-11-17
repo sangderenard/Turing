@@ -364,10 +364,29 @@ def test_per_instance_state_dir_reaches_only_that_child_and_routes_are_passed(tm
     a, dev = plan["m-a"]["command"], plan["m-dev"]["command"]
     assert a[a.index("--state-dir") + 1] == str(tmp_path / "root")
     assert dev[dev.index("--state-dir") + 1] == str(tmp_path / "devroot")
+    assert "--accounts-db" not in a
+    assert dev[dev.index("--accounts-db") + 1] == str(tmp_path / "devroot" / "sql" / "accounts.db")
+    assert str(tmp_path / "a.db") not in dev
     for cmd in (a, dev):
         assert cmd[cmd.index("--routes") + 1] == "a,b"
         assert cmd[cmd.index("--stable-route") + 1] == "a" and cmd[cmd.index("--dev-route") + 1] == "b"
     assert not (tmp_path / "devroot").exists() and not (tmp_path / "a.db").exists()          # dry-run creates nothing
+
+
+def test_dev_accounts_db_is_explicit_and_cannot_select_live(tmp_path):
+    inst = _dev_pair(tmp_path)
+    data = json.loads(inst.read_text(encoding="utf-8"))
+    isolated = tmp_path / "redacted" / "sql" / "accounts.db"
+    data["instances"][1]["accounts_db"] = str(isolated)
+    inst.write_text(json.dumps(data), encoding="utf-8")
+    plan = _plan(tmp_path, inst)
+    dev = plan["m-dev"]["command"]
+    assert dev[dev.index("--accounts-db") + 1] == str(isolated)
+    data["instances"][1]["accounts_db"] = str(tmp_path / "a.db")
+    inst.write_text(json.dumps(data), encoding="utf-8")
+    plan = _plan(tmp_path, inst)
+    assert plan["m-dev"]["command"] is None
+    assert "must differ" in plan["m-dev"]["skipped"]
 
 
 def test_disabled_instance_is_skipped_and_contributes_no_route(tmp_path):

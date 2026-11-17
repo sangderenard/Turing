@@ -909,3 +909,13 @@ lowering. The worker interrupted it, claimed no scan/native result, and kept
 the completed focused tests and mapping audit separate. Cost: approximately
 20 seconds of unrelated work. Prevention: inspect the scanner entry point and
 its actual scope before invoking it; use the named mapping audit for this slice.
+
+## 2026-11-17 — invoked a helper that tried Git CLI in a central checkout
+
+The user instructed me to use SpeakToMe MCP for checkouts and not run Git CLI.
+After the focused tests passed, I invoked `python tools/hazards_log.py new`
+without reading its branch discovery first. The helper attempted `git rev-parse`
+and failed with exit 128 in the MCP checkout. It made no repository change.
+The cost was one failed command and an avoidable violation of the user's
+narrow instruction. Inspecting the helper and passing its `--branch` option
+would have kept Git CLI out of the command path.
