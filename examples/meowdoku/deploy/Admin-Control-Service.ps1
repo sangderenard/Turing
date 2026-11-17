@@ -45,7 +45,7 @@ if ($Register) {
         $holders = @($batch -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         if ($holders -notcontains "*$sid") {
             $holders += "*$sid"
-            $policy = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`"`r`nRevision=1`r`n[Privilege Rights]`r`nSeBatchLogonRight = $($holders -join ',')`r`n"
+            $policy = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`$`"`r`nRevision=1`r`n[Privilege Rights]`r`nSeBatchLogonRight = $($holders -join ',')`r`n"
             Set-Content -LiteralPath $apply -Value $policy -Encoding Unicode
             & secedit.exe /configure /db $database /cfg $apply /areas USER_RIGHTS /quiet
             if ($LASTEXITCODE -ne 0) { throw 'Could not grant batch logon right.' }

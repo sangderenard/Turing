@@ -108,7 +108,7 @@ foreach ($right in @($rights.Keys)) {
     if ($holders -notcontains "*$sid") { $holders += "*$sid" }
     $rights[$right] = $holders -join ','
 }
-$inf = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`"`r`nRevision=1`r`n[Privilege Rights]`r`nSeServiceLogonRight = $($rights.SeServiceLogonRight)`r`nSeDenyInteractiveLogonRight = $($rights.SeDenyInteractiveLogonRight)`r`n"
+$inf = "[Unicode]`r`nUnicode=yes`r`n[Version]`r`nsignature=`"`$CHICAGO`$`"`r`nRevision=1`r`n[Privilege Rights]`r`nSeServiceLogonRight = $($rights.SeServiceLogonRight)`r`nSeDenyInteractiveLogonRight = $($rights.SeDenyInteractiveLogonRight)`r`n"
 Write-Host 'Apply service and denied-interactive logon rights while retaining existing holders'
 if (-not $WhatIf) {
     try {
