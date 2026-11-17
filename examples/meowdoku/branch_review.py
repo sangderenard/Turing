@@ -2,8 +2,9 @@
 
 A change is one pushed branch at one commit. Its author submits it; it is then one row of ``branch_reviews`` in the
 accounts database, beside the tickets and the instance requests, and the row is the record of what was asked, who
-answered and what was done. Nothing here runs Git: ``branch_gate.py`` is the operator's tool that lands an accepted
-change and removes branches, and it does only what these rows allow.
+answered and what was done. Nothing here changes Git: ``branch_gate.py`` is the operator's tool that lands an accepted
+change and removes branches, and it does only what these rows allow. The one Git read here is ``diff``: the change a
+review names, for any reviewer (GET /api/reviews/diff), through ``branch_gate.git``.
 
     submit(db, user_id=, username=, repository=, branch=, base=, head=, timeout_s=, delete_branch=, known=[...])
     remark(db, review_id, user_id=, username=, verdict="agree" | "object", note="")     a peer; never the author
@@ -205,6 +206,37 @@ def listing(db, now=None, *, limit: int = 100) -> list:
             record["id"] in read or now - record["revoked_at"] >= REVOKED_SHOWN_S)
         out.append(record)
     return out
+
+
+def diff(db, policy, review_id, *, path=None, stat=False) -> dict:
+    """The change a review names, read-only: ``git diff <base>...<head>`` (from their merge base to the reviewed commit)
+    in the repository the policy declares, through ``branch_gate.git``. ``base`` is the remote's copy of the review's
+    base branch when the core repository has it (the ref central_checkout makes branches from), else the local branch.
+    The answer names the head, so a remark or a decision names exactly what was read. ``path`` limits it to one file
+    or folder; ``stat`` gives the summary instead of the text. Capped at central_checkout.MAX_DIFF_BYTES, and says so."""
+    from meowdoku import branch_gate, central_checkout
+    record = get(db, review_id)
+    declared = policy["repositories"].get(record["repository"])
+    if declared is None:
+        raise ReviewError("that review's repository is not in the branch policy", 404)
+    repo, remote = declared["path"], policy.get("remote", "origin")
+    base = f"refs/remotes/{remote}/{record['base']}"
+    if not branch_gate.git(repo, "rev-parse", "-q", "--verify", base, check=False):
+        base = f"refs/heads/{record['base']}"
+    arguments = ["diff", "--no-color", "--no-ext-diff", *(["--stat"] if stat else []), f"{base}...{record['head']}"]
+    if path:
+        cleaned = path.replace("\\", "/") if isinstance(path, str) and len(path) <= 400 else None
+        if cleaned is None or cleaned.startswith("/") or ":" in cleaned or ".." in cleaned.split("/"):
+            raise ReviewError("path must be a relative path inside the repository, without '..' or a drive")
+        arguments += ["--", cleaned]
+    try:
+        text = branch_gate.git(repo, *arguments)
+    except branch_gate.GateError as error:
+        raise ReviewError(str(error), 409) from None
+    cap = central_checkout.MAX_DIFF_BYTES
+    return {"id": record["id"], "repository": record["repository"], "branch": record["branch"], "base": base,
+            "head": record["head"], "standing": record["standing"], "path": path or None, "stat": bool(stat),
+            "diff": text[:cap], "truncated": len(text) > cap}
 
 
 def mark_read(db, review_id, *, user_id, username, now=None) -> dict:
@@ -705,6 +737,7 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         POST /api/reviews/revoke          {id, reason}              an operator or admin takes back an approval
         GET  /api/reviews/threads?tail=N  the changes with a thread or a revoked approval, each with its last N messages
         GET  /api/reviews/attention       the threads waiting for this account's answer (what the MCP shows first)
+        GET  /api/reviews/diff?id=ID&path=P&stat=1   the change a review names, base...head, for any reviewer (``diff``)
     A change's thread is written through the comments engine (POST /api/comments, kind "review"); the reviewers' room is
     the chat server's room "reviewers" (/api/chat/rooms/reviewers).
 
@@ -759,6 +792,10 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             return self._json({"threads": threads(db, tail), "tail": tail})
         if method == "GET" and path == "/api/reviews/attention":
             return self._json({"attention": attention(db, username=principal.username)})
+        if method == "GET" and path == "/api/reviews/diff":
+            query = parse_qs(self.path.partition("?")[2])
+            return self._json(diff(db, policy, (query.get("id") or [""])[0], path=(query.get("path") or [None])[0],
+                                   stat=(query.get("stat") or [""])[0].lower() in ("1", "true", "yes")))
         if method == "GET" and path == "/api/reviews":
             every = (parse_qs(self.path.partition("?")[2]).get("all") or [""])[0].lower() in ("1", "true", "yes")
             records = listing(db)
