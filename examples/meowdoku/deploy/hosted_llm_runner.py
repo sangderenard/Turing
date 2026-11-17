@@ -135,7 +135,7 @@ class LocalModel:
         args = [str(self.executable), "-m", str(self.model), "--host", "127.0.0.1",
                 "--port", str(self.port), "-ngl", "99", "-c", str(4096 * self.parallel),
                 "-np", str(self.parallel), "-cb"]
-        if self.adapter.is_file():
+        if self.adapter is not None and self.adapter.is_file():     # [BASELINE] only with --use-adapter (off by default)
             args += ["--lora", str(self.adapter)]
         self.process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT,
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -383,6 +383,8 @@ def settle_rewards(rest, db, username):
 
 
 def train_due(args, db, model):
+    if not args.train:                                   # [BASELINE] no training unless --train (off by default)
+        return
     if time.time() - float(current(db, "train_at", "0")) < TRAIN_SECONDS:
         return
     found = db.execute("SELECT 1 FROM attempts WHERE reward=1 AND trained_at IS NULL LIMIT 1").fetchone()
@@ -408,7 +410,7 @@ def run(args):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, isolation_level=None)
     db.executescript(SCHEMA)
-    model = LocalModel(Path(args.llama_server), Path(args.model), Path(args.adapter),
+    model = LocalModel(Path(args.llama_server), Path(args.model), Path(args.adapter) if args.use_adapter else None,
                        args.port, Path(args.state_dir) / "logs", args.batch_slots)
     try:
         model.start()
@@ -457,6 +459,10 @@ def main():
     parser.add_argument("--adapter-root", required=True)
     parser.add_argument("--batch-slots", type=int, choices=range(1, 9), default=2)
     parser.add_argument("--batch-limit", type=int, choices=range(1, 33), default=16)
+    # [BASELINE] Owner, 2026-11-17: "llama's lora is set to off by default, no training, no use, so llama is baseline llama
+    # now". Both are off unless asked for; adapters already on disk are kept and simply not loaded.
+    parser.add_argument("--use-adapter", action="store_true", help="load the LoRA adapter (--adapter) into llama-server; off by default")
+    parser.add_argument("--train", action="store_true", help="train new LoRA adapters from rewarded attempts; off by default")
     run(parser.parse_args())
 
 
