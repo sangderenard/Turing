@@ -13,6 +13,10 @@ NOT GATED: unlike deploy/*.ps1 (operator gate, authz.py script-auth; see LAUNCH_
 launched by httpd under Apache's identity, not by a user, so it carries no -User/-PasswordFile check.
 Only one supervisor manages instances (an OS lock on ``<state>/supervisor.lock``); a second one (httpd on Windows can open the pipe
 from more than one process) stays a log sink.  A port that already has a listener is not launched over (state ``external``).
+[DEV] An instance may run another tree's code: ``"code_root"`` (its working directory) and ``"speaktome_root"`` (its SPEAKTOME_REPO),
+so the dev server can follow what landed while stable stays on its own checkout.
+[LOAN] With a ``"loans"`` block in instances.json, every ready branch loan (branch_servers.py) is one more instance,
+``loan-<port>``: started when its loan becomes ready, stopped when the loan ends or goes idle (checked every 10 s).
 
   python apache_supervisor.py --status                 # service_instances as JSON
   python apache_supervisor.py --once --dry-run         # print what would be done, change nothing
@@ -55,6 +59,7 @@ STOP_WAIT = 20.0
 MAX_RESTARTS, RESTART_WINDOW = 5, 600.0
 START_TIMEOUT = {"meowdoku": 300.0, "nodus": 60.0}
 EXIT_RESTART = lifecycle_mod.EXIT_RESTART
+LOAN_CHECK_S = 10.0                                 # [LOAN] how often the branch loans are compared with the running loan instances
 
 DDL = """
 CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT,
@@ -238,6 +243,12 @@ class Instance:
         self.console_port = None  # the port the host reported on its first JSON line
         self.contract_prefix = None   # first entry of that line's contract_ports: its prefix and listen_port
         self.contract_port = None
+        # [DEV] per-instance "code_root" (a turing tree, absolute or relative to this repo root): the child's working directory, so
+        # its relative argv (examples/meowdoku/server.py, task_worker.py ...) runs THAT tree's code; "speaktome_root" becomes the
+        # child's SPEAKTOME_REPO.  Neither set = this supervisor's own tree, exactly as before.  Relative paths in "args" resolve
+        # against the code root too, so a dev tree's instance gives its TLS pair and other untracked files as absolute paths.
+        self.code_root = _abs(spec["code_root"]) if spec.get("code_root") else ROOT
+        self.speaktome_root = _abs(spec["speaktome_root"]) if spec.get("speaktome_root") else None
         # [ROUTE] per-instance "state_dir" (a path, absolute or relative to the repo root): that child's --state-dir and nothing else
         self.paths = StatePaths(_abs(spec["state_dir"])) if spec.get("state_dir") else sup.paths
         self.federation_args = []     # [FEDERATE] --federation-port/--federation-canvas, set by begin() from spec["federation_from"]
@@ -305,6 +316,8 @@ class Instance:
             env["NODUS_HEADLESS_TEST_DLL"] = n["dll"]
         if n.get("path_prepend"):
             env["PATH"] = os.pathsep.join([str(Path(p)) for p in n["path_prepend"]] + [env.get("PATH", "")])
+        if self.speaktome_root is not None:             # [DEV] the SpeakToMe tree this child imports (rest_api.py reads it)
+            env["SPEAKTOME_REPO"] = str(self.speaktome_root)
         # Optional "env" of the instance: variables its child is started with (e.g. the Nodus exec rows' declarations).
         for key, value in (self.spec.get("env") or {}).items():
             env[str(key)] = str(value)
@@ -324,6 +337,12 @@ class Instance:
             return "disabled (enabled: false)"
         if self.kind not in ("meowdoku", "nodus", "command"):
             return f"unknown kind {self.kind!r}"
+        if not self.code_root.is_dir():                   # [DEV] a missing tree is reported, never replaced by this one
+            return f"code_root not found: {self.code_root}"
+        if self.kind == "meowdoku" and not (self.code_root / "examples" / "meowdoku" / "server.py").is_file():
+            return f"code_root has no examples/meowdoku/server.py: {self.code_root}"
+        if self.speaktome_root is not None and not (self.speaktome_root / "speaktome_api" / "__init__.py").is_file():
+            return f"speaktome_root has no speaktome_api package: {self.speaktome_root}"
         if self.kind == "nodus":
             n = self.spec.get("nodus") or {}
             if not n.get("canvas") or (not n.get("create_canvas", False) and not _abs(n["canvas"]).exists()):
@@ -380,7 +399,7 @@ class Instance:
         out = open(self.logfile, "ab")
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
-            self.proc = subprocess.Popen(self.command(), cwd=str(ROOT), env=self.env(), stdin=subprocess.DEVNULL, stdout=out,
+            self.proc = subprocess.Popen(self.command(), cwd=str(self.code_root), env=self.env(), stdin=subprocess.DEVNULL, stdout=out,
                                          stderr=subprocess.STDOUT, creationflags=flags)
         finally:
             out.close()
@@ -717,7 +736,9 @@ class Supervisor:
                         "route": inst.route, "console_port": (spec.get("nodus") or {}).get("console_port", spec.get("console_port")),
                         "leases": spec.get("leases", []), "federation_from": spec.get("federation_from"),
                         "command": inst.command() if not reason else None, "skipped": reason,
-                        "state_dir": str(inst.paths.root) if spec.get("state_dir") else None})
+                        "state_dir": str(inst.paths.root) if spec.get("state_dir") else None,
+                        "code_root": str(inst.code_root) if spec.get("code_root") else None,
+                        "speaktome_root": str(inst.speaktome_root) if inst.speaktome_root is not None else None})
         return out
 
     def run(self, manage=True):
@@ -746,7 +767,14 @@ class Supervisor:
                 except Exception as error:
                     inst.state = "failed"
                     self.log(f"{inst.name}: start failed: {error!r}")
+            loans_due = 0.0
             while not self.stop.wait(1.0):
+                if time.monotonic() >= loans_due:           # [LOAN] before the requests, so a loan's restart finds its instance
+                    loans_due = time.monotonic() + LOAN_CHECK_S
+                    try:
+                        self.reconcile_loans()
+                    except Exception as error:
+                        self.log(f"loan reconcile error: {error!r}")
                 try:
                     self.handle_requests()
                 except Exception as error:
@@ -761,6 +789,41 @@ class Supervisor:
             self.log("another supervisor owns the instances; this process only logs")
             self.stop.wait()
         return 0
+
+    def reconcile_loans(self):
+        """[LOAN] Start the ready loans that have no instance yet; stop and drop the loan instances whose loan ended or went
+        idle. Only instances this method made (site "loan") are ever stopped here."""
+        from meowdoku import branch_servers
+        cfg = branch_servers.config(self.instances_path)
+        if cfg is None:
+            return
+        db = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+        try:
+            from meowdoku import central_checkout
+            central_checkout.ensure(db)
+            wanted = {spec["name"]: spec for spec in branch_servers.specs(db, cfg)}
+        finally:
+            db.close()
+        current = {inst.name: inst for inst in self.instances if inst.spec.get("site") == "loan"}
+        for name, inst in current.items():
+            if name not in wanted:
+                try:
+                    said = inst.force_stop()
+                except Exception as error:
+                    said = f"stop failed: {error!r}"
+                self.instances.remove(inst)
+                self.log(f"{name}: its loan ended or went idle: {said}")
+        for name, spec in wanted.items():
+            if name in current:
+                continue
+            inst = Instance(spec, self)
+            self.instances.append(inst)
+            try:
+                inst.begin()
+                self.log(f"{name}: lent for {spec['loan']['repository']} {spec['loan']['branch']} on port {spec['port']}")
+            except Exception as error:
+                inst.state = "failed"
+                self.log(f"{name}: start failed: {error!r}")
 
     def handle_requests(self):
         """[CONTROL] Perform the pending rows of ``instance_requests``. ``*`` means every instance: sources of a

@@ -10,6 +10,12 @@ prefix as a host and waits to be asked. What it can be asked:
   manual.hardcopy   check the published hard copy of the manual against the manual; rebuild it when they differ
   system.broadcast  tell an audience one system event, as messages from the system account (when --accounts-db and
                     --system-account are given); asked for once per event, never on the schedule
+  dev.follow        move the dev instance's own trees (instances.json code_root/speaktome_root) to what landed, export
+                    its pages and ask for its restart (with --instances and --follow-instance); never a stable tree
+  loans.refresh     export each branch loan's pages, restart it after a new commit, end closed loans, idle unused ones
+                    (with --instances; only when instances.json has a "loans" block)
+  stable.candidate  record what the dev server runs as a candidate for stable, for an admin to sign off
+  stable.follow     move stable's own trees to the newest signed-off commit; its restart counts down (with --stable-instance)
   state.backup      one snapshot of the state root (when --backup-dir is given): with --backup-text-only the
                     databases and the text files, no binary files; --backup-keep 1 means no rolling window
 
@@ -55,6 +61,11 @@ def main(argv=None) -> int:
     parser.add_argument("--hosted-agents", default="", help="comma-separated hosted agent account names for cron room dispatch")
     parser.add_argument("--branch-policy", default=None,
                         help="the branch policy file; with --accounts-db, reviews.land and branches.clean are offered")
+    parser.add_argument("--instances", default=None, help="instances.json; with --follow-instance and --branch-policy, dev.follow is offered")
+    parser.add_argument("--follow-instance", default=None,
+                        help="the dev instance whose declared code_root/speaktome_root follow what landed (dev.follow)")
+    parser.add_argument("--stable-instance", default=None,
+                        help="the stable instance; with --instances and --follow-instance, stable.candidate and stable.follow are offered")
     parser.add_argument("--federation-port", default=None, help=argparse.SUPPRESS)      # the supervisor passes these to any
     parser.add_argument("--federation-canvas", default=None, help=argparse.SUPPRESS)    # instance that names a Nodus host
     args = parser.parse_args(argv)
@@ -77,6 +88,16 @@ def main(argv=None) -> int:
     if args.branch_policy and args.accounts_db:
         from meowdoku import branch_gate
         needs["branches"] = {"policy": args.branch_policy, "accounts_db": args.accounts_db, "module": branch_gate}
+        if args.instances and args.follow_instance:
+            from meowdoku import dev_follow
+            needs["dev"] = {"instances": args.instances, "instance": args.follow_instance, "module": dev_follow}
+        if args.instances and args.follow_instance and args.stable_instance:   # [STABLE] the nightly signed-off copy
+            from meowdoku import stable_release
+            needs["stable"] = {"instances": args.instances, "instance": args.stable_instance, "dev": args.follow_instance,
+                               "module": stable_release}
+        if args.instances:                               # [LOAN] the branch servers, when instances.json has a loans block
+            from meowdoku import branch_servers
+            needs["loans"] = {"instances": args.instances, "module": branch_servers}
 
     native, tools = studio_product_nodus.nodus_modules()[0], studio_product_nodus.DEFAULT_NODUS_TOOLS
     if args.accounts_db and args.system_account:

@@ -17,6 +17,9 @@ The account then works through declared operations only, each a name and typed a
     commit  {repository, branch, message}   commit everything, as the author identity this account declared
     close   {repository, branch}            remove the working folder (it must be committed); the branch stays
 
+[LOAN] Opening a turing or speaktome checkout also lends its owner a server for the branch (branch_servers.py); the answer
+says which (``server``), or why there is none. Closing the checkout ends the loan.
+
 Submitting is the existing review (POST /api/reviews {repository, branch, head}): the branch is in the core
 repository, where the lander looks for it, so landing is unchanged. The cleaner removes a landed branch's worktree.
 
@@ -31,7 +34,7 @@ import stat
 import time
 from pathlib import Path
 
-from meowdoku import branch_gate, branch_review
+from meowdoku import branch_gate, branch_review, branch_servers
 
 MAX_FILE_BYTES = 2_000_000
 MAX_LISTING = 2000
@@ -520,6 +523,7 @@ def run(db, policy, root, *, user_id, username, operation, body) -> dict:
     try:
         if operation == "open":
             result = open_checkout(db, policy, root, user_id=user_id, username=username, repository=repository, branch=branch)
+            result["server"] = branch_servers.lend(db, repository=repository, branch=branch, user_id=user_id)   # [LOAN]
         else:
             row = _mine(db, user_id=user_id, repository=repository, branch=branch)
             if operation == "files":
@@ -540,6 +544,9 @@ def run(db, policy, root, *, user_id, username, operation, body) -> dict:
                 result = commit(db, row, user_id=user_id, message=body.get("message"))
             else:
                 result = close(db, policy, row)
+                ended = branch_servers.release(db, row["repository"], row["branch"])                       # [LOAN]
+                if ended is not None:
+                    result["server"] = {"ended": branch_servers.name(ended)}
     except CheckoutError as error:
         _record(db, who, repository, branch, operation, path, error=error.message)
         raise

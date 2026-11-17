@@ -2426,7 +2426,9 @@ def make_handler(sessions: Sessions):
             if principal.user_id is None:
                 return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
             caps = self._caps()
-            if "account_manage" not in caps and "lifecycle_admin" not in caps:
+            manager = "account_manage" in caps or "lifecycle_admin" in caps
+            # [LOAN] below those, a dev_ui account may only POST a restart or start of its own branch server (checked below)
+            if not manager and not ("dev_ui" in caps and method == "POST" and not cancel):
                 return self._json({"error": "this needs account_manage or lifecycle_admin"}, HTTPStatus.FORBIDDEN)
             body = None
             if method == "POST":
@@ -2438,6 +2440,11 @@ def make_handler(sessions: Sessions):
             db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
             try:
                 known = profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)
+                from meowdoku import branch_servers
+                lent = [loan["instance"] for loan in branch_servers.loans(db)]
+                if method == "POST" and not manager and not branch_servers.may_restart(
+                        db, body.get("instance"), principal.user_id, body.get("action")):
+                    return self._json({"error": "you may restart or start only your own branch server"}, HTTPStatus.FORBIDDEN)
                 if method == "GET":
                     from meowdoku import service_jobs
                     return self._json({"instances": known, "requests": instance_control.recent(db),
@@ -2449,7 +2456,7 @@ def make_handler(sessions: Sessions):
                 made = instance_control.request(db, instance=body.get("instance"), action=body.get("action"),
                                                 user_id=principal.user_id, username=principal.username,
                                                 reason=body.get("reason"), delay_s=body.get("delay", 0),
-                                                known=[i["name"] for i in known], after_jobs=body.get("after_jobs", True))
+                                                known=[i["name"] for i in known] + lent, after_jobs=body.get("after_jobs", True))
                 print(f"[control] {principal.username} asked: {made['action']} {made['instance']} (request {made['id']})", flush=True)
                 return self._json({"request": made}, HTTPStatus.ACCEPTED)
             except instance_control.ControlError as error:
@@ -3361,6 +3368,29 @@ def make_handler(sessions: Sessions):
                 return self._picture_route(path, "GET")
             if path == "/api/control/instances":
                 return self._instance_control("GET")
+            if path == "/api/stable":                    # [STABLE] the candidates for stable and their sign-offs
+                if not self._require("dev_ui"):
+                    return
+                import sqlite3
+                from meowdoku import stable_release
+                db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
+                try:
+                    return self._json({"candidates": stable_release.listing(db)})
+                finally:
+                    db.close()
+            if path == "/api/loans":                     # [LOAN] the open branch servers, for the dev site's server menu
+                if not self._require("dev_ui"):
+                    return
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                import sqlite3
+                from meowdoku import branch_servers, central_checkout
+                db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
+                try:
+                    central_checkout.ensure(db)
+                    return self._json({"loans": branch_servers.public(db), "ports": [branch_servers.PORT_FIRST, branch_servers.PORT_LAST]})
+                finally:
+                    db.close()
             if path == "/site" or path.startswith("/site/"):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
@@ -4078,6 +4108,31 @@ def make_handler(sessions: Sessions):
                 return self._fortune_route(path0, "POST")
             if path0 == "/api/condition":                         # [CONDITION]
                 return self._condition_route(path0, "POST")
+            if path0 == "/api/stable/signoff":           # [STABLE] an admin signs one stable candidate off (stable_release.py)
+                self._classify()
+                self.close_connection = True
+                if not self._is_secure():
+                    return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+                if not self._require("account_manage"):
+                    return
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                body = self._body_json(1024)
+                if body is None:
+                    return
+                import sqlite3
+                from meowdoku import stable_release
+                principal = self._principal()
+                db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
+                try:
+                    made = stable_release.sign_off(db, body.get("id"), user_id=principal.user_id, username=principal.username)
+                except stable_release.StableError as error:
+                    return self._json({"error": error.message}, error.status)
+                finally:
+                    db.close()
+                print(f"[stable] {principal.username} signed off candidate {made['id']}: {made['repository']} {made['commit'][:12]}",
+                      flush=True)
+                return self._json({"candidate": made})
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")
             if path0 == "/api/control/instances/cancel":
