@@ -149,3 +149,24 @@ def test_profile_tick_submits_two_individuals_to_one_model_concurrently():
     assert runner.run_profile_batch(rest, BatchModel(), 2) == 2
     assert {item["response"] for item in rest.completed} == {"north result", "south result"}
     assert {item["claim_token"] for item in rest.completed} == {"one", "two"}
+
+
+def test_profile_context_keeps_contract_and_job_while_excerpting_memory():
+    work = {"preamble": "character contract", "prompt": "current task",
+            "memory": "old facts " * 30 + "LATEST MEMORY"}
+    messages = runner.profile_messages(work, len, input_budget=220)
+    assert messages[0]["content"] == "character contract"
+    assert messages[1]["content"].endswith("Current job:\ncurrent task")
+    assert "LATEST MEMORY" in messages[1]["content"]
+    assert "old facts " * 30 not in messages[1]["content"]
+    assert sum(map(lambda message: len(message["content"]), messages)) <= 220
+
+
+def test_profile_context_rejects_contract_that_cannot_fit():
+    work = {"preamble": "x" * 200, "prompt": "job", "memory": "memory"}
+    try:
+        runner.profile_messages(work, len, input_budget=160)
+    except RuntimeError as error:
+        assert "contract and job" in str(error)
+    else:
+        raise AssertionError("oversized character contract was silently truncated")

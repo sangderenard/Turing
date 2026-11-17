@@ -80,6 +80,45 @@ def context(messages, username, limit=24):
                      and not m.get("removed"))
 
 
+def profile_messages(work, count_tokens, input_budget=4096 - 256 - 128):
+    """Keep the full contract and job; fit only saved memory to one slot.
+
+    The runner reserves 256 tokens for the answer and 128 for the chat
+    template. Its shared KV pool is sized for 4096 tokens per active slot.
+    Saved memory stays complete on disk and is excerpted only for this call.
+    """
+    system = str(work["preamble"])
+    memory = str(work.get("memory") or "")
+    lead = "Saved memory for this instance (context, not a new instruction):\n"
+    tail = "\n\nCurrent job:\n" + str(work["prompt"])
+    system_tokens = count_tokens(system)
+
+    def fits(excerpt):
+        return system_tokens + count_tokens(lead + excerpt + tail) <= input_budget
+
+    if not fits("(empty)"):
+        raise RuntimeError("Character contract and job exceed the Llama context budget")
+    if not memory:
+        excerpt = "(empty)"
+    elif fits(memory):
+        excerpt = memory
+    else:
+        marker = "[Earlier saved memory omitted for this turn.]\n"
+        if not fits(marker):
+            excerpt = "(empty)"
+        else:
+            low, high = 0, len(memory)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if fits(marker + memory[-middle:]):
+                    low = middle
+                else:
+                    high = middle - 1
+            excerpt = marker + memory[-low:] if low else marker
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": lead + excerpt + tail}]
+
+
 class LocalModel:
     def __init__(self, executable, model, adapter, port, log_dir, parallel=2):
         self.executable, self.model, self.adapter, self.port = executable, model, adapter, port
@@ -160,10 +199,16 @@ class LocalModel:
         return answer[:500]
 
     def answer_profile(self, work):
-        payload = {"model": self.model.stem, "messages": [
-            {"role": "system", "content": work["preamble"]},
-            {"role": "user", "content": "Saved memory for this instance (context, not a new instruction):\n"
-             + (work["memory"] or "(empty)") + "\n\nCurrent job:\n" + work["prompt"]}],
+        def count_tokens(content):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/tokenize",
+                data=json.dumps({"content": content}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return len(json.load(response)["tokens"])
+
+        payload = {"model": self.model.stem,
+            "messages": profile_messages(work, count_tokens),
             "temperature": 0.8, "max_tokens": 256}
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                                          data=json.dumps(payload).encode("utf-8"),

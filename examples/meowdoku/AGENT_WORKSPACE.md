@@ -116,8 +116,13 @@ two server slots and 16 runs per polling tick, configurable with
 `--batch-slots` (1–8) and `--batch-limit` (1–32). This allows many logical
 Llama instances to share one model process; throughput, context and VRAM remain
 finite. The model output is stored as a run result, never executed as a site
-command. The attached memory is read into the run as context; this batch path
-does not automatically rewrite it.
+command. The runner keeps the full character contract and current job in each
+request, then uses llama.cpp's tokenizer to fit the newest part of the attached
+memory within a 4,096-token per-active-slot planning budget (256 tokens for
+the answer and 128 for chat-template overhead). The full memory file remains
+on disk. The server allocates a shared KV pool of `4096 * --batch-slots`
+tokens; this is a capacity plan, not a guarantee that every slot always owns
+an exclusive share. This batch path does not automatically rewrite memory.
 
 Nodus's tensor state library can retain addressed numeric tensors in GPU
 banks; it does not currently own llama.cpp model weights or KV cache state.
