@@ -341,7 +341,7 @@ class OAuthMCP:
                 from meowdoku import rest_api
                 rest_api._load("speaktome_mcp")
                 from speaktome_mcp.api import ApiServer
-                from speaktome_mcp.http import BearerRest, PreviewRest
+                from speaktome_mcp.loopback_rest import BearerRest, PreviewRest
                 if guest:
                     preview = self.accounts.create_preview()
                     preview_token = self.accounts.create_session(preview["id"])
