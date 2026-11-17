@@ -125,10 +125,15 @@ def test_profile_tick_submits_two_individuals_to_one_model_concurrently():
     class BatchRest:
         def __init__(self):
             self.completed = []
+            self.claimed = False
 
         def call(self, path, body=None, *, headers=None):
             assert headers == {"X-Meowdoku-Workspace": "1"}
             if path.endswith("/claim"):
+                assert body["limit"] == 2
+                if self.claimed:
+                    return {"runs": []}
+                self.claimed = True
                 return {"runs": [{"id": "a", "claim_token": "one", "preamble": "north", "memory": "",
                                   "prompt": "draw north"},
                                  {"id": "b", "claim_token": "two", "preamble": "south", "memory": "",
@@ -149,6 +154,40 @@ def test_profile_tick_submits_two_individuals_to_one_model_concurrently():
     assert runner.run_profile_batch(rest, BatchModel(), 2) == 2
     assert {item["response"] for item in rest.completed} == {"north result", "south result"}
     assert {item["claim_token"] for item in rest.completed} == {"one", "two"}
+
+
+def test_profile_subbatches_isolate_generation_and_completion_errors(capsys):
+    class BatchRest:
+        def __init__(self):
+            self.todo = [{"id": str(i), "claim_token": str(i), "preamble": str(i)} for i in range(5)]
+            self.claim_limits = []
+            self.completed = []
+
+        def call(self, path, body=None, *, headers=None):
+            assert headers == {"X-Meowdoku-Workspace": "1"}
+            if path.endswith("/claim"):
+                self.claim_limits.append(body["limit"])
+                chunk, self.todo = self.todo[:body["limit"]], self.todo[body["limit"]:]
+                return {"runs": chunk}
+            assert path.endswith("/complete")
+            if body["id"] == "2":
+                raise runner.RestError("temporary completion failure", 503)
+            self.completed.append(body)
+            return {"status": "done"}
+
+    class BatchModel:
+        def answer_profile(self, work):
+            if work["id"] == "1":
+                raise RuntimeError("model rejected this run")
+            return work["id"] + " result"
+
+    rest = BatchRest()
+    assert runner.run_profile_batch(rest, BatchModel(), parallel=2, limit=5) == 5
+    assert rest.claim_limits == [2, 2, 1]
+    assert {row["id"] for row in rest.completed} == {"0", "1", "3", "4"}
+    assert next(row for row in rest.completed if row["id"] == "1")["error"].endswith(
+        "model rejected this run")
+    assert "completion for 2 failed" in capsys.readouterr().err
 
 
 def test_profile_context_keeps_contract_and_job_while_excerpting_memory():

@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from speaktome_mcp.rest import Rest, RestError
 
@@ -224,26 +224,43 @@ class LocalModel:
 
 
 def run_profile_batch(rest, model, parallel, limit=16):
-    try:
-        runs = rest.call("/api/agent-runs/claim", {"limit": limit},
-                         headers={"X-Meowdoku-Workspace": "1"})["runs"]
-    except RestError as error:
-        if error.status == 404:  # older site during a staged upgrade
-            return 0
-        raise
-    if not runs:
-        return 0
+    # Claim only what can start now. A full claim can outlive its 15-minute
+    # lease while later work waits behind earlier model requests.
+    parallel = max(1, int(parallel))
+    remaining = int(limit)
+    handled = 0
+    headers = {"X-Meowdoku-Workspace": "1"}
     with ThreadPoolExecutor(max_workers=parallel) as pool:
-        pending = [(work, pool.submit(model.answer_profile, work)) for work in runs]
-        for work, future in pending:
+        while remaining > 0:
             try:
-                answer = future.result()
-                outcome = {"response": answer, "error": ""}
-            except (OSError, ValueError, KeyError, RuntimeError) as error:
-                outcome = {"response": "", "error": f"{type(error).__name__}: {error}"[:1000]}
-            rest.call("/api/agent-runs/complete", {"id": work["id"], "claim_token": work["claim_token"],
-                                                   **outcome}, headers={"X-Meowdoku-Workspace": "1"})
-    return len(runs)
+                runs = rest.call("/api/agent-runs/claim",
+                                 {"limit": min(parallel, remaining)},
+                                 headers=headers)["runs"]
+            except RestError as error:
+                if error.status == 404:  # older site during a staged upgrade
+                    break
+                raise
+            if not runs:
+                break
+            pending = {pool.submit(model.answer_profile, work): work for work in runs}
+            for future in as_completed(pending):
+                work = pending[future]
+                try:
+                    outcome = {"response": future.result(), "error": ""}
+                except Exception as error:
+                    outcome = {"response": "", "error": f"{type(error).__name__}: {error}"[:1000]}
+                try:
+                    rest.call("/api/agent-runs/complete",
+                              {"id": work["id"], "claim_token": work["claim_token"], **outcome},
+                              headers=headers)
+                except Exception as error:
+                    # This claim will be retried by the server after its lease;
+                    # keep completing the other results in this subbatch.
+                    print(f"[hosted-llm] completion for {work.get('id', '?')} failed: "
+                          f"{type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            handled += len(runs)
+            remaining -= len(runs)
+    return handled
 
 
 def mode(rest, username, scope, place):

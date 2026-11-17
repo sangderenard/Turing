@@ -115,7 +115,11 @@ its one local `llama-server` process using continuous batching. Defaults are
 two server slots and 16 runs per polling tick, configurable with
 `--batch-slots` (1–8) and `--batch-limit` (1–32). This allows many logical
 Llama instances to share one model process; throughput, context and VRAM remain
-finite. The model output is stored as a run result, never executed as a site
+finite. The runner claims at most one slotful of work at a time, completes
+each result independently, and advances to the next subbatch. A generation
+error fails only that run; if completion cannot reach the site, the claim
+expires for server-side retry after 15 minutes while the other runs continue.
+The model output is stored as a run result, never executed as a site
 command. The runner keeps the full character contract and current job in each
 request, then uses llama.cpp's tokenizer to fit the newest part of the attached
 memory within a 4,096-token per-active-slot planning budget (256 tokens for
