@@ -753,6 +753,7 @@ async function main() {
     link("People (accounts and groups)", "/people.html", caps.has("account_manage")),
     link("Operator control", "/operator-control.html", caps.has("deploy_scripts")),
     link("Agent workspace", "/agent-workspace.html", caps.has("operator_workspace")),
+    link("Agent training arena", "/agent-training-arena.html", caps.has("operator_workspace")),
     link("Rooms", "/rooms.html"),
     link("Account and password", "/login.html"),
     link("Invite someone", "/invite.html"),                                         // [INVITE] invitations.py: a link and a QR code, once

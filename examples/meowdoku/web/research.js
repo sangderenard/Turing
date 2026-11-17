@@ -155,9 +155,31 @@ function render() {
 async function loadCase() {
   if (!current || loading) return;
   loading = true;
-  try { state = await request(`/api/research/cases/${current}`); render(); await Promise.all([loadChat(),loadThreads()]); }
+  try { state = await request(`/api/research/cases/${current}`); render(); await Promise.all([loadChat(),loadThreads(),loadArena()]); }
   catch (error) { status(error.message); }
   finally { loading = false; }
+}
+async function loadArena() {
+  const box = $("arena-attempts"); box.replaceChildren();
+  const refs = mode === "development" ? [{kind:"research",id:state.case.id}] :
+    state.case.ticket_ids.map(id => ({kind:"ticket",id}));
+  if (!refs.length) { box.append(el("p","No related ticket references.")); return; }
+  let count = 0;
+  for (const ref of refs) {
+    try {
+      const query = new URLSearchParams(ref);
+      const data = await request(`/api/agent-training-arena/by-source?${query}`);
+      for (const run of data.runs) {
+        for (const team of run.result.teams || []) {
+          count++;
+          const item = el("details"), title = el("summary",`${team.name} · ${ref.kind} ${ref.id} · ${Object.values(team.scores).reduce((a,b)=>a+b,0)}/20 · ${when(run.finished)}`);
+          const body = el("pre",`Goal: ${run.specification.goal}\n\nRuntime: ${JSON.stringify(run.specification.runtime)}\n\nPrompt: ${team.system_prompt}\n\nFirst message: ${team.first_message}\n\nResult: ${team.response}\n\nScores: ${JSON.stringify(team.scores)}\nEach piece: ${JSON.stringify(team.pieces || team.reasons)}\nTests: ${JSON.stringify(team.test_evidence)}`);
+          item.append(title,body); box.append(item);
+        }
+      }
+    } catch(error) { box.append(el("p",`Could not read arena attempts for ${ref.id}: ${error.message}`)); }
+  }
+  if (!count) box.append(el("p","No completed arena attempts for these references."));
 }
 async function loadChat() {
   if (!state || state.requires_affirmation) return;

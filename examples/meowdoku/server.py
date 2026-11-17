@@ -104,6 +104,7 @@ from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES]
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
 from meowdoku import agent_runs as agent_runs_mod  # noqa: E402
+from meowdoku import agent_training_arena as agent_training_arena_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
 from meowdoku import paper_arena as paper_arena_mod
@@ -1748,6 +1749,93 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": str(error)}, error.status)
             except (OSError, sqlite3.Error):
                 return self._json({"error": "agent run queue unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _agent_training_arena_route(self, path: str, method: str) -> None:
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            principal = self._principal()
+            if method == "GET" and path == "/api/agent-training-arena/by-source":
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not self._require("view_site"):
+                    return
+                if principal.user_id is None:
+                    return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+                from http.cookies import SimpleCookie
+                from urllib.parse import parse_qs
+                query = parse_qs(self.path.partition("?")[2])
+                if set(query) != {"kind", "id"} or any(len(values) != 1 for values in query.values()):
+                    return self._json({"error": "kind and id required"}, HTTPStatus.BAD_REQUEST)
+                kind, source_id = query["kind"][0], query["id"][0]
+                if kind not in ("ticket", "research"):
+                    return self._json({"error": "invalid source kind"}, HTTPStatus.BAD_REQUEST)
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                try:
+                    if kind == "ticket":
+                        issue_tickets_mod.Service(sessions.accounts).get(token, source_id)
+                    else:
+                        source = ticket_research_mod.Service(sessions.accounts).snapshot(token, source_id)
+                        if source.get("requires_affirmation"):
+                            return self._json({"error": "join the Research case to read its attempts"}, HTTPStatus.FORBIDDEN)
+                except (issue_tickets_mod.IssueError, ticket_research_mod.ResearchError) as error:
+                    return self._json({"error": str(error)}, error.status)
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                try:
+                    return self._json(agent_training_arena_mod.by_source(db, kind, source_id))
+                except agent_training_arena_mod.ArenaError as error:
+                    return self._json({"error": str(error)}, error.status)
+                finally:
+                    db.close()
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("operator_workspace"):
+                return
+            if principal.role not in ("operator", "admin"):
+                return self._json({"error": "operator or admin required"}, HTTPStatus.FORBIDDEN)
+            if method == "POST" and self.headers.get("X-Meowdoku-Arena") != "1":
+                return self._json({"error": "arena write header required"}, HTTPStatus.FORBIDDEN)
+            db = None
+            try:
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                if method == "GET":
+                    if path == "/api/agent-training-arena":
+                        return self._json(agent_training_arena_mod.listing(db, principal.user_id))
+                    if path.startswith("/api/agent-training-arena/"):
+                        return self._json(agent_training_arena_mod.read(db, principal.user_id, path.rsplit("/", 1)[1]))
+                if method == "POST":
+                    body = self._body_json(limit=agent_training_arena_mod.MAX_RESULT + 8192)
+                    if body is None:
+                        return
+                    if path == "/api/agent-training-arena":
+                        agent_training_arena_mod.validate(body)
+                        from http.cookies import SimpleCookie
+                        jar = SimpleCookie(self.headers.get("Cookie", ""))
+                        token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                        source = body["source"]
+                        if source["kind"] == "ticket":
+                            issue_tickets_mod.Service(sessions.accounts).get(token, source["id"])
+                        else:
+                            resolved = ticket_research_mod.Service(sessions.accounts).snapshot(token, source["id"])
+                            if resolved.get("requires_affirmation"):
+                                raise agent_training_arena_mod.ArenaError("join the Research case before using it", 403)
+                        return self._json(agent_training_arena_mod.submit(db, principal.user_id, body))
+                    if path == "/api/agent-training-arena/claim":
+                        return self._json(agent_training_arena_mod.claim(db, principal.user_id))
+                    if path == "/api/agent-training-arena/heartbeat":
+                        return self._json(agent_training_arena_mod.heartbeat(db, principal.user_id, body))
+                    if path == "/api/agent-training-arena/complete":
+                        return self._json(agent_training_arena_mod.complete(db, principal.user_id, body))
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except agent_training_arena_mod.ArenaError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (issue_tickets_mod.IssueError, ticket_research_mod.ResearchError) as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error):
+                return self._json({"error": "arena storage unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -3522,6 +3610,8 @@ def make_handler(sessions: Sessions):
                 return self._memory_route(path, "GET")
             if path == "/api/agent-runs" or path.startswith("/api/agent-runs/"):
                 return self._agent_runs_route(path, "GET")
+            if path == "/api/agent-training-arena" or path.startswith("/api/agent-training-arena/"):
+                return self._agent_training_arena_route(path, "GET")
             if path in ("/api/file-keys/me", "/api/file-keys/peer"):
                 return self._file_keys_route(path, "GET")
             if path.startswith("/api/connections/"):
@@ -4199,6 +4289,8 @@ def make_handler(sessions: Sessions):
                 return self._memory_route(path0, "POST")
             if path0 == "/api/agent-runs" or path0 in ("/api/agent-runs/claim", "/api/agent-runs/complete"):
                 return self._agent_runs_route(path0, "POST")
+            if path0 in ("/api/agent-training-arena", "/api/agent-training-arena/claim", "/api/agent-training-arena/heartbeat", "/api/agent-training-arena/complete"):
+                return self._agent_training_arena_route(path0, "POST")
             if path0 == "/api/file-keys/me":
                 return self._file_keys_route(path0, "POST")
             if path0.startswith("/api/connections/"):

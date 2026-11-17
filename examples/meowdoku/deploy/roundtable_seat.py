@@ -150,10 +150,13 @@ def _program(name: str) -> str:
 class Claude:
     """Claude Code in print mode with stream-json in and out: one process, one session, a user message per turn."""
 
-    def __init__(self, program=None, popen=subprocess.Popen):
-        self.process = popen([program or _program("claude"), "-p", "--input-format", "stream-json",
+    def __init__(self, program=None, popen=subprocess.Popen, system_prompt=None):
+        command = [program or _program("claude"), "-p", "--input-format", "stream-json",
                               "--output-format", "stream-json", "--verbose",
-                              "--allowedTools", "mcp__speaktome", "--disallowedTools", "mcp__speaktome__chat_post"],
+                              "--allowedTools", "mcp__speaktome", "--disallowedTools", "mcp__speaktome__chat_post"]
+        if system_prompt is not None:
+            command += ["--system-prompt", system_prompt]
+        self.process = popen(command,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=WORKSPACE)
         self.lines = Lines(self.process.stdout)
         self.owed = 0                    # results of turns that ran past their time, still to come and be dropped
@@ -188,7 +191,7 @@ class Codex:
                  "item/fileChange/requestApproval": {"decision": "decline"},
                  "execCommandApproval": {"decision": "denied"}, "applyPatchApproval": {"decision": "denied"}}
 
-    def __init__(self, program=None, popen=subprocess.Popen, seconds: float = 180):
+    def __init__(self, program=None, popen=subprocess.Popen, seconds: float = 180, base_instructions=None):
         self.process = popen([program or _program("codex"), "app-server"],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=WORKSPACE)
         self.lines = Lines(self.process.stdout)
@@ -197,7 +200,10 @@ class Codex:
         self.request("initialize", {"clientInfo": {"name": "speaktome_roundtable", "title": "SpeakToMe round table",
                                                    "version": "1"}}, deadline)
         _send(self.process, {"method": "initialized"})
-        started = self.request("thread/start", {"cwd": WORKSPACE, "approvalPolicy": "never", "sandbox": "read-only"}, deadline)
+        params = {"cwd": WORKSPACE, "approvalPolicy": "never", "sandbox": "read-only"}
+        if base_instructions is not None:
+            params["baseInstructions"] = base_instructions
+        started = self.request("thread/start", params, deadline)
         self.thread = started["thread"]["id"]
 
     def request(self, method: str, params: dict, deadline: float) -> dict:
