@@ -17,6 +17,8 @@ memory and records nothing: a value is never passed through raw because the reco
 """
 from __future__ import annotations
 
+import atexit
+import contextlib
 import hashlib
 import hmac
 import os
@@ -28,6 +30,10 @@ import time
 from pathlib import Path
 
 KINDS = ("ip", "email", "ua")
+# [BATCH] 2026-11-18: one connection and one commit per occurrence made every server start re-commit thousands of rows
+# (Ring._load, 60 s on an idle disk, minutes in a restart) and every redacted line commit at run time. A new token is still
+# written at once; repeats are added up in memory and written together at most every FLUSH_SECONDS, in one transaction.
+FLUSH_SECONDS = 5.0
 TOKEN_RE = re.compile(r"\b(?:ip|email|ua)~[0-9a-f]{12}\b")
 _OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
 IPV4_RE = re.compile(rf"(?<![\w.]){_OCTET}(?:\.{_OCTET}){{3}}(?!\.?\w)")
@@ -57,6 +63,8 @@ class Record:
             raise ValueError("the private hash key is too short")
         self.key, self.db_path, self.lock = key, (Path(db_path) if db_path else None), threading.Lock()
         self.cipher = cipher                    # a secure_records.RecordCipher: the stored value is sealed at rest
+        self._pending: dict[str, list] = {}     # [BATCH] token -> [kind, value, first_seen, last_seen, occurrences]
+        self._batch, self._flushed = 0, time.monotonic()
         self._known: set[str] = set()
         if self.db_path is not None:
             with self._connect() as conn:
@@ -82,18 +90,53 @@ class Record:
             return
         now = time.time()
         with self.lock:
-            fresh = token not in self._known
-            self._known.add(token)
+            item = self._pending.get(token)
+            if item is None:
+                self._pending[token] = [kind, value, now, now, 1]
+            else:
+                item[3] = now
+                item[4] += 1
+            if not self._batch and (token not in self._known or time.monotonic() - self._flushed >= FLUSH_SECONDS):
+                self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        """Every pending note in one transaction. On failure the notes stay pending for the next flush; the token is still
+        returned either way, so a record failure never lets a raw value through."""
+        self._flushed = time.monotonic()
+        if not self._pending or self.db_path is None:
+            return
+        rows = [(token, kind, self._seal(value), first, last, count)
+                for token, (kind, value, first, last, count) in self._pending.items()]
+        try:
+            conn = self._connect()
             try:
-                with self._connect() as conn:
-                    if fresh:
-                        conn.execute("INSERT INTO private_record(token, kind, value, first_seen, last_seen) VALUES (?,?,?,?,?) "
-                                     "ON CONFLICT(token) DO UPDATE SET last_seen = excluded.last_seen, seen = seen + 1",
-                                     (token, kind, self._seal(value), now, now))
-                    else:
-                        conn.execute("UPDATE private_record SET last_seen = ?, seen = seen + 1 WHERE token = ?", (now, token))
-            except sqlite3.Error:
-                self._known.discard(token)      # the token is still returned: a record failure never lets a raw value through
+                with conn:
+                    conn.executemany("INSERT INTO private_record(token, kind, value, first_seen, last_seen, seen) "
+                                     "VALUES (?,?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET "
+                                     "last_seen = max(last_seen, excluded.last_seen), seen = seen + excluded.seen", rows)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return
+        self._known.update(self._pending)
+        self._pending.clear()
+
+    def flush(self) -> None:
+        with self.lock:
+            self._flush_locked()
+
+    @contextlib.contextmanager
+    def batch(self):
+        """Every note inside is written in one transaction when the outermost batch ends."""
+        with self.lock:
+            self._batch += 1
+        try:
+            yield self
+        finally:
+            with self.lock:
+                self._batch -= 1
+                if not self._batch:
+                    self._flush_locked()
 
     def _seal(self, value: str) -> str:
         if self.cipher is None:
@@ -127,6 +170,7 @@ class Record:
         wanted = sorted({t for t in tokens if isinstance(t, str) and TOKEN_RE.fullmatch(t)})
         if not wanted or self.db_path is None:
             return {}
+        self.flush()                            # [BATCH] what is pending is read too
         with self._connect() as conn:
             rows = conn.execute(f"SELECT token, kind, value, first_seen, last_seen, seen FROM private_record "
                                 f"WHERE token IN ({','.join('?' * len(wanted))})", wanted).fetchall()
@@ -163,6 +207,18 @@ def configure(key_path: Path, db_path: Path, cipher=None) -> Record:
 
 def token(kind: str, value) -> str:
     return RECORD.token(kind, value)
+
+
+def batch():
+    """[BATCH] ``with private_record.batch():`` writes every note made inside in one transaction."""
+    return RECORD.batch()
+
+
+def flush() -> None:
+    RECORD.flush()
+
+
+atexit.register(lambda: RECORD.flush())          # [BATCH] what is still pending is written at exit
 
 
 def redact(text) -> str:

@@ -81,10 +81,11 @@ class Ring:
         try:
             with self.path.open("rb") as saved:
                 lines = saved.readlines()[-100000:]
-            for line in lines:
-                e = json.loads(self.cipher.open(line))
-                e["text"] = private_record.redact(e["text"])          # a line persisted before [PRIVATE] holds raw addresses
-                self.entries.append(e); self.bytes += self._cost(e["text"]); self.seq = max(self.seq, e["seq"])
+            with private_record.batch():                              # [BATCH] one transaction for the whole reload
+                for line in lines:
+                    e = json.loads(self.cipher.open(line))
+                    e["text"] = private_record.redact(e["text"])      # a line persisted before [PRIVATE] holds raw addresses
+                    self.entries.append(e); self.bytes += self._cost(e["text"]); self.seq = max(self.seq, e["seq"])
             while self.bytes > self.cap and len(self.entries) > 1:
                 self.bytes -= self._cost(self.entries.popleft()["text"])
         except FileNotFoundError:
