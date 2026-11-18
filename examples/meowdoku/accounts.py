@@ -56,6 +56,29 @@ ALPHA_TERMS_VERSION = "alpha-2026-11-15"
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _SCRYPT_DKLEN = 2 ** 14, 8, 1, 32
 
 
+# An account's private state, by user_id: what a preview wipe and an account purge remove. Public posts and audit rows stay.
+PRIVATE_TABLES = (
+    "oauth_mcp_codes", "oauth_mcp_tokens", "guest_post_queue",
+    "guest_test_evidence", "guest_qualification", "guest_actor_kind",
+    "orientation_state", "account_prefs", "account_instances",
+    "account_roles", "account_permission_grants",
+    "account_capability_modifiers", "account_nodus_grants",
+    "account_content_invitations", "account_content_members", "account_git_identity",
+    "msg_contacts", "msg_cursor", "msg_image_consent", "msg_suspended",
+    "relay_addresses", "user_file_keys", "research_affirmations",
+    "research_ballots", "research_eligible", "research_surveys",
+    "radio_requests", "radio_turns", "radio_votes",
+    "owned_assets", "sessions", "preview_recovery", "temporary_accounts",
+)
+
+
+# What a purge removes beyond PRIVATE_TABLES (Accounts.purge_account): more rows keyed by user_id, and messaging rows where
+# the account is either side. A table that does not exist yet is skipped.
+PURGE_USER_TABLES = ("alpha_agreements", "agent_orientation_seen", "agent_decision_at", "llm_registrations")
+PURGE_PAIR_ROWS = (("msg_contacts", ("user_id", "peer_id")), ("msg_image_consent", ("user_id", "peer_id")),
+                   ("msg_handles", ("sender_id", "peer_id")), ("msg_send_keys", ("sender_id", "peer_id")))
+
+
 class AccountError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -294,26 +317,58 @@ class Accounts:
                 raise AccountError("frozen preview not found", 404)
             if row[0] != expected_username:
                 raise AccountError("preview name does not match", 409)
-            private_tables = (
-                "oauth_mcp_codes", "oauth_mcp_tokens", "guest_post_queue",
-                "guest_test_evidence", "guest_qualification", "guest_actor_kind",
-                "orientation_state", "account_prefs", "account_instances",
-                "account_roles", "account_permission_grants",
-                "account_capability_modifiers", "account_nodus_grants",
-                "account_content_invitations", "account_content_members", "account_git_identity",
-                "msg_contacts", "msg_cursor", "msg_image_consent", "msg_suspended",
-                "relay_addresses", "user_file_keys", "research_affirmations",
-                "research_ballots", "research_eligible", "research_surveys",
-                "radio_requests", "radio_turns", "radio_votes",
-                "owned_assets", "sessions", "preview_recovery", "temporary_accounts",
-            )
             try:
                 present = {item[0] for item in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")}
-                for table in private_tables:
+                for table in PRIVATE_TABLES:
                     if table in present:
                         self._conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
                 self._conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def purge_account(self, user_id: int, expected_username: str) -> None:
+        """Remove a permanent account's private state and seal it; its public posts and audit rows stay.
+
+        What goes (the retention rule, case 4f21753ebb544fa6ab664411afd47b38):
+        - every row keyed by the account's user_id in PRIVATE_TABLES and PURGE_USER_TABLES;
+        - every private message it sent or received, with their images, and every messaging row where it is either
+          side (PURGE_PAIR_ROWS: contacts, image consent, send handles and keys), so no one's thread or contact list
+          still holds it. msg_audit stays: it is the moderation record.
+        What stays: its public posts (tickets, pages) and audit rows, under the users row kept as a sealed tombstone,
+        so they still name a valid owner. The tombstone is renamed ``purged:<id>``, which no signup can take (USERNAME
+        has no colon), shown as "(purged account)", with a password hash nothing can match. The old name is free again.
+        Only an ordinary account: one with any role row or group grant, or a temporary preview (wipe_preview), is refused.
+        """
+        with self.lock:
+            row = self._conn.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
+            if row is None:
+                raise AccountError("account not found", 404)
+            if row[0] != expected_username:
+                raise AccountError("account name does not match", 409)
+            if self._conn.execute("SELECT 1 FROM temporary_accounts WHERE user_id=?", (user_id,)).fetchone():
+                raise AccountError("a temporary preview is wiped, not purged", 409)
+            present = {item[0] for item in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("account_roles", "account_permission_grants"):
+                if table in present and self._conn.execute(f"SELECT 1 FROM {table} WHERE user_id=?", (user_id,)).fetchone():
+                    raise AccountError("an account with a role or a group grant is not purged here", 409)
+            try:
+                for table in PRIVATE_TABLES + PURGE_USER_TABLES:
+                    if table in present:
+                        self._conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+                if "msg_messages" in present:
+                    if "msg_images" in present:
+                        self._conn.execute("DELETE FROM msg_images WHERE sender_id=? OR message_id IN (SELECT id FROM msg_messages "
+                                           "WHERE sender_id=? OR recipient_id=?)", (user_id, user_id, user_id))
+                    self._conn.execute("DELETE FROM msg_messages WHERE sender_id=? OR recipient_id=?", (user_id, user_id))
+                for table, columns in PURGE_PAIR_ROWS:
+                    if table in present:
+                        self._conn.execute(f"DELETE FROM {table} WHERE " + " OR ".join(f"{c}=?" for c in columns),
+                                           (user_id,) * len(columns))
+                self._conn.execute("UPDATE users SET username=?, display_name=?, password_hash=? WHERE id=?",
+                                   (f"purged:{user_id}", "(purged account)", "!", user_id))
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()

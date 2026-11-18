@@ -4,6 +4,7 @@
 //   GET  /api/account/admin/tools?username=NAME    that account's capabilities and tools
 //   POST /api/account/authority/grant              {username, group: dev|operator|nodus|message, enabled}
 //   POST /api/account/admin/grant | revoke         {username}
+//   POST /api/account/admin/purge                  {username, password}: an ordinary account and its private rows; posts stay
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
 let people = [], selected = null;
@@ -91,6 +92,24 @@ async function open(username) {
       buttons.append(b);
     }
     panel.append(buttons, el("p", "A role row (operator, admin) set by authz.py is a direct grant too; removing a group here removes only a grant made here.", "muted"));
+    if (!person.role_row && !(a.direct || []).length) {   // [PURGE] ordinary accounts only; the server refuses any other
+      const purge = el("button", "Purge account"); purge.type = "button";
+      purge.onclick = async () => {
+        if (prompt(`Purging removes ${person.username}'s private rows and sign-in for good; its public posts stay under a sealed name. Type ${person.username} to confirm:`) !== person.username) return;
+        const password = prompt("Enter your admin account password to confirm:");
+        if (!password) return;
+        purge.disabled = true;
+        try {
+          const response = await fetch("/api/account/admin/purge", { method: "POST", credentials: "same-origin", cache: "no-store",
+            headers: { "Content-Type": "application/json", "X-Meowdoku-Account-Purge": "1" },
+            body: JSON.stringify({ username: person.username, password }) });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+          status(`Purged ${person.username}.`); await load();
+        } catch (error) { status(error.message); purge.disabled = false; }
+      };
+      panel.append(purge);
+    }
   }
 
   // tools: what the speaktome MCP offers this account, and what it does not, with what each needs

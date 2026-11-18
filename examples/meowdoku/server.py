@@ -4644,6 +4644,43 @@ def make_handler(sessions: Sessions):
                 except authz_mod.AuthzError as error:
                     return self._json({"error": error.message}, error.status)
                 return self._json({"ok": True, "admins": self._admin_list()})
+            if path0 == "/api/account/admin/purge":              # [PURGE] an admin removes an ordinary permanent account
+                if not self._require("account_manage"):
+                    return
+                if authz_mod.role_of(sessions.accounts_db, self._account()["id"]) != "admin":
+                    return self._json({"error": "an admin account is required"}, HTTPStatus.FORBIDDEN)
+                if self.headers.get("X-Meowdoku-Account-Purge") != "1" or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    return self._json({"error": "same-site purge request required"}, HTTPStatus.FORBIDDEN)
+                body = self._body_json(2048)
+                if body is None:
+                    return
+                actor = self._account()
+                guard = login_guard_mod.connect(sessions.accounts_db)
+                try:
+                    wait = login_guard_mod.check(guard, self._client_ip, actor["username"])
+                    if wait:
+                        return self._json({"error": "too many password attempts", "retry_after": int(wait)}, HTTPStatus.TOO_MANY_REQUESTS)
+                    try:
+                        sessions.accounts.login(actor["username"], str(body.get("password", "")))
+                    except accounts_mod.AccountError:
+                        login_guard_mod.record(guard, self._client_ip, actor["username"], False)
+                        raise
+                    login_guard_mod.record(guard, self._client_ip, actor["username"], True)
+                    username = str(body.get("username", ""))
+                    lookup = sqlite3.connect(sessions.accounts_db, timeout=10)
+                    try:
+                        found = lookup.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+                    finally:
+                        lookup.close()
+                    if found is None:
+                        raise accounts_mod.AccountError("account not found", 404)
+                    sessions.accounts.purge_account(found[0], username)
+                except (accounts_mod.AccountError, TypeError, ValueError) as error:
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+                finally:
+                    guard.close()
+                logring_mod.RING.add(f"account-purge actor={actor['username']} user_id={found[0]} client={self._client_ip}", source="server")
+                return self._json({"ok": True, "purged_user_id": found[0], "admins": self._admin_list()})
             if path0 == "/api/account/admin/look-wipe":
                 if not self._require("account_manage"):
                     return
