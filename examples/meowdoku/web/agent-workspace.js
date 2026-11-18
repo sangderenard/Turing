@@ -1,6 +1,9 @@
 const $ = id => document.getElementById(id);
 const kinds = ["orientation", "prompt", "personality", "guidance", "trouble", "scenario"];
 let current = null, parent = null, mode = "orientation", editing = null;
+// `parentSet` counts every explicit choice of `parent` (fill, restoreDraft, "New child", a save or delete in the shown
+// session). branch() compares counts, not values, so choosing the same parent again still cancels a pending navigation.
+let parentSet = 0;
 let activeProfile = null, activeJob = null, activeInstance = null;
 const ids = value => value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 function showProfile() { $("profile-editor").hidden = false; $("document-editor").hidden = true; $("decision-editor").hidden = true; }
@@ -36,7 +39,7 @@ function dropDraft() { try { localStorage.removeItem(DRAFT); } catch {} }
 function restoreDraft() {
   let draft = null; try { draft = JSON.parse(localStorage.getItem(DRAFT) || "null"); } catch {}
   if (!draft || !(draft.title || draft.body)) return false;
-  session++; showDocument(); editing = draft.editing || null; current = null; parent = draft.parent || null;
+  session++; showDocument(); editing = draft.editing || null; current = null; parent = draft.parent || null; parentSet++;
   $("kind").value = draft.kind; $("title").value = draft.title; $("body").value = draft.body;
   $("contexts").value = draft.contexts || ""; $("scenario").hidden = draft.kind !== "scenario";
   $("identity").textContent = editing ? "Unsaved changes to document " + editing : "New document under " + (parent || "root");
@@ -46,22 +49,42 @@ function itemButton(label, action) { const button = document.createElement("butt
 // branch(id) shows a branch and makes it where "New here" puts documents. branch(id, false) only redraws the tree and
 // leaves `parent` alone (the refresh after a save or delete). Only the latest request draws, so a slow answer cannot
 // replace the branch the visitor moved to while it was pending.
-let treeRequest = 0;
+// `shown` is the branch the tree last drew (null for the root list of `mode`; undefined before the first draw), and
+// `inFlight` is the latest tree request while it is still pending (null when none is). `parent` and `shown` change
+// together, only when the latest request draws: a rejected or superseded navigation leaves both where they were, so
+// "New here" always targets the branch on screen (review 41bcd53c, comments 118-123). A navigation does not take
+// `parent` back from fill(), restoreDraft() or "New child" if one of them set it while the request was pending, even
+// to the value it already had: `parentSet` is compared, not `parent` (review cef13e41, comments 147-149).
+// `stale` holds every branch a Save committed into while a tree request was pending (the root branch is null, a valid
+// member). That pending listing may predate the Save, whatever branch it is going to, so when the latest request
+// settles, succeeded or rejected, and the branch on screen is in `stale`, the tree is fetched once more; then `stale`
+// is cleared (reviews e2b02b66 and 6198d83c, comments 127-132 and 140-144). Clearing the other marks is safe: moving
+// to one of those branches later fetches a fresh listing. A superseded request leaves `stale` to the newer one.
+let treeRequest = 0, shown, inFlight = null;
+const stale = new Set();
 async function branch(id = null, navigate = true) {
-  if (navigate) parent = id;
-  const request = ++treeRequest;
+  const request = ++treeRequest, mark = parentSet; inFlight = request;
   const query = new URLSearchParams(); if (id) query.set("parent", id); if (!id) query.set("kind", mode);
-  const result = await api("/api/agent-workspace/children?" + query);
-  if (request !== treeRequest) return;
-  $("tree").replaceChildren();
-  if (id) $("tree").append(itemButton("← Parent branch", async () => { const row = await api("/api/agent-workspace/document/" + id); await branch(row.parent_id); }));
-  for (const row of result.documents) {
-    const wrap = document.createElement("div");
-    wrap.append(itemButton(row.title + " · " + row.kind, () => open(row.id)), itemButton("Expand", () => branch(row.id)),
-      itemButton("Copy ID", () => navigator.clipboard.writeText(row.id).then(() => notice("Copied document ID"))));
-    $("tree").append(wrap);
+  let result, failure = null;
+  try { result = await api("/api/agent-workspace/children?" + query); }
+  catch (error) { failure = error; }
+  finally { if (inFlight === request) inFlight = null; }
+  if (request !== treeRequest) { if (failure) throw failure; return; }
+  if (!failure) {
+    shown = id; if (navigate && parentSet === mark) parent = id;
+    $("tree").replaceChildren();
+    if (id) $("tree").append(itemButton("← Parent branch", async () => { const row = await api("/api/agent-workspace/document/" + id); await branch(row.parent_id); }));
+    for (const row of result.documents) {
+      const wrap = document.createElement("div");
+      wrap.append(itemButton(row.title + " · " + row.kind, () => open(row.id)), itemButton("Expand", () => branch(row.id)),
+        itemButton("Copy ID", () => navigator.clipboard.writeText(row.id).then(() => notice("Copied document ID"))));
+      $("tree").append(wrap);
+    }
+    if (!result.documents.length) $("tree").append("No documents in this branch.");
   }
-  if (!result.documents.length) $("tree").append("No documents in this branch.");
+  const again = shown !== undefined && stale.has(shown); stale.clear();
+  if (again) try { await branch(shown, false); } catch (error) { notice("The tree did not refresh after the save: " + error.message, true); }
+  if (failure) throw failure;
 }
 async function open(id) {
   showDocument();
@@ -69,7 +92,7 @@ async function open(id) {
   fill(row); notice("Opened " + row.title);
 }
 function fill(row) {                                   // synchronous: nothing can be typed between these writes
-  session++; showDocument(); current = row; editing = row.id; parent = row.parent_id;
+  session++; showDocument(); current = row; editing = row.id; parent = row.parent_id; parentSet++;
   $("kind").value = row.kind; $("title").value = row.title; $("body").value = row.body;
   $("contexts").value = row.contexts.join("\n"); $("scenario").hidden = row.kind !== "scenario";
   $("identity").textContent = "Document " + row.id + " · author account " + row.owner_id;
@@ -106,8 +129,19 @@ async function save() {
     throw new Error("Not saved: " + error.message + ". Your title and body are still here and kept in this browser's draft; press Save again.");
   }
   finally { saving = false; $("save").disabled = false; }
-  if (session !== started) return notice("Saved " + row.title + ". The document you moved to was left as it is.");
-  current = row; editing = row.id; parent = row.parent_id;
+  if (session !== started) {                           // the editor has switched (review 3817e271, comments 112-115)
+    // Leave editing, current, parent and the other document's draft alone; only the tree may change. If a tree request
+    // is pending, its listing may predate this Save wherever it is going (comment 140): mark the saved document's
+    // branch in `stale`, and branch() fetches it once more if that is where the tree ends up. Otherwise refresh now,
+    // only when the branch on screen is where the saved document lives.
+    const home = row.parent_id || null; let refreshed = "";
+    if (home || row.kind === mode) {
+      if (inFlight !== null) stale.add(home);
+      else if (shown === home) try { await branch(home, false); } catch (error) { refreshed = " (the tree did not refresh: " + error.message + ")"; }
+    }
+    return notice("Saved " + row.title + refreshed + ". The document you moved to was left as it is.");
+  }
+  current = row; editing = row.id; parent = row.parent_id; parentSet++;
   if (editorState() === submitted) dropDraft(); else keepDraft();
   if (!row.parent_id && row.kind !== mode) {     // a root document is listed under its own kind
     mode = row.kind; for (const other of $("modes").children) other.removeAttribute("aria-current");
@@ -131,7 +165,7 @@ async function remove() {
   try { await api("/api/agent-workspace/documents", {action:"delete", id}); }
   finally { removing = false; $("delete").disabled = false; }
   deleted.add(id);
-  if (session === started) { dropDraft(); parent = p; fresh(); await branch(p); notice("Deleted " + title); return; }
+  if (session === started) { dropDraft(); parent = p; parentSet++; fresh(); await branch(p); notice("Deleted " + title); return; }
   let note = "Deleted " + title + ". The document you moved to was left as it is.";
   if (editing === id) {                                // A was opened again while its delete was pending
     editing = null; current = null; keepDraft(); $("identity").textContent = "Document " + id + " was deleted; Save makes a new one";
@@ -370,7 +404,7 @@ for (const kind of kinds) {
 $("kind").onchange = () => { $("scenario").hidden = $("kind").value !== "scenario"; keepDraft(); };
 for (const id of ["title", "body", "contexts"]) $(id).addEventListener("input", keepDraft);
 $("new").onclick = fresh; $("save").onclick = guard(save); $("delete").onclick = guard(remove);
-$("new-child").onclick = () => { if (!editing) return notice("Open a parent document first"); const child = editing; fresh(); parent = child; $("identity").textContent = "New child under " + child; };
+$("new-child").onclick = () => { if (!editing) return notice("Open a parent document first"); const child = editing; fresh(); parent = child; parentSet++; $("identity").textContent = "New child under " + child; };
 $("parent").onclick = guard(async () => { if (current?.parent_id) await open(current.parent_id); });
 $("full").onclick = () => { const full = $("workspace").classList.toggle("full"); $("full").textContent = full ? "Restore panes" : "Full screen"; };
 $("scratch-save").onclick = guard(() => scratchChange("write")); $("scratch-delete").onclick = guard(() => scratchChange("delete"));
