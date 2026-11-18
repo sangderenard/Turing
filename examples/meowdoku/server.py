@@ -89,6 +89,7 @@ from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real pas
 from meowdoku.oauth_mcp import OAuthMCP
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
+from meowdoku import llm_registration as llm_registration_mod  # noqa: E402  [LLM REGISTRATION] an agent registers as a member
 from meowdoku import permission_groups as permission_groups_mod
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
@@ -4598,14 +4599,25 @@ def make_handler(sessions: Sessions):
                     if not isinstance(body, dict):
                         raise ValueError("expected an object")
                     username, password = str(body.get("username", "")), str(body.get("password", ""))
+                    llm = None
                     if path0.endswith("signup"):
                         alpha = body.get("alpha_terms_version")
-                        if alpha is not None or self._origin != "lan":
+                        register_as = body.get("register_as", "human")
+                        if register_as not in ("human", "llm"):
+                            raise ValueError("register_as is human or llm")
+                        if alpha is not None or self._origin != "lan" or register_as == "llm":
                             if (alpha != accounts_mod.ALPHA_TERMS_VERSION or
                                     any(body.get(key) is not True for key in
                                         ("agree_mit", "agree_observation", "agree_research"))):
                                 raise ValueError("agree to the current MIT, observation, and research terms to request alpha access")
+                        if register_as == "llm":                  # [LLM REGISTRATION] llm_registration.py
+                            if body.get("agree_credentials") is not True:
+                                raise ValueError("an LLM registers by agreeing to keep its credentials (agree_credentials: true); "
+                                                 "read the brief at /register.html#llm")
+                            llm_registration_mod.check_quota(sessions.accounts_db)
                         user = sessions.accounts.signup(username, password, alpha_terms_version=alpha)
+                        if register_as == "llm":
+                            llm = llm_registration_mod.admit(sessions.accounts_db, user)
                     else:
                         user = sessions.accounts.login(username, password)
                     sessions.introduce_agents(user["id"])
@@ -4624,7 +4636,11 @@ def make_handler(sessions: Sessions):
                     name = sessions.profiles.by_token(held) if held else None
                     if name:
                         sessions.accounts.claim(user["id"], "profile", name)
-                    return self._json({"account": user}, HTTPStatus.CREATED if path0.endswith("signup") else HTTPStatus.OK)
+                    return self._json({"account": user, **({"llm": llm} if llm else {})},
+                                      HTTPStatus.CREATED if path0.endswith("signup") else HTTPStatus.OK)
+                except llm_registration_mod.LlmRegistrationError as error:
+                    self._set_cookie = []
+                    return self._json({"error": str(error)}, error.status)
                 except (ValueError, TypeError, json.JSONDecodeError) as error:
                     self._set_cookie = []
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
