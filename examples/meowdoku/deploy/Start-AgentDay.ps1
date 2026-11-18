@@ -20,6 +20,11 @@ agent's own lock (<AgentDays>\running\<agent>.lock), so two ticks never start th
      when reduce requests wait and the agent's profile declares the job "reduce", unless its reducer already runs. The
      reducer keeps one session while requests keep coming and ends after 30 idle minutes; it never blocks a bell or a
      work run.
+  5. for a character whose session is declared resumable (agent_capacity, and session in $Agents below), the bell starts
+     a kept bell session (agent_session.py, case 46d6ad2d stage 5) instead of a one-shot bell run: one claude or codex
+     session as the agent's account that asks for new notices every 10 seconds and answers each within seconds, briefed
+     in full only once a day or when its documents change, and ends after 30 idle minutes. While it lives the tick
+     still asks the bell's question, only to keep what was seen current; the session answers. It never blocks a work run.
 Whatever stops a tick from starting a run is written to <AgentDays>\tick.log; nothing is skipped silently.
 
 Every run's prompt is the preamble (built in; <AgentDays>\preamble.md replaces it) and, for a work run, the day's prompt:
@@ -77,8 +82,8 @@ $Agents = [ordered]@{
     # Each run line gives its CLI an empty standard input: Invoke-AsAgent hands this script to pwsh on standard input, and
     # a CLI that reads it takes the rest of the script (codex bell runs, 2026-11-17, took "it $LASTEXITCODE" and left pwsh
     # "ex", logged exit 1). Case 26f097a3ed5e4462b2acbe70017384ce.
-    claude = @{ account = 'agents'; login = 'claude'; offset = 0; reduce = $true; run = '$null | & claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
-    codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; reduce = $true; run = '$null | & codex exec --skip-git-repo-check $prompt 2>&1' }
+    claude = @{ account = 'agents'; login = 'claude'; offset = 0; reduce = $true; session = $true; run = '$null | & claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
+    codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; reduce = $true; session = $true; run = '$null | & codex exec --skip-git-repo-check $prompt 2>&1' }
     gemini = @{ account = 'agents-gemini'; login = 'gemini'; offset = 40; lead = $true; run = @"
 `$extra = @()
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
@@ -186,6 +191,38 @@ function Ring-Bell([string]$name, [hashtable]$declared, [pscredential]$cred) {
     $line.Substring(5) | ConvertFrom-Json -AsHashtable
 }
 
+# The memory file a run keeps when none is chosen for it: a bell run (and a kept bell session) has its own, so it never
+# writes the work run's.
+function Get-DefaultMemoryId([string]$name, [bool]$bellRun) {
+    $memoryPath = Join-Path $AgentDays "$name\$(if ($bellRun) { 'bell.id' } else { 'persistence.id' })"
+    $memoryId = if (Test-Path -LiteralPath $memoryPath) { (Get-Content -Raw -LiteralPath $memoryPath).Trim() } else { '' }
+    if ($memoryId -notmatch '^[a-f0-9]{32}$') {
+        $memoryId = [Guid]::NewGuid().ToString('N')
+        New-Item -ItemType Directory -Force -Path (Split-Path $memoryPath) | Out-Null
+        Set-Content -LiteralPath $memoryPath -Value $memoryId -Encoding ascii
+    }
+    $memoryId
+}
+
+# [SESSIONS] A kept bell session, started as the agent's account; its record names its own process, so it lives exactly
+# as long as the session does.
+function Start-AgentSession([string]$name, [pscredential]$cred, [string]$why) {
+    $declared = $Agents[$name]
+    $memoryId = Get-DefaultMemoryId $name $true
+    & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
+    if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $name" }
+    $catalogId = (& $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --register-instance $memoryId) -join ''
+    $workPath = Join-Path $AgentDays "$name\persistence.id"
+    $workId = if (Test-Path -LiteralPath $workPath) { (Get-Content -Raw -LiteralPath $workPath).Trim() } else { '' }
+    $arguments = @((Join-Path $PSScriptRoot 'agent_session.py'), '--agent', $name, '--login', $declared.login,
+        '--account', $declared.account, '--slot', ('{0:00}' -f $declared.offset), '--memory', $memoryId,
+        '--answer-minutes', "$BellTimeoutMinutes", '--base', $Base, '--why', $why)
+    if ($workId -match '^[a-f0-9]{32}$') { $arguments += @('--work-memory', $workId) }
+    $process = Start-AsAgent $cred $Python $arguments $Workspace -Hidden
+    Add-AgentRecord $AgentDays 'session' $declared.account $process.Id @{ agent = $name; reason = 'bell' } | Out-Null
+    Log "${name}: bell session started as $($declared.account), instance $catalogId, persistence $memoryId, pid $($process.Id): $why"
+}
+
 function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     $declared = $Agents[$name]
     $bellRun = $reason -eq 'bell'
@@ -213,16 +250,8 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
         if ($LASTEXITCODE -ne 0) { throw "Cannot read attached memory for instance $InstanceId" }
     }
     if (-not $memoryId -and ($NewPersistence -or $ProfileId)) { $memoryId = [Guid]::NewGuid().ToString('N') }
-    if (-not $memoryId) {
-        # A bell run may go beside a work run: it keeps its own memory file, so two runs never write the same one.
-        $memoryPath = Join-Path $AgentDays "$name\$(if ($bellRun) { 'bell.id' } else { 'persistence.id' })"
-        if (Test-Path -LiteralPath $memoryPath) { $memoryId = (Get-Content -Raw -LiteralPath $memoryPath).Trim() }
-        if ($memoryId -notmatch '^[a-f0-9]{32}$') {
-            $memoryId = [Guid]::NewGuid().ToString('N')
-            New-Item -ItemType Directory -Force -Path (Split-Path $memoryPath) | Out-Null
-            Set-Content -LiteralPath $memoryPath -Value $memoryId -Encoding ascii
-        }
-    }
+    # A bell run may go beside a work run: it keeps its own memory file, so two runs never write the same one.
+    if (-not $memoryId) { $memoryId = Get-DefaultMemoryId $name $bellRun }
     & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
     if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $name" }
     $catalogId = $InstanceId
@@ -276,8 +305,11 @@ if ($Register -or $Unregister) {
     foreach ($name in $Agents.Keys) {
         $task = "SpeakToMe agent $name"
         if ($Unregister) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue; Write-Host "removed '$task'"; continue }
-        $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') `
-            -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`" -Tick -Agent $name"
+        # Headless conhost: an Interactive-logon console task otherwise opens a window, and takes the foreground,
+        # before pwsh can apply -WindowStyle Hidden (a Windows Terminal default host ignores it). conhost --headless
+        # gives pwsh a console with no window; same account, session and credentials.
+        $action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\conhost.exe') `
+            -Argument "--headless `"$(Join-Path $PSHOME 'pwsh.exe')`" -NoProfile -NonInteractive -File `"$PSCommandPath`" -Tick -Agent $name"
         # The tasks start 15 s apart within each minute: all three firing in the same second each saw fewer than
         # -MaxRunning runs before any had written its record (2026-11-14 23:50: three ran at once under a limit of two).
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds((15 * $order++) % 60) -RepetitionInterval (New-TimeSpan -Minutes 1)
@@ -329,7 +361,9 @@ $run = $null
 try {
     $records = @(Get-AgentRecords $AgentDays)
     $now = Get-Date
-    $mine = @($records | Where-Object { $_.account -eq $declared.account -and $_.kind -ne 'reduce' })
+    # The account's reducer and kept bell session go beside everything else; neither blocks a work run.
+    $mine = @($records | Where-Object { $_.account -eq $declared.account -and $_.kind -notin 'reduce', 'session' })
+    $kept = @($records | Where-Object { $_.account -eq $declared.account -and $_.kind -eq 'session' }).Count -gt 0
     $cred = Read-AgentCredential $declared.account
     if (-not $cred) { exit 0 }
     # [GUIDANCE] the reducer, beside everything else, under this same lock so two ticks never start two. reduce: the CLIs
@@ -356,7 +390,7 @@ try {
     }
     if (-not $run) {
         if ($state.bell_off_until -and [datetime]$state.bell_off_until -gt $now) { exit 0 }
-        if (@($records | Where-Object { $_.kind -eq 'bell' }).Count -ge $MaxBells) { Log "${Agent}: bell waiting, $MaxBells bell runs already going"; exit 0 }
+        if (-not $kept -and @($records | Where-Object { $_.kind -in 'bell', 'session' }).Count -ge $MaxBells) { Log "${Agent}: bell waiting, $MaxBells bell runs already going"; exit 0 }
         $bell = Ring-Bell $Agent $declared $cred
         if ($bell.error) {
             $state.bell_off_until = $now.AddHours(1).ToString('o'); $state.bell_off_why = [string]$bell.error; Save-State $Agent $state
@@ -366,13 +400,23 @@ try {
         $seen = @($state.bell_seen)
         $new = @(@($bell.messages | ForEach-Object { "m$_" }) + @($bell.threads | ForEach-Object { "t$_" }) | Where-Object { $_ -notin $seen })
         $state.bell_seen = @(@($bell.messages | ForEach-Object { "m$_" }) + @($bell.threads | ForEach-Object { "t$_" }))
+        if ($new.Count -and $kept) { $new = @() }                     # the kept session answers it; this only keeps seen current
         if ($new.Count) {
             $state.last_bell = $now.ToString('o')
             $count = @($new | Where-Object { $_ -like 'm*' }).Count
             $threads = @($new | Where-Object { $_ -like 't*' }).Count
             $run = @{ reason = 'bell'; why = "$count new message(s) and $threads review thread(s) waiting for your answer"; kind = 'bell' }
+            if ($declared.session) {
+                & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --resumable
+                if ($LASTEXITCODE -eq 0) { $run.kind = 'session' }
+            }
         }
         Save-State $Agent $state
+        if ($run -and $run.kind -eq 'session') {                    # started under this lock, so two ticks never start two
+            try { Start-AgentSession $Agent $cred $run.why }
+            catch { Log "${Agent}: bell session not started: $($_.Exception.Message)" }
+            exit 0
+        }
     }
     # The record is written before the lock is let go, so the next tick already sees this run.
     if ($run) { $run.record = Add-AgentRecord $AgentDays $run.kind $declared.account $PID @{ agent = $Agent; reason = $run.reason } }

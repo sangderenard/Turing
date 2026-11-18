@@ -66,7 +66,8 @@ def test_ticks_every_minute_in_parallel_and_the_bell_has_its_own_limits():
     assert "$_.kind -ne 'run'" in tick, "a bell run, a seat or a console of the account blocks the tick"
     assert "-not $working -and" in tick, "the hourly run waits while the account's work run goes; the bell does not"
     run = text[text.index("function Invoke-AgentRun"):text.index("# ---------------------------------------------------------------- the tasks")]
-    assert "'bell.id'" in run and "($limit * 60)" in run, "a bell run has its own memory file and its own timeout"
+    memory = text[text.index("function Get-DefaultMemoryId"):text.index("function Start-AgentSession")]
+    assert "Get-DefaultMemoryId $name $bellRun" in run and "'bell.id'" in memory and "($limit * 60)" in run,         "a bell run has its own memory file and its own timeout"
 
 
 # ---- case 26f097a3ed5e4462b2acbe70017384ce: an agent CLI never reads the launcher's script
@@ -107,10 +108,25 @@ def test_the_tick_starts_the_reducer_under_its_lock_and_a_reducer_never_blocks_a
     """[GUIDANCE] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 4."""
     text = _launcher()
     tick = text[text.index("# ---------------------------------------------------------------- one tick for one agent"):]
-    assert "$_.kind -ne 'reduce'" in tick, "the account's reducer is left out of what blocks a bell or a work run"
+    assert "$_.kind -notin 'reduce', 'session'" in tick, "the account's reducer is left out of what blocks a bell or a work run"
     start = tick.index("'guidance_reducer.py'")
     assert tick.index("--reduce-pending") < start < tick.index("$lock.Dispose()"), "read, then started, under the lock"
     assert tick.index("Add-AgentRecord $AgentDays 'reduce'") < tick.index("$lock.Dispose()"), "its record is written first"
     assert "$declared.reduce -and" in tick
     block = text[text.index("$Agents = [ordered]@{"):text.index("$Preamble = @'")]
     assert block.count("reduce = $true") == 2, "the CLIs guidance_reducer.py has an adapter for: claude and codex"
+
+
+def test_a_resumable_character_is_rung_into_a_kept_session_that_never_blocks_a_work_run():
+    """[SESSIONS] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 5."""
+    text = _launcher()
+    tick = text[text.index("# ---------------------------------------------------------------- one tick for one agent"):]
+    assert "$_.kind -notin 'reduce', 'session'" in tick, "the account's kept session does not block its work run"
+    assert "if ($new.Count -and $kept) { $new = @() }" in tick, "while it lives the session answers; the tick keeps seen"
+    assert tick.index("--resumable") < tick.index("Start-AgentSession $Agent") < tick.index("$lock.Dispose()"), "under the lock"
+    assert "$_.kind -in 'bell', 'session'" in tick, "sessions count toward -MaxBells"
+    start = text[text.index("function Start-AgentSession"):text.index("function Invoke-AgentRun")]
+    assert "Get-DefaultMemoryId $name $true" in start and "'agent_session.py'" in start
+    assert "Add-AgentRecord $AgentDays 'session' $declared.account $process.Id" in start, "the record names the session"
+    block = text[text.index("$Agents = [ordered]@{"):text.index("$Preamble = @'")]
+    assert block.count("session = $true") == 2, "the CLIs agent_session.py has an adapter for: claude and codex"

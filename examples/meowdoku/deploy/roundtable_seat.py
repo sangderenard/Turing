@@ -63,6 +63,16 @@ class SeatError(Exception):
     pass
 
 
+def sign_in(login: str, base: str = BASE) -> None:
+    """The agent's own SpeakToMe sign-in, as Start-AgentDay.ps1 sets it; claude's and codex's speaktome MCP read it too."""
+    speaktome = os.path.join(WORKSPACE, "speaktome")
+    os.environ.update(SPEAKTOME_USER=login, SPEAKTOME_BASE=base, PYTHONDONTWRITEBYTECODE="1",
+                      SPEAKTOME_SECRET_FILE=os.path.join(os.path.expanduser("~"), "speaktome-credentials", f"{login}.secret"),
+                      PYTHONPATH=os.pathsep.join(p for p in (speaktome, os.environ.get("PYTHONPATH", "")) if p))
+    if speaktome not in sys.path:
+        sys.path.insert(0, speaktome)
+
+
 def log(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
@@ -150,10 +160,13 @@ def _program(name: str) -> str:
 class Claude:
     """Claude Code in print mode with stream-json in and out: one process, one session, a user message per turn."""
 
-    def __init__(self, program=None, popen=subprocess.Popen, system_prompt=None):
+    def __init__(self, program=None, popen=subprocess.Popen, system_prompt=None, disallowed=("mcp__speaktome__chat_post",)):
+        # disallowed: a seat posts its answer itself, so chat_post is taken away; a kept bell session (agent_session.py)
+        # answers with its own tools and passes ().
         command = [program or _program("claude"), "-p", "--input-format", "stream-json",
-                              "--output-format", "stream-json", "--verbose",
-                              "--allowedTools", "mcp__speaktome", "--disallowedTools", "mcp__speaktome__chat_post"]
+                              "--output-format", "stream-json", "--verbose", "--allowedTools", "mcp__speaktome"]
+        if disallowed:
+            command += ["--disallowedTools", ",".join(disallowed)]
         if system_prompt is not None:
             command += ["--system-prompt", system_prompt]
         self.process = popen(command,
@@ -459,12 +472,7 @@ def main(argv=None) -> int:
         sys.stdout.write(json.dumps(message) + "\n")
         sys.stdout.flush()
 
-    # The agent's own SpeakToMe sign-in, as Start-AgentDay.ps1 sets it; claude's and codex's speaktome MCP read it too.
-    speaktome = os.path.join(WORKSPACE, "speaktome")
-    os.environ.update(SPEAKTOME_USER=args.login, SPEAKTOME_BASE=args.base, PYTHONDONTWRITEBYTECODE="1",
-                      SPEAKTOME_SECRET_FILE=os.path.join(os.path.expanduser("~"), "speaktome-credentials", f"{args.login}.secret"),
-                      PYTHONPATH=os.pathsep.join(p for p in (speaktome, os.environ.get("PYTHONPATH", "")) if p))
-    sys.path.insert(0, speaktome)
+    sign_in(args.login, args.base)
     agent = None
     try:
         from speaktome_mcp.api import ApiServer

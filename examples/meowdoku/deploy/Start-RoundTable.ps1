@@ -58,8 +58,11 @@ function Say([string]$line) {
 # ---------------------------------------------------------------- the task, and status
 if ($Register -or $Unregister) {
     if ($Unregister) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue; Write-Host "removed '$TaskName'"; exit 0 }
-    $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`" -Watch -Room $Room"
+    # Headless conhost: an Interactive-logon console task otherwise opens a window, and takes the foreground,
+    # before pwsh can apply -WindowStyle Hidden (a Windows Terminal default host ignores it). conhost --headless
+    # gives pwsh a console with no window; same account, session and credentials.
+    $action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\conhost.exe') `
+        -Argument "--headless `"$(Join-Path $PSHOME 'pwsh.exe')`" -NoProfile -NonInteractive -File `"$PSCommandPath`" -Watch -Room $Room"
     # Every 5 minutes, and a task never starts a second copy of itself: a runner that ended (or failed) is started again.
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
