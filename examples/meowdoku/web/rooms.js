@@ -1,8 +1,9 @@
 // Rooms: the chat server's rooms (chat_rooms.py) as site objects. HAND-AUTHORED. createElement/textContent only; the server
 // decides every permission, this page only decides what to offer.
+import { CHANNELS, renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
-let who = null, rooms = [], selected = new URLSearchParams(location.search).get("room");   // ?room=NAME opens that room (a menu link)
+let who = null, rooms = [], presenceByName = new Map(), selected = new URLSearchParams(location.search).get("room");   // ?room=NAME opens that room (a menu link)
 
 async function request(path, body) {
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store",
@@ -16,6 +17,13 @@ async function request(path, body) {
   return result;
 }
 const status = message => { byId("message").textContent = message; };
+async function loadAgentPresence() {
+  if (byId("agents").hidden) return;
+  try { const data = await request("/api/worldmap/presence");
+    presenceByName = new Map(data.agents.map(agent => [agent.username, agent]));
+    renderAgentPresence(byId("agent-presence"), data); }
+  catch (error) { byId("agent-presence").textContent = `Agent status unavailable: ${error.message}`; }
+}
 const when = seconds => seconds == null ? "—" : new Date(seconds * 1000).toLocaleString();
 const field = (label, input) => { const box = el("div"), l = el("label", label); input.id ||= `f-${Math.random().toString(36).slice(2)}`; l.htmlFor = input.id; box.append(l, input); return box; };
 const input = (value = "", type = "text") => { const i = document.createElement("input"); i.type = type; i.value = value; return i; };
@@ -58,6 +66,13 @@ async function open(name, { quiet = false } = {}) {
     for (const m of messages) {
       const li = el("li");
       li.append(el("span", m.username, "who"));
+      const presence = presenceByName.get(m.username);
+      if (presence) {
+        const summary = CHANNELS.map(([key, label]) => `${label}: ${presence.channels[key]?.state || "unknown"}`).join("; ");
+        const badge = el("span", CHANNELS.map(([key]) => ["active", "recent"].includes(presence.channels[key]?.state) ? "■" : "□").join(""), "agent-mini");
+        badge.title = `${m.username} · ${summary}`; badge.setAttribute("role", "img"); badge.setAttribute("aria-label", badge.title);
+        li.append(badge);
+      }
       if (m.round) li.append(el("span", `round ${m.round}`, "badge round"));          // written at the round table
       li.append(document.createTextNode(m.removed ? "(removed by an admin)" : m.body), el("span", when(m.at), "at"));
       if (m.sticker && !m.removed) {                                                   // a picture the site made, through the room
@@ -308,6 +323,7 @@ async function main() {
   if (!who.signed_in) { byId("signin").hidden = false; status("Sign in to see your rooms."); return; }
   byId("content").hidden = false;
   byId("make").hidden = !(who.capabilities || []).includes("dev_ui");
+  byId("agents").hidden = byId("make").hidden;
   byId("make").onsubmit = async event => {
     event.preventDefault();
     try {
@@ -317,7 +333,9 @@ async function main() {
   };
   byId("refresh").onclick = load;
   byId("tail").onchange = () => selected && open(selected);
+  await loadAgentPresence();
   await load();
-  setInterval(() => { if (!document.hidden) load(); }, 20000);
+  setInterval(() => { if (!document.hidden) { load(); loadAgentPresence(); } }, 20000);
+  setInterval(() => tickAgentCountdowns(byId("agent-presence")), 1000);
 }
 main();

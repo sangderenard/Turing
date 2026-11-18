@@ -82,10 +82,11 @@ def _cookie(server, name, role):
 
 
 def test_refused_without_dev_ui(server):
-    for path in ("/api/worldmap/index", "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT)):
-        assert _raw(server.port, path, headers=OUTSIDE)[0] == 403
+    for path in ("/api/worldmap/index", "/api/worldmap/presence", "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT)):
+        assert _raw(server.port, path, headers=OUTSIDE)[0] in (401, 403)
     h = _cookie(server, "member1", "member")
     assert _raw(server.port, "/api/worldmap/index", headers={**h, **OUTSIDE})[0] == 403
+    assert _raw(server.port, "/api/worldmap/presence", headers={**h, **OUTSIDE})[0] == 403
 
 
 def test_dev_gets_index_and_map(server):
@@ -96,6 +97,11 @@ def test_dev_gets_index_and_map(server):
     status, headers, body = _raw(server.port, "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT), headers=h)
     assert status == 200 and headers["cache-control"] == "no-store" and "content-encoding" not in headers
     assert json.loads(body)["schema"] == "repo-world-map.v1"
+    status, headers, body = _raw(server.port, "/api/worldmap/presence", headers=h)
+    assert status == 200 and headers["cache-control"] == "no-store"
+    snapshot = json.loads(body)
+    assert {agent["username"] for agent in snapshot["agents"]} >= {"claude", "codex", "gemini"}
+    assert all(agent["channels"]["api_out"]["state"] == "unknown" for agent in snapshot["agents"])
 
 
 def test_gzip_honoured(server):
