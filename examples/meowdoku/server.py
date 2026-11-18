@@ -5275,7 +5275,52 @@ def resolve_state(state_dir, web_dir: Path) -> StatePaths:
     return StatePaths(Path(state_dir)) if state_dir else StatePaths.legacy_at(Path(web_dir).parent)
 
 
+class _StartupLog:
+    """[STARTUP] Owner, 2026-11-18: a restart left the site down for minutes with nothing in the instance's log. Each startup
+    step prints ``[startup +12.3s] <step>``; while the server is not yet listening, a watchdog prints every WATCH_SECONDS
+    where the main thread is (file:line function, the deepest frame in this tree and the deepest overall), so the log
+    says where a start is stuck. It stops at ``listening``."""
+
+    WATCH_SECONDS = 15.0
+
+    def __init__(self):
+        self.t0, self.step_name, self.done = time.monotonic(), "parsing arguments", threading.Event()
+        self.main_id = threading.get_ident()
+        threading.Thread(target=self._watch, name="startup-watchdog", daemon=True).start()
+
+    def step(self, name):
+        self.step_name = name
+        print(f"[startup +{time.monotonic() - self.t0:7.1f}s] {name}", flush=True)
+
+    def listening(self, where):
+        self.step(f"listening on {where}")
+        self.done.set()
+
+    def _where(self):
+        import traceback
+        frame = sys._current_frames().get(self.main_id)
+        stack = traceback.extract_stack(frame) if frame is not None else []
+        here = str(ROOT).lower()
+        ours = [f for f in stack if here in (f.filename or "").lower()]
+        pick = ours[-1] if ours else (stack[-1] if stack else None)
+        if pick is None:
+            return "?"
+        text = f"{Path(pick.filename).name}:{pick.lineno} {pick.name}"
+        if stack and stack[-1] is not pick:
+            text += f" <- {Path(stack[-1].filename).name}:{stack[-1].lineno} {stack[-1].name}"
+        return text
+
+    def _watch(self):
+        while not self.done.wait(self.WATCH_SECONDS):
+            try:
+                where = self._where()
+            except Exception as error:                       # noqa: BLE001  the watchdog never stops a start
+                where = f"? ({type(error).__name__})"
+            print(f"[startup +{time.monotonic() - self.t0:7.1f}s] still in: {self.step_name}; at {where}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
+    startup = _StartupLog()                                          # [STARTUP]
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--bind", default="127.0.0.1")
@@ -5372,6 +5417,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.retain_fountain_products:
         from meowdoku.retained_products import validate_receipt
+        startup.step("retained fountain products: SHA-256 check")
         try:
             validate_receipt(web_dir, Path(args.retain_fountain_products))
         except ValueError as error:
@@ -5380,6 +5426,7 @@ def main(argv: list[str] | None = None) -> int:
     # [LOADING] BIND FIRST.  Nothing below the listening socket waits on a compile: the prepare steps run in background lanes
     # (startup.py), each product reporting its state to /api/ready; a game's page starts when ITS products are ready (the Meowdoku
     # puzzle, chess, ... need none: playable at once) and a request for a file that is still building waits for it.
+    startup.step("install_shell")
     install_shell(web_dir)
     if args.no_wasm:
         os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"                   # the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only
@@ -5387,13 +5434,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
+    startup.step("state root")
     state = resolve_state(args.state_dir, web_dir)
     state.ensure(restrict=False)        # ACLs on secrets/ are set by the operator (operators.py / ensure()), never by a server start
     from meowdoku.secure_records import RecordCipher
+    startup.step("record cipher")
     records = RecordCipher(state.records_key, existing_streams=(state.log_ring, state.logs_dir / "apache-access.log"))
+    startup.step("private records")
     private_mod.configure(state.private_hash_key, state.private_record_db, cipher=records)   # [PRIVATE] before the ring: nothing enters it raw
+    startup.step("log ring")
     logring_mod.RING = logring_mod.Ring(path=state.log_ring, key_path=state.records_key); logring_mod.tee_stdout()   # [LOG]
     profiles_path = Path(args.profiles) if args.profiles else (state.profiles_json if args.state_dir else PROFILES)
+    startup.step("Sessions(...)")
     sessions = Sessions(web_dir, Profiles(profiles_path), state)
     sessions.nodus_ui_ports = nodus_ui_ports
     sessions.route = args.route
@@ -5403,17 +5455,21 @@ def main(argv: list[str] | None = None) -> int:
         sessions.accounts_db = Path(args.accounts_db)
         sessions.accounts = accounts_mod.Accounts(sessions.accounts_db)
         sessions.authz_policy = authz_mod.Policy.beside(sessions.accounts_db)
+    startup.step("introduce_agents")
     sessions.introduce_agents()                                                     # [MESSAGES] existing accounts, after --accounts-db overrides
+    startup.step("authored pages")
     authored_pages.connect(sessions.accounts_db).close()                          # [PAGES] declare once before concurrent feed requests
     sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
     from meowdoku import service_jobs                                # [JOBS] the server-wide job table: what a restart waits for
+    startup.step("service jobs")
     sessions.jobs = service_jobs.Registry(sessions.accounts_db, sessions.instance)
     sessions.marble_photos.registry = sessions.jobs
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
     # A supervised instance restart keeps the supervisor's loaded spec. The
     # deployed product is discoverable from this instance's own state root,
     # so installing the native row does not require a whole-stack restart.
+    startup.step("fabric row")
     fabric_dir = state.products_dir / "fabric-row"
     if not args.fabric_row_host and (fabric_dir / "spring_network_nodus_host.exe").is_file():
         args.fabric_row_host = str(fabric_dir / "spring_network_nodus_host.exe")
@@ -5424,6 +5480,7 @@ def main(argv: list[str] | None = None) -> int:
         sessions.fabric_motion = FabricMotion(Path(args.fabric_row_host), Path(args.fabric_row_plugin),
                                              Path(args.fabric_core_dir), state.run_dir, args.fabric_udp_port)
         print(f"[fabric] native Nodus row UDP receiver on loopback:{args.fabric_udp_port}", flush=True)
+    startup.step("studio")
     if args.studio_nodus_port and args.studio_assets:               # [SHOW] settings -> Nodus -> owned photo job
         from meowdoku import studio_agent, studio_pictures
         sessions.studio_pictures = studio_pictures.StudioPictures(
@@ -5435,6 +5492,7 @@ def main(argv: list[str] | None = None) -> int:
             saved_objects_for=sessions.marble_objects.for_account, registry=sessions.jobs,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
         print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
+    startup.step("task port")
     if args.task_port and args.task_jobs_dir:                      # [REVIEWS] the landing queue's "land now": one reviews.land task
         import importlib.util
         from meowdoku import studio_product_nodus
@@ -5467,14 +5525,18 @@ def main(argv: list[str] | None = None) -> int:
             threading.Thread(target=send, name="system-notice", daemon=True).start()
         sessions.system_notify = system_notify
         print(f"[reviews] the landing queue asks the updater through Nodus port {args.task_port}", flush=True)
+    startup.step("site compiler")
     site_compiler = None
     if args.site_compiler_config:
         from meowdoku.site_compiler import configure as configure_site_compiler
         site_compiler = configure_site_compiler(sessions, args.site_compiler_config, federation_port=args.federation_port)
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
+    startup.step("access policy")
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
+    startup.step("binding the socket")
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
+    startup.listening(f"{args.bind}:{args.port}")                    # [STARTUP] the watchdog stops here
     lc = lifecycle_mod.Lifecycle(sessions, state, args.port, lambda: Table(web_dir, sessions.profiles))     # LIFECYCLE
     lc.server, sessions.lifecycle = server, lc
     sessions.readiness.predictor_stems = predictor_stems()
