@@ -816,7 +816,7 @@ def main(argv=None) -> int:
             print(f"{args.username} user_id={uid} role={role_of(args.db, uid)}")
         else:
             uid = None if args.role == "guest" else 0
-            default_tier = {"lan": "edit", "dns": "shader", "ip": "dev"}
+            default_tier = {"lan": "edit", "dns": "shader", "ip": "shader"}   # access.DEFAULT_POLICY: a Host header never raises a tier
             if args.tier in ORIGINS:
                 origin, tier = args.tier, default_tier[args.tier]
             else:
