@@ -251,8 +251,11 @@ if ($Register -or $Unregister) {
     foreach ($name in $Agents.Keys) {
         $task = "SpeakToMe agent $name"
         if ($Unregister) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue; Write-Host "removed '$task'"; continue }
-        $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') `
-            -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`" -Tick -Agent $name"
+        # Headless conhost: an Interactive-logon console task otherwise opens a window, and takes the foreground,
+        # before pwsh can apply -WindowStyle Hidden (a Windows Terminal default host ignores it). conhost --headless
+        # gives pwsh a console with no window; same account, session and credentials.
+        $action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\conhost.exe') `
+            -Argument "--headless `"$(Join-Path $PSHOME 'pwsh.exe')`" -NoProfile -NonInteractive -File `"$PSCommandPath`" -Tick -Agent $name"
         # The tasks start 15 s apart within each minute: all three firing in the same second each saw fewer than
         # -MaxRunning runs before any had written its record (2026-11-14 23:50: three ran at once under a limit of two).
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds(15 * $order++) -RepetitionInterval (New-TimeSpan -Minutes 1)
