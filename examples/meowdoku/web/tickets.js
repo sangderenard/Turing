@@ -1,7 +1,15 @@
 const list = document.getElementById("list"), detail = document.getElementById("detail"), message = document.getElementById("message");
 let selected = null, canEdit = false;
 const el = (tag, text, className) => { const node = document.createElement(tag); node.textContent = text; if (className) node.className = className; return node; };
-async function request(url, options) { const response = await fetch(url, { cache: "no-store", ...options }); const body = await response.json(); if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`); return body; }
+async function request(url, options) {
+  const response = await fetch(url, { cache: "no-store", ...options });
+  // A proxy error page (502/504 from Apache) or a login redirect is HTML, not JSON.
+  // Report the HTTP status instead of the JSON parser's "Unexpected token <".
+  let body = null; try { body = await response.json(); } catch { body = null; }
+  if (!response.ok) throw new Error(body?.error || `HTTP ${response.status} ${response.statusText}`.trim());
+  if (body === null) throw new Error(`HTTP ${response.status}: the server did not answer with JSON`);
+  return body;
+}
 async function load() {
   try {
     const [who, result] = await Promise.all([request("/api/whoami"), request("/api/tickets")]);
