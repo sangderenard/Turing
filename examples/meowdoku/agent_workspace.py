@@ -82,6 +82,8 @@ def connect(db_path: Path) -> sqlite3.Connection:
                "profile_id TEXT PRIMARY KEY REFERENCES agent_profiles(id) ON DELETE CASCADE, state TEXT NOT NULL, "
                "context_tokens INTEGER NOT NULL, tools TEXT NOT NULL, session TEXT NOT NULL, note TEXT NOT NULL, "
                "declared_by INTEGER NOT NULL, declared_at REAL NOT NULL)")
+    from meowdoku import agent_decisions          # [DECISIONS] its own schema module and tables
+    agent_decisions.prepare(db)
     return db
 
 
@@ -745,6 +747,11 @@ def orientation(db, user_id, now=None, full=False):
                     ". Read them again in full with workspace_orientation (full=1).") if documents else ""
     if declared:                                  # [CAPACITY] the agent is told how it is run, first
         preamble = CAPACITY_LINES[declared["state"]] + ("\n\n" + preamble if preamble else "")
+    if declared and declared["state"] == "stateless":     # [DECISIONS] and, last, where it stands in its graph
+        from meowdoku import agent_decisions
+        where = agent_decisions.where_text(db, user_id)
+        if where:
+            preamble += "\n\n" + where
     return {"first_today": first, "day": day, "branch": branch, "decision": decision, "capacity": declared,
             "documents": [{"id": d["id"], "kind": d["kind"], "title": d["title"]} for d in documents],
             "preamble": preamble}

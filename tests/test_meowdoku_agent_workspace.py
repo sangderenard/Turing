@@ -245,3 +245,26 @@ def test_an_operator_declares_how_a_character_is_run(server):
                  {**PUBLIC_XFF, "Cookie": agent, "X-Meowdoku-Workspace": "1"}, declare)[0] == 403
     mine = _call(server.port, "/api/agent-workspace/orientation", headers={**PUBLIC_XFF, "Cookie": agent})[1]
     assert mine["capacity"]["state"] == "stateless" and mine["preamble"].startswith("You are run stateless")
+
+
+def test_any_account_walks_its_own_decision_graph_and_only_operators_edit_it(server):
+    """[DECISIONS] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 3."""
+    operator = _signup(server.port, "graph_operator")
+    walker = _signup(server.port, "graph_walker")
+    authz.grant_role(server.sessions.accounts_db, "graph_operator", "operator", "test")
+    headers = {**PUBLIC_XFF, "Cookie": operator, "X-Meowdoku-Workspace": "1"}
+    mine = {**PUBLIC_XFF, "Cookie": walker, "X-Meowdoku-Workspace": "1"}
+    for place in ({"key": "arrived", "title": "Arrived", "start": True, "acts": [{"tool": "pending", "for": "see"}]},
+                  {"key": "triage", "title": "Triage"}):
+        assert _call(server.port, "/api/agent-workspace/decisions", "POST", headers, {"action": "place", **place})[0] == 200
+    route = {"action": "route", "source": "arrived", "target": "triage", "condition": "nothing is waiting"}
+    assert _call(server.port, "/api/agent-workspace/decisions", "POST", headers, route)[0] == 200
+    assert _call(server.port, "/api/agent-workspace/decisions", "POST", mine, route)[0] == 403, "a walker cannot edit"
+    status, found, _, _ = _call(server.port, "/api/agent-workspace/decisions/map", headers=mine)
+    assert status == 200 and found["at"] == "decisions:line/arrived" and found["map"]["kind"] == "decisions"
+    status, moved, _, _ = _call(server.port, "/api/agent-workspace/decisions/at", "POST", mine, {"at": "decisions:line/triage"})
+    assert status == 200 and moved["key"] == "triage"
+    assert _call(server.port, "/api/agent-workspace/decisions/at", headers=mine)[1]["key"] == "triage"
+    assert _call(server.port, "/api/agent-workspace/decisions/at", "POST", {**PUBLIC_XFF, "Cookie": walker},
+                 {"at": "arrived"})[0] == 403, "a write needs the workspace header"
+    assert _call(server.port, "/api/agent-workspace/decisions/map", headers=PUBLIC_XFF)[0] == 401
