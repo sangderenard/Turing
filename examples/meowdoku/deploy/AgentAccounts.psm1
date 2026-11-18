@@ -60,12 +60,28 @@ function Add-AgentRecord([string]$AgentDays, [string]$Kind, [string]$Account, [i
     $file
 }
 
+# A record is alive only while the process that wrote it lives (case fd54c5e9404140238c7d5f1f56d73feb). Windows reuses
+# process ids: a record left by a run that a reboot killed named a svchost after the boot, and Codex started no run from
+# 20:10 to 21:12 on 2026-11-17. So: the record is from this boot, its pid exists, and that process did not start after
+# the record was written. A process whose start time this account may not read keeps its record.
+function Test-AgentRecordAlive($Record, [datetime]$Boot) {
+    $written = [datetime]$Record.started
+    if ($written -lt $Boot) { return $false }
+    $process = Get-Process -Id $Record.pid -ErrorAction SilentlyContinue
+    if (-not $process) { return $false }
+    $began = $null
+    try { $began = $process.StartTime } catch { }
+    if ($began -and $began -gt $written.AddSeconds(1)) { return $false }      # a later process was given this pid
+    $true
+}
+
 function Get-AgentRecords([string]$AgentDays) {
     $dir = Join-Path $AgentDays 'running'
     if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
     foreach ($file in Get-ChildItem -LiteralPath $dir -Filter '*.json') {
         try { $record = Get-Content -Raw -LiteralPath $file.FullName | ConvertFrom-Json } catch { continue }
-        if (Get-Process -Id $record.pid -ErrorAction SilentlyContinue) { $record }
+        if (Test-AgentRecordAlive $record $boot) { $record }
         else { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
     }
 }
