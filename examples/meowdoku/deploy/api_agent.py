@@ -37,9 +37,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gemini_agent  # noqa: E402
 from gemini_agent import DEFAULT_TOOLS, SYSTEM, AgentError, SpeakToMe, arguments_for, read_key  # noqa: E402
 
-PROVIDERS = ("openai", "anthropic", "gemini")
+# openai-responses: OpenAI's Responses API, for reasoning models that take function tools only there (gpt-5.6-sol on
+# /chat/completions refuses tools unless reasoning_effort is none, case d2ea5818).
+PROVIDERS = ("openai", "anthropic", "gemini", "openai-responses")
 DEFAULT_BASE = {"openai": "https://api.openai.com/v1", "anthropic": "https://api.anthropic.com/v1",
-                "gemini": gemini_agent.API}
+                "gemini": gemini_agent.API, "openai-responses": "https://api.openai.com/v1"}
 ANTHROPIC_VERSION = "2023-06-01"
 SAFE_URL = re.compile(r"[A-Za-z0-9._~:/\[\]%-]{1,300}")
 
@@ -165,6 +167,54 @@ def _converse_openai(world, call, model, system, history, offered, max_calls, lo
             history.append({"role": "tool", "tool_call_id": asked_call.get("id", ""), "content": _result_text(result)})
 
 
+# ---------------------------------------------------------------- OpenAI Responses
+def _output_text(output: list) -> str:
+    return "".join(part.get("text", "") for item in output if isinstance(item, dict) and item.get("type") == "message"
+                   for part in (item.get("content") or []) if isinstance(part, dict) and part.get("type") == "output_text").strip()
+
+
+def _converse_openai_responses(world, call, model, system, history, offered, max_calls, log):
+    """store false: nothing of the run is kept on OpenAI's side; the reasoning items come back encrypted
+    (include reasoning.encrypted_content) and go out again in ``input``, so the model keeps its reasoning between
+    tool calls."""
+    tools = [{"type": "function", "name": name, "description": str(world.tools[name].get("description", ""))[:1000],
+              "parameters": _schema(world.tools[name])} for name in offered]
+    calls = 0
+    while True:
+        body = {"model": model, "instructions": system, "input": history, "store": False,
+                "include": ["reasoning.encrypted_content"]}
+        if tools:
+            body["tools"] = tools
+            if calls >= max_calls:
+                body["tool_choice"] = "none"
+        answer = call("POST", "/responses", body)
+        output = [item for item in (answer.get("output") or []) if isinstance(item, dict)]
+        asked = [item for item in output if item.get("type") == "function_call"]
+        if not asked or calls >= max_calls:
+            reply = _output_text(output)
+            if not reply:
+                why = (answer.get("incomplete_details") or {}).get("reason") or answer.get("status") or "no text"
+                raise AgentError(f"the model gave no answer ({why})")
+            # Text only: a function_call kept without its function_call_output would make the next call a 400.
+            history.append({"role": "assistant", "content": reply})
+            return reply, calls
+        history.extend(output)                                      # reasoning, calls and any text, as returned
+        for asked_call in asked:
+            name = asked_call.get("name", "")
+            try:
+                given = json.loads(asked_call.get("arguments") or "{}")
+            except ValueError:
+                given = None
+            calls += 1
+            if not isinstance(given, dict):
+                result = {"error": "the arguments were not a JSON object"}
+            else:
+                result = _call_tool(world, offered, name, given, calls, max_calls)
+            log(f"tool {name}: {'refused' if _refused(result) else 'ok'}")
+            history.append({"type": "function_call_output", "call_id": asked_call.get("call_id", ""),
+                            "output": _result_text(result)})
+
+
 # ---------------------------------------------------------------- Anthropic Messages
 def _converse_anthropic(world, call, model, system, history, offered, max_calls, log, max_tokens=4096):
     tools = [{"name": name, "description": str(world.tools[name].get("description", ""))[:1000],
@@ -219,7 +269,7 @@ def run(world, call, provider: str, model: str, prompt: str, *, room: str | None
     contents = history if history is not None else []
     kept = len(contents)
     contents.append({"role": "user", "content": text})
-    converse = _converse_anthropic if provider == "anthropic" else _converse_openai
+    converse = {"anthropic": _converse_anthropic, "openai-responses": _converse_openai_responses}.get(provider, _converse_openai)
     try:
         return converse(world, call, model, system, contents, offered, max_calls, log)
     except BaseException:

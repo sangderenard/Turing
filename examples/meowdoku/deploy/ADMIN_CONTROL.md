@@ -30,7 +30,8 @@ A site restart does not restart the worker. After a code update, stop and start 
 ## External API agents (case 989e507e)
 
 The admin-only "External agents" section declares an API-backed model as a SpeakToMe agent: name, provider
-(`openai` for any OpenAI-compatible Chat Completions server, `anthropic`, `gemini`), base URL, model, SpeakToMe tools,
+(`openai` for any OpenAI-compatible Chat Completions server, `anthropic`, `gemini`, and `openai-responses` for OpenAI's
+Responses API, which reasoning models such as gpt-5.6-sol need to use tools while reasoning, case d2ea5818), base URL, model, SpeakToMe tools,
 the minute of its hourly work run and its brief. Saving a declaration (`agent_declare`, password-checked like every
 action) writes only `external_agents` in `<state>\sql\admin_control.db`; nothing on the computer changes and no key is
 asked for. The declaration is not an action of the worker either.

@@ -131,7 +131,8 @@ class Opener:
 
 
 @pytest.mark.parametrize("provider,header,value", [("openai", "Authorization", "Bearer sk-secret"),
-                                                    ("anthropic", "X-api-key", "sk-secret")])
+                                                    ("anthropic", "X-api-key", "sk-secret"),
+                                                    ("openai-responses", "Authorization", "Bearer sk-secret")])
 def test_key_only_in_its_header(provider, header, value):
     opener = Opener()
     call = agent.caller_for(provider, agent.check_base_url(provider, None), "sk-secret", opener)
@@ -270,3 +271,56 @@ def test_unschedule_only_confirmed_withdrawals(tmp_path):
         ext.mark(db, name, "installed")
     ext.mark(db, "sonnet", "withdrawn")
     assert ext.unschedule(db, ["claude", "mistral", "sonnet", "ghost"]) == ["sonnet"]
+
+
+def responses_answer(*items, status="completed"):
+    return {"status": status, "output": list(items)}
+
+
+def test_responses_tool_call_then_answer():
+    """openai-responses: function_call answered by function_call_output; reasoning goes back in input; store false."""
+    world = World()
+    reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque", "summary": []}
+    call, sent = scripted(
+        responses_answer(reasoning, {"type": "function_call", "call_id": "c1", "name": "chat_post",
+                                     "arguments": json.dumps({"room": "agents", "body": "hi"})}),
+        responses_answer({"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": "Posted hi."}]}))
+    history = []
+    reply, calls = agent.run(world, call, "openai-responses", "gpt-5.6-sol", "Say hi.",
+                             allowed=["chat_post", "missing"], history=history)
+    assert (reply, calls) == ("Posted hi.", 1)
+    assert world.calls == [("chat_post", {"room": "agents", "body": "hi"})]
+    method, path, body = sent[0]
+    assert (method, path) == ("POST", "/responses")
+    assert body["store"] is False and body["include"] == ["reasoning.encrypted_content"]
+    assert "data" in body["instructions"] and body["input"][0]["role"] == "user"
+    assert body["tools"] == [{"type": "function", "name": "chat_post", "description": "Write in a room.",
+                              "parameters": TOOLS["chat_post"]["inputSchema"]}]
+    second = sent[1][2]["input"]
+    assert reasoning in second, "the reasoning item goes back to the model"
+    assert second[-1]["type"] == "function_call_output" and second[-1]["call_id"] == "c1"
+    assert history[-1] == {"role": "assistant", "content": "Posted hi."}
+
+
+def test_responses_call_limit_keeps_only_text():
+    use = responses_answer({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "More."}]},
+                           {"type": "function_call", "call_id": "c", "name": "whoami", "arguments": "{}"})
+    call, sent = scripted(use, use)
+    history = []
+    reply, calls = agent.run(World(), call, "openai-responses", "m", "Go.", allowed=["whoami"], max_calls=1, history=history)
+    assert (reply, calls) == ("More.", 1) and sent[1][2]["tool_choice"] == "none"
+    assert history[-1] == {"role": "assistant", "content": "More."}
+
+
+def test_responses_empty_answer_rolls_back():
+    call, _ = scripted(responses_answer(status="incomplete") | {"incomplete_details": {"reason": "max_output_tokens"}})
+    history = [{"role": "user", "content": "earlier"}]
+    with pytest.raises(agent.AgentError, match="max_output_tokens"):
+        agent.run(World(), call, "openai-responses", "m", "Go.", history=history)
+    assert history == [{"role": "user", "content": "earlier"}]
+
+
+def test_responses_provider_is_declarable(tmp_path):
+    one = ext.declare(registry(tmp_path), 3, {"name": "operator-sol", "provider": "openai-responses", "model": "gpt-5.6-sol"})
+    assert one["base_url"] == "https://api.openai.com/v1" and one["provider"] == "openai-responses"

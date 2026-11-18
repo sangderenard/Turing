@@ -74,9 +74,10 @@ function render() {
     (item.note?" · "+item.note:""),{class:"card"}));
   if(!state.jobs.length) jobs.append(node("p","No runs yet."));
 }
-const BASES={openai:"https://api.openai.com/v1",anthropic:"https://api.anthropic.com/v1",gemini:""};
+const BASES={openai:"https://api.openai.com/v1",anthropic:"https://api.anthropic.com/v1",gemini:"","openai-responses":"https://api.openai.com/v1"};
 const BASE_HELP={openai:"Any OpenAI-compatible Chat Completions server: OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, or http://localhost for Ollama or vLLM.",
-  anthropic:"Anthropic Messages API.",gemini:"Gemini's base URL is fixed; leave this blank."};
+  anthropic:"Anthropic Messages API.",
+  "openai-responses":"OpenAI Responses API: for reasoning models (gpt-5.6-sol and later) that take tools only there.",gemini:"Gemini's base URL is fixed; leave this blank."};
 function providerChanged() {
   const p=byId("agent-provider").value;
   byId("agent-base").placeholder=BASES[p]||""; byId("agent-base").disabled=p==="gemini";
