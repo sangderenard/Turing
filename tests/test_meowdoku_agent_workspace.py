@@ -225,3 +225,23 @@ def test_character_instances_attach_memory_and_llama_batch_claims(server):
     assert status == 200 and moved["id"] == first["id"] and moved["memory_id"] == first["memory_id"]
     assert moved["individual"] == "batch_outsider"
     assert _call(server.port, "/api/memory/file/" + first["memory_id"], headers=headers(outsider))[0] == 200
+
+
+def test_an_operator_declares_how_a_character_is_run(server):
+    """[CAPACITY] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 2: action capacity on the profiles route."""
+    operator = _signup(server.port, "capacity_operator")
+    agent = _signup(server.port, "capacity_agent")
+    authz.grant_role(server.sessions.accounts_db, "capacity_operator", "operator", "test")
+    headers = {**PUBLIC_XFF, "Cookie": operator, "X-Meowdoku-Workspace": "1"}
+    status, character, _, _ = _call(server.port, "/api/agent-workspace/profiles", "POST", headers,
+                                    {"action": "save", "title": "Run me", "individual": "capacity_agent", "document_ids": []})
+    assert status == 200 and character["capacity"] is None
+    declare = {"action": "capacity", "id": character["id"], "state": "stateless", "context_tokens": 4096,
+               "tools": "runner", "session": "none", "note": ""}
+    status, saved, _, _ = _call(server.port, "/api/agent-workspace/profiles", "POST", headers, declare)
+    assert status == 200 and saved["capacity"]["state"] == "stateless"
+    assert _call(server.port, "/api/agent-workspace/profiles", "POST", headers, {**declare, "state": "maybe"})[0] == 400
+    assert _call(server.port, "/api/agent-workspace/profiles", "POST",
+                 {**PUBLIC_XFF, "Cookie": agent, "X-Meowdoku-Workspace": "1"}, declare)[0] == 403
+    mine = _call(server.port, "/api/agent-workspace/orientation", headers={**PUBLIC_XFF, "Cookie": agent})[1]
+    assert mine["capacity"]["state"] == "stateless" and mine["preamble"].startswith("You are run stateless")

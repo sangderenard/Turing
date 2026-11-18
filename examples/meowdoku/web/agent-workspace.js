@@ -90,6 +90,7 @@ async function openProfile(id) {
   const row = await api("/api/agent-workspace/profile/" + id); activeProfile = row; activeJob = null; activeInstance = null; showProfile();
   $("profile-title").value = row.title; $("profile-individual").value = row.individual;
   $("profile-documents").value = row.document_ids.join("\n"); $("profile-resolved").value = "";
+  showCapacity(row.capacity);
   $("job-list").replaceChildren();
   for (const job of row.jobs) $("job-list").append(itemButton(job.title + " · " + job.job_key, guard(() => openJob(job.id))));
   freshJob(); freshInstance(); notice("Opened character " + row.title);
@@ -98,7 +99,22 @@ function freshProfile() {
   activeProfile = null; activeJob = null; activeInstance = null; showProfile();
   $("profile-title").value = ""; $("profile-individual").value = "";
   $("profile-documents").value = ""; $("profile-resolved").value = "";
+  showCapacity(null);
   $("job-list").replaceChildren(); freshJob(); freshInstance(); notice("New character");
+}
+function showCapacity(declared) {                       // [CAPACITY] stateful or stateless, as declared
+  $("capacity-state").value = declared ? declared.state : ""; $("capacity-tokens").value = declared ? declared.context_tokens : "";
+  $("capacity-tools").value = declared ? declared.tools : "own"; $("capacity-session").value = declared ? declared.session : "none";
+  $("capacity-note").value = declared ? declared.note : "";
+  $("capacity-declared").textContent = declared ? "Declared " + new Date(declared.declared_at * 1000).toLocaleString() : "Not declared";
+}
+async function saveCapacity() {
+  if (!activeProfile) return notice("Open or save a character first");
+  if (!$("capacity-state").value) return notice("Choose stateful or stateless");
+  const row = await api("/api/agent-workspace/profiles", {action:"capacity", id:activeProfile.id, state:$("capacity-state").value,
+    context_tokens:Number($("capacity-tokens").value), tools:$("capacity-tools").value, session:$("capacity-session").value,
+    note:$("capacity-note").value});
+  activeProfile = row; showCapacity(row.capacity); notice("Saved how " + row.title + " is run");
 }
 async function saveProfile() {
   const data = {action:"save", title:$("profile-title").value, individual:$("profile-individual").value,
@@ -219,6 +235,7 @@ $("memory-save").onclick = guard(() => memoryChange("write")); $("memory-delete"
 $("memory-transfer").onclick = guard(() => memoryChange("transfer"));
 $("profile-new").onclick = freshProfile; $("profile-save").onclick = guard(saveProfile);
 $("profile-delete").onclick = guard(deleteProfile); $("profile-preview").onclick = guard(() => previewProfile());
+$("capacity-save").onclick = guard(saveCapacity);
 $("job-new").onclick = freshJob; $("job-save").onclick = guard(saveJob); $("job-delete").onclick = guard(deleteJob);
 $("job-preview").onclick = guard(() => previewProfile(true));
 $("instance-new").onclick = freshInstance; $("instance-save").onclick = guard(saveInstance);

@@ -1571,6 +1571,8 @@ def make_handler(sessions: Sessions):
                             return self._json(agent_workspace_mod.save_profile(db, body))
                         if body.get("action") == "delete":
                             return self._json(agent_workspace_mod.delete_profile(db, body.get("id")))
+                        if body.get("action") == "capacity":       # [CAPACITY] stateful or stateless, declared
+                            return self._json(agent_workspace_mod.save_capacity(db, self._principal().user_id, body))
                     elif path.endswith("/jobs"):
                         if body.get("action") == "save":
                             return self._json(agent_workspace_mod.save_profile_job(db, body))

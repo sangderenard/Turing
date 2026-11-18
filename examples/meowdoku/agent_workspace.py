@@ -76,6 +76,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
                "created REAL NOT NULL, updated REAL NOT NULL, seed_key TEXT UNIQUE)")
     db.execute("CREATE INDEX IF NOT EXISTS agent_instances_profile ON agent_instances(profile_id,title)")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS agent_instances_memory ON agent_instances(memory_id)")
+    # [CAPACITY] its own schema module, so code that knows only agent_workspace 2 is unaffected.
+    schema_version.declare(db, "agent_capacity", 1)
+    db.execute("CREATE TABLE IF NOT EXISTS agent_capacity ("
+               "profile_id TEXT PRIMARY KEY REFERENCES agent_profiles(id) ON DELETE CASCADE, state TEXT NOT NULL, "
+               "context_tokens INTEGER NOT NULL, tools TEXT NOT NULL, session TEXT NOT NULL, note TEXT NOT NULL, "
+               "declared_by INTEGER NOT NULL, declared_at REAL NOT NULL)")
     return db
 
 
@@ -288,7 +294,63 @@ def profile(db, profile_id):
     jobs = [dict(job) for job in db.execute(
         "SELECT id,job_key,title,updated FROM agent_profile_jobs WHERE profile_id=? ORDER BY title COLLATE NOCASE",
         (profile_id,))]
-    return {**dict(row), "document_ids": json.loads(row["document_ids"]), "jobs": jobs}
+    return {**dict(row), "document_ids": json.loads(row["document_ids"]), "jobs": jobs,
+            "capacity": capacity(db, profile_id)}
+
+
+# [CAPACITY] How each character is run (case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 2), declared by an operator and
+# never inferred from a name:
+#   state    stateful  - its own context lasts between calls, so it is briefed now and then;
+#            stateless - every call starts empty, so its orientation and memory are carried for it each time;
+#   context_tokens     - how much it reads at once;
+#   tools    own       - it calls the tools itself;   runner - a runner calls them for it (Llama);
+#   session  resumable - its session can be kept and resumed;   none - it cannot.
+CAPACITY_STATES = ("stateful", "stateless")
+CAPACITY_TOOLS = ("own", "runner")
+CAPACITY_SESSIONS = ("resumable", "none")
+CAPACITY_LINES = {
+    "stateful": ("You are run stateful: your session keeps its context between calls, so you are briefed on the first "
+                 "call of the day and when your documents change. Read them again in full whenever you need the why."),
+    "stateless": ("You are run stateless: every call starts empty, so your orientation and memory are handed to you "
+                  "each time. Keep your memory file current; it is how you continue."),
+}
+
+
+def capacity(db, profile_id):
+    """The declared capacity of one character, or None when none is declared."""
+    row = db.execute("SELECT state,context_tokens,tools,session,note,declared_by,declared_at FROM agent_capacity "
+                     "WHERE profile_id=?", (profile_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def save_capacity(db, actor_id: int, data: dict):
+    profile_id = data.get("id")
+    if not isinstance(profile_id, str) or not profile_id:
+        raise WorkspaceError("profile id is required")
+    profile(db, profile_id)                                           # 404 for an unknown character
+    state, tools, session, tokens = data.get("state"), data.get("tools"), data.get("session"), data.get("context_tokens")
+    if state not in CAPACITY_STATES:
+        raise WorkspaceError("state must be stateful or stateless")
+    if tools not in CAPACITY_TOOLS:
+        raise WorkspaceError("tools must be own or runner")
+    if session not in CAPACITY_SESSIONS:
+        raise WorkspaceError("session must be resumable or none")
+    if type(tokens) is not int or not 256 <= tokens <= 10_000_000:
+        raise WorkspaceError("context_tokens must be a whole number from 256 to 10000000")
+    note = _text(data.get("note", ""), "capacity note", 2000).strip()
+    db.execute("INSERT INTO agent_capacity(profile_id,state,context_tokens,tools,session,note,declared_by,declared_at) "
+               "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(profile_id) DO UPDATE SET state=excluded.state,"
+               "context_tokens=excluded.context_tokens,tools=excluded.tools,session=excluded.session,note=excluded.note,"
+               "declared_by=excluded.declared_by,declared_at=excluded.declared_at",
+               (profile_id, state, tokens, tools, session, note, actor_id, time.time()))
+    return profile(db, profile_id)
+
+
+def _capacity_words(declared):
+    if not declared:
+        return "how you are run: not declared"
+    return (f"how you are run: {declared['state']}, {declared['context_tokens']} tokens, tools by "
+            f"{'you' if declared['tools'] == 'own' else 'the runner'}, session {declared['session']}")
 
 
 def save_profile(db, data):
@@ -662,6 +724,7 @@ def orientation(db, user_id, now=None, full=False):
     basics = [document(db, row[0]) for row in db.execute(
         "SELECT id FROM agent_documents WHERE kind='orientation' AND parent_id IS NULL ORDER BY updated, title")]
     profile_id = _profile_for(db, user_id)
+    declared = capacity(db, profile_id) if profile_id else None
     own, job = [], None
     if profile_id:
         has_job = db.execute("SELECT 1 FROM agent_profile_jobs WHERE profile_id=? AND job_key=?", (profile_id, branch)).fetchone()
@@ -672,13 +735,16 @@ def orientation(db, user_id, now=None, full=False):
         if item["id"] not in seen_ids:
             seen_ids.add(item["id"]); documents.append(item)
     decision = ["first interaction with this account today? " + ("yes" if first else "no"),
-                f"profile: {'yes' if profile_id else 'none'}" + (f", job {job['key']}" if job else "")]
+                f"profile: {'yes' if profile_id else 'none'}" + (f", job {job['key']}" if job else ""),
+                _capacity_words(declared)]
     if first or job or full:
         preamble = "\n\n".join(f"# {item['title']}\n{item['body']}" for item in documents)
     else:
         preamble = ("You were oriented earlier today (UTC " + day + "). Your documents, in order: " +
                     "; ".join(item["title"] for item in documents) +
                     ". Read them again in full with workspace_orientation (full=1).") if documents else ""
-    return {"first_today": first, "day": day, "branch": branch, "decision": decision,
+    if declared:                                  # [CAPACITY] the agent is told how it is run, first
+        preamble = CAPACITY_LINES[declared["state"]] + ("\n\n" + preamble if preamble else "")
+    return {"first_today": first, "day": day, "branch": branch, "decision": decision, "capacity": declared,
             "documents": [{"id": d["id"], "kind": d["kind"], "title": d["title"]} for d in documents],
             "preamble": preamble}
