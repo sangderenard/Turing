@@ -106,11 +106,15 @@ def connect(state_dir, readonly=False):
     return ensure(db)
 
 
+PS_SINGLE_QUOTES = "'‘’‚‛"
+
+
 def install_command(name, script=None):
-    """The copyable install command. The script path is a PowerShell single-quoted literal (an embedded ' doubled),
-    so a checkout under a folder with spaces stays one argument (review 003eb9cb, comment 198). NAME keeps the agent
-    name to [a-z0-9-], which needs no quoting."""
-    path = str(INSTALL_SCRIPT if script is None else script).replace("'", "''")
+    """The copyable install command. The script path is a PowerShell single-quoted literal, so a checkout under a
+    folder with spaces stays one argument (review 003eb9cb, comment 198). Every character PowerShell takes as a
+    single quote is doubled, as its CodeGeneration.EscapeSingleQuotedStringContent does: ' and the curly
+    U+2018..U+201B (review 9b6ce7fe, comment 207). NAME keeps the agent name to [a-z0-9-], which needs no quoting."""
+    path = "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(INSTALL_SCRIPT if script is None else script))
     return f"pwsh -File '{path}' -Name {name}"
 
 

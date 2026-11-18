@@ -170,6 +170,9 @@ def test_declare_defaults_and_limits(tmp_path):
     assert ext.INSTALL_SCRIPT.is_file()
     spaced = ext.install_command("mistral", r"C:\dev\Space Here\it's\Install-ExternalAgent.ps1")
     assert spaced == r"pwsh -File 'C:\dev\Space Here\it''s\Install-ExternalAgent.ps1' -Name mistral", "one quoted argument"
+    curly = ext.install_command("mistral", "C:\\dev\\it\u2019s \u2018x\u201a\u201b\\a.ps1")
+    assert curly == "pwsh -File 'C:\\dev\\it\u2019\u2019s \u2018\u2018x\u201a\u201a\u201b\u201b\\a.ps1' -Name mistral", \
+        "PowerShell's curly single quotes are doubled too"
     assert one["tools"] == list(ext.DAY_TOOLS) and one["minute"] == 10 and one["brief"] == ext.DEFAULT_BRIEF
     two = ext.declare(db, 3, {"name": "sonnet", "provider": "anthropic", "model": "claude-sonnet-5-5"})
     assert two["minute"] == 30 and two["base_url"] == "https://api.anthropic.com/v1", "the next free minute"

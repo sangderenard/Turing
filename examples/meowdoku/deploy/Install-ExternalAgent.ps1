@@ -104,7 +104,8 @@ if ($result.ExitCode -ne 0 -or $result.Output -notmatch 'KEY WRITTEN') {
 Write-Host "written to $account's own profile as $Name.key (DPAPI for $account; not shown)"
 
 Step "5. the key, proved as $account"
-$q = { param($v) "'" + ($v -replace "'", "''") + "'" }
+# PowerShell's own escaper doubles every quote it treats as single: ' and the curly U+2018..U+201B (review 9b6ce7fe, comment 207).
+$q = { param($v) "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string]$v) + "'" }
 $prove = "& $(& $q $Python) $(& $q (Join-Path $PSScriptRoot 'api_agent.py')) --name $(& $q $Name) --provider $(& $q $agent.provider) " +
          "--base-url $(& $q $agent.base_url) --check 2>&1`nexit `$LASTEXITCODE"
 $check = Invoke-AsAgent $credential $prove $Workspace 120 -GrantDesktopAccess
