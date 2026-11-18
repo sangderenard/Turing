@@ -259,3 +259,44 @@ def test_peer_closing_closes_the_upstream_socket(fed):
     fed.stub.wait_frames(1)
     peer.close()
     assert fed.stub.closed.wait(5)
+
+
+# ---- [LINK] Nodus link tickets from a peer grant (research case 98d49cb8520e44d092c5d134c37c3c32, stage 3) ----
+def _link_post(env, prefix, body, forwarded_http=False):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", env.port, timeout=5)
+    headers = {"Content-Type": "application/json"}
+    if forwarded_http:   # as Apache would forward a plain-HTTP request (proxy_trust: loopback is the trusted proxy)
+        headers.update({"X-Forwarded-For": "203.0.113.7", "X-Forwarded-Proto": "http"})
+    conn.request("POST", f"/api/link/ticket/{prefix}", json.dumps(body), headers)
+    response = conn.getresponse()
+    answer = (response.status, json.loads(response.read() or b"{}"))
+    conn.close()
+    return answer
+
+
+def test_link_ticket_from_grant(fed):
+    import base64
+    import hashlib
+    import hmac as hmac_mod
+    from meowdoku import link_tickets
+    gid, secret = _grant(fed, "engine", "result")
+    body = {"grant_id": gid, "secret": secret, "direction": "engine"}
+    status, answer = _link_post(fed, "lab", body)
+    assert status == 503 and "no link key" in answer["error"], (status, answer)   # no key on this instance yet
+    link_tickets.create_key(fed.sessions.state.secrets_dir)
+    key = link_tickets.load_key(fed.sessions.state.secrets_dir)
+    status, answer = _link_post(fed, "lab", body)
+    assert status == 200, answer
+    control, bulk = base64.b64decode(answer["control_ticket"]), base64.b64decode(answer["bulk_ticket"])
+    assert answer["account"] == fed.uid and answer["path"] == "/ws/link/lab/"
+    assert struct.unpack("<Q", control[56:64])[0] == fed.uid                    # the grant's service account, not the peer's choice
+    assert control[24:56] == hashlib.sha256(b"lab").digest()
+    for t in (control, bulk):
+        assert hmac_mod.compare_digest(t[96:], hmac_mod.new(key, t[:96], hashlib.sha256).digest())
+    assert _link_post(fed, "lab", body, forwarded_http=True)[0] == 403           # never plain HTTP through the front
+    assert _link_post(fed, "lab", dict(body, secret=secret + "x"))[1] == {"error": "grant refused"}
+    assert _link_post(fed, "other", body)[1] == {"error": "grant refused"}      # the grant names its prefix
+    assert _link_post(fed, "lab", dict(body, direction="host"))[1] == {"error": "grant refused"}
+    authz.revoke_peer(fed.db, gid)
+    assert _link_post(fed, "lab", body)[1] == {"error": "grant refused"}
