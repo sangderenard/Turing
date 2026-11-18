@@ -306,3 +306,26 @@ def test_a_declared_reducer_claims_and_returns_guidance_that_the_stateless_agent
     assert _call(server.port, "/api/agent-workspace/guidance", headers=headers)[1]["cached"][0]["current"] == "yes"
     assert _call(server.port, "/api/agent-workspace/guidance", headers={**PUBLIC_XFF, "Cookie": agent})[0] == 403
     assert _call(server.port, "/api/agent-workspace/guidance", headers=PUBLIC_XFF)[0] == 401
+
+
+def test_an_account_keeps_and_drops_its_own_characters_session(server):
+    """[SESSIONS] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 5."""
+    operator = _signup(server.port, "session_operator")
+    agent = _signup(server.port, "session_agent")
+    authz.grant_role(server.sessions.accounts_db, "session_operator", "operator", "test")
+    headers = {**PUBLIC_XFF, "Cookie": operator, "X-Meowdoku-Workspace": "1"}
+    mine = {**PUBLIC_XFF, "Cookie": agent, "X-Meowdoku-Workspace": "1"}
+    assert _call(server.port, "/api/agent-workspace/session", "POST", mine, {"action": "keep"})[0] == 409, "no character yet"
+    status, character, _, _ = _call(server.port, "/api/agent-workspace/profiles", "POST", headers,
+                                    {"action": "save", "title": "Kept", "individual": "session_agent", "document_ids": []})
+    assert status == 200
+    assert _call(server.port, "/api/agent-workspace/profiles", "POST", headers, {"action": "capacity", "id": character["id"],
+                 "state": "stateless", "context_tokens": 200000, "tools": "own", "session": "resumable", "note": ""})[0] == 200
+    assert _call(server.port, "/api/agent-workspace/session", "POST", {**PUBLIC_XFF, "Cookie": agent},
+                 {"action": "keep"})[0] == 403, "a write needs the workspace header"
+    status, kept, _, _ = _call(server.port, "/api/agent-workspace/session", "POST", mine, {"action": "keep"})
+    assert status == 200 and kept["state"] == "stateful"
+    oriented = _call(server.port, "/api/agent-workspace/orientation", headers=mine)[1]
+    assert oriented["capacity"]["state"] == "stateful" and oriented["source_digest"]
+    assert _call(server.port, "/api/agent-workspace/session", "POST", mine, {"action": "drop"})[1]["state"] == "stateless"
+    assert _call(server.port, "/api/agent-workspace/session", "POST", PUBLIC_XFF, {"action": "keep"})[0] == 401

@@ -82,6 +82,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
                "profile_id TEXT PRIMARY KEY REFERENCES agent_profiles(id) ON DELETE CASCADE, state TEXT NOT NULL, "
                "context_tokens INTEGER NOT NULL, tools TEXT NOT NULL, session TEXT NOT NULL, note TEXT NOT NULL, "
                "declared_by INTEGER NOT NULL, declared_at REAL NOT NULL)")
+    # [SESSIONS] a character's kept session (stage 5), its own schema module: while its heartbeat is fresh, the character
+    # reads stateful. The operator's declaration in agent_capacity is never rewritten.
+    schema_version.declare(db, "agent_sessions", 1)
+    db.execute("CREATE TABLE IF NOT EXISTS agent_sessions (profile_id TEXT PRIMARY KEY REFERENCES agent_profiles(id) "
+               "ON DELETE CASCADE, since REAL NOT NULL, heartbeat REAL NOT NULL, dropped_at REAL, "
+               "error TEXT NOT NULL DEFAULT '')")
     from meowdoku import agent_decisions          # [DECISIONS] its own schema module and tables
     agent_decisions.prepare(db)
     from meowdoku import agent_guidance           # [GUIDANCE] its own schema module and tables
@@ -298,8 +304,10 @@ def profile(db, profile_id):
     jobs = [dict(job) for job in db.execute(
         "SELECT id,job_key,title,updated FROM agent_profile_jobs WHERE profile_id=? ORDER BY title COLLATE NOCASE",
         (profile_id,))]
+    session = db.execute("SELECT since,heartbeat,dropped_at,error FROM agent_sessions WHERE profile_id=?",
+                         (profile_id,)).fetchone()
     return {**dict(row), "document_ids": json.loads(row["document_ids"]), "jobs": jobs,
-            "capacity": capacity(db, profile_id)}
+            "capacity": capacity(db, profile_id), "session": dict(session) if session else None}
 
 
 # [CAPACITY] How each character is run (case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 2), declared by an operator and
@@ -348,6 +356,52 @@ def save_capacity(db, actor_id: int, data: dict):
                "declared_by=excluded.declared_by,declared_at=excluded.declared_at",
                (profile_id, state, tokens, tools, session, note, actor_id, time.time()))
     return profile(db, profile_id)
+
+
+# [SESSIONS] case 46d6ad2d, stage 5: a character whose session is declared resumable may keep one (deploy/agent_session.py).
+# While it is kept, its heartbeat at most KEPT_SECONDS old, the character reads stateful: it was briefed in that session
+# and is handed only what is new. Dropped, or its heartbeat stale, it reads as declared again. KEPT_SECONDS is longer
+# than one turn (Start-AgentDay.ps1 -BellTimeoutMinutes 4): the session does not beat while the agent answers.
+KEPT_SECONDS = 600
+
+
+def kept_session(db, profile_id, now=None):
+    now = time.time() if now is None else now
+    row = db.execute("SELECT since,heartbeat FROM agent_sessions WHERE profile_id=? AND dropped_at IS NULL AND heartbeat>=?",
+                     (profile_id, now - KEPT_SECONDS)).fetchone()
+    return dict(row) if row else None
+
+
+def running_capacity(db, profile_id, now=None):
+    """The declared capacity, its state read stateful while a kept session lives; declared_state is what was declared."""
+    declared = capacity(db, profile_id)
+    if not declared:
+        return None
+    kept = kept_session(db, profile_id, now) if declared["session"] == "resumable" else None
+    return {**declared, "declared_state": declared["state"], "state": "stateful" if kept else declared["state"],
+            "kept_since": kept["since"] if kept else None}
+
+
+def keep_session(db, user_id, data, now=None):
+    """The signed-in account keeps (action keep, its heartbeat) or drops (action drop, with an error when it failed) the
+    kept session of its own character. Only a character whose session is declared resumable keeps one."""
+    now = time.time() if now is None else now
+    profile_id = _profile_for(db, user_id)
+    declared = capacity(db, profile_id) if profile_id else None
+    if not declared or declared["session"] != "resumable":
+        raise WorkspaceError("this account's character has no session declared resumable", 409)
+    action = data.get("action")
+    if action == "keep":
+        db.execute("INSERT INTO agent_sessions(profile_id,since,heartbeat) VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE "
+                   "SET since=CASE WHEN dropped_at IS NOT NULL OR heartbeat<? THEN excluded.since ELSE since END, "
+                   "heartbeat=excluded.heartbeat, dropped_at=NULL, error=''", (profile_id, now, now, now - KEPT_SECONDS))
+    elif action == "drop":
+        error = _text(data.get("error", ""), "session error", 1000).strip()
+        db.execute("UPDATE agent_sessions SET dropped_at=?, error=? WHERE profile_id=?", (now, error, profile_id))
+    else:
+        raise WorkspaceError("action is keep or drop")
+    return {"profile_id": profile_id, "state": running_capacity(db, profile_id, now)["state"],
+            "kept_seconds": KEPT_SECONDS}
 
 
 def _capacity_words(declared):
@@ -744,7 +798,7 @@ def orientation(db, user_id, now=None, full=False):
     first, day = _orientation_seen(db, user_id, now)
     branch = FIRST_TODAY if first else RETURNING
     profile_id = _profile_for(db, user_id)
-    declared = capacity(db, profile_id) if profile_id else None
+    declared = running_capacity(db, profile_id, now) if profile_id else None      # [SESSIONS] stateful while kept
     job = None
     if profile_id:
         has_job = db.execute("SELECT 1 FROM agent_profile_jobs WHERE profile_id=? AND job_key=?", (profile_id, branch)).fetchone()
@@ -778,4 +832,13 @@ def orientation(db, user_id, now=None, full=False):
             preamble += "\n\n" + where
     return {"first_today": first, "day": day, "branch": branch, "decision": decision, "capacity": declared,
             "documents": [{"id": d["id"], "kind": d["kind"], "title": d["title"]} for d in documents],
-            "guidance": guidance, "preamble": preamble}
+            "guidance": guidance, "preamble": preamble,
+            # [SESSIONS] a kept session is briefed again when this changes (agent_guidance.sources: documents, graph, capacity)
+            "source_digest": _source_digest(db, profile_id)}
+
+
+def _source_digest(db, profile_id):
+    if not profile_id:
+        return None
+    from meowdoku import agent_guidance
+    return agent_guidance.sources(db, profile_id)["digest"]

@@ -1540,6 +1540,27 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": str(error)}, error.status)
                 finally:
                     db.close()
+            if path == "/api/agent-workspace/session":
+                # [SESSIONS] any signed-in account keeps or drops its own character's kept session (stage 5)
+                principal = self._principal()
+                if principal.user_id is None:
+                    return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+                if method != "POST":
+                    return self._json({"error": "POST keep or drop"}, HTTPStatus.METHOD_NOT_ALLOWED)
+                if self.headers.get("X-Meowdoku-Workspace") != "1":
+                    return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+                body = self._body_json(limit=4096)
+                if body is None:
+                    return
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                try:
+                    if not isinstance(body, dict):
+                        raise agent_workspace_mod.WorkspaceError("object required")
+                    return self._json(agent_workspace_mod.keep_session(db, principal.user_id, body))
+                except agent_workspace_mod.WorkspaceError as error:
+                    return self._json({"error": str(error)}, error.status)
+                finally:
+                    db.close()
             if path == "/api/agent-workspace/guidance":
                 # [GUIDANCE] the reducer (an account whose profile declares the job "reduce") claims requests and returns
                 # reductions; operators and reducers read the cache's status. agent_guidance.py.
@@ -4357,7 +4378,8 @@ def make_handler(sessions: Sessions):
                 return self._user_files_route(path0, "POST")
             if path0 in ("/api/agent-workspace/documents", "/api/agent-workspace/profiles", "/api/agent-workspace/jobs",
                          "/api/agent-workspace/instances", "/api/agent-workspace/decisions",
-                         "/api/agent-workspace/decisions/at", "/api/agent-workspace/guidance"):
+                         "/api/agent-workspace/decisions/at", "/api/agent-workspace/guidance",
+                         "/api/agent-workspace/session"):
                 return self._agent_workspace_route(path0, "POST")
             if path0 == "/api/scratch":
                 return self._scratch_route(path0, "POST")

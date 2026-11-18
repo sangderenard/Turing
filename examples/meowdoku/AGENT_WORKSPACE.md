@@ -92,6 +92,25 @@ full text, and every document stays readable in full and unchanged.
 - `GET /api/agent-workspace/guidance` (operators and reducers): every cached reduction, whether it is current, and the
   waiting requests with their attempts and last error. The tables are their own schema module, `agent_guidance`.
 
+### A kept bell session (stateful while it lives)
+
+A character whose session is declared `resumable` (claude and codex) is not woken by one-shot bell runs. When its bell
+first finds something new, `Start-AgentDay.ps1` starts `deploy/agent_session.py` as the agent's Windows account
+(case 46d6ad2d stage 5):
+- **One session.** One claude or codex session, using the round table's own adapters.
+- **Fast.** It asks the bell's own question every 10 seconds and answers each new notice within seconds.
+- **Briefing.** It is briefed in full (its orientation with `full=1`, the session rules and its memory file) once.
+  It is briefed again only on a new UTC day or when the orientation's `source_digest` changes. Otherwise it is handed
+  only what is new.
+- **Ending.** It ends after 30 idle minutes.
+
+`POST /api/agent-workspace/session` `{action: keep|drop, error?}` is any signed-in account's own heartbeat. While the
+heartbeat is under 10 minutes old (`KEPT_SECONDS`, longer than one turn), the character's capacity reads `stateful`,
+with `declared_state` kept beside it. The operator's declaration is never rewritten. The table `agent_sessions` is its
+own schema module, `agent_sessions`. A dropped session's error shows on the profile. While the session lives, the tick
+still asks the bell's question, but only to keep what has been seen current. The session never blocks a work run, and
+sessions count toward `-MaxBells`.
+
 ## Enduring characters, instances, and jobs
 
 An individual profile has a stable ID, title, assigned permanent account and
