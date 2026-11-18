@@ -27,7 +27,8 @@ async function act(data) {
     const body=await res.json().catch(()=>({error:"No response from control service."}));
     if(!res.ok) throw Error(body.error||"HTTP "+res.status);
     await refresh();
-    show(data.action==="run"?"Queued run "+body.job_id:"Saved "+data.action+".");
+    show(data.action==="run"?"Queued run "+body.job_id:data.action==="agent_declare"?
+      "Declared "+body.agent.name+". Install it over SSH: "+body.agent.install:"Saved "+data.action+".");
   } catch(e) { show(e.message,true); }
 }
 function render() {
@@ -65,6 +66,7 @@ function render() {
     }
     grantBox.append(row);
   }
+  renderAgents();
   const jobs=byId("jobs"); jobs.replaceChildren();
   for(const item of state.jobs) jobs.append(node("div",
     "Run "+item.id+" · action "+item.preset_id+" · "+item.status+
@@ -72,6 +74,59 @@ function render() {
     (item.note?" · "+item.note:""),{class:"card"}));
   if(!state.jobs.length) jobs.append(node("p","No runs yet."));
 }
+const BASES={openai:"https://api.openai.com/v1",anthropic:"https://api.anthropic.com/v1",gemini:""};
+const BASE_HELP={openai:"Any OpenAI-compatible Chat Completions server: OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, or http://localhost for Ollama or vLLM.",
+  anthropic:"Anthropic Messages API.",gemini:"Gemini's base URL is fixed; leave this blank."};
+function providerChanged() {
+  const p=byId("agent-provider").value;
+  byId("agent-base").placeholder=BASES[p]||""; byId("agent-base").disabled=p==="gemini";
+  byId("agent-base-help").textContent=BASE_HELP[p]||"";
+}
+function renderAgents() {
+  byId("agents-section").hidden=!state.admin;
+  if(!state.admin) return;
+  const providers=byId("agent-provider");
+  if(!providers.options.length) {
+    for(const name of state.providers) providers.append(node("option",name,{value:name}));
+    byId("agent-tools").value=state.agent_tools.join(", ");
+    providerChanged();
+  }
+  const box=byId("agents"); box.replaceChildren();
+  for(const item of state.agents) {
+    const card=node("div","",{class:"card"});
+    card.append(node("strong",item.name+" "),node("small",item.provider+" · "+item.model+" · "+item.base_url+
+      " · :"+String(item.minute).padStart(2,"0")+" · "+item.account+" · "+item.status+(item.note?" · "+item.note:"")));
+    if(item.status!=="installed"&&item.status!=="withdrawn") {
+      const cmd=node("div","",{class:"row"}); cmd.append(node("small","Install over SSH: "),node("code",item.install));
+      card.append(cmd);
+    }
+    const row=node("div","",{class:"row"});
+    if(item.status!=="installed") {
+      const edit=node("button","Edit",{type:"button"});
+      edit.addEventListener("click",()=>{
+        byId("agent-name").value=item.name; byId("agent-provider").value=item.provider; providerChanged();
+        byId("agent-base").value=item.provider==="gemini"?"":item.base_url; byId("agent-model").value=item.model;
+        byId("agent-tools").value=item.tools.join(", "); byId("agent-minute").value=item.minute; byId("agent-brief").value=item.brief;
+      });
+      row.append(edit);
+    }
+    if(item.status!=="withdrawn") {
+      const withdraw=node("button","Withdraw",{type:"button"});
+      withdraw.addEventListener("click",()=>{if(confirm("Stop scheduling "+item.name+"? Its accounts and key stay until removed by hand.")) act({action:"agent_withdraw",name:item.name});});
+      row.append(withdraw);
+    }
+    card.append(row); box.append(card);
+  }
+  if(!state.agents.length) box.append(node("p","No external agents declared."));
+}
+byId("agent-provider").addEventListener("change",providerChanged);
+byId("agent-declare").addEventListener("click",()=>{
+  const minute=byId("agent-minute").value;
+  act({action:"agent_declare",agent:{name:byId("agent-name").value.trim(),provider:byId("agent-provider").value,
+    base_url:byId("agent-base").value.trim(),model:byId("agent-model").value.trim(),
+    tools:byId("agent-tools").value.split(",").map(t=>t.trim()).filter(Boolean),
+    minute:minute===""?null:Number(minute),brief:byId("agent-brief").value}});
+});
 byId("create").addEventListener("click",()=>{
   let argv;
   try { argv=JSON.parse(byId("argv").value); } catch { show("Arguments must be a JSON array.",true); return; }

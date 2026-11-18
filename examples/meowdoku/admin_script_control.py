@@ -171,7 +171,12 @@ def list_state(db, user_id, admin):
         "SELECT id,preset_id,requested_by,requested,status,started,finished,exit_code,note "
         "FROM control_jobs " + ("" if admin else "WHERE requested_by=? ") + "ORDER BY id DESC LIMIT 50",
         () if admin else (user_id,))]
-    return {"scripts": SCRIPTS if admin else (), "presets": presets, "grants": grants, "jobs": jobs}
+    # [EXTERNAL AGENTS] declarations only (external_agents.py); the install is the owner's stm agent install.
+    from meowdoku import external_agents
+    return {"scripts": SCRIPTS if admin else (), "presets": presets, "grants": grants, "jobs": jobs,
+            "agents": external_agents.agents(external_agents.ensure(db)) if admin else [],
+            "providers": external_agents.PROVIDERS if admin else (),
+            "agent_tools": external_agents.DAY_TOOLS if admin else ()}
 
 
 def command(db, accounts_db, user_id, admin, body):
@@ -250,6 +255,21 @@ def command(db, accounts_db, user_id, admin, body):
                             (preset, user_id, now))
         audit(db, user_id, action, cursor.lastrowid, True)
         return {"job_id": cursor.lastrowid, "status": "queued"}
+    if action in ("agent_declare", "agent_withdraw"):
+        # Saves what is not secret. Nothing on the machine changes here: the owner runs stm agent install <name>
+        # elevated, over SSH, and that script alone makes the accounts and asks for the API key (case 989e507e).
+        from meowdoku import external_agents
+        if not admin:
+            raise ControlError("admin account required", 403)
+        try:
+            if action == "agent_declare":
+                agent = external_agents.declare(db, user_id, body.get("agent") or {}, accounts_db, now)
+            else:
+                agent = external_agents.mark(external_agents.ensure(db), str(body.get("name", "")), "withdrawn", "withdrawn on the page", now)
+        except external_agents.ExternalAgentError as error:
+            raise ControlError(str(error), error.status) from None
+        audit(db, user_id, action, agent["name"], True)
+        return {"agent": agent}
     raise ControlError("unknown action")
 
 
@@ -278,7 +298,7 @@ def route(handler, sessions, method):
             return handler._json({"error": "same-origin request required"}, 403)
         if not csrf_check(db, token, handler.headers.get("X-Control-CSRF")):
             return handler._json({"error": "CSRF token expired; reload the page"}, 403)
-        body = handler._body_json(limit=8192)
+        body = handler._body_json(limit=16384)
         if body is None:
             return
         try:

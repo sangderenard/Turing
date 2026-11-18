@@ -26,3 +26,26 @@ Each script executes as the owner with `MEOWDOKU_OPERATOR=admin` and the specifi
 If a worker dies during a script, the job stays `running` and queued jobs stay held. Inspect the process and local log before manually reconciling the database; the worker does not replay a possibly partial deployment.
 
 A site restart does not restart the worker. After a code update, stop and start the scheduled task to load the new worker code.
+
+## External API agents (case 989e507e)
+
+The admin-only "External agents" section declares an API-backed model as a SpeakToMe agent: name, provider
+(`openai` for any OpenAI-compatible Chat Completions server, `anthropic`, `gemini`), base URL, model, SpeakToMe tools,
+the minute of its hourly work run and its brief. Saving a declaration (`agent_declare`, password-checked like every
+action) writes only `external_agents` in `<state>\sql\admin_control.db`; nothing on the computer changes and no key is
+asked for. The declaration is not an action of the worker either.
+
+The install is the owner's, from an elevated shell (an SSH session as the owner is one), with the command the page shows:
+
+```
+stm agent install <name>
+```
+
+`Install-ExternalAgent.ps1` does what was done by hand for Gemini on 2026-11-14: the SpeakToMe login with a random
+secret in `<state>\secrets\operator_credentials\<name>.secret` and role member; the Windows account `agents-<name>`
+through `Set-AgentBox.ps1 -Apply -CreateAgentAccount` (generated password, DPAPI for the owner); the API key typed at its
+prompt and written as that account to its own `~\<name>.key` (DPAPI for the agent, like `~\gemini.key`); a key check as
+the agent (`api_agent.py --check`); the character profile; then `Start-AgentDay.ps1 -Register`. The key passes to the
+agent's process on standard input only and is never logged. `stm agent key <name>` replaces the key, `stm agent run
+<name>` starts one work run, `stm agent withdraw <name>` stops scheduling it (its accounts and key stay; remove them by
+hand if wanted). The script is not in the action catalogue because it prompts for the key.

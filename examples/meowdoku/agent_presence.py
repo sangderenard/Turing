@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 AGENTS = {"claude": ("agents", 0), "codex": ("agents-codex", 20), "gemini": ("agents-gemini", 40)}
+# Installed external API agents (external_agents.py, case 989e507e), read beside the accounts database at each snapshot.
+_external: dict[str, tuple[str, int]] = {}
 RECENT_SECONDS = 30
 REQUEST_CHANNELS = ("api_in", "mcp_in")
 _lock = threading.Lock()
@@ -23,9 +25,26 @@ _recent: dict[tuple[str, str], float] = {}
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9_./-]{1,400}$")
 
 
+def known_agents(accounts_db: Path | None = None) -> dict[str, tuple[str, int]]:
+    """The built-in agents, then the installed external ones (account agents-<name>, their declared minute)."""
+    global _external
+    if accounts_db is not None:
+        found = {}
+        path = Path(accounts_db).with_name("admin_control.db")
+        try:
+            with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1) as db:
+                for name, minute in db.execute("SELECT name, minute FROM external_agents WHERE status='installed'"):
+                    if name not in AGENTS:
+                        found[name] = ("agents-" + name, int(minute))
+        except (sqlite3.Error, OSError, ValueError):
+            found = dict(_external)
+        _external = found
+    return {**AGENTS, **_external}
+
+
 def note_inbound(username: str, *, mcp: bool, now: float | None = None) -> None:
     """Record an authenticated API request; a call is only 'recent', not 'running'."""
-    if username not in AGENTS and username not in ("operator-claude", "operator-codex"):
+    if username not in AGENTS and username not in _external and username not in ("operator-claude", "operator-codex"):
         return
     with _lock:
         _recent[(username, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
@@ -70,8 +89,9 @@ def _process_started(pid: int) -> float | None:
         kernel.CloseHandle(ctypes.c_void_p(handle))
 
 
-def _run_records(days: Path, now: float) -> dict[str, list[dict]]:
-    found: dict[str, list[dict]] = {name: [] for name in AGENTS}
+def _run_records(days: Path, now: float, agents: dict | None = None) -> dict[str, list[dict]]:
+    agents = AGENTS if agents is None else agents
+    found: dict[str, list[dict]] = {name: [] for name in agents}
     directory = days / "running"
     if not directory.is_dir():
         return found
@@ -80,7 +100,7 @@ def _run_records(days: Path, now: float) -> dict[str, list[dict]]:
             record = json.loads(file.read_text(encoding="utf-8-sig"))
             if not isinstance(record, dict):
                 continue
-            name = record.get("agent") or next((n for n, (account, _) in AGENTS.items() if record.get("account") == account), None)
+            name = record.get("agent") or next((n for n, (account, _) in agents.items() if record.get("account") == account), None)
             started, pid = _stamp(record.get("started")), record.get("pid")
             if name not in found or started is None or type(pid) is not int:
                 continue
@@ -126,7 +146,7 @@ def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
         return []
     seen, out = set(), []
     for username, repository, path, at in rows:
-        if username not in AGENTS and username not in ("operator-claude", "operator-codex"):
+        if username not in AGENTS and username not in _external and username not in ("operator-claude", "operator-codex"):
             continue
         if username in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
             continue
@@ -139,10 +159,11 @@ def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
 def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     days = Path(agent_days) if agent_days is not None else Path.home() / "AgentDays"
-    records = _run_records(days, now)
+    known = known_agents(accounts_db)
+    records = _run_records(days, now, known)
     records_available = (days / "running").is_dir()
     agents = []
-    for name, (account, minute) in AGENTS.items():
+    for name, (account, minute) in known.items():
         runs = records[name]
         channels = {"api_in": _observed(name, now)["api_in"], "mcp_in": _observed(name, now)["mcp_in"],
                     "api_out": {"state": "unknown"}, "mcp_out": {"state": "unknown"},

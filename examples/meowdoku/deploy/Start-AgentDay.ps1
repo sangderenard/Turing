@@ -79,10 +79,30 @@ $Agents = [ordered]@{
     # "ex", logged exit 1). Case 26f097a3ed5e4462b2acbe70017384ce.
     claude = @{ account = 'agents'; login = 'claude'; offset = 0; reduce = $true; run = '$null | & claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
     codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; reduce = $true; run = '$null | & codex exec --skip-git-repo-check $prompt 2>&1' }
-    gemini = @{ account = 'agents-gemini'; login = 'gemini'; offset = 40; run = @"
+    gemini = @{ account = 'agents-gemini'; login = 'gemini'; offset = 40; lead = $true; run = @"
 `$extra = @()
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
 `$null | & '$Python' '$Workspace\turing\examples\meowdoku\deploy\gemini_agent.py' --model '$GeminiModel' --tools '$GeminiTools' --prompt `$prompt @extra 2>&1
+"@ }
+}
+
+# External API agents (case 989e507e): each one an admin declared on /operator-control.html and the owner installed with
+# Install-ExternalAgent.ps1 (stm agent install) runs as Gemini does, through api_agent.py, as its own account agents-<name>
+# with its key in that account's ~\<name>.key. The built-in agents above are never replaced by a declaration.
+function Quote([string]$value) { "'" + ($value -replace "'", "''") + "'" }
+$StateRoot = Split-Path (Split-Path $AccountsDb)
+$ExternalAgents = @()
+try {
+    $listed = & $Python (Join-Path $PSScriptRoot '..\external_agents.py') --state-dir $StateRoot list --status installed 2>$null
+    if ($LASTEXITCODE -eq 0 -and $listed) { $ExternalAgents = @($listed | ConvertFrom-Json) }
+    else { Write-Host "external agents not read (exit $LASTEXITCODE)" }
+} catch { Write-Host "external agents not read: $($_.Exception.Message)" }
+foreach ($x in $ExternalAgents) {
+    if ($Agents.Contains($x.name)) { continue }
+    $Agents[$x.name] = @{ account = $x.account; login = $x.name; offset = [int]$x.minute; lead = $true; external = $true; run = @"
+`$extra = @()
+while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
+`$null | & '$Python' '$Workspace\turing\examples\meowdoku\deploy\api_agent.py' --name $(Quote $x.name) --provider $(Quote $x.provider) --base-url $(Quote $x.base_url) --model $(Quote $x.model) --tools $(Quote ($x.tools -join ',')) --prompt `$prompt @extra 2>&1
 "@ }
 }
 
@@ -220,7 +240,7 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
     $day = @((Join-Path $AgentDays "$name\$(Get-Date -Format 'yyyy-MM-dd').md"), (Join-Path $AgentDays "$name\default.md")) |
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     $lead = ''
-    if ($name -eq 'gemini' -and $day) {                         # gemini_agent's room/tail lines stay first
+    if ($declared.lead -and $day) {                             # gemini_agent's (api_agent's) room/tail lines stay first
         $dayText = Get-Content -Raw -LiteralPath $day -Encoding utf8
         if ($dayText -match '^((?:(?:room|tail):\s*\S+\s*\r?\n)+)') { $lead = $Matches[1]; $dayText = $dayText.Substring($lead.Length) }
     } elseif ($day) { $dayText = Get-Content -Raw -LiteralPath $day -Encoding utf8 }
@@ -248,6 +268,11 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
 # ---------------------------------------------------------------- the tasks
 if ($Register -or $Unregister) {
     $order = 0
+    # A withdrawn external agent's task is removed: it would tick for an agent no longer declared.
+    foreach ($stale in @(Get-ScheduledTask -TaskName 'SpeakToMe agent *' -ErrorAction SilentlyContinue |
+                         Where-Object { -not $Agents.Contains($_.TaskName.Substring('SpeakToMe agent '.Length)) })) {
+        Unregister-ScheduledTask -TaskName $stale.TaskName -Confirm:$false; Write-Host "removed '$($stale.TaskName)' (not declared now)"
+    }
     foreach ($name in $Agents.Keys) {
         $task = "SpeakToMe agent $name"
         if ($Unregister) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue; Write-Host "removed '$task'"; continue }
@@ -255,7 +280,7 @@ if ($Register -or $Unregister) {
             -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`" -Tick -Agent $name"
         # The tasks start 15 s apart within each minute: all three firing in the same second each saw fewer than
         # -MaxRunning runs before any had written its record (2026-11-14 23:50: three ran at once under a limit of two).
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds(15 * $order++) -RepetitionInterval (New-TimeSpan -Minutes 1)
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds((15 * $order++) % 60) -RepetitionInterval (New-TimeSpan -Minutes 1)
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
         # Parallel: a tick that is waiting for its work run must not stop the next minute's bell. The agent's lock in
         # -Tick keeps two ticks from deciding at once.
