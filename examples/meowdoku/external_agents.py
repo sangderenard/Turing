@@ -101,11 +101,19 @@ def connect(state_dir, readonly=False):
     return ensure(db)
 
 
+def install_command(name, script=None):
+    """The copyable install command. The script path is a PowerShell single-quoted literal (an embedded ' doubled),
+    so a checkout under a folder with spaces stays one argument (review 003eb9cb, comment 198). NAME keeps the agent
+    name to [a-z0-9-], which needs no quoting."""
+    path = str(INSTALL_SCRIPT if script is None else script).replace("'", "''")
+    return f"pwsh -File '{path}' -Name {name}"
+
+
 def _row(row):
     item = dict(row)
     item["tools"] = json.loads(item["tools"])
     item["account"] = "agents-" + item["name"]
-    item["install"] = f"pwsh -File {INSTALL_SCRIPT} -Name {item['name']}"
+    item["install"] = install_command(item["name"])
     return item
 
 

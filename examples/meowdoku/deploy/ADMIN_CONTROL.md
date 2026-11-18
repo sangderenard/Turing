@@ -38,7 +38,7 @@ asked for. The declaration is not an action of the worker either.
 The install is the owner's, from an elevated shell (an SSH session as the owner is one), with the command the page shows:
 
 ```
-pwsh -File C:\dev\Powershell\turing\examples\meowdoku\deploy\Install-ExternalAgent.ps1 -Name <name>
+pwsh -File 'C:\dev\Powershell\turing\examples\meowdoku\deploy\Install-ExternalAgent.ps1' -Name <name>
 ```
 
 `Install-ExternalAgent.ps1` does what was done by hand for Gemini on 2026-11-14: the SpeakToMe login with a random

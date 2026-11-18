@@ -114,5 +114,8 @@ Write-Host "profile $($made.profile_id) $($made.profile_was) (edit it in Agent w
 Step "7. installed; the agent ticks"
 Registry @('mark', $Name, 'installed', '--note', "installed by $env:USERNAME") | Out-Null
 & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'Start-AgentDay.ps1') -Register | Out-Host
-if ($LASTEXITCODE -ne 0) { Write-Host "Start-AgentDay -Register exited $LASTEXITCODE; run '$PSScriptRoot\Start-AgentDay.ps1 -Register' again." -ForegroundColor Yellow }
-Write-Host "`n$Name is installed: work run at :$('{0:00}' -f $agent.minute) each hour, and its bell. '$PSScriptRoot\Start-AgentDay.ps1 -RunOne $Name' starts one now." -ForegroundColor Green
+# Copyable hints: the script path is a quoted PowerShell literal, so a checkout under a folder with spaces stays one
+# argument (review 003eb9cb, comment 198).
+$day = & $q (Join-Path $PSScriptRoot 'Start-AgentDay.ps1')
+if ($LASTEXITCODE -ne 0) { Write-Host "Start-AgentDay -Register exited $LASTEXITCODE; run: pwsh -File $day -Register" -ForegroundColor Yellow }
+Write-Host "`n$Name is installed: work run at :$('{0:00}' -f $agent.minute) each hour, and its bell. To start one now: pwsh -File $day -RunOne $Name" -ForegroundColor Green

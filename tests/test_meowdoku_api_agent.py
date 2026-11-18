@@ -166,8 +166,10 @@ def test_declare_defaults_and_limits(tmp_path):
     db = registry(tmp_path)
     one = ext.declare(db, 3, {"name": "mistral", "provider": "openai", "base_url": "https://api.mistral.ai/v1",
                               "model": "mistral-small-latest"})
-    assert one["status"] == "declared" and one["account"] == "agents-mistral" and one["install"] == f"pwsh -File {ext.INSTALL_SCRIPT} -Name mistral"
+    assert one["status"] == "declared" and one["account"] == "agents-mistral" and one["install"] == f"pwsh -File '{ext.INSTALL_SCRIPT}' -Name mistral"
     assert ext.INSTALL_SCRIPT.is_file()
+    spaced = ext.install_command("mistral", r"C:\dev\Space Here\it's\Install-ExternalAgent.ps1")
+    assert spaced == r"pwsh -File 'C:\dev\Space Here\it''s\Install-ExternalAgent.ps1' -Name mistral", "one quoted argument"
     assert one["tools"] == list(ext.DAY_TOOLS) and one["minute"] == 10 and one["brief"] == ext.DEFAULT_BRIEF
     two = ext.declare(db, 3, {"name": "sonnet", "provider": "anthropic", "model": "claude-sonnet-5-5"})
     assert two["minute"] == 30 and two["base_url"] == "https://api.anthropic.com/v1", "the next free minute"
