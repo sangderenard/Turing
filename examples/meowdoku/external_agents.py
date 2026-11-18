@@ -110,6 +110,18 @@ def agents(db, status=None):
     return [_row(row) for row in rows]
 
 
+def unschedule(db, names):
+    """Of these agent names (from the scheduled tasks), the ones whose declaration is on record and is not installed:
+    only a confirmed withdrawal (or a failed or new declaration) loses its task. A name with no row, such as a
+    built-in agent, and every name when the registry cannot be read, keeps its task."""
+    out = []
+    for name in names:
+        row = db.execute("SELECT status FROM external_agents WHERE name=?", (name,)).fetchone()
+        if row is not None and row[0] != "installed":
+            out.append(name)
+    return out
+
+
 def get(db, name):
     row = db.execute("SELECT * FROM external_agents WHERE name=?", (name,)).fetchone()
     if row is None:
@@ -159,6 +171,8 @@ def declare(db, actor_id, body, accounts_db=None, now=None):
         minute = next((m for m in (10, 30, 50, 5, 15, 25, 35, 45, 55) if m not in taken), 10)
     if type(minute) is not int or not 0 <= minute <= 59:
         raise ExternalAgentError("the minute is 0 through 59")
+    if minute in taken:
+        raise ExternalAgentError(f"minute :{minute:02d} is another agent's work slot; leave it empty for a free one", 409)
     brief = body.get("brief") or DEFAULT_BRIEF
     if not isinstance(brief, str) or len(brief) > MAX_BRIEF:
         raise ExternalAgentError(f"the brief is at most {MAX_BRIEF} characters")
@@ -219,19 +233,20 @@ def ensure_login(accounts_db, secrets_dir, name):
 
 def ensure_profile(accounts_db, agent):
     """The character profile Start-AgentDay resolves before a run: Gemini's profile documents (the agent-day
-    preamble the workspace imported from Start-AgentDay.ps1), then this agent's declared brief."""
+    preamble the workspace imported from Start-AgentDay.ps1), then this agent's declared brief. Both profiles are
+    chosen in profile_prompt.py's order (the seeded one first, then the oldest), so this reads the one that runs."""
     from meowdoku import agent_workspace
     db = agent_workspace.connect(Path(accounts_db))
     try:
         account = db.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (agent["name"],)).fetchone()
         if account is None:
             raise ExternalAgentError("the login does not exist yet", 409)
-        have = db.execute("SELECT id FROM agent_profiles WHERE individual_id=? ORDER BY updated LIMIT 1", (account[0],)).fetchone()
+        have = db.execute("SELECT id FROM agent_profiles WHERE individual_id=? ORDER BY (seed_key IS NULL), updated LIMIT 1", (account[0],)).fetchone()
         if have:
             return {"profile_id": have[0], "profile_was": "kept"}
         base = []
         gemini = db.execute("SELECT p.document_ids FROM agent_profiles p JOIN users u ON u.id=p.individual_id "
-                            "WHERE u.username='gemini' ORDER BY p.updated LIMIT 1").fetchone()
+                            "WHERE u.username='gemini' ORDER BY (p.seed_key IS NULL), p.updated LIMIT 1").fetchone()
         if gemini:
             base = json.loads(gemini[0])
         brief = agent_workspace.save_document(db, agent["declared_by"], {
@@ -255,14 +270,17 @@ def main(argv=None):
     p = sub.add_parser("list"); p.add_argument("--status", choices=STATUSES)
     for cmd in ("show", "ensure-login", "ensure-profile"):
         sub.add_parser(cmd).add_argument("name")
+    p = sub.add_parser("unschedule"); p.add_argument("names", nargs="*")
     p = sub.add_parser("mark"); p.add_argument("name"); p.add_argument("status", choices=STATUSES); p.add_argument("--note", default="")
     args = parser.parse_args(argv)
     state = Path(args.state_dir)
     accounts_db = state / "sql" / "accounts.db"
-    db = connect(state, readonly=args.cmd in ("list", "show"))
+    db = connect(state, readonly=args.cmd in ("list", "show", "unschedule"))
     try:
         if args.cmd == "list":
             out = agents(db, args.status)
+        elif args.cmd == "unschedule":
+            out = unschedule(db, args.names)
         elif args.cmd == "show":
             out = get(db, args.name)
         elif args.cmd == "ensure-login":

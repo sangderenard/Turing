@@ -232,3 +232,39 @@ def test_install_login_is_member_and_profile_resolves(tmp_path):
     finally:
         wdb.close()
     assert "Be Mistral." in json.dumps(text)
+
+
+def test_anthropic_limit_keeps_only_text_in_history():
+    """At the call limit a tool_use left in history without its tool_result would make the next call a 400."""
+    use = {"content": [{"type": "text", "text": "More."}, {"type": "tool_use", "id": "t", "name": "whoami", "input": {}}],
+           "stop_reason": "tool_use"}
+    call, sent = scripted(use, use)
+    history = []
+    reply, calls = agent.run(World(), call, "anthropic", "m", "Go.", allowed=["whoami"], max_calls=1, history=history)
+    assert reply == "More." and calls == 1 and sent[1][2]["tool_choice"] == {"type": "none"}
+    assert history[-1] == {"role": "assistant", "content": "More."}
+
+
+def test_a_taken_minute_is_refused(tmp_path):
+    db = registry(tmp_path)
+    for minute in ext.BUILTIN_MINUTES:
+        with pytest.raises(ext.ExternalAgentError, match="work slot") as error:
+            ext.declare(db, 3, {"name": "mistral", "provider": "openai", "model": "m", "minute": minute})
+        assert error.value.status == 409
+    ext.declare(db, 3, {"name": "mistral", "provider": "openai", "model": "m", "minute": 15})
+    with pytest.raises(ext.ExternalAgentError, match="work slot"):
+        ext.declare(db, 3, {"name": "sonnet", "provider": "anthropic", "model": "m", "minute": 15})
+    assert ext.declare(db, 3, {"name": "mistral", "provider": "openai", "model": "m2", "minute": 15})["minute"] == 15, \
+        "an agent keeps its own minute when declared again"
+
+
+def test_unschedule_only_confirmed_withdrawals(tmp_path):
+    """-Register removes a task only for a declaration on record that is not installed; an unread registry removes none."""
+    assert ext.main(["--state-dir", str(tmp_path / "nowhere"), "unschedule", "mistral", "claude"]) == 0
+    assert not (tmp_path / "nowhere" / "sql" / "admin_control.db").exists(), "reading it made nothing"
+    db = registry(tmp_path)
+    for name in ("mistral", "sonnet"):
+        ext.declare(db, 3, {"name": name, "provider": "openai", "model": "m"})
+        ext.mark(db, name, "installed")
+    ext.mark(db, "sonnet", "withdrawn")
+    assert ext.unschedule(db, ["claude", "mistral", "sonnet", "ghost"]) == ["sonnet"]

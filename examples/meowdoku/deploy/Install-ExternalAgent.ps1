@@ -75,7 +75,9 @@ $credential = Read-AgentCredential $account
 if (-not $credential) { Fail 'windows account' "no saved password for $account (Set-AgentBox.ps1 -Apply -ResetPassword -AgentAccount $account)" }
 
 Step "4. the $($agent.provider) API key, written as $account"
-$secure = Read-Host -AsSecureString "API key for $Name ($($agent.provider)); typing is not shown"
+# The destination is named again where the key is typed: an admin chose the base URL, and the key goes there.
+$destination = ([Uri]$agent.base_url).Host
+$secure = Read-Host -AsSecureString "API key for $Name ($($agent.provider) at $destination); typing is not shown"
 $plain = [Net.NetworkCredential]::new('', $secure).Password
 if (-not $plain) { Fail 'key' 'no key was typed' }
 $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plain))

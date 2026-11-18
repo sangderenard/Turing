@@ -184,7 +184,8 @@ def _converse_anthropic(world, call, model, system, history, offered, max_calls,
                             if isinstance(block, dict) and block.get("type") == "text").strip()
             if not reply:
                 raise AgentError(f"the model gave no answer ({answer.get('stop_reason') or 'no text'})")
-            history.append({"role": "assistant", "content": content})
+            # Text only: a tool_use kept here without its tool_result would make the next call on this history a 400.
+            history.append({"role": "assistant", "content": reply})
             return reply, calls
         history.append({"role": "assistant", "content": content})    # unchanged, thinking blocks included
         results = []

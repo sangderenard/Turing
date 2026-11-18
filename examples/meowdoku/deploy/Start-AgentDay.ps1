@@ -97,9 +97,10 @@ while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Mat
 function Quote([string]$value) { "'" + ($value -replace "'", "''") + "'" }
 $StateRoot = Split-Path (Split-Path $AccountsDb)
 $ExternalAgents = @()
+$ExternalRead = $false                                          # -Register removes no task unless the registry was read
 try {
     $listed = & $Python (Join-Path $PSScriptRoot '..\external_agents.py') --state-dir $StateRoot list --status installed 2>$null
-    if ($LASTEXITCODE -eq 0 -and $listed) { $ExternalAgents = @($listed | ConvertFrom-Json) }
+    if ($LASTEXITCODE -eq 0) { $ExternalAgents = @($listed | ConvertFrom-Json); $ExternalRead = $true }
     else { Write-Host "external agents not read (exit $LASTEXITCODE)" }
 } catch { Write-Host "external agents not read: $($_.Exception.Message)" }
 foreach ($x in $ExternalAgents) {
@@ -297,11 +298,19 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
 # ---------------------------------------------------------------- the tasks
 if ($Register -or $Unregister) {
     $order = 0
-    # A withdrawn external agent's task is removed: it would tick for an agent no longer declared.
-    foreach ($stale in @(Get-ScheduledTask -TaskName 'SpeakToMe agent *' -ErrorAction SilentlyContinue |
-                         Where-Object { -not $Agents.Contains($_.TaskName.Substring('SpeakToMe agent '.Length)) })) {
-        Unregister-ScheduledTask -TaskName $stale.TaskName -Confirm:$false; Write-Host "removed '$($stale.TaskName)' (not declared now)"
-    }
+    # A withdrawn external agent's task is removed: it would tick for an agent no longer declared. Only names the
+    # registry confirms are not installed (external_agents.py unschedule), and only after it was read: a registry
+    # that cannot be read leaves every task where it is.
+    $unknown = @(Get-ScheduledTask -TaskName 'SpeakToMe agent *' -ErrorAction SilentlyContinue |
+                 ForEach-Object { $_.TaskName.Substring('SpeakToMe agent '.Length) } | Where-Object { -not $Agents.Contains($_) })
+    if ($unknown.Count -and $ExternalRead) {
+        $gone = & $Python (Join-Path $PSScriptRoot '..\external_agents.py') --state-dir $StateRoot unschedule @unknown 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($stale in @($gone | ConvertFrom-Json)) {
+                Unregister-ScheduledTask -TaskName "SpeakToMe agent $stale" -Confirm:$false; Write-Host "removed 'SpeakToMe agent $stale' (not installed now)"
+            }
+        } else { Write-Host "no task removed: the registry did not answer (exit $LASTEXITCODE)" }
+    } elseif ($unknown.Count) { Write-Host "no task removed: the external agents were not read ($($unknown -join ', ') kept)" }
     foreach ($name in $Agents.Keys) {
         $task = "SpeakToMe agent $name"
         if ($Unregister) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue; Write-Host "removed '$task'"; continue }
