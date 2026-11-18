@@ -1,15 +1,40 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reports</title></head><body>
-<h1>Reports</h1><p>Public reports are signed off and readable by anyone on the Internet. Personal reports are unfinished/private. Administrators can explicitly include every report.</p>
-<p><a href="/login.html">Sign in</a></p>
-<label>Show <select id="scope"><option value="public">Public, signed off</option><option value="mine">My reports</option><option value="shared">My group spaces</option><option value="all" hidden>All system reports, including private (admin)</option></select></label>
-<button id="refresh" type="button">Refresh</button><button id="next" type="button" disabled>Next page</button>
+<title>Reports · Meowdoku</title>
+<link rel="stylesheet" href="/pages.css">
+<style>
+:root { font: 16px/1.5 system-ui, sans-serif; }
+body { margin: 0; color: #edf2fb; }
+main { margin: auto; }
+a { color: #a9cfff; }
+.muted { color: #becbe0; }
+button, select, textarea { font: inherit; color: inherit; background: #101a29; border: 1px solid #506582; border-radius: 6px; padding: .45rem .7rem; }
+button { cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+.controls { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+#list { list-style: none; padding: 0; margin: 1rem 0; display: grid; gap: .5rem; }
+#list li a { display: block; padding: .7rem 1rem; border: 1px solid #384d67; border-radius: .8rem; background: #1b2839; color: #f0f5ff; text-decoration: none; overflow-wrap: anywhere; }
+#list li a:hover { background: #24354b; }
+#detail { margin-top: 2rem; padding: clamp(1rem, 3vw, 1.7rem); border: 1px solid #435a77; border-radius: 1.4rem; background: #1a283b; }
+#detail pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #101a29; border: 1px solid #34455c; border-radius: .7rem; padding: 1rem; line-height: 1.45; }
+#steps li { overflow-wrap: anywhere; }
+#sharing { display: grid; gap: .8rem; max-width: 37rem; margin-top: 1.5rem; }
+#sharing label { display: grid; gap: .3rem; }
+#sharing label:has(input[type=checkbox]) { display: flex; gap: .5rem; align-items: start; }
+#sharing .controls button { border-radius: 999px; }
+</style></head><body>
+<main>
+<header class="mast"><div class="mast-copy"><div class="eyebrow">Meowdoku · reports</div><h1>Reports</h1>
+<p class="muted">Public reports are signed off and readable by anyone on the Internet. Personal reports are unfinished/private. Administrators can explicitly include every report.</p></div>
+<nav class="quick-links" aria-label="Reports"><a href="/login.html">Sign in</a></nav></header>
+<div class="controls"><label>Show <select id="scope"><option value="public">Public, signed off</option><option value="mine">My reports</option><option value="shared">My group spaces</option><option value="all" hidden>All system reports, including private (admin)</option></select></label>
+<button id="refresh" type="button">Refresh</button><button id="next" type="button" disabled>Next page</button></div>
 <p id="status" role="status" aria-live="polite"></p><ul id="list"></ul>
-<section id="detail" hidden><h2 id="title"></h2><p id="access"></p><pre id="body"></pre>
+<section id="detail" hidden><h2 id="title"></h2><p id="access" class="muted"></p><pre id="body"></pre>
 <h3>Prompt history</h3><pre id="prompts"></pre><h3>Next steps</h3><ul id="steps"></ul>
 <form id="sharing" hidden><h3>Sharing</h3><label>Access <select id="visibility"><option value="personal">Personal / private</option><option value="group">Group space</option><option value="public">Public / signed off</option></select></label>
 <label id="group-label" hidden>Group <select id="group"></select></label>
 <label id="signoff-label" hidden><input type="checkbox" id="signoff">I approve publishing the complete report, its prompt history and next steps to anyone on the Internet.</label>
-<button id="save" type="submit">Save sharing</button><button id="cancel" type="button">Cancel changes</button></form></section>
+<div class="controls"><button id="save" type="submit">Save sharing</button><button id="cancel" type="button">Cancel changes</button></div></form></section>
+</main>
 <script src="/reports.js" defer></script></body></html>
