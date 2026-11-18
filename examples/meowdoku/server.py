@@ -103,6 +103,7 @@ from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
+from meowdoku import agent_decisions as agent_decisions_mod  # noqa: E402  [DECISIONS]
 from meowdoku import agent_runs as agent_runs_mod  # noqa: E402
 from meowdoku import agent_training_arena as agent_training_arena_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
@@ -1529,6 +1530,29 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": str(error)}, error.status)
                 finally:
                     db.close()
+            if path in ("/api/agent-workspace/decisions/map", "/api/agent-workspace/decisions/at"):
+                # [DECISIONS] any signed-in account walks its own decision graph and keeps its own place
+                principal = self._principal()
+                if principal.user_id is None:
+                    return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+                if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                    return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                try:
+                    if method == "GET" and path.endswith("/map"):
+                        return self._json(agent_decisions_mod.as_map(db, principal.user_id))
+                    if method == "GET":
+                        return self._json(agent_decisions_mod.here(db, principal.user_id))
+                    body = self._body_json(limit=4096)
+                    if body is None:
+                        return
+                    if not isinstance(body, dict) or set(body) != {"at"}:
+                        raise agent_decisions_mod.DecisionError("give at: a place of your decision graph")
+                    return self._json(agent_decisions_mod.move(db, principal.user_id, body["at"]))
+                except agent_workspace_mod.WorkspaceError as error:
+                    return self._json({"error": str(error)}, error.status)
+                finally:
+                    db.close()
             if not self._require("operator_workspace") or self._principal().role not in ("operator", "admin"):
                 return
             if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
@@ -1554,6 +1578,9 @@ def make_handler(sessions: Sessions):
                             db, (query.get("profile") or [None])[0], (query.get("job") or [None])[0]))
                     if path == "/api/agent-workspace":
                         return self._json(agent_workspace_mod.index(db))
+                    if path == "/api/agent-workspace/decisions":       # [DECISIONS] a whole graph, for operators
+                        return self._json(agent_decisions_mod.listing(
+                            db, (query.get("graph") or [agent_decisions_mod.DEFAULT_GRAPH])[0]))
                     if path == "/api/agent-workspace/children":
                         return self._json(agent_workspace_mod.children(db, (query.get("parent") or [None])[0],
                                                                       (query.get("kind") or [None])[0]))
@@ -1587,6 +1614,11 @@ def make_handler(sessions: Sessions):
                             return self._json(agent_workspace_mod.transfer_instance(
                                 db, body.get("id"), body.get("target_profile_id")))
                     raise agent_workspace_mod.WorkspaceError("action must be save or delete")
+                if method == "POST" and path == "/api/agent-workspace/decisions":   # [DECISIONS] operator edits
+                    body = self._body_json(limit=agent_decisions_mod.MAX_BODY + 8192)
+                    if body is None:
+                        return
+                    return self._json(agent_decisions_mod.change(db, body))
                 if method == "POST" and path == "/api/agent-workspace/documents":
                     body = self._body_json(limit=agent_workspace_mod.MAX_DOC_BYTES + 8192)
                     if body is None:
@@ -4283,7 +4315,8 @@ def make_handler(sessions: Sessions):
             if path0 == "/api/user-files":
                 return self._user_files_route(path0, "POST")
             if path0 in ("/api/agent-workspace/documents", "/api/agent-workspace/profiles", "/api/agent-workspace/jobs",
-                         "/api/agent-workspace/instances"):
+                         "/api/agent-workspace/instances", "/api/agent-workspace/decisions",
+                         "/api/agent-workspace/decisions/at"):
                 return self._agent_workspace_route(path0, "POST")
             if path0 == "/api/scratch":
                 return self._scratch_route(path0, "POST")

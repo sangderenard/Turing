@@ -3,8 +3,9 @@ const kinds = ["orientation", "prompt", "personality", "guidance", "trouble", "s
 let current = null, parent = null, mode = "orientation", editing = null;
 let activeProfile = null, activeJob = null, activeInstance = null;
 const ids = value => value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-function showProfile() { $("profile-editor").hidden = false; $("document-editor").hidden = true; }
-function showDocument() { $("profile-editor").hidden = true; $("document-editor").hidden = false; }
+function showProfile() { $("profile-editor").hidden = false; $("document-editor").hidden = true; $("decision-editor").hidden = true; }
+function showDocument() { $("profile-editor").hidden = true; $("document-editor").hidden = false; $("decision-editor").hidden = true; }
+function showDecisions() { $("profile-editor").hidden = true; $("document-editor").hidden = true; $("decision-editor").hidden = false; }
 async function api(path, body) {
   const response = await fetch(path, {method: body ? "POST" : "GET", credentials: "same-origin", cache: "no-store",
     headers: body ? {"Content-Type": "application/json", "X-Meowdoku-Workspace": "1"} : {}, body: body ? JSON.stringify(body) : undefined});
@@ -107,6 +108,57 @@ function showCapacity(declared) {                       // [CAPACITY] stateful o
   $("capacity-tools").value = declared ? declared.tools : "own"; $("capacity-session").value = declared ? declared.session : "none";
   $("capacity-note").value = declared ? declared.note : "";
   $("capacity-declared").textContent = declared ? "Declared " + new Date(declared.declared_at * 1000).toLocaleString() : "Not declared";
+}
+// [DECISIONS] the decision graphs: places with acts, and routes labelled by their conditions
+let graph = null, activePlace = null;
+async function openGraph() {
+  showDecisions();
+  graph = await api("/api/agent-workspace/decisions?graph=" + encodeURIComponent($("graph-name").value.trim() || "line"));
+  $("place-list").replaceChildren();
+  for (const place of graph.places) $("place-list").append(itemButton((place.start ? "▶ " : "") + place.title + " · " + place.key, () => openPlace(place.key)));
+  if (activePlace && graph.places.some(p => p.key === activePlace)) openPlace(activePlace); else freshPlace();
+  notice("Graph " + graph.graph + ": " + graph.places.length + " places, " + graph.routes.length + " routes");
+}
+function freshPlace() {
+  activePlace = null; for (const id of ["place-key", "place-title", "place-body", "place-acts", "place-routes"]) $(id).value = "";
+  $("place-start").checked = false;
+}
+function openPlace(key) {
+  const place = graph.places.find(p => p.key === key); activePlace = key;
+  $("place-key").value = place.key; $("place-title").value = place.title; $("place-body").value = place.body;
+  $("place-acts").value = place.acts.map(a => a.tool + ": " + a.for).join("\n"); $("place-start").checked = place.start;
+  $("place-routes").value = graph.routes.filter(r => r.source === key).map(r => r.condition + " -> " + r.target).join("\n");
+}
+async function savePlace() {
+  const acts = $("place-acts").value.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+    const at = line.indexOf(":"); return at < 0 ? {tool: line, for: ""} : {tool: line.slice(0, at).trim(), for: line.slice(at + 1).trim()};
+  });
+  await api("/api/agent-workspace/decisions", {action: "place", graph: graph.graph, key: $("place-key").value.trim(),
+    title: $("place-title").value, body: $("place-body").value, acts, start: $("place-start").checked});
+  activePlace = $("place-key").value.trim(); await openGraph(); notice("Saved place " + activePlace);
+}
+async function deletePlace() {
+  if (!activePlace || !confirm("Delete this place and every route to or from it?")) return;
+  await api("/api/agent-workspace/decisions", {action: "delete_place", graph: graph.graph, key: activePlace});
+  activePlace = null; await openGraph();
+}
+async function saveRoutes() {
+  if (!activePlace) return notice("Open or save a place first");
+  const wanted = $("place-routes").value.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+    const at = line.lastIndexOf("->"); if (at < 0) throw new Error("Each route is: condition -> place key");
+    return {condition: line.slice(0, at).trim(), target: line.slice(at + 2).trim()};
+  });
+  for (const old of graph.routes.filter(r => r.source === activePlace && !wanted.some(w => w.condition === r.condition)))
+    await api("/api/agent-workspace/decisions", {action: "delete_route", graph: graph.graph, source: activePlace, condition: old.condition});
+  for (const route of wanted)
+    await api("/api/agent-workspace/decisions", {action: "route", graph: graph.graph, source: activePlace, ...route});
+  await openGraph(); notice("Saved " + wanted.length + " routes from " + activePlace);
+}
+async function assignGraph() {
+  if (!activeProfile) return notice("Open a character first");
+  const name = $("profile-graph").value.trim();
+  const result = await api("/api/agent-workspace/decisions", {action: "assign", profile_id: activeProfile.id, graph: name || null});
+  notice(activeProfile.title + " walks the decision graph " + result.graph);
 }
 async function saveCapacity() {
   if (!activeProfile) return notice("Open or save a character first");
@@ -236,6 +288,9 @@ $("memory-transfer").onclick = guard(() => memoryChange("transfer"));
 $("profile-new").onclick = freshProfile; $("profile-save").onclick = guard(saveProfile);
 $("profile-delete").onclick = guard(deleteProfile); $("profile-preview").onclick = guard(() => previewProfile());
 $("capacity-save").onclick = guard(saveCapacity);
+$("decisions-open").onclick = guard(openGraph); $("graph-open").onclick = guard(openGraph); $("place-new").onclick = freshPlace;
+$("place-save").onclick = guard(savePlace); $("place-delete").onclick = guard(deletePlace); $("routes-save").onclick = guard(saveRoutes);
+$("profile-graph-save").onclick = guard(assignGraph);
 $("job-new").onclick = freshJob; $("job-save").onclick = guard(saveJob); $("job-delete").onclick = guard(deleteJob);
 $("job-preview").onclick = guard(() => previewProfile(true));
 $("instance-new").onclick = freshInstance; $("instance-save").onclick = guard(saveInstance);
