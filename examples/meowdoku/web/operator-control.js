@@ -74,28 +74,31 @@ function render() {
     (item.note?" · "+item.note:""),{class:"card"}));
   if(!state.jobs.length) jobs.append(node("p","No runs yet."));
 }
-const BASES={openai:"https://api.openai.com/v1",anthropic:"https://api.anthropic.com/v1",gemini:"","openai-responses":"https://api.openai.com/v1"};
+const BASES={openai:"https://api.openai.com/v1",anthropic:"https://api.anthropic.com/v1",gemini:""};
 const BASE_HELP={openai:"Any OpenAI-compatible Chat Completions server: OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, or http://localhost for Ollama or vLLM.",
-  anthropic:"Anthropic Messages API.",
-  "openai-responses":"OpenAI Responses API: for reasoning models (gpt-5.6-sol and later) that take tools only there.",gemini:"Gemini's base URL is fixed; leave this blank."};
+  anthropic:"Anthropic Messages API.",gemini:"Gemini's base URL is fixed; leave this blank."};
 function providerChanged() {
   const p=byId("agent-provider").value;
   byId("agent-base").placeholder=BASES[p]||""; byId("agent-base").disabled=p==="gemini";
   byId("agent-base-help").textContent=BASE_HELP[p]||"";
+  byId("agent-api-row").hidden=p!=="openai"; if(p!=="openai") byId("agent-api").value="chat";
 }
+const API_HELP={chat:"Chat Completions: any OpenAI-compatible server.",
+  responses:"OpenAI's Responses API: reasoning models (gpt-5.6-sol and later) use tools while reasoning only there."};
 function renderAgents() {
   byId("agents-section").hidden=!state.admin;
   if(!state.admin) return;
   const providers=byId("agent-provider");
   if(!providers.options.length) {
     for(const name of state.providers) providers.append(node("option",name,{value:name}));
+    for(const name of state.apis) byId("agent-api").append(node("option",name+" · "+(API_HELP[name]||""),{value:name}));
     byId("agent-tools").value=state.agent_tools.join(", ");
     providerChanged();
   }
   const box=byId("agents"); box.replaceChildren();
   for(const item of state.agents) {
     const card=node("div","",{class:"card"});
-    card.append(node("strong",item.name+" "),node("small",item.provider+" · "+item.model+" · "+item.base_url+
+    card.append(node("strong",item.name+" "),node("small",item.provider+(item.provider==="openai"?" ("+item.api+")":"")+" · "+item.model+" · "+item.base_url+
       " · :"+String(item.minute).padStart(2,"0")+" · "+item.account+" · "+item.status+(item.note?" · "+item.note:"")));
     if(item.status!=="installed"&&item.status!=="withdrawn") {
       const cmd=node("div","",{class:"row"}); cmd.append(node("small","Install over SSH: "),node("code",item.install));
@@ -105,11 +108,17 @@ function renderAgents() {
     if(item.status!=="installed") {
       const edit=node("button","Edit",{type:"button"});
       edit.addEventListener("click",()=>{
-        byId("agent-name").value=item.name; byId("agent-provider").value=item.provider; providerChanged();
+        byId("agent-name").value=item.name; byId("agent-provider").value=item.provider; providerChanged(); byId("agent-api").value=item.api||"chat";
         byId("agent-base").value=item.provider==="gemini"?"":item.base_url; byId("agent-model").value=item.model;
         byId("agent-tools").value=item.tools.join(", "); byId("agent-minute").value=item.minute; byId("agent-brief").value=item.brief;
       });
       row.append(edit);
+    }
+    if(item.status!=="withdrawn"&&item.provider==="openai") {   // the API style alone, installed or not
+      const other=item.api==="responses"?"chat":"responses";
+      const style=node("button","Use "+other+" API",{type:"button"});
+      style.addEventListener("click",()=>{if(confirm(item.name+": speak the "+other+" API from its next run?")) act({action:"agent_api",name:item.name,api:other});});
+      row.append(style);
     }
     if(item.status!=="withdrawn") {
       const withdraw=node("button","Withdraw",{type:"button"});
@@ -123,7 +132,7 @@ function renderAgents() {
 byId("agent-provider").addEventListener("change",providerChanged);
 byId("agent-declare").addEventListener("click",()=>{
   const minute=byId("agent-minute").value;
-  act({action:"agent_declare",agent:{name:byId("agent-name").value.trim(),provider:byId("agent-provider").value,
+  act({action:"agent_declare",agent:{name:byId("agent-name").value.trim(),provider:byId("agent-provider").value,api:byId("agent-api").value,
     base_url:byId("agent-base").value.trim(),model:byId("agent-model").value.trim(),
     tools:byId("agent-tools").value.split(",").map(t=>t.trim()).filter(Boolean),
     minute:minute===""?null:Number(minute),brief:byId("agent-brief").value}});
