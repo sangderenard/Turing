@@ -2588,6 +2588,41 @@ def make_handler(sessions: Sessions):
             return central_checkout.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
                                                root=sessions.state.content_dir / "checkouts")
 
+        def _link_ticket_route(self, path: str) -> None:
+            """[LINK] POST /api/link/ticket/<prefix> {grant_id, secret, direction} -> the two tickets of one new Nodus link.
+
+            Research case 98d49cb8520e44d092c5d134c37c3c32, stage 3.  The credential is the peer GRANT, checked exactly as
+            ``/ws/contract`` checks it (``authz.verify_peer``: secret, live, unrevoked, this prefix, this direction); the grant's
+            service account becomes the ticket's account, the peer cannot choose it.  HTTPS only (the body carries the grant
+            secret; a direct 127.0.0.1 caller, such as the local Nodus host, is exempt).  The tickets are signed with ``<secrets>/nodus_link.key``, which the native listener reads; this server
+            never carries link traffic.  A refused grant gets one reason, as on /ws/contract."""
+            from meowdoku import link_tickets
+            self._classify()
+            self.close_connection = True
+            direct_loopback = not self._via_proxy and self.client_address[0] in ("127.0.0.1", "::1")
+            if not (self._is_secure() or direct_loopback):        # a direct loopback caller never leaves this machine
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if not self._require("view_site"):
+                return
+            if self._is_viewer():
+                return self._refuse_viewer()
+            prefix = path[len("/api/link/ticket/"):]
+            if not prefix or "/" in prefix or len(prefix) > 120:
+                return self._json({"error": "expected /api/link/ticket/<prefix>"}, HTTPStatus.BAD_REQUEST)
+            body = self._body_json(2048)
+            if body is None:
+                return
+            grant = authz_mod.verify_peer(sessions.accounts_db, body.get("grant_id"), body.get("secret"), prefix,
+                                          str(body.get("direction") or ""))
+            if grant is None:
+                print(f"[link] refused grant for prefix {prefix!r} ({private_mod.token('ip', self.client_address[0])})", flush=True)
+                return self._json({"error": "grant refused"}, HTTPStatus.FORBIDDEN)
+            try:
+                key = link_tickets.load_key(sessions.state.secrets_dir)
+            except link_tickets.LinkKeyMissing:
+                return self._json({"error": "this instance holds no link key"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return self._json(link_tickets.issue(key, prefix, int(grant["service_user_id"])))
+
         def _relay_route(self, path: str, method: str) -> None:
             """[RELAY] datagrams and packages, address to address, for any signed-in account (relay.py)."""
             from meowdoku import relay
@@ -4302,6 +4337,8 @@ def make_handler(sessions: Sessions):
                 return self._orientation_route(path0, "POST")
             if path0.startswith("/api/relay/"):                   # [RELAY]
                 return self._relay_route(path0, "POST")
+            if path0.startswith("/api/link/ticket/"):             # [LINK] Nodus link tickets from a peer grant
+                return self._link_ticket_route(path0)
             if path0 == "/api/fortune" or path0.startswith("/api/fortune/"):   # [FORTUNE]
                 return self._fortune_route(path0, "POST")
             if path0 in ("/api/condition", "/api/condition/notice"):   # [CONDITION] [NOTICE]
