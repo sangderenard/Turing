@@ -197,6 +197,77 @@ def test_declare_defaults_and_limits(tmp_path):
     assert ext.declare(db, 3, {"name": "mistral", "provider": "openai", "model": "other"})["status"] == "declared"
 
 
+INSTALLER = ROOT / "examples" / "meowdoku" / "deploy" / "Install-ExternalAgent.ps1"
+
+
+def installer_q_line():
+    """The installer's own $q block, read from the script, so the tests check the line that runs."""
+    lines = [line for line in INSTALLER.read_text(encoding="utf-8").splitlines() if line.startswith("$q = {")]
+    assert len(lines) == 1, "one $q block in the installer"
+    return lines[0]
+
+
+def test_installer_quotes_the_set_external_agents_quotes():
+    """Exact parity (review 1932e1c3, comments 214-215): the installer's character class and PS_SINGLE_QUOTES name
+    the same characters, so adding or dropping a quote on either side fails here."""
+    import re
+    line = installer_q_line()
+    assert "CodeGeneration" not in line, "no .NET call: ConstrainedLanguage refuses it"
+    found = re.search(r'-replace "\[(.*?)\]", \'\$0\$0\'', line)
+    assert found, "the $q block doubles a character class with -replace"
+    body = re.sub(r"`u\{([0-9A-Fa-f]+)\}", lambda m: chr(int(m.group(1), 16)), found.group(1))
+    chars, i = set(), 0
+    while i < len(body):
+        if i + 2 < len(body) and body[i + 1] == "-":
+            chars |= {chr(c) for c in range(ord(body[i]), ord(body[i + 2]) + 1)}
+            i += 3
+        else:
+            chars.add(body[i])
+            i += 1
+    assert chars == set(ext.PS_SINGLE_QUOTES) and len(ext.PS_SINGLE_QUOTES) == 5
+
+
+def _pwsh():
+    import shutil
+    return shutil.which("pwsh")
+
+
+@pytest.mark.skipif(_pwsh() is None, reason="needs pwsh")
+def test_installer_q_block_runs_under_constrained_language():
+    """The behavioral check: the installer's $q line, run in a ConstrainedLanguage session on all five quotes and a
+    space, makes a literal that PowerShell parses back to the same characters."""
+    import os
+    import subprocess
+    probe = "a b'c\u2018d\u2019e\u201af\u201bg"
+    body = installer_q_line() + ("; $lit = & $q $env:Q_PROBE; $back = Invoke-Expression $lit; "
+                                 "$ExecutionContext.SessionState.LanguageMode; ([int[]][char[]]$back) -join ','")
+    command = "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; Invoke-Expression $env:Q_BODY"
+    out = subprocess.run([_pwsh(), "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
+                         text=True, encoding="utf-8", timeout=60, env={**os.environ, "Q_PROBE": probe, "Q_BODY": body})
+    assert out.returncode == 0, out.stderr
+    mode, codes = out.stdout.strip().splitlines()[-2:]
+    assert mode == "ConstrainedLanguage"
+    assert codes == ",".join(str(ord(c)) for c in probe), "every quote survives the round trip"
+
+
+@pytest.mark.skipif(_pwsh() is None, reason="needs pwsh")
+def test_installer_retry_hint_keeps_the_register_exit_code():
+    """codex's check (review 1932e1c3, comment 217): a failed -Register's exit code is what the hint reports, even
+    though $q runs between them. The installer's own lines from -Register to the hint run with a failing command."""
+    import os
+    import subprocess
+    lines = INSTALLER.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if "'Start-AgentDay.ps1') -Register" in line)
+    assert lines[start + 1].startswith("$registerExit = $LASTEXITCODE"), "kept on the very next line"
+    hint = next(i for i in range(start, len(lines)) if "Start-AgentDay -Register exited" in lines[i])
+    assert "$LASTEXITCODE" not in "\n".join(lines[start + 2:hint + 1])
+    fail = "& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -Command 'exit 7' | Out-Host"
+    script = "\n".join([installer_q_line(), "$PSScriptRoot = 'C:\\x'", fail, *lines[start + 1:hint + 1]])
+    out = subprocess.run([_pwsh(), "-NoProfile", "-NonInteractive", "-Command", "-"], input=script,
+                         capture_output=True, text=True, encoding="utf-8", timeout=60, env=dict(os.environ))
+    assert "Start-AgentDay -Register exited 7;" in out.stdout, out.stdout + out.stderr
+
+
 def test_declare_refuses_someone_elses_account(tmp_path):
     accounts = tmp_path / "accounts.db"
     with sqlite3.connect(accounts) as db:

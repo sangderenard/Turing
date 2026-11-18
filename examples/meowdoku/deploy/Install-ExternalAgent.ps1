@@ -104,8 +104,10 @@ if ($result.ExitCode -ne 0 -or $result.Output -notmatch 'KEY WRITTEN') {
 Write-Host "written to $account's own profile as $Name.key (DPAPI for $account; not shown)"
 
 Step "5. the key, proved as $account"
-# PowerShell's own escaper doubles every quote it treats as single: ' and the curly U+2018..U+201B (review 9b6ce7fe, comment 207).
-$q = { param($v) "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string]$v) + "'" }
+# Every quote PowerShell treats as single is doubled: ' and the curly U+2018..U+201B (review 9b6ce7fe, comment 207), the
+# set CodeGeneration.EscapeSingleQuotedStringContent doubles. A plain -replace, not that .NET call: a ConstrainedLanguage
+# session refuses the call (review 1932e1c3, comment 213). external_agents.PS_SINGLE_QUOTES is the same set (tested).
+$q = { param($v) "'" + ([string]$v -replace "['`u{2018}-`u{201B}]", '$0$0') + "'" }
 $prove = "& $(& $q $Python) $(& $q (Join-Path $PSScriptRoot 'api_agent.py')) --name $(& $q $Name) --provider $(& $q $agent.provider) " +
          "--base-url $(& $q $agent.base_url) --check 2>&1`nexit `$LASTEXITCODE"
 $check = Invoke-AsAgent $credential $prove $Workspace 120 -GrantDesktopAccess
@@ -120,8 +122,9 @@ Write-Host "profile $($made.profile_id) $($made.profile_was) (edit it in Agent w
 Step "7. installed; the agent ticks"
 Registry @('mark', $Name, 'installed', '--note', "installed by $env:USERNAME") | Out-Null
 & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'Start-AgentDay.ps1') -Register | Out-Host
+$registerExit = $LASTEXITCODE        # kept at once: nothing after it may change the exit code the hint reports
 # Copyable hints: the script path is a quoted PowerShell literal, so a checkout under a folder with spaces stays one
 # argument (review 003eb9cb, comment 198).
 $day = & $q (Join-Path $PSScriptRoot 'Start-AgentDay.ps1')
-if ($LASTEXITCODE -ne 0) { Write-Host "Start-AgentDay -Register exited $LASTEXITCODE; run: pwsh -File $day -Register" -ForegroundColor Yellow }
+if ($registerExit -ne 0) { Write-Host "Start-AgentDay -Register exited $registerExit; run: pwsh -File $day -Register" -ForegroundColor Yellow }
 Write-Host "`n$Name is installed: work run at :$('{0:00}' -f $agent.minute) each hour, and its bell. To start one now: pwsh -File $day -RunOne $Name" -ForegroundColor Green
