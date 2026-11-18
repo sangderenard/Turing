@@ -72,6 +72,13 @@ PRIVATE_TABLES = (
 )
 
 
+# What a purge removes beyond PRIVATE_TABLES (Accounts.purge_account): more rows keyed by user_id, and messaging rows where
+# the account is either side. A table that does not exist yet is skipped.
+PURGE_USER_TABLES = ("alpha_agreements", "agent_orientation_seen", "agent_decision_at", "llm_registrations")
+PURGE_PAIR_ROWS = (("msg_contacts", ("user_id", "peer_id")), ("msg_image_consent", ("user_id", "peer_id")),
+                   ("msg_handles", ("sender_id", "peer_id")), ("msg_send_keys", ("sender_id", "peer_id")))
+
+
 class AccountError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -325,9 +332,14 @@ class Accounts:
     def purge_account(self, user_id: int, expected_username: str) -> None:
         """Remove a permanent account's private state and seal it; its public posts and audit rows stay.
 
-        The users row stays as a tombstone, so what the account posted still names a valid owner (no foreign key is
-        left dangling): renamed ``purged-<id>``, shown as "(purged account)", with a password hash nothing can match,
-        and every private row (PRIVATE_TABLES, alpha_agreements) deleted. The old name is free again.
+        What goes (the retention rule, case 4f21753ebb544fa6ab664411afd47b38):
+        - every row keyed by the account's user_id in PRIVATE_TABLES and PURGE_USER_TABLES;
+        - every private message it sent or received, with their images, and every messaging row where it is either
+          side (PURGE_PAIR_ROWS: contacts, image consent, send handles and keys), so no one's thread or contact list
+          still holds it. msg_audit stays: it is the moderation record.
+        What stays: its public posts (tickets, pages) and audit rows, under the users row kept as a sealed tombstone,
+        so they still name a valid owner. The tombstone is renamed ``purged:<id>``, which no signup can take (USERNAME
+        has no colon), shown as "(purged account)", with a password hash nothing can match. The old name is free again.
         Only an ordinary account: one with any role row or group grant, or a temporary preview (wipe_preview), is refused.
         """
         with self.lock:
@@ -343,11 +355,20 @@ class Accounts:
                 if table in present and self._conn.execute(f"SELECT 1 FROM {table} WHERE user_id=?", (user_id,)).fetchone():
                     raise AccountError("an account with a role or a group grant is not purged here", 409)
             try:
-                for table in PRIVATE_TABLES + ("alpha_agreements",):
+                for table in PRIVATE_TABLES + PURGE_USER_TABLES:
                     if table in present:
                         self._conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+                if "msg_messages" in present:
+                    if "msg_images" in present:
+                        self._conn.execute("DELETE FROM msg_images WHERE sender_id=? OR message_id IN (SELECT id FROM msg_messages "
+                                           "WHERE sender_id=? OR recipient_id=?)", (user_id, user_id, user_id))
+                    self._conn.execute("DELETE FROM msg_messages WHERE sender_id=? OR recipient_id=?", (user_id, user_id))
+                for table, columns in PURGE_PAIR_ROWS:
+                    if table in present:
+                        self._conn.execute(f"DELETE FROM {table} WHERE " + " OR ".join(f"{c}=?" for c in columns),
+                                           (user_id,) * len(columns))
                 self._conn.execute("UPDATE users SET username=?, display_name=?, password_hash=? WHERE id=?",
-                                   (f"purged-{user_id}", "(purged account)", "!", user_id))
+                                   (f"purged:{user_id}", "(purged account)", "!", user_id))
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
