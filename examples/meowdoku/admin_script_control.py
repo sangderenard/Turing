@@ -176,6 +176,7 @@ def list_state(db, user_id, admin):
     return {"scripts": SCRIPTS if admin else (), "presets": presets, "grants": grants, "jobs": jobs,
             "agents": external_agents.agents(external_agents.ensure(db)) if admin else [],
             "providers": external_agents.PROVIDERS if admin else (),
+            "apis": external_agents.APIS if admin else (),
             "agent_tools": external_agents.DAY_TOOLS if admin else ()}
 
 
@@ -255,7 +256,7 @@ def command(db, accounts_db, user_id, admin, body):
                             (preset, user_id, now))
         audit(db, user_id, action, cursor.lastrowid, True)
         return {"job_id": cursor.lastrowid, "status": "queued"}
-    if action in ("agent_declare", "agent_withdraw"):
+    if action in ("agent_declare", "agent_withdraw", "agent_api"):
         # Saves what is not secret. Nothing on the machine changes here: the owner runs Install-ExternalAgent.ps1 -Name <name>
         # elevated, over SSH, and that script alone makes the accounts and asks for the API key (case 989e507e).
         from meowdoku import external_agents
@@ -264,6 +265,8 @@ def command(db, accounts_db, user_id, admin, body):
         try:
             if action == "agent_declare":
                 agent = external_agents.declare(db, user_id, body.get("agent") or {}, accounts_db, now)
+            elif action == "agent_api":                 # the API style alone; allowed on an installed agent
+                agent = external_agents.set_api(db, str(body.get("name", "")), str(body.get("api", "")))
             else:
                 agent = external_agents.mark(external_agents.ensure(db), str(body.get("name", "")), "withdrawn", "withdrawn on the page", now)
         except external_agents.ExternalAgentError as error:

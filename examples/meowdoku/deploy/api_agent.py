@@ -40,6 +40,19 @@ from gemini_agent import DEFAULT_TOOLS, SYSTEM, AgentError, SpeakToMe, arguments
 PROVIDERS = ("openai", "anthropic", "gemini")
 DEFAULT_BASE = {"openai": "https://api.openai.com/v1", "anthropic": "https://api.anthropic.com/v1",
                 "gemini": gemini_agent.API}
+# The API style, a separate choice from the provider: an openai agent speaks Chat Completions ("chat", every
+# OpenAI-compatible server) or OpenAI's Responses API ("responses", for reasoning models that take function tools
+# only there: gpt-5.6-sol on /chat/completions refuses tools unless reasoning_effort is none, case d2ea5818).
+APIS = ("chat", "responses")
+
+
+def check_api(provider: str, api: str | None) -> str:
+    api = api or "chat"
+    if api not in APIS:
+        raise AgentError(f"unknown API style {api!r} (one of {', '.join(APIS)})", 2)
+    if api == "responses" and provider != "openai":
+        raise AgentError("the responses API style is for the openai provider", 2)
+    return api
 ANTHROPIC_VERSION = "2023-06-01"
 SAFE_URL = re.compile(r"[A-Za-z0-9._~:/\[\]%-]{1,300}")
 
@@ -165,6 +178,54 @@ def _converse_openai(world, call, model, system, history, offered, max_calls, lo
             history.append({"role": "tool", "tool_call_id": asked_call.get("id", ""), "content": _result_text(result)})
 
 
+# ---------------------------------------------------------------- OpenAI Responses
+def _output_text(output: list) -> str:
+    return "".join(part.get("text", "") for item in output if isinstance(item, dict) and item.get("type") == "message"
+                   for part in (item.get("content") or []) if isinstance(part, dict) and part.get("type") == "output_text").strip()
+
+
+def _converse_openai_responses(world, call, model, system, history, offered, max_calls, log):
+    """store false: nothing of the run is kept on OpenAI's side; the reasoning items come back encrypted
+    (include reasoning.encrypted_content) and go out again in ``input``, so the model keeps its reasoning between
+    tool calls."""
+    tools = [{"type": "function", "name": name, "description": str(world.tools[name].get("description", ""))[:1000],
+              "parameters": _schema(world.tools[name])} for name in offered]
+    calls = 0
+    while True:
+        body = {"model": model, "instructions": system, "input": history, "store": False,
+                "include": ["reasoning.encrypted_content"]}
+        if tools:
+            body["tools"] = tools
+            if calls >= max_calls:
+                body["tool_choice"] = "none"
+        answer = call("POST", "/responses", body)
+        output = [item for item in (answer.get("output") or []) if isinstance(item, dict)]
+        asked = [item for item in output if item.get("type") == "function_call"]
+        if not asked or calls >= max_calls:
+            reply = _output_text(output)
+            if not reply:
+                why = (answer.get("incomplete_details") or {}).get("reason") or answer.get("status") or "no text"
+                raise AgentError(f"the model gave no answer ({why})")
+            # Text only: a function_call kept without its function_call_output would make the next call a 400.
+            history.append({"role": "assistant", "content": reply})
+            return reply, calls
+        history.extend(output)                                      # reasoning, calls and any text, as returned
+        for asked_call in asked:
+            name = asked_call.get("name", "")
+            try:
+                given = json.loads(asked_call.get("arguments") or "{}")
+            except ValueError:
+                given = None
+            calls += 1
+            if not isinstance(given, dict):
+                result = {"error": "the arguments were not a JSON object"}
+            else:
+                result = _call_tool(world, offered, name, given, calls, max_calls)
+            log(f"tool {name}: {'refused' if _refused(result) else 'ok'}")
+            history.append({"type": "function_call_output", "call_id": asked_call.get("call_id", ""),
+                            "output": _result_text(result)})
+
+
 # ---------------------------------------------------------------- Anthropic Messages
 def _converse_anthropic(world, call, model, system, history, offered, max_calls, log, max_tokens=4096):
     tools = [{"name": name, "description": str(world.tools[name].get("description", ""))[:1000],
@@ -201,8 +262,11 @@ def _converse_anthropic(world, call, model, system, history, offered, max_calls,
 
 
 def run(world, call, provider: str, model: str, prompt: str, *, room: str | None = None, tail: int = 30,
-        allowed=DEFAULT_TOOLS, max_calls: int = 8, log=lambda line: None, history: list | None = None):
-    """One shot: returns (the model's answer, the number of tool calls made). ``history`` as in gemini_agent.run."""
+        allowed=DEFAULT_TOOLS, max_calls: int = 8, log=lambda line: None, history: list | None = None,
+        api: str = "chat"):
+    """One shot: returns (the model's answer, the number of tool calls made). ``history`` as in gemini_agent.run;
+    ``api`` the API style (APIS)."""
+    api = check_api(provider, api)
     if provider == "gemini":
         return gemini_agent.run(world, call, model, prompt, room=room, tail=tail, allowed=allowed,
                                 max_calls=max_calls, log=log, history=history)
@@ -219,7 +283,10 @@ def run(world, call, provider: str, model: str, prompt: str, *, room: str | None
     contents = history if history is not None else []
     kept = len(contents)
     contents.append({"role": "user", "content": text})
-    converse = _converse_anthropic if provider == "anthropic" else _converse_openai
+    if provider == "anthropic":
+        converse = _converse_anthropic
+    else:
+        converse = _converse_openai_responses if api == "responses" else _converse_openai
     try:
         return converse(world, call, model, system, contents, offered, max_calls, log)
     except BaseException:
@@ -239,6 +306,7 @@ def main(argv=None) -> int:
     parser.add_argument("--name", required=True, help="the agent's name; the key file defaults to ~/<name>.key")
     parser.add_argument("--provider", required=True, choices=PROVIDERS)
     parser.add_argument("--base-url")
+    parser.add_argument("--api", choices=APIS, default="chat", help="the API style: chat (default) or responses (openai)")
     parser.add_argument("--model")
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
@@ -279,7 +347,8 @@ def main(argv=None) -> int:
         except RestError as error:
             raise AgentError(f"speaktome: {error.message}", 2) from None
         reply, calls = run(world, call, args.provider, args.model, prompt, room=args.room, tail=args.tail,
-                           allowed=[t.strip() for t in args.tools.split(",") if t.strip()], max_calls=args.max_calls, log=log)
+                           allowed=[t.strip() for t in args.tools.split(",") if t.strip()], max_calls=args.max_calls, log=log,
+                           api=args.api)
         print(reply)
         log(f"done: {calls} tool call(s)")
         return 0

@@ -270,3 +270,121 @@ def test_unschedule_only_confirmed_withdrawals(tmp_path):
         ext.mark(db, name, "installed")
     ext.mark(db, "sonnet", "withdrawn")
     assert ext.unschedule(db, ["claude", "mistral", "sonnet", "ghost"]) == ["sonnet"]
+
+
+def responses_answer(*items, status="completed"):
+    return {"status": status, "output": list(items)}
+
+
+def test_responses_tool_call_then_answer():
+    """openai with the responses API style: function_call answered by function_call_output; reasoning goes back in
+    input; store false."""
+    world = World()
+    reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque", "summary": []}
+    call, sent = scripted(
+        responses_answer(reasoning, {"type": "function_call", "call_id": "c1", "name": "chat_post",
+                                     "arguments": json.dumps({"room": "agents", "body": "hi"})}),
+        responses_answer({"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": "Posted hi."}]}))
+    history = []
+    reply, calls = agent.run(world, call, "openai", "gpt-5.6-sol", "Say hi.",
+                             allowed=["chat_post", "missing"], history=history, api="responses")
+    assert (reply, calls) == ("Posted hi.", 1)
+    assert world.calls == [("chat_post", {"room": "agents", "body": "hi"})]
+    method, path, body = sent[0]
+    assert (method, path) == ("POST", "/responses")
+    assert body["store"] is False and body["include"] == ["reasoning.encrypted_content"]
+    assert "data" in body["instructions"] and body["input"][0]["role"] == "user"
+    assert body["tools"] == [{"type": "function", "name": "chat_post", "description": "Write in a room.",
+                              "parameters": TOOLS["chat_post"]["inputSchema"]}]
+    second = sent[1][2]["input"]
+    assert reasoning in second, "the reasoning item goes back to the model"
+    assert second[-1]["type"] == "function_call_output" and second[-1]["call_id"] == "c1"
+    assert history[-1] == {"role": "assistant", "content": "Posted hi."}
+
+
+def test_responses_call_limit_keeps_only_text():
+    use = responses_answer({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "More."}]},
+                           {"type": "function_call", "call_id": "c", "name": "whoami", "arguments": "{}"})
+    call, sent = scripted(use, use)
+    history = []
+    reply, calls = agent.run(World(), call, "openai", "m", "Go.", allowed=["whoami"], max_calls=1, history=history,
+                             api="responses")
+    assert (reply, calls) == ("More.", 1) and sent[1][2]["tool_choice"] == "none"
+    assert history[-1] == {"role": "assistant", "content": "More."}
+
+
+def test_responses_empty_answer_rolls_back():
+    call, _ = scripted(responses_answer(status="incomplete") | {"incomplete_details": {"reason": "max_output_tokens"}})
+    history = [{"role": "user", "content": "earlier"}]
+    with pytest.raises(agent.AgentError, match="max_output_tokens"):
+        agent.run(World(), call, "openai", "m", "Go.", history=history, api="responses")
+    assert history == [{"role": "user", "content": "earlier"}]
+
+
+def test_api_style_is_apart_from_the_provider():
+    """The style is checked on its own: chat is the default, responses only for the openai provider."""
+    call, sent = scripted(openai_message("Hi."))
+    assert agent.run(World(), call, "openai", "m", "Hi.", allowed=[]) == ("Hi.", 0)
+    assert sent[0][1] == "/chat/completions", "chat stays the default"
+    for provider in ("anthropic", "gemini"):
+        with pytest.raises(agent.AgentError, match="openai provider"):
+            agent.run(World(), call, provider, "m", "Hi.", api="responses")
+    with pytest.raises(agent.AgentError, match="API style"):
+        agent.run(World(), call, "openai", "m", "Hi.", api="soap")
+
+
+def test_declare_and_change_the_api_style(tmp_path):
+    db = registry(tmp_path)
+    one = ext.declare(db, 3, {"name": "operator-gpt", "provider": "openai", "api": "responses", "model": "gpt-5.6-sol"})
+    assert (one["provider"], one["api"], one["base_url"]) == ("openai", "responses", "https://api.openai.com/v1")
+    assert ext.declare(db, 3, {"name": "gpt", "provider": "openai", "model": "gpt-5.4-mini"})["api"] == "chat"
+    with pytest.raises(ext.ExternalAgentError, match="openai provider"):
+        ext.declare(db, 3, {"name": "sonnet", "provider": "anthropic", "api": "responses", "model": "m"})
+    assert ext.declare(db, 3, {"name": "operator-gpt", "provider": "openai", "model": "gpt-5.6-sol"})["api"] == "responses", \
+        "declaring again without a style keeps the one it had"
+    ext.mark(db, "operator-gpt", "installed")
+    changed = ext.set_api(db, "operator-gpt", "chat")
+    assert (changed["api"], changed["status"]) == ("chat", "installed"), "the style changes on an installed agent"
+    ext.mark(db, "operator-gpt", "withdrawn")
+    with pytest.raises(ext.ExternalAgentError, match="withdrawn"):
+        ext.set_api(db, "operator-gpt", "responses")
+
+
+def test_an_older_table_gains_the_api_style(tmp_path):
+    (tmp_path / "sql").mkdir()
+    with sqlite3.connect(tmp_path / "sql" / "admin_control.db") as old:
+        old.execute("CREATE TABLE external_agents (name TEXT PRIMARY KEY, provider TEXT NOT NULL, base_url TEXT NOT NULL, "
+                    "model TEXT NOT NULL, tools TEXT NOT NULL, minute INTEGER NOT NULL, brief TEXT NOT NULL, "
+                    "status TEXT NOT NULL, declared_by INTEGER NOT NULL, declared REAL NOT NULL, installed REAL, "
+                    "note TEXT NOT NULL DEFAULT '')")
+        old.execute("INSERT INTO external_agents VALUES ('gpt','openai','https://api.openai.com/v1','m','[]',10,'b',"
+                    "'installed',3,0,0,'')")
+    read = ext.connect(tmp_path, readonly=True)
+    assert [a["api"] for a in ext.agents(read)] == ["chat"], "read-only before the column exists"
+    read.close()
+    db = ext.connect(tmp_path)
+    assert [a["api"] for a in ext.agents(db)] == ["chat"]
+    assert ext.set_api(db, "gpt", "responses")["api"] == "responses"
+
+
+def test_the_page_changes_only_the_style(tmp_path):
+    """agent_api is password-checked like every action, admin only, and changes the style of an installed agent."""
+    from meowdoku import admin_script_control as control
+    from meowdoku.accounts import _hash_password
+    accounts_db = tmp_path / "accounts.db"
+    with sqlite3.connect(accounts_db) as raw:
+        raw.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT)")
+        raw.execute("INSERT INTO users VALUES(1,'admin',?)", (_hash_password("admin-pass"),))
+        raw.execute("INSERT INTO users VALUES(2,'operator',?)", (_hash_password("operator-pass"),))
+    db = control.connect(tmp_path)
+    ext.declare(db, 1, {"name": "operator-gpt", "provider": "openai", "model": "gpt-5.6-sol"})
+    ext.mark(db, "operator-gpt", "installed")
+    assert tuple(control.list_state(db, 1, True)["apis"]) == ("chat", "responses")
+    out = control.command(db, accounts_db, 1, True, {"action": "agent_api", "password": "admin-pass",
+                                                     "name": "operator-gpt", "api": "responses"})
+    assert (out["agent"]["api"], out["agent"]["status"], out["agent"]["model"]) == ("responses", "installed", "gpt-5.6-sol")
+    with pytest.raises(control.ControlError, match="admin"):
+        control.command(db, accounts_db, 2, False, {"action": "agent_api", "password": "operator-pass",
+                                                    "name": "operator-gpt", "api": "chat"})
+    assert ext.get(db, "operator-gpt")["api"] == "responses"

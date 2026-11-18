@@ -108,7 +108,7 @@ foreach ($x in $ExternalAgents) {
     $Agents[$x.name] = @{ account = $x.account; login = $x.name; offset = [int]$x.minute; lead = $true; external = $true; run = @"
 `$extra = @()
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
-`$null | & '$Python' '$Workspace\turing\examples\meowdoku\deploy\api_agent.py' --name $(Quote $x.name) --provider $(Quote $x.provider) --base-url $(Quote $x.base_url) --model $(Quote $x.model) --tools $(Quote ($x.tools -join ',')) --prompt `$prompt @extra 2>&1
+`$null | & '$Python' '$Workspace\turing\examples\meowdoku\deploy\api_agent.py' --name $(Quote $x.name) --provider $(Quote $x.provider) --api $(Quote $(if ($x.api) { $x.api } else { 'chat' })) --base-url $(Quote $x.base_url) --model $(Quote $x.model) --tools $(Quote ($x.tools -join ',')) --prompt `$prompt @extra 2>&1
 "@ }
 }
 

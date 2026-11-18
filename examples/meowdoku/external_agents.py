@@ -34,7 +34,7 @@ sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "examples")) if p not in sys.p
 if str(HERE / "deploy") not in sys.path:      # last, so a deploy script's name never shadows a module in the server
     sys.path.append(str(HERE / "deploy"))
 
-from api_agent import PROVIDERS, AgentError, check_base_url  # noqa: E402
+from api_agent import APIS, PROVIDERS, AgentError, check_api, check_base_url  # noqa: E402
 from gemini_agent import DEFAULT_TOOLS  # noqa: E402
 
 # The install command the page shows: this script, run by the owner from an elevated shell. The owner's `stm agent
@@ -45,7 +45,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS external_agents (
     name TEXT PRIMARY KEY, provider TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
     tools TEXT NOT NULL, minute INTEGER NOT NULL, brief TEXT NOT NULL, status TEXT NOT NULL,
-    declared_by INTEGER NOT NULL, declared REAL NOT NULL, installed REAL, note TEXT NOT NULL DEFAULT '');
+    declared_by INTEGER NOT NULL, declared REAL NOT NULL, installed REAL, note TEXT NOT NULL DEFAULT '',
+    api TEXT NOT NULL DEFAULT 'chat');
 """
 # The Windows account is agents-<name>: Windows allows 20 characters, "agents-" takes 7.
 NAME = re.compile(r"[a-z][a-z0-9-]{1,12}\Z")
@@ -79,6 +80,10 @@ class ExternalAgentError(Exception):
 
 def ensure(db):
     db.executescript(SCHEMA)
+    # The API style came after the first declarations (case d2ea5818): an older table gains it, every row "chat".
+    if "api" not in {row[1] for row in db.execute("PRAGMA table_info(external_agents)")}:
+        db.execute("ALTER TABLE external_agents ADD COLUMN api TEXT NOT NULL DEFAULT 'chat'")
+        db.commit()
     return db
 
 
@@ -104,6 +109,7 @@ def connect(state_dir, readonly=False):
 def _row(row):
     item = dict(row)
     item["tools"] = json.loads(item["tools"])
+    item.setdefault("api", "chat")                 # a table read read-only before it gained the column
     item["account"] = "agents-" + item["name"]
     item["install"] = f"pwsh -File {INSTALL_SCRIPT} -Name {item['name']}"
     return item
@@ -161,6 +167,11 @@ def declare(db, actor_id, body, accounts_db=None, now=None):
         base_url = check_base_url(provider, body.get("base_url") or None)
     except AgentError as error:
         raise ExternalAgentError(str(error)) from None
+    old = db.execute("SELECT status, api FROM external_agents WHERE name=?", (name,)).fetchone()
+    try:
+        api = check_api(provider, body.get("api") or (old["api"] if old and provider == "openai" else None))
+    except AgentError as error:
+        raise ExternalAgentError(str(error)) from None
     model = body.get("model")
     if not isinstance(model, str) or not MODEL.fullmatch(model.strip()):
         raise ExternalAgentError("the model is a provider model id, at most 128 characters")
@@ -181,7 +192,6 @@ def declare(db, actor_id, body, accounts_db=None, now=None):
     brief = body.get("brief") or DEFAULT_BRIEF
     if not isinstance(brief, str) or len(brief) > MAX_BRIEF:
         raise ExternalAgentError(f"the brief is at most {MAX_BRIEF} characters")
-    old = db.execute("SELECT status FROM external_agents WHERE name=?", (name,)).fetchone()
     if old is None:
         if db.execute("SELECT COUNT(*) FROM external_agents").fetchone()[0] >= MAX_AGENTS:
             raise ExternalAgentError("the external agent list is full", 429)
@@ -189,12 +199,27 @@ def declare(db, actor_id, body, accounts_db=None, now=None):
             raise ExternalAgentError(f"a SpeakToMe account {name!r} already exists", 409)
     elif old["status"] == "installed":
         raise ExternalAgentError(f"{name} is installed; withdraw it before changing its details", 409)
-    db.execute("INSERT INTO external_agents(name,provider,base_url,model,tools,minute,brief,status,declared_by,declared) "
-               "VALUES(?,?,?,?,?,?,?,'declared',?,?) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,"
+    db.execute("INSERT INTO external_agents(name,provider,base_url,model,tools,minute,brief,status,declared_by,declared,api) "
+               "VALUES(?,?,?,?,?,?,?,'declared',?,?,?) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,"
                "base_url=excluded.base_url,model=excluded.model,tools=excluded.tools,minute=excluded.minute,"
                "brief=excluded.brief,status='declared',declared_by=excluded.declared_by,declared=excluded.declared,"
-               "installed=NULL,note=''",
-               (name, provider, base_url, model.strip(), json.dumps(tools), minute, brief, actor_id, now))
+               "installed=NULL,note='',api=excluded.api",
+               (name, provider, base_url, model.strip(), json.dumps(tools), minute, brief, actor_id, now, api))
+    return get(db, name)
+
+
+def set_api(db, name, api):
+    """The API style alone, a matter apart from the declaration: it changes which endpoint the next run speaks, not
+    the accounts, the key or the schedule, so it may change on an installed agent (the install is not redone)."""
+    ensure(db)
+    agent = get(db, name)
+    if agent["status"] == "withdrawn":
+        raise ExternalAgentError(f"{name} is withdrawn", 409)
+    try:
+        api = check_api(agent["provider"], api)
+    except AgentError as error:
+        raise ExternalAgentError(str(error)) from None
+    db.execute("UPDATE external_agents SET api=? WHERE name=?", (api, name))
     return get(db, name)
 
 
@@ -276,6 +301,7 @@ def main(argv=None):
     for cmd in ("show", "ensure-login", "ensure-profile"):
         sub.add_parser(cmd).add_argument("name")
     p = sub.add_parser("unschedule"); p.add_argument("names", nargs="*")
+    p = sub.add_parser("api"); p.add_argument("name"); p.add_argument("style", choices=APIS)
     p = sub.add_parser("mark"); p.add_argument("name"); p.add_argument("status", choices=STATUSES); p.add_argument("--note", default="")
     args = parser.parse_args(argv)
     state = Path(args.state_dir)
@@ -284,6 +310,9 @@ def main(argv=None):
     try:
         if args.cmd == "list":
             out = agents(db, args.status)
+        elif args.cmd == "api":
+            out = set_api(db, args.name, args.style)
+            db.commit()
         elif args.cmd == "unschedule":
             out = unschedule(db, args.names)
         elif args.cmd == "show":
