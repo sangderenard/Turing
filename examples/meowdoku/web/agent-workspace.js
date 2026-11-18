@@ -403,7 +403,12 @@ for (const kind of kinds) {
 }
 $("kind").onchange = () => { $("scenario").hidden = $("kind").value !== "scenario"; keepDraft(); };
 for (const id of ["title", "body", "contexts"]) $(id).addEventListener("input", keepDraft);
-$("new").onclick = fresh; $("save").onclick = guard(save); $("delete").onclick = guard(remove);
+// "New here" puts the document under the branch on screen. After a delayed Expand, `parent` can still hold a parent
+// that "New child" chose while the navigation was pending (A, with B shown), so it is set from `shown`, not reused
+// (review 676cc042, comments 158-160, ticket dd8efbc1 / case 454e6a32). `parentSet` is not counted: this follows the
+// screen, so a navigation still pending when it is pressed moves `parent` again when it draws. Before the first draw
+// (`shown` undefined) `parent` is left as it is.
+$("new").onclick = () => { if (shown !== undefined) parent = shown; fresh(); }; $("save").onclick = guard(save); $("delete").onclick = guard(remove);
 $("new-child").onclick = () => { if (!editing) return notice("Open a parent document first"); const child = editing; fresh(); parent = child; parentSet++; $("identity").textContent = "New child under " + child; };
 $("parent").onclick = guard(async () => { if (current?.parent_id) await open(current.parent_id); });
 $("full").onclick = () => { const full = $("workspace").classList.toggle("full"); $("full").textContent = full ? "Restore panes" : "Full screen"; };
