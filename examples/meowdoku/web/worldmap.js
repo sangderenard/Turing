@@ -1,3 +1,4 @@
+import { renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
 // /worldmap.html: a compact repository world map.  Regions (folders) nest as a squarified treemap by bytes, rooms (files) are the
 // cells inside them, portals (cross-file references) are curves drawn only for the selected room.  Plain ES module, canvas 2D, no libraries;
 // everything is set with textContent / createElement, never innerHTML.  The layout functions at the top are pure and exported so Node can test them.
@@ -116,7 +117,7 @@ function startPage() {
   const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined && text !== null) n.textContent = String(text); if (cls) n.className = cls; return n; };
   const canvas = $("map"), ctx = canvas.getContext("2d");
   const S = { map: null, idx: null, adj: null, layout: null, view: 0, sel: -1, hover: -1, cam: { k: 1, x: 0, y: 0 }, links: false,
-              query: "", matches: null, paths: null, langColor: new Map(), W: 0, H: 0, dpr: 1 };
+              query: "", matches: null, paths: null, langColor: new Map(), presence: null, W: 0, H: 0, dpr: 1 };
   let drag = null;
 
   async function getJson(url) {
@@ -128,6 +129,24 @@ function startPage() {
 
   const roomPath = (m) => { const room = S.map.rooms[m], g = S.map.regions[room.region]; return g.path ? g.path + "/" + room.name : room.name; };
   const colorOf = (lang) => S.langColor.get(lang || "") || OTHER;
+  const placeRoom = (place) => {
+    if (!S.map || !place || String(S.map.repo || "").split("/").pop().toLowerCase() !== String(place.repository || "").toLowerCase()) return -1;
+    return S.map.rooms.findIndex((_, m) => roomPath(m) === place.path);
+  };
+  async function loadPresence() {
+    const box = $("agent-locations");
+    try {
+      const { status, body } = await getJson("/api/worldmap/presence");
+      if (status !== 200 || !body) { box.textContent = status === 403 ? "Developer access is required for agent activity." : `Agent activity unavailable (${status}).`; return; }
+      S.presence = body;
+      renderAgentPresence(box, body, { locations: true, onLocation: place => {
+        const m = placeRoom(place);
+        if (m >= 0) jumpTo(m);
+        else setStatus("That last checkout file is absent from this generated map or belongs to another repository.", true);
+      }});
+      draw();
+    } catch (_) { box.textContent = "Agent activity unavailable."; }
+  }
   const setStatus = (text, bad) => { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : "mut"; };
 
   async function loadIndex() {
@@ -162,7 +181,7 @@ function startPage() {
     $("stats").textContent = body.regions.length + " regions, " + body.rooms.length + " rooms, " + (body.portals || []).length + " portals, " +
       (body.unresolved_count || 0) + " unresolved, commit " + String(body.commit || "").slice(0, 8) + ", generated " + when;
     setStatus("");
-    relayout(); renderPanel(); draw();
+    relayout(); renderPanel(); draw(); loadPresence();
   }
 
   function relayout() {
@@ -236,6 +255,19 @@ function startPage() {
     }
     if (S.links) drawRegionLinks();
     if (S.sel >= 0) drawPortals(S.sel);
+    if (S.presence) {
+      const places = S.presence.locations || [];
+      for (let i = 0; i < places.length; i++) {
+        const m = placeRoom(places[i]);
+        if (m < 0) continue;
+        const center = roomCenter(m);
+        if (!center) continue;
+        ctx.beginPath(); ctx.arc(center[0], center[1], 7, 0, Math.PI * 2);
+        ctx.fillStyle = "#101820"; ctx.fill(); ctx.strokeStyle = "#9ce8af"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.font = "bold 9px system-ui, sans-serif"; ctx.textBaseline = "middle";
+        ctx.fillText(String(i + 1), center[0] - 3, center[1]); ctx.textBaseline = "top"; ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1;
+      }
+    }
     for (const m of [S.hover, S.sel]) {
       if (m < 0 || rm[4 * m + 2] <= 0) continue;
       ctx.strokeStyle = m === S.sel ? "#ffd166" : "#fff"; ctx.lineWidth = 2;
@@ -352,6 +384,8 @@ function startPage() {
   window.addEventListener("resize", resize);
   resize();
   loadIndex();
+  setInterval(() => { if (!document.hidden && S.map) loadPresence(); }, 20000);
+  setInterval(() => tickAgentCountdowns($("agent-locations")), 1000);
 }
 
 if (typeof document !== "undefined" && document.getElementById("map")) startPage();

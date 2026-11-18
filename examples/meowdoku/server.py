@@ -114,6 +114,7 @@ from meowdoku import paper_mock as paper_mock_mod
 from meowdoku import paper_policies as paper_policies_mod
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
+from meowdoku import agent_presence as agent_presence_mod  # noqa: E402  observed agent activity
 from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
 from meowdoku import divider_intake as divider_intake_mod  # noqa: E402  [DIVIDER] source-divider intake and status (no worker)
@@ -597,6 +598,7 @@ def make_handler(sessions: Sessions):
                 user = sessions.oauth_mcp.user_for_token(authorization[0][7:])
                 if user is not None:
                     self._oauth_internal = True
+                    agent_presence_mod.note_inbound(user["username"], mcp=True)
                     return user
                 return None
             if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
@@ -605,6 +607,7 @@ def make_handler(sessions: Sessions):
                 user = sessions.accounts.user_for_token(authorization[0][8:])
                 if user is not None and user.get("temporary"):
                     self._mcp_preview_internal = True
+                    agent_presence_mod.note_inbound(user["username"], mcp=True)
                     return user
                 return None
             if self.path.partition("?")[0].startswith("/api/messages/"):
@@ -616,12 +619,17 @@ def make_handler(sessions: Sessions):
                     parts = authorization[0].split()
                     if len(parts) != 2 or parts[0].lower() != "bearer":
                         return None
-                    return sessions.accounts.user_for_token(parts[1])
+                    user = sessions.accounts.user_for_token(parts[1])
+                    if user is not None:
+                        agent_presence_mod.note_inbound(user["username"], mcp=False)
+                    return user
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
             user = sessions.accounts.user_for_token(token)
             if user is not None:                                  # [LOG] an `activity` line when this account was quiet IDLE_SECONDS
                 logring_mod.note_activity(user["id"], user["username"], getattr(self, "_client_ip", None))
+                if self.path.partition("?")[0].startswith("/api/"):
+                    agent_presence_mod.note_inbound(user["username"], mcp=False)
             return user
 
         def _set_account_cookie(self, token: str, max_age: int = accounts_mod.SESSION_SECONDS) -> None:
@@ -2640,6 +2648,8 @@ def make_handler(sessions: Sessions):
             try:
                 if path == "/api/worldmap/index":
                     return self._json(worldmap_mod.index(sessions.state))
+                if path == "/api/worldmap/presence":
+                    return self._json(agent_presence_mod.snapshot(sessions.accounts_db))
                 if path != "/api/worldmap/map":
                     return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}

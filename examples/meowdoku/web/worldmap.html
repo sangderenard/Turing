@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>World map</title>
+<link rel="stylesheet" href="/agent-presence.css">
 <style>
   :root { color-scheme: dark; --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --acc:#7db0ff; --card:#202024; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
@@ -35,6 +36,7 @@
   <div id="crumbs" class="bar"></div>
   <p id="stats" class="mut"></p>
   <div id="legend"></div>
+  <section aria-labelledby="agent-locations-heading"><h2 id="agent-locations-heading">Agent activity and last checkout files</h2><p class="mut">Numbered map rings mark last observed checkout files present in this generated snapshot; they do not establish where an agent is now.</p><div id="agent-locations"></div></section>
   <div class="layout">
     <div><div class="stage"><canvas id="map"></canvas></div><div id="tip"></div></div>
     <aside id="panel"></aside>
