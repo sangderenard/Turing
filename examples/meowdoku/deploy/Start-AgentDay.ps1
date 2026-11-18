@@ -65,8 +65,9 @@ $env:PYTHONIOENCODING = 'utf-8'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 
 # Gemini's SpeakToMe tools (gemini_agent --tools): the ones the preamble asks it to use. reviews_list is left out: its
-# answer is larger than one model turn reads well; reviews_attention names what waits for it.
-$GeminiTools = 'whoami,man,chat_rooms,chat_room,chat_post,pending,say,acknowledge,contacts,reviews_attention,reviews_threads,comments_thread,comments_post,memory_files,memory_file,memory_change'
+# answer is larger than one model turn reads well; reviews_attention names what waits for it. reviews_diff reads the
+# change a review names (ticket f2136454f55e4a01be0e85cd899a3fee): the preamble lets an agent vote only on a diff it read.
+$GeminiTools = 'whoami,man,chat_rooms,chat_room,chat_post,pending,say,acknowledge,contacts,reviews_attention,reviews_threads,reviews_diff,comments_thread,comments_post,memory_files,memory_file,memory_change'
 
 $Agents = [ordered]@{
     claude = @{ account = 'agents'; login = 'claude'; offset = 0; run = '& claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
