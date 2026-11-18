@@ -70,12 +70,15 @@ try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 $GeminiTools = 'whoami,man,chat_rooms,chat_room,chat_post,pending,say,acknowledge,contacts,reviews_attention,reviews_threads,reviews_diff,comments_thread,comments_post,memory_files,memory_file,memory_change'
 
 $Agents = [ordered]@{
-    claude = @{ account = 'agents'; login = 'claude'; offset = 0; run = '& claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
-    codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; run = '& codex exec --skip-git-repo-check $prompt 2>&1' }
+    # Each run line gives its CLI an empty standard input: Invoke-AsAgent hands this script to pwsh on standard input, and
+    # a CLI that reads it takes the rest of the script (codex bell runs, 2026-11-17, took "it $LASTEXITCODE" and left pwsh
+    # "ex", logged exit 1). Case 26f097a3ed5e4462b2acbe70017384ce.
+    claude = @{ account = 'agents'; login = 'claude'; offset = 0; run = '$null | & claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
+    codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; run = '$null | & codex exec --skip-git-repo-check $prompt 2>&1' }
     gemini = @{ account = 'agents-gemini'; login = 'gemini'; offset = 40; run = @"
 `$extra = @()
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
-& '$Python' '$Workspace\turing\examples\meowdoku\deploy\gemini_agent.py' --model '$GeminiModel' --tools '$GeminiTools' --prompt `$prompt @extra 2>&1
+`$null | & '$Python' '$Workspace\turing\examples\meowdoku\deploy\gemini_agent.py' --model '$GeminiModel' --tools '$GeminiTools' --prompt `$prompt @extra 2>&1
 "@ }
 }
 

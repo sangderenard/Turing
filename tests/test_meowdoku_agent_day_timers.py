@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
@@ -63,3 +67,37 @@ def test_ticks_every_minute_in_parallel_and_the_bell_has_its_own_limits():
     assert "-not $working -and" in tick, "the hourly run waits while the account's work run goes; the bell does not"
     run = text[text.index("function Invoke-AgentRun"):text.index("# ---------------------------------------------------------------- the tasks")]
     assert "'bell.id'" in run and "($limit * 60)" in run, "a bell run has its own memory file and its own timeout"
+
+
+# ---- case 26f097a3ed5e4462b2acbe70017384ce: an agent CLI never reads the launcher's script
+
+def test_every_run_line_gives_its_cli_an_empty_standard_input():
+    text = _launcher()
+    block = text[text.index("$Agents = [ordered]@{"):text.index("$Preamble = @'")]
+    assert block.count("run = '$null | & ") == 2, "claude and codex"
+    assert "`$null | & '$Python' '$Workspace\\turing\\examples\\meowdoku\\deploy\\gemini_agent.py'" in block
+
+
+CHILD = "import sys; data = sys.stdin.read(); print('CHILD READ', len(data))"
+
+
+def _split_pipe(guard: str) -> str:
+    """pwsh runs a script given on stdin in two parts; its middle line starts a child that reads standard input."""
+    python = sys.executable.replace("'", "''")
+    first = f"$x = 1\n{guard}& '{python}' -c \"{CHILD}\"\nex"
+    process = subprocess.Popen(["pwsh", "-NoProfile", "-NonInteractive", "-Command", "-"], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    process.stdin.write(first); process.stdin.flush()
+    time.sleep(2)                                   # the child has started before the rest of the script arrives
+    process.stdin.write("it 7\n"); process.stdin.close()
+    out = process.stdout.read()
+    process.wait(timeout=60)
+    return out, process.returncode
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell 7")
+def test_an_empty_standard_input_keeps_the_script_whole():
+    out, code = _split_pipe("")
+    assert "CHILD READ 5" in out, "unguarded, the child takes the script's last line ('it 7\\n')"
+    out, code = _split_pipe("$null | ")
+    assert "CHILD READ 0" in out and code == 7, "guarded, the child reads nothing and the script's own exit runs"
