@@ -8,17 +8,51 @@ function showDocument() { $("profile-editor").hidden = true; $("document-editor"
 function showDecisions() { $("profile-editor").hidden = true; $("document-editor").hidden = true; $("decision-editor").hidden = false; }
 async function api(path, body) {
   const response = await fetch(path, {method: body ? "POST" : "GET", credentials: "same-origin", cache: "no-store",
-    headers: body ? {"Content-Type": "application/json", "X-Meowdoku-Workspace": "1"} : {}, body: body ? JSON.stringify(body) : undefined});
-  const value = await response.json();
-  if (!response.ok) throw new Error(value.error || String(response.status));
+    headers: body ? {"Content-Type": "application/json", "X-Meowdoku-Workspace": "1"} : {}, body: body ? JSON.stringify(body) : undefined})
+    .catch(() => { throw new Error("could not reach the server"); });
+  // A stopped stable answers with Apache's HTML 503 page: report its status, not a JSON parse error (ticket dd8efbc1).
+  const text = await response.text(); let value = null;
+  try { value = text ? JSON.parse(text) : {}; } catch { value = null; }
+  if (!response.ok) throw new Error(response.status + " " + (response.statusText || "error") + (value?.error ? ": " + value.error : ""));
+  if (value === null) throw new Error("the server answered " + response.status + " with a page that is not JSON");
   return value;
 }
-function notice(message) { $("status").textContent = message; }
+function notice(message, error = false) { $("status").textContent = message; $("status").classList.toggle("error", error); }
+// The editor session: fresh(), fill() and restoreDraft() each put a different document in the editor and count it.
+// A save's or delete's answer may change editing/current/parent, the draft or the editor only while the session it
+// started in is still the one shown (reviews 962c9145 and 53b3ca65, comments 94-97 and 102-104).
+let session = 0;
+// Documents deleted from this page, so a later Save under one of them says plainly why it failed (comment 104).
+const deleted = new Set();
+// The document being typed is kept in this browser until the server confirms a save or delete of exactly that text,
+// so a failed save or a reload while the server is down loses nothing (ticket dd8efbc1). Only Save sends it anywhere.
+const DRAFT = "agent-workspace-draft";
+function editorState() { return JSON.stringify([$("kind").value, $("title").value, $("body").value, $("contexts").value]); }
+function keepDraft() {
+  try { localStorage.setItem(DRAFT, JSON.stringify({editing, parent, kind:$("kind").value, title:$("title").value,
+    body:$("body").value, contexts:$("contexts").value})); } catch {}
+}
+function dropDraft() { try { localStorage.removeItem(DRAFT); } catch {} }
+function restoreDraft() {
+  let draft = null; try { draft = JSON.parse(localStorage.getItem(DRAFT) || "null"); } catch {}
+  if (!draft || !(draft.title || draft.body)) return false;
+  session++; showDocument(); editing = draft.editing || null; current = null; parent = draft.parent || null;
+  $("kind").value = draft.kind; $("title").value = draft.title; $("body").value = draft.body;
+  $("contexts").value = draft.contexts || ""; $("scenario").hidden = draft.kind !== "scenario";
+  $("identity").textContent = editing ? "Unsaved changes to document " + editing : "New document under " + (parent || "root");
+  notice("Restored an unsaved draft from this browser; press Save to keep it."); return true;
+}
 function itemButton(label, action) { const button = document.createElement("button"); button.type = "button"; button.textContent = label; button.onclick = action; return button; }
-async function branch(id = null) {
-  parent = id;
+// branch(id) shows a branch and makes it where "New here" puts documents. branch(id, false) only redraws the tree and
+// leaves `parent` alone (the refresh after a save or delete). Only the latest request draws, so a slow answer cannot
+// replace the branch the visitor moved to while it was pending.
+let treeRequest = 0;
+async function branch(id = null, navigate = true) {
+  if (navigate) parent = id;
+  const request = ++treeRequest;
   const query = new URLSearchParams(); if (id) query.set("parent", id); if (!id) query.set("kind", mode);
   const result = await api("/api/agent-workspace/children?" + query);
+  if (request !== treeRequest) return;
   $("tree").replaceChildren();
   if (id) $("tree").append(itemButton("← Parent branch", async () => { const row = await api("/api/agent-workspace/document/" + id); await branch(row.parent_id); }));
   for (const row of result.documents) {
@@ -32,26 +66,82 @@ async function branch(id = null) {
 async function open(id) {
   showDocument();
   const row = await api("/api/agent-workspace/document/" + id);
-  current = row; editing = id; parent = row.parent_id;
+  fill(row); notice("Opened " + row.title);
+}
+function fill(row) {                                   // synchronous: nothing can be typed between these writes
+  session++; showDocument(); current = row; editing = row.id; parent = row.parent_id;
   $("kind").value = row.kind; $("title").value = row.title; $("body").value = row.body;
   $("contexts").value = row.contexts.join("\n"); $("scenario").hidden = row.kind !== "scenario";
   $("identity").textContent = "Document " + row.id + " · author account " + row.owner_id;
-  notice("Opened " + row.title);
 }
 function fresh() {
-  showDocument();
+  session++; showDocument();
   editing = null; current = null; $("kind").value = mode; $("title").value = ""; $("body").value = "";
   $("contexts").value = ""; $("scenario").hidden = mode !== "scenario"; $("identity").textContent = "New document under " + (parent || "root"); notice("New document");
 }
+// Typing goes on while Save waits for the server and the tree refresh (review ced45d8b, comments 80 and 82), and the
+// visitor may open or start another document meanwhile (review 962c9145, comments 94-97). So:
+// - the answer touches editing/current/parent, the draft and the editor only while `session` is the one Save started in;
+// - the editor is replaced by the saved document, and the draft dropped, only while it still holds exactly the submitted
+//   text; newer edits stay in the editor and the draft, attached to the saved id, so the next Save updates that record;
+// - the tree refresh after a save never assigns `parent`.
+let saving = false;
 async function save() {
+  if (saving) return notice("A save is already waiting for the server.");
+  const submitted = editorState(), started = session;
   const data = {action:"save", kind:$("kind").value, title:$("title").value, body:$("body").value,
     parent_id:current ? current.parent_id : parent, contexts:$("contexts").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean)};
   if (editing) data.id = editing;
-  const row = await api("/api/agent-workspace/documents", data); await branch(row.parent_id); await open(row.id); notice("Saved");
+  if (deleted.has(data.parent_id)) {                   // the parent was deleted from this page (comment 104, step e)
+    keepDraft();
+    throw new Error("Not saved: its parent document " + data.parent_id + " was deleted. Your text is still here and in this " +
+      "browser's draft. Open another branch in the tree (Expand, or ← Parent branch), then press Save to put it there.");
+  }
+  let row; saving = true; $("save").disabled = true;
+  try { row = await api("/api/agent-workspace/documents", data); }
+  catch (error) {
+    if (session !== started)
+      throw new Error("Not saved: \"" + data.title + "\" (" + error.message + "). You had already moved to another document, so its text is no longer in the editor.");
+    keepDraft();
+    throw new Error("Not saved: " + error.message + ". Your title and body are still here and kept in this browser's draft; press Save again.");
+  }
+  finally { saving = false; $("save").disabled = false; }
+  if (session !== started) return notice("Saved " + row.title + ". The document you moved to was left as it is.");
+  current = row; editing = row.id; parent = row.parent_id;
+  if (editorState() === submitted) dropDraft(); else keepDraft();
+  if (!row.parent_id && row.kind !== mode) {     // a root document is listed under its own kind
+    mode = row.kind; for (const other of $("modes").children) other.removeAttribute("aria-current");
+    $("modes").children[kinds.indexOf(mode)]?.setAttribute("aria-current", "page");
+  }
+  let refreshed = "";
+  try { await branch(row.parent_id, false); } catch (error) { refreshed = " (the tree did not refresh: " + error.message + ")"; }
+  if (session !== started) return notice("Saved " + row.title + refreshed + ". The document you moved to was left as it is.");
+  if (editorState() === submitted) { dropDraft(); fill(row); notice("Saved " + row.title + refreshed); return; }
+  keepDraft(); $("identity").textContent = "Unsaved changes to document " + row.id;
+  notice("Saved " + row.title + refreshed + ". What you typed since is still here and in this browser's draft; press Save to keep it.");
 }
+// The same rule for Delete (review 53b3ca65, comments 102-104): if the visitor opened or started another document while
+// the delete was pending, its answer leaves that editor, its draft and `parent` alone, and only redraws the tree.
+let removing = false;
 async function remove() {
+  if (removing) return notice("A delete is already waiting for the server.");
   if (!editing || !confirm("Delete this document?")) return;
-  await api("/api/agent-workspace/documents", {action:"delete", id:editing}); const p = current.parent_id; fresh(); await branch(p); notice("Deleted");
+  const id = editing, title = $("title").value, started = session, p = current ? current.parent_id : parent;
+  removing = true; $("delete").disabled = true;
+  try { await api("/api/agent-workspace/documents", {action:"delete", id}); }
+  finally { removing = false; $("delete").disabled = false; }
+  deleted.add(id);
+  if (session === started) { dropDraft(); parent = p; fresh(); await branch(p); notice("Deleted " + title); return; }
+  let note = "Deleted " + title + ". The document you moved to was left as it is.";
+  if (editing === id) {                                // A was opened again while its delete was pending
+    editing = null; current = null; keepDraft(); $("identity").textContent = "Document " + id + " was deleted; Save makes a new one";
+    note = "Deleted " + title + ". Its text is still in the editor; Save makes a new document under its old parent.";
+  } else if (parent === id && !current) {              // B is a new draft under the deleted document (step e)
+    $("identity").textContent = "New document under " + id + " (deleted)";
+    note += " Its parent was the deleted document: open another branch in the tree, then press Save to put it there.";
+  }
+  try { await branch(parent === id ? p : parent, false); } catch (error) { note += " (the tree did not refresh: " + error.message + ")"; }
+  notice(note);
 }
 async function scratch() {
   const result = await api("/api/scratch"); $("scratch-list").replaceChildren();
@@ -268,7 +358,7 @@ async function submitRun() {
   if (activeJob) data.job_key = activeJob.job_key;
   const row = await api("/api/agent-runs", data); await runs(); notice("Queued Llama run " + row.id);
 }
-function guard(fn) { return async () => { try { await fn(); } catch (error) { notice(error.message); } }; }
+function guard(fn) { return async () => { try { await fn(); } catch (error) { notice(error.message, true); } }; }
 for (const kind of kinds) {
   $("kind").append(new Option(kind, kind));
   const button = itemButton(kind[0].toUpperCase() + kind.slice(1), guard(async () => {
@@ -277,7 +367,8 @@ for (const kind of kinds) {
   }));
   if (kind === mode) button.setAttribute("aria-current", "page"); $("modes").append(button);
 }
-$("kind").onchange = () => $("scenario").hidden = $("kind").value !== "scenario";
+$("kind").onchange = () => { $("scenario").hidden = $("kind").value !== "scenario"; keepDraft(); };
+for (const id of ["title", "body", "contexts"]) $(id).addEventListener("input", keepDraft);
 $("new").onclick = fresh; $("save").onclick = guard(save); $("delete").onclick = guard(remove);
 $("new-child").onclick = () => { if (!editing) return notice("Open a parent document first"); const child = editing; fresh(); parent = child; $("identity").textContent = "New child under " + child; };
 $("parent").onclick = guard(async () => { if (current?.parent_id) await open(current.parent_id); });
@@ -296,4 +387,5 @@ $("job-preview").onclick = guard(() => previewProfile(true));
 $("instance-new").onclick = freshInstance; $("instance-save").onclick = guard(saveInstance);
 $("instance-delete").onclick = guard(deleteInstance); $("run-submit").onclick = guard(submitRun);
 $("instance-transfer").onclick = guard(transferInstance);
-guard(async () => { const result = await api("/api/agent-workspace"); $("orientation").textContent = result.orientation; await branch(); fresh(); await profiles(); await instances(); await runs(); await memories(); await scratch(); })();
+const restored = restoreDraft();   // first, so a draft shows even when the server is down
+guard(async () => { const result = await api("/api/agent-workspace"); $("orientation").textContent = result.orientation; await branch(); if (!restored || !restoreDraft()) fresh(); await profiles(); await instances(); await runs(); await memories(); await scratch(); })();
