@@ -69,9 +69,11 @@ def test_the_agent_is_told_how_it_is_run_first_in_every_branch(tmp_path):
     W.save_capacity(db, 1, {"id": profile["id"], **LLAMA})
     full = W.orientation(db, 7, now=DAY + 86400)
     assert full["preamble"].startswith(W.CAPACITY_LINES["stateless"]) and "Be helpful." in full["preamble"]
-    assert full["decision"][-1] == "how you are run: stateless, 4096 tokens, tools by the runner, session none"
-    reminder = W.orientation(db, 7, now=DAY + 86400 + 60)
-    assert reminder["preamble"].startswith(W.CAPACITY_LINES["stateless"]) and "Be helpful." not in reminder["preamble"]
+    assert full["decision"][2] == "how you are run: stateless, 4096 tokens, tools by the runner, session none"
+    # Stage 4: a stateless agent remembers nothing, so it is never handed the short reminder: its full documents until a
+    # reduction is cached (test_meowdoku_agent_guidance.py).
+    again = W.orientation(db, 7, now=DAY + 86400 + 60)
+    assert again["preamble"].startswith(W.CAPACITY_LINES["stateless"]) and "Be helpful." in again["preamble"]
 
 
 def test_the_capacity_is_its_own_schema_module(tmp_path):

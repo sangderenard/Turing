@@ -84,6 +84,8 @@ def connect(db_path: Path) -> sqlite3.Connection:
                "declared_by INTEGER NOT NULL, declared_at REAL NOT NULL)")
     from meowdoku import agent_decisions          # [DECISIONS] its own schema module and tables
     agent_decisions.prepare(db)
+    from meowdoku import agent_guidance           # [GUIDANCE] its own schema module and tables
+    agent_guidance.prepare(db)
     return db
 
 
@@ -718,28 +720,50 @@ def _profile_for(db, user_id):
     return row[0] if row else None
 
 
-def orientation(db, user_id, now=None, full=False):
-    """The signed-in account's own orientation, chosen by the decision tree above. Records today's interaction."""
-    now = time.time() if now is None else now
-    first, day = _orientation_seen(db, user_id, now)
-    branch = FIRST_TODAY if first else RETURNING
+def orientation_documents(db, profile_id, job_key=None):
+    """The documents an orientation is made of: the shared basics (every root "orientation" document, oldest first), then
+    the profile's own (under job_key when given), each once."""
     basics = [document(db, row[0]) for row in db.execute(
         "SELECT id FROM agent_documents WHERE kind='orientation' AND parent_id IS NULL ORDER BY updated, title")]
-    profile_id = _profile_for(db, user_id)
-    declared = capacity(db, profile_id) if profile_id else None
-    own, job = [], None
-    if profile_id:
-        has_job = db.execute("SELECT 1 FROM agent_profile_jobs WHERE profile_id=? AND job_key=?", (profile_id, branch)).fetchone()
-        resolved = resolve_profile(db, profile_id, branch if has_job else None)
-        own, job = resolved["documents"], resolved["job"]
+    own = resolve_profile(db, profile_id, job_key)["documents"] if profile_id else []
     seen_ids, documents = set(), []
     for item in basics + own:
         if item["id"] not in seen_ids:
             seen_ids.add(item["id"]); documents.append(item)
+    return documents
+
+
+def orientation(db, user_id, now=None, full=False):
+    """The signed-in account's own orientation, chosen by the decision tree above. Records today's interaction.
+
+    [GUIDANCE] A stateless character (no job for this branch, full not asked) is never handed the short reminder: it
+    remembers nothing. It gets its cached reduced guidance while that is current (agent_guidance.py), else its full
+    documents, and a reduce request is queued.
+    """
+    now = time.time() if now is None else now
+    first, day = _orientation_seen(db, user_id, now)
+    branch = FIRST_TODAY if first else RETURNING
+    profile_id = _profile_for(db, user_id)
+    declared = capacity(db, profile_id) if profile_id else None
+    job = None
+    if profile_id:
+        has_job = db.execute("SELECT 1 FROM agent_profile_jobs WHERE profile_id=? AND job_key=?", (profile_id, branch)).fetchone()
+        job = resolve_profile(db, profile_id, branch if has_job else None)["job"]
+    documents = orientation_documents(db, profile_id, job["key"] if job else None)
     decision = ["first interaction with this account today? " + ("yes" if first else "no"),
                 f"profile: {'yes' if profile_id else 'none'}" + (f", job {job['key']}" if job else ""),
                 _capacity_words(declared)]
-    if first or job or full:
+    guidance = None
+    stateless = bool(declared and declared["state"] == "stateless")
+    if stateless and not job and not full:
+        from meowdoku import agent_guidance
+        reduced, row = agent_guidance.working_guidance(db, profile_id, now)
+        guidance = ({"reduced": True, "made_by": row["made_by"], "made_at": row["made_at"], "drop_at": row["drop_at"]}
+                    if row else {"reduced": False, "requested": True})
+        decision.append("working guidance: " + ("the cached reduction" if row else "not current; full documents, reduction requested"))
+    if guidance and guidance["reduced"]:
+        preamble = reduced
+    elif first or job or full or stateless:
         preamble = "\n\n".join(f"# {item['title']}\n{item['body']}" for item in documents)
     else:
         preamble = ("You were oriented earlier today (UTC " + day + "). Your documents, in order: " +
@@ -754,4 +778,4 @@ def orientation(db, user_id, now=None, full=False):
             preamble += "\n\n" + where
     return {"first_today": first, "day": day, "branch": branch, "decision": decision, "capacity": declared,
             "documents": [{"id": d["id"], "kind": d["kind"], "title": d["title"]} for d in documents],
-            "preamble": preamble}
+            "guidance": guidance, "preamble": preamble}

@@ -101,3 +101,16 @@ def test_an_empty_standard_input_keeps_the_script_whole():
     assert "CHILD READ 5" in out, "unguarded, the child takes the script's last line ('it 7\\n')"
     out, code = _split_pipe("$null | ")
     assert "CHILD READ 0" in out and code == 7, "guarded, the child reads nothing and the script's own exit runs"
+
+
+def test_the_tick_starts_the_reducer_under_its_lock_and_a_reducer_never_blocks_a_run():
+    """[GUIDANCE] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 4."""
+    text = _launcher()
+    tick = text[text.index("# ---------------------------------------------------------------- one tick for one agent"):]
+    assert "$_.kind -ne 'reduce'" in tick, "the account's reducer is left out of what blocks a bell or a work run"
+    start = tick.index("'guidance_reducer.py'")
+    assert tick.index("--reduce-pending") < start < tick.index("$lock.Dispose()"), "read, then started, under the lock"
+    assert tick.index("Add-AgentRecord $AgentDays 'reduce'") < tick.index("$lock.Dispose()"), "its record is written first"
+    assert "$declared.reduce -and" in tick
+    block = text[text.index("$Agents = [ordered]@{"):text.index("$Preamble = @'")]
+    assert block.count("reduce = $true") == 2, "the CLIs guidance_reducer.py has an adapter for: claude and codex"

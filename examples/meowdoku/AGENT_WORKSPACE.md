@@ -69,6 +69,29 @@ The SpeakToMe MCP server appends this preamble to its initialize instructions on
 interaction starts oriented. The interactions are counted per account per day in `agent_orientation_seen`, under its
 own schema module, `agent_orientation`.
 
+### A stateless agent's working guidance
+
+A character declared `stateless` remembers nothing between calls, so it is never handed the short reminder. Its
+orientation is its **working guidance**: a reduction of its full orientation, made by a reducer and cached
+(`agent_guidance.py`, case 46d6ad2d stage 4). Its job branches (`first-today`, `returning`) and `?full=1` still give the
+full text, and every document stays readable in full and unchanged.
+- **Sources.** What the agent itself reads: the shared basics and its profile's documents, its decision graph and its
+  declared capacity. Never its memory, its messages or anything private.
+- **Digest.** The sha256 of every source document's id, updated time and body, the graph's places and routes, and the
+  capacity row. A reduction is served only while its digest is the current one, so a changed document invalidates it
+  at once.
+- **Random drop.** Each reduction expires 6 h x uniform(0.5, 1.5) after it was made, so the reductions refresh at
+  different times.
+- **Stale or missing.** The full documents are served and a request is queued in `agent_guidance_requests`.
+- **The reducer.** An account whose own profile declares the job `reduce` (its job documents are its instructions for
+  reducing). `Start-AgentDay.ps1` starts `deploy/guidance_reducer.py` as that agent's Windows account when requests
+  wait. It reads and answers through `POST /api/agent-workspace/guidance` (`claim`, `submit` citing the digest it
+  read, `fail`), keeps one claude or codex session (the round table's own adapters) while requests keep coming, and
+  ends after 30 idle minutes. Its size budget is a quarter of the agent's declared context, at about 4 bytes a token
+  (1 to 32 KiB).
+- `GET /api/agent-workspace/guidance` (operators and reducers): every cached reduction, whether it is current, and the
+  waiting requests with their attempts and last error. The tables are their own schema module, `agent_guidance`.
+
 ## Enduring characters, instances, and jobs
 
 An individual profile has a stable ID, title, assigned permanent account and

@@ -268,3 +268,41 @@ def test_any_account_walks_its_own_decision_graph_and_only_operators_edit_it(ser
     assert _call(server.port, "/api/agent-workspace/decisions/at", "POST", {**PUBLIC_XFF, "Cookie": walker},
                  {"at": "arrived"})[0] == 403, "a write needs the workspace header"
     assert _call(server.port, "/api/agent-workspace/decisions/map", headers=PUBLIC_XFF)[0] == 401
+
+
+def test_a_declared_reducer_claims_and_returns_guidance_that_the_stateless_agent_is_then_served(server):
+    """[GUIDANCE] case 46d6ad2dc4b14ce497e53d5fba151b8d, stage 4."""
+    operator = _signup(server.port, "guide_operator")
+    agent = _signup(server.port, "guide_agent")
+    reducer = _signup(server.port, "guide_reducer")
+    authz.grant_role(server.sessions.accounts_db, "guide_operator", "operator", "test")
+    headers = {**PUBLIC_XFF, "Cookie": operator, "X-Meowdoku-Workspace": "1"}
+    def post(path, body, who=headers, status=200):
+        got, result, _, _ = _call(server.port, path, "POST", who, body)
+        assert got == status, result
+        return result
+    doc = post("/api/agent-workspace/documents", {"action": "save", "kind": "guidance", "title": "Rules", "body": "Answer briefly."})
+    character = post("/api/agent-workspace/profiles", {"action": "save", "title": "Guided", "individual": "guide_agent",
+                                                       "document_ids": [doc["id"]]})
+    post("/api/agent-workspace/profiles", {"action": "capacity", "id": character["id"], "state": "stateless",
+                                           "context_tokens": 4096, "tools": "runner", "session": "none", "note": ""})
+    mine = {**PUBLIC_XFF, "Cookie": reducer, "X-Meowdoku-Workspace": "1"}
+    assert _call(server.port, "/api/agent-workspace/guidance", "POST", mine, {"action": "claim"})[0] == 403, "not declared"
+    worker = post("/api/agent-workspace/profiles", {"action": "save", "title": "Reducer", "individual": "guide_reducer",
+                                                    "document_ids": []})
+    post("/api/agent-workspace/jobs", {"action": "save", "profile_id": worker["id"], "job_key": "reduce", "title": "Reduce"})
+    seen = _call(server.port, "/api/agent-workspace/orientation", headers={**PUBLIC_XFF, "Cookie": agent})[1]
+    assert seen["guidance"] == {"reduced": False, "requested": True} and "Answer briefly." in seen["preamble"]
+    assert _call(server.port, "/api/agent-workspace/guidance", "POST", {**PUBLIC_XFF, "Cookie": reducer},
+                 {"action": "claim"})[0] == 403, "a write needs the workspace header"
+    request = post("/api/agent-workspace/guidance", {"action": "claim"}, mine)["requests"][0]
+    assert request["profile_id"] == character["id"] and "Answer briefly." in request["text"]
+    post("/api/agent-workspace/guidance", {"action": "submit", "profile_id": character["id"],
+                                           "source_digest": request["digest"], "body": "Be brief. (Rules)"}, mine)
+    served = _call(server.port, "/api/agent-workspace/orientation", headers={**PUBLIC_XFF, "Cookie": agent})[1]
+    assert served["guidance"]["reduced"] and "Be brief. (Rules)" in served["preamble"]
+    assert "Answer briefly." in _call(server.port, "/api/agent-workspace/orientation?full=1",
+                                      headers={**PUBLIC_XFF, "Cookie": agent})[1]["preamble"], "full stays full"
+    assert _call(server.port, "/api/agent-workspace/guidance", headers=headers)[1]["cached"][0]["current"] == "yes"
+    assert _call(server.port, "/api/agent-workspace/guidance", headers={**PUBLIC_XFF, "Cookie": agent})[0] == 403
+    assert _call(server.port, "/api/agent-workspace/guidance", headers=PUBLIC_XFF)[0] == 401

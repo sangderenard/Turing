@@ -105,6 +105,7 @@ from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES]
 from meowdoku import user_files as user_files_mod         # noqa: E402  [USER FILES] account-owned uploads; message subjects grant reads
 from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
 from meowdoku import agent_decisions as agent_decisions_mod  # noqa: E402  [DECISIONS]
+from meowdoku import agent_guidance as agent_guidance_mod  # noqa: E402  [GUIDANCE]
 from meowdoku import agent_runs as agent_runs_mod  # noqa: E402
 from meowdoku import agent_training_arena as agent_training_arena_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
@@ -1535,6 +1536,35 @@ def make_handler(sessions: Sessions):
                 db = agent_workspace_mod.connect(sessions.accounts_db)
                 try:
                     return self._json(agent_workspace_mod.orientation(db, principal.user_id, full=full))
+                except agent_workspace_mod.WorkspaceError as error:
+                    return self._json({"error": str(error)}, error.status)
+                finally:
+                    db.close()
+            if path == "/api/agent-workspace/guidance":
+                # [GUIDANCE] the reducer (an account whose profile declares the job "reduce") claims requests and returns
+                # reductions; operators and reducers read the cache's status. agent_guidance.py.
+                principal = self._principal()
+                if principal.user_id is None:
+                    return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+                if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                    return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+                db = agent_workspace_mod.connect(sessions.accounts_db)
+                try:
+                    if method == "GET":
+                        if principal.role not in ("operator", "admin") and not agent_guidance_mod.is_reducer(db, principal.user_id):
+                            raise agent_guidance_mod.GuidanceError("operators and reducers read the guidance cache", 403)
+                        return self._json(agent_guidance_mod.status(db))
+                    body = self._body_json(limit=agent_guidance_mod.MAX_BUDGET + 8192)
+                    if body is None:
+                        return
+                    action = body.get("action") if isinstance(body, dict) else None
+                    if action == "claim":
+                        return self._json(agent_guidance_mod.claim(db, principal.user_id))
+                    if action == "submit":
+                        return self._json(agent_guidance_mod.submit(db, principal.user_id, body))
+                    if action == "fail":
+                        return self._json(agent_guidance_mod.fail(db, principal.user_id, body))
+                    raise agent_guidance_mod.GuidanceError("action is claim, submit or fail")
                 except agent_workspace_mod.WorkspaceError as error:
                     return self._json({"error": str(error)}, error.status)
                 finally:
@@ -4327,7 +4357,7 @@ def make_handler(sessions: Sessions):
                 return self._user_files_route(path0, "POST")
             if path0 in ("/api/agent-workspace/documents", "/api/agent-workspace/profiles", "/api/agent-workspace/jobs",
                          "/api/agent-workspace/instances", "/api/agent-workspace/decisions",
-                         "/api/agent-workspace/decisions/at"):
+                         "/api/agent-workspace/decisions/at", "/api/agent-workspace/guidance"):
                 return self._agent_workspace_route(path0, "POST")
             if path0 == "/api/scratch":
                 return self._scratch_route(path0, "POST")

@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from meowdoku import agent_workspace  # noqa: E402
+from meowdoku import agent_guidance, agent_workspace  # noqa: E402
 
 
 def main(argv=None):
@@ -28,6 +29,9 @@ def main(argv=None):
     parser.add_argument("--register-instance")
     parser.add_argument("--job")
     parser.add_argument("--ensure-memory")
+    parser.add_argument("--reduce-pending", action="store_true",
+                        help="print how many reduce requests wait for a reducer; exit 2 when this individual's profile "
+                             "does not declare the job 'reduce' (agent_guidance.py)")
     args = parser.parse_args(argv)
     if not args.accounts_db.is_file():
         print("accounts database missing", file=sys.stderr)
@@ -53,6 +57,13 @@ def main(argv=None):
                 except agent_workspace.WorkspaceError as problem:
                     print(str(problem), file=sys.stderr)
                     return 1
+            return 0
+        if args.reduce_pending:
+            account = db.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (args.individual,)).fetchone()
+            if account is None or not agent_guidance.is_reducer(db, account[0]):
+                return 2
+            print(db.execute("SELECT COUNT(*) FROM agent_guidance_requests WHERE claimed_by IS NULL OR claimed_at<?",
+                             (time.time() - agent_guidance.LEASE_SECONDS,)).fetchone()[0])
             return 0
         author = db.execute("SELECT user_id FROM account_roles WHERE role IN ('admin','operator') "
                             "ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END,user_id LIMIT 1").fetchone()

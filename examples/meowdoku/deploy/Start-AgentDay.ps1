@@ -16,6 +16,10 @@ agent's own lock (<AgentDays>\running\<agent>.lock), so two ticks never start th
      after -BellTimeoutMinutes, with its own memory file (<agent>\bell.id) so two runs never write the same one. What it
      was woken for is remembered, so the same thing does not wake it twice. A failed sign-in stops the bell for that
      agent for an hour, so the login guard is never tripped.
+  4. beside all of that, starts the guidance reducer (guidance_reducer.py, case 46d6ad2d stage 4) as the agent's account
+     when reduce requests wait and the agent's profile declares the job "reduce", unless its reducer already runs. The
+     reducer keeps one session while requests keep coming and ends after 30 idle minutes; it never blocks a bell or a
+     work run.
 Whatever stops a tick from starting a run is written to <AgentDays>\tick.log; nothing is skipped silently.
 
 Every run's prompt is the preamble (built in; <AgentDays>\preamble.md replaces it) and, for a work run, the day's prompt:
@@ -73,8 +77,8 @@ $Agents = [ordered]@{
     # Each run line gives its CLI an empty standard input: Invoke-AsAgent hands this script to pwsh on standard input, and
     # a CLI that reads it takes the rest of the script (codex bell runs, 2026-11-17, took "it $LASTEXITCODE" and left pwsh
     # "ex", logged exit 1). Case 26f097a3ed5e4462b2acbe70017384ce.
-    claude = @{ account = 'agents'; login = 'claude'; offset = 0; run = '$null | & claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
-    codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; run = '$null | & codex exec --skip-git-repo-check $prompt 2>&1' }
+    claude = @{ account = 'agents'; login = 'claude'; offset = 0; reduce = $true; run = '$null | & claude -p $prompt --allowedTools mcp__speaktome 2>&1' }
+    codex  = @{ account = 'agents-codex'; login = 'codex'; offset = 20; reduce = $true; run = '$null | & codex exec --skip-git-repo-check $prompt 2>&1' }
     gemini = @{ account = 'agents-gemini'; login = 'gemini'; offset = 40; run = @"
 `$extra = @()
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
@@ -300,11 +304,22 @@ $run = $null
 try {
     $records = @(Get-AgentRecords $AgentDays)
     $now = Get-Date
-    $mine = @($records | Where-Object { $_.account -eq $declared.account })
-    if (@($mine | Where-Object { $_.kind -ne 'run' }).Count) { exit 0 }     # a bell run, a seat or a console is open
-    $working = $mine.Count -gt 0                                            # this account's work run is going
+    $mine = @($records | Where-Object { $_.account -eq $declared.account -and $_.kind -ne 'reduce' })
     $cred = Read-AgentCredential $declared.account
     if (-not $cred) { exit 0 }
+    # [GUIDANCE] the reducer, beside everything else, under this same lock so two ticks never start two. reduce: the CLIs
+    # guidance_reducer.py has an adapter for (roundtable_seat.Claude, Codex); the job "reduce" in SQL decides the rest.
+    if ($declared.reduce -and -not @($records | Where-Object { $_.account -eq $declared.account -and $_.kind -eq 'reduce' }).Count) {
+        $waiting = & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --reduce-pending
+        if ($LASTEXITCODE -eq 0 -and [int]($waiting -join '') -gt 0) {
+            $reducer = Start-AsAgent $cred $Python @((Join-Path $PSScriptRoot 'guidance_reducer.py'), '--agent', $Agent,
+                '--login', $declared.login, '--base', $Base) $Workspace -Hidden
+            Add-AgentRecord $AgentDays 'reduce' $declared.account $reducer.Id @{ agent = $Agent } | Out-Null
+            Log "${Agent}: reducer started as $($declared.account) for $($waiting -join '') waiting request(s), pid $($reducer.Id)"
+        } elseif ($LASTEXITCODE -notin 0, 2) { Log "${Agent}: reduce requests not read (exit $LASTEXITCODE)" }
+    }
+    if (@($mine | Where-Object { $_.kind -ne 'run' }).Count) { exit 0 }     # a bell run, a seat or a console is open
+    $working = $mine.Count -gt 0                                            # this account's work run is going
     $state = Read-State $Agent
     $slot = Slot $declared $now
     if (-not $working -and (-not $state.last_hourly -or [datetime]$state.last_hourly -lt $slot)) {

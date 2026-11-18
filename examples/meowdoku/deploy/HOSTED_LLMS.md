@@ -63,7 +63,8 @@ prompt and its intern prompt are removed (the emoji targets were a placeholder f
 Llama's own page of training parameters, goals and methods, a separate ticket.
 
 Every chat reply (rooms and direct messages) is built from:
-- Llama's own orientation: `GET /api/agent-workspace/orientation?full=1`, the shared basics, then its profile;
+- Llama's own orientation: `GET /api/agent-workspace/orientation`. Llama is declared stateless, so this is its cached
+  reduced guidance while that is current, else the shared basics and then its profile in full (agent_guidance.py);
 - its memory file;
 - the recent chat lines.
 Both the orientation and the memory are read every five minutes. They are fitted to the 4,096-token context by the

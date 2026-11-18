@@ -138,7 +138,7 @@ def _one_line(text, limit=240):
 
 class Guide:
     """What Llama brings to every chat reply, and what it keeps from it. Read as Llama itself, every GUIDE_SECONDS:
-    its own orientation (GET /api/agent-workspace/orientation?full=1: the shared basics, then its profile) and its newest
+    its own orientation (GET /api/agent-workspace/orientation: its cached reduced guidance, else its full documents) and its newest
     memory file (GET /api/memory, /api/memory/file/<id>). After each reply the runner adds one line to that memory
     (remember) and writes it back at most every MEMORY_FLUSH_SECONDS (POST /api/memory), keeping it under MEMORY_BYTES by
     dropping the oldest lines. When Llama has no memory file yet, the first write creates one. Anything the site cannot
@@ -155,7 +155,9 @@ class Guide:
             return
         self.read_at = now
         try:
-            got = self.rest.call("/api/agent-workspace/orientation?full=1")
+            # Llama is declared stateless: its orientation is its cached reduced guidance while that is current, else
+            # its full documents (agent_guidance.py, case 46d6ad2d stage 4).
+            got = self.rest.call("/api/agent-workspace/orientation")
             text = got.get("preamble") if isinstance(got, dict) else None
             if isinstance(text, str) and text.strip():
                 self.orientation = text.strip()

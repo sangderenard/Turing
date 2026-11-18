@@ -79,11 +79,15 @@ def _key(graph, value):
     return _name(value, "place")
 
 
-def graph_for(db, user_id):
-    profile_id = agent_workspace._profile_for(db, user_id)
+def graph_of(db, profile_id):
+    """The graph a character walks: its assignment, else DEFAULT_GRAPH."""
     row = db.execute("SELECT graph FROM agent_decision_assignments WHERE profile_id=?", (profile_id,)).fetchone() \
         if profile_id else None
     return row[0] if row else DEFAULT_GRAPH
+
+
+def graph_for(db, user_id):
+    return graph_of(db, agent_workspace._profile_for(db, user_id))
 
 
 def _places(db, graph):
