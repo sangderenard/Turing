@@ -19,13 +19,12 @@ submitted by this process, word for word, as guidance.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roundtable_seat import BASE, WORKSPACE, Claude, Codex, SeatError, log  # noqa: E402
+from roundtable_seat import BASE, Claude, Codex, SeatError, log, sign_in  # noqa: E402
 
 IDLE_SECONDS = 30 * 60
 POLL_SECONDS = 20
@@ -103,12 +102,7 @@ def main(argv=None) -> int:
     parser.add_argument("--login", required=True)
     parser.add_argument("--base", default=BASE)
     args = parser.parse_args(argv)
-    # The agent's own SpeakToMe sign-in, as roundtable_seat.py and Start-AgentDay.ps1 set it.
-    speaktome = os.path.join(WORKSPACE, "speaktome")
-    os.environ.update(SPEAKTOME_USER=args.login, SPEAKTOME_BASE=args.base, PYTHONDONTWRITEBYTECODE="1",
-                      SPEAKTOME_SECRET_FILE=os.path.join(os.path.expanduser("~"), "speaktome-credentials", f"{args.login}.secret"),
-                      PYTHONPATH=os.pathsep.join(p for p in (speaktome, os.environ.get("PYTHONPATH", "")) if p))
-    sys.path.insert(0, speaktome)
+    sign_in(args.login, args.base)
     from speaktome_mcp.rest import Rest, RestError
     start = (lambda system: Claude(system_prompt=system)) if args.agent == "claude" else \
         (lambda system: Codex(base_instructions=system))

@@ -32,6 +32,8 @@ def main(argv=None):
     parser.add_argument("--reduce-pending", action="store_true",
                         help="print how many reduce requests wait for a reducer; exit 2 when this individual's profile "
                              "does not declare the job 'reduce' (agent_guidance.py)")
+    parser.add_argument("--resumable", action="store_true",
+                        help="exit 0 when this individual's character declares its session resumable, else 2 (stage 5)")
     args = parser.parse_args(argv)
     if not args.accounts_db.is_file():
         print("accounts database missing", file=sys.stderr)
@@ -58,6 +60,11 @@ def main(argv=None):
                     print(str(problem), file=sys.stderr)
                     return 1
             return 0
+        if args.resumable:
+            row = db.execute("SELECT c.session FROM agent_profiles p JOIN users u ON u.id=p.individual_id "
+                             "JOIN agent_capacity c ON c.profile_id=p.id WHERE u.username=? COLLATE NOCASE "
+                             "ORDER BY (p.seed_key IS NULL),p.updated LIMIT 1", (args.individual,)).fetchone()
+            return 0 if row and row[0] == "resumable" else 2
         if args.reduce_pending:
             account = db.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (args.individual,)).fetchone()
             if account is None or not agent_guidance.is_reducer(db, account[0]):
