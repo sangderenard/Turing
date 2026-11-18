@@ -7,12 +7,34 @@ function showProfile() { $("profile-editor").hidden = false; $("document-editor"
 function showDocument() { $("profile-editor").hidden = true; $("document-editor").hidden = false; }
 async function api(path, body) {
   const response = await fetch(path, {method: body ? "POST" : "GET", credentials: "same-origin", cache: "no-store",
-    headers: body ? {"Content-Type": "application/json", "X-Meowdoku-Workspace": "1"} : {}, body: body ? JSON.stringify(body) : undefined});
-  const value = await response.json();
-  if (!response.ok) throw new Error(value.error || String(response.status));
+    headers: body ? {"Content-Type": "application/json", "X-Meowdoku-Workspace": "1"} : {}, body: body ? JSON.stringify(body) : undefined})
+    .catch(() => { throw new Error("could not reach the server"); });
+  // A stopped stable answers with Apache's HTML 503 page: report its status, not a JSON parse error (ticket dd8efbc1).
+  const text = await response.text(); let value = null;
+  try { value = text ? JSON.parse(text) : {}; } catch { value = null; }
+  if (!response.ok) throw new Error(response.status + " " + (response.statusText || "error") + (value?.error ? ": " + value.error : ""));
+  if (value === null) throw new Error("the server answered " + response.status + " with a page that is not JSON");
   return value;
 }
-function notice(message) { $("status").textContent = message; }
+function notice(message, error = false) { $("status").textContent = message; $("status").classList.toggle("error", error); }
+// The document being typed is kept in this browser until the server confirms a save or delete of exactly that text,
+// so a failed save or a reload while the server is down loses nothing (ticket dd8efbc1). Only Save sends it anywhere.
+const DRAFT = "agent-workspace-draft";
+function editorState() { return JSON.stringify([$("kind").value, $("title").value, $("body").value, $("contexts").value]); }
+function keepDraft() {
+  try { localStorage.setItem(DRAFT, JSON.stringify({editing, parent, kind:$("kind").value, title:$("title").value,
+    body:$("body").value, contexts:$("contexts").value})); } catch {}
+}
+function dropDraft() { try { localStorage.removeItem(DRAFT); } catch {} }
+function restoreDraft() {
+  let draft = null; try { draft = JSON.parse(localStorage.getItem(DRAFT) || "null"); } catch {}
+  if (!draft || !(draft.title || draft.body)) return false;
+  showDocument(); editing = draft.editing || null; current = null; parent = draft.parent || null;
+  $("kind").value = draft.kind; $("title").value = draft.title; $("body").value = draft.body;
+  $("contexts").value = draft.contexts || ""; $("scenario").hidden = draft.kind !== "scenario";
+  $("identity").textContent = editing ? "Unsaved changes to document " + editing : "New document under " + (parent || "root");
+  notice("Restored an unsaved draft from this browser; press Save to keep it."); return true;
+}
 function itemButton(label, action) { const button = document.createElement("button"); button.type = "button"; button.textContent = label; button.onclick = action; return button; }
 async function branch(id = null) {
   parent = id;
@@ -30,8 +52,10 @@ async function branch(id = null) {
 }
 async function open(id) {
   showDocument();
-  const row = await api("/api/agent-workspace/document/" + id);
-  current = row; editing = id; parent = row.parent_id;
+  fill(await api("/api/agent-workspace/document/" + id));
+}
+function fill(row) {                                   // synchronous: nothing can be typed between these writes
+  showDocument(); current = row; editing = row.id; parent = row.parent_id;
   $("kind").value = row.kind; $("title").value = row.title; $("body").value = row.body;
   $("contexts").value = row.contexts.join("\n"); $("scenario").hidden = row.kind !== "scenario";
   $("identity").textContent = "Document " + row.id + " · author account " + row.owner_id;
@@ -42,15 +66,40 @@ function fresh() {
   editing = null; current = null; $("kind").value = mode; $("title").value = ""; $("body").value = "";
   $("contexts").value = ""; $("scenario").hidden = mode !== "scenario"; $("identity").textContent = "New document under " + (parent || "root"); notice("New document");
 }
+// Typing goes on while Save waits for the server, the tree refresh and the reload (review ced45d8b, comments 80
+// and 82). So the editor is replaced by the saved document, and the draft dropped, only while the editor still holds
+// exactly the submitted text; newer edits stay in the editor and the draft, attached to the saved id, so the next
+// Save updates the same record instead of creating a second one.
+let saving = false;
 async function save() {
+  if (saving) return notice("A save is already waiting for the server.");
+  const submitted = editorState();
   const data = {action:"save", kind:$("kind").value, title:$("title").value, body:$("body").value,
     parent_id:current ? current.parent_id : parent, contexts:$("contexts").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean)};
   if (editing) data.id = editing;
-  const row = await api("/api/agent-workspace/documents", data); await branch(row.parent_id); await open(row.id); notice("Saved");
+  let row; saving = true; $("save").disabled = true;
+  try { row = await api("/api/agent-workspace/documents", data); }
+  catch (error) {
+    keepDraft();
+    throw new Error("Not saved: " + error.message + ". Your title and body are still here and kept in this browser's draft; press Save again.");
+  }
+  finally { saving = false; $("save").disabled = false; }
+  current = row; editing = row.id; parent = row.parent_id;
+  if (editorState() === submitted) dropDraft(); else keepDraft();
+  if (!row.parent_id && row.kind !== mode) {     // a root document is listed under its own kind
+    mode = row.kind; for (const other of $("modes").children) other.removeAttribute("aria-current");
+    $("modes").children[kinds.indexOf(mode)]?.setAttribute("aria-current", "page");
+  }
+  let refreshed = "";
+  try { await branch(row.parent_id); } catch (error) { refreshed = " (the tree did not refresh: " + error.message + ")"; }
+  if (editorState() === submitted) { dropDraft(); fill(row); notice("Saved " + row.title + refreshed); return; }
+  keepDraft(); $("identity").textContent = "Unsaved changes to document " + row.id;
+  notice("Saved " + row.title + refreshed + ". What you typed since is still here and in this browser's draft; press Save to keep it.");
 }
 async function remove() {
   if (!editing || !confirm("Delete this document?")) return;
-  await api("/api/agent-workspace/documents", {action:"delete", id:editing}); const p = current.parent_id; fresh(); await branch(p); notice("Deleted");
+  await api("/api/agent-workspace/documents", {action:"delete", id:editing}); dropDraft();
+  const p = current ? current.parent_id : parent; fresh(); await branch(p); notice("Deleted");
 }
 async function scratch() {
   const result = await api("/api/scratch"); $("scratch-list").replaceChildren();
@@ -216,7 +265,7 @@ async function submitRun() {
   if (activeJob) data.job_key = activeJob.job_key;
   const row = await api("/api/agent-runs", data); await runs(); notice("Queued Llama run " + row.id);
 }
-function guard(fn) { return async () => { try { await fn(); } catch (error) { notice(error.message); } }; }
+function guard(fn) { return async () => { try { await fn(); } catch (error) { notice(error.message, true); } }; }
 for (const kind of kinds) {
   $("kind").append(new Option(kind, kind));
   const button = itemButton(kind[0].toUpperCase() + kind.slice(1), guard(async () => {
@@ -225,7 +274,8 @@ for (const kind of kinds) {
   }));
   if (kind === mode) button.setAttribute("aria-current", "page"); $("modes").append(button);
 }
-$("kind").onchange = () => $("scenario").hidden = $("kind").value !== "scenario";
+$("kind").onchange = () => { $("scenario").hidden = $("kind").value !== "scenario"; keepDraft(); };
+for (const id of ["title", "body", "contexts"]) $(id).addEventListener("input", keepDraft);
 $("new").onclick = fresh; $("save").onclick = guard(save); $("delete").onclick = guard(remove);
 $("new-child").onclick = () => { if (!editing) return notice("Open a parent document first"); const child = editing; fresh(); parent = child; $("identity").textContent = "New child under " + child; };
 $("parent").onclick = guard(async () => { if (current?.parent_id) await open(current.parent_id); });
@@ -241,4 +291,5 @@ $("job-preview").onclick = guard(() => previewProfile(true));
 $("instance-new").onclick = freshInstance; $("instance-save").onclick = guard(saveInstance);
 $("instance-delete").onclick = guard(deleteInstance); $("run-submit").onclick = guard(submitRun);
 $("instance-transfer").onclick = guard(transferInstance);
-guard(async () => { const result = await api("/api/agent-workspace"); $("orientation").textContent = result.orientation; await branch(); fresh(); await profiles(); await instances(); await runs(); await memories(); await scratch(); })();
+const restored = restoreDraft();   // first, so a draft shows even when the server is down
+guard(async () => { const result = await api("/api/agent-workspace"); $("orientation").textContent = result.orientation; await branch(); if (!restored || !restoreDraft()) fresh(); await profiles(); await instances(); await runs(); await memories(); await scratch(); })();
