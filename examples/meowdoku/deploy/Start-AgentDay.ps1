@@ -92,7 +92,7 @@ while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Mat
 }
 
 # External API agents (case 989e507e): each one an admin declared on /operator-control.html and the owner installed with
-# Install-ExternalAgent.ps1 (stm agent install) runs as Gemini does, through api_agent.py, as its own account agents-<name>
+# Install-ExternalAgent.ps1 -Name <name> runs as Gemini does, through api_agent.py, as its own account agents-<name>
 # with its key in that account's ~\<name>.key. The built-in agents above are never replaced by a declaration.
 function Quote([string]$value) { "'" + ($value -replace "'", "''") + "'" }
 $StateRoot = Split-Path (Split-Path $AccountsDb)

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS  Install an external API agent that an admin declared on /operator-control.html, the way Gemini was installed
-by hand on 2026-11-14, in one run from an elevated shell (an SSH session as the owner is one): stm agent install <name>.
+by hand on 2026-11-14, in one run from an elevated shell (an SSH session as the owner is one): .\Install-ExternalAgent.ps1 -Name <name>.
 
 What it does, in order, printing each step and never a secret:
   1. reads the declaration (external_agents.py show): provider, base URL, model, tools, minute, brief
@@ -114,5 +114,5 @@ Write-Host "profile $($made.profile_id) $($made.profile_was) (edit it in Agent w
 Step "7. installed; the agent ticks"
 Registry @('mark', $Name, 'installed', '--note', "installed by $env:USERNAME") | Out-Null
 & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'Start-AgentDay.ps1') -Register | Out-Host
-if ($LASTEXITCODE -ne 0) { Write-Host "Start-AgentDay -Register exited $LASTEXITCODE; run 'stm agents' again." -ForegroundColor Yellow }
-Write-Host "`n$Name is installed: work run at :$('{0:00}' -f $agent.minute) each hour, and its bell. 'stm agent run $Name' starts one now." -ForegroundColor Green
+if ($LASTEXITCODE -ne 0) { Write-Host "Start-AgentDay -Register exited $LASTEXITCODE; run '$PSScriptRoot\Start-AgentDay.ps1 -Register' again." -ForegroundColor Yellow }
+Write-Host "`n$Name is installed: work run at :$('{0:00}' -f $agent.minute) each hour, and its bell. '$PSScriptRoot\Start-AgentDay.ps1 -RunOne $Name' starts one now." -ForegroundColor Green

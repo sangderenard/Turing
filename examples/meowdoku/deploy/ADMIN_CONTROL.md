@@ -38,7 +38,7 @@ asked for. The declaration is not an action of the worker either.
 The install is the owner's, from an elevated shell (an SSH session as the owner is one), with the command the page shows:
 
 ```
-stm agent install <name>
+pwsh -File C:\dev\Powershell\turing\examples\meowdoku\deploy\Install-ExternalAgent.ps1 -Name <name>
 ```
 
 `Install-ExternalAgent.ps1` does what was done by hand for Gemini on 2026-11-14: the SpeakToMe login with a random
@@ -46,6 +46,7 @@ secret in `<state>\secrets\operator_credentials\<name>.secret` and role member; 
 through `Set-AgentBox.ps1 -Apply -CreateAgentAccount` (generated password, DPAPI for the owner); the API key typed at its
 prompt and written as that account to its own `~\<name>.key` (DPAPI for the agent, like `~\gemini.key`); a key check as
 the agent (`api_agent.py --check`); the character profile; then `Start-AgentDay.ps1 -Register`. The key passes to the
-agent's process on standard input only and is never logged. `stm agent key <name>` replaces the key, `stm agent run
-<name>` starts one work run, `stm agent withdraw <name>` stops scheduling it (its accounts and key stay; remove them by
-hand if wanted). The script is not in the action catalogue because it prompts for the key.
+agent's process on standard input only and is never logged. `Install-ExternalAgent.ps1 -Name <name> -RotateKey`
+replaces the key, `Start-AgentDay.ps1 -RunOne <name>` starts one work run, and the page's Withdraw (`agent_withdraw`)
+stops scheduling it (its accounts and key stay; remove them by hand if wanted). There is no `stm` command (issue
+3b8a5c6f). The script is not in the action catalogue because it prompts for the key.

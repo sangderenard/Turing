@@ -2,7 +2,7 @@
 
 The table ``external_agents`` lives in ``<state>/sql/admin_control.db`` beside the operator-control presets. It holds
 only what is not secret: the agent's name, its provider, base URL, model, tools, hourly minute and brief. No key, no
-password: those exist only in the owner's elevated shell during ``Install-ExternalAgent.ps1`` (``stm agent install``)
+password: those exist only in the owner's elevated shell during ``Install-ExternalAgent.ps1 -Name NAME``
 and then in the agent account's own DPAPI files, exactly as Gemini's were made by hand on 2026-11-14.
 
   declared   an admin saved the details on the page; nothing on the machine changed
@@ -36,6 +36,10 @@ if str(HERE / "deploy") not in sys.path:      # last, so a deploy script's name 
 
 from api_agent import PROVIDERS, AgentError, check_base_url  # noqa: E402
 from gemini_agent import DEFAULT_TOOLS  # noqa: E402
+
+# The install command the page shows. There is no `stm` command on this computer (issue 3b8a5c6f): the install is
+# this script, run by the owner from an elevated shell.
+INSTALL_SCRIPT = HERE / "deploy" / "Install-ExternalAgent.ps1"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS external_agents (
@@ -100,7 +104,7 @@ def _row(row):
     item = dict(row)
     item["tools"] = json.loads(item["tools"])
     item["account"] = "agents-" + item["name"]
-    item["install"] = f"stm agent install {item['name']}"
+    item["install"] = f"pwsh -File {INSTALL_SCRIPT} -Name {item['name']}"
     return item
 
 

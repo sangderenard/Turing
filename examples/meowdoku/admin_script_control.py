@@ -171,7 +171,7 @@ def list_state(db, user_id, admin):
         "SELECT id,preset_id,requested_by,requested,status,started,finished,exit_code,note "
         "FROM control_jobs " + ("" if admin else "WHERE requested_by=? ") + "ORDER BY id DESC LIMIT 50",
         () if admin else (user_id,))]
-    # [EXTERNAL AGENTS] declarations only (external_agents.py); the install is the owner's stm agent install.
+    # [EXTERNAL AGENTS] declarations only (external_agents.py); the install is the owner's Install-ExternalAgent.ps1 -Name <name>.
     from meowdoku import external_agents
     return {"scripts": SCRIPTS if admin else (), "presets": presets, "grants": grants, "jobs": jobs,
             "agents": external_agents.agents(external_agents.ensure(db)) if admin else [],
@@ -256,7 +256,7 @@ def command(db, accounts_db, user_id, admin, body):
         audit(db, user_id, action, cursor.lastrowid, True)
         return {"job_id": cursor.lastrowid, "status": "queued"}
     if action in ("agent_declare", "agent_withdraw"):
-        # Saves what is not secret. Nothing on the machine changes here: the owner runs stm agent install <name>
+        # Saves what is not secret. Nothing on the machine changes here: the owner runs Install-ExternalAgent.ps1 -Name <name>
         # elevated, over SSH, and that script alone makes the accounts and asks for the API key (case 989e507e).
         from meowdoku import external_agents
         if not admin:
