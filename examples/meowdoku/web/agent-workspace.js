@@ -46,22 +46,39 @@ function itemButton(label, action) { const button = document.createElement("butt
 // branch(id) shows a branch and makes it where "New here" puts documents. branch(id, false) only redraws the tree and
 // leaves `parent` alone (the refresh after a save or delete). Only the latest request draws, so a slow answer cannot
 // replace the branch the visitor moved to while it was pending.
-let treeRequest = 0;
+// `shown` is the branch the tree last drew (null for the root list of `mode`; undefined before the first draw), and
+// `inFlight` is the latest tree request while it is still pending (null when none is). `parent` and `shown` change
+// together, only when the latest request draws: a rejected or superseded navigation leaves both where they were, so
+// "New here" always targets the branch on screen (review 41bcd53c, comments 118-123). A navigation does not take
+// `parent` back from fill(), restoreDraft() or "New child" if one of them set it while the request was pending.
+// `stale` is the branch a Save committed into while a tree request was pending (undefined when none; the root branch
+// is null, so it is tested with !== undefined, never for truthiness). That pending listing may predate the Save, so when the
+// latest request settles, succeeded or rejected, and the branch on screen is `stale`, the tree is fetched once more
+// (review e2b02b66, comments 127-132). A superseded request leaves `stale` to the newer one.
+let treeRequest = 0, shown, inFlight = null, stale;
 async function branch(id = null, navigate = true) {
-  if (navigate) parent = id;
-  const request = ++treeRequest;
+  const request = ++treeRequest, before = parent; inFlight = request;
   const query = new URLSearchParams(); if (id) query.set("parent", id); if (!id) query.set("kind", mode);
-  const result = await api("/api/agent-workspace/children?" + query);
-  if (request !== treeRequest) return;
-  $("tree").replaceChildren();
-  if (id) $("tree").append(itemButton("← Parent branch", async () => { const row = await api("/api/agent-workspace/document/" + id); await branch(row.parent_id); }));
-  for (const row of result.documents) {
-    const wrap = document.createElement("div");
-    wrap.append(itemButton(row.title + " · " + row.kind, () => open(row.id)), itemButton("Expand", () => branch(row.id)),
-      itemButton("Copy ID", () => navigator.clipboard.writeText(row.id).then(() => notice("Copied document ID"))));
-    $("tree").append(wrap);
+  let result, failure = null;
+  try { result = await api("/api/agent-workspace/children?" + query); }
+  catch (error) { failure = error; }
+  finally { if (inFlight === request) inFlight = null; }
+  if (request !== treeRequest) { if (failure) throw failure; return; }
+  if (!failure) {
+    shown = id; if (navigate && parent === before) parent = id;
+    $("tree").replaceChildren();
+    if (id) $("tree").append(itemButton("← Parent branch", async () => { const row = await api("/api/agent-workspace/document/" + id); await branch(row.parent_id); }));
+    for (const row of result.documents) {
+      const wrap = document.createElement("div");
+      wrap.append(itemButton(row.title + " · " + row.kind, () => open(row.id)), itemButton("Expand", () => branch(row.id)),
+        itemButton("Copy ID", () => navigator.clipboard.writeText(row.id).then(() => notice("Copied document ID"))));
+      $("tree").append(wrap);
+    }
+    if (!result.documents.length) $("tree").append("No documents in this branch.");
   }
-  if (!result.documents.length) $("tree").append("No documents in this branch.");
+  const again = stale !== undefined && shown === stale; stale = undefined;
+  if (again) try { await branch(shown, false); } catch (error) { notice("The tree did not refresh after the save: " + error.message, true); }
+  if (failure) throw failure;
 }
 async function open(id) {
   showDocument();
@@ -106,7 +123,17 @@ async function save() {
     throw new Error("Not saved: " + error.message + ". Your title and body are still here and kept in this browser's draft; press Save again.");
   }
   finally { saving = false; $("save").disabled = false; }
-  if (session !== started) return notice("Saved " + row.title + ". The document you moved to was left as it is.");
+  if (session !== started) {                           // the editor has switched (review 3817e271, comments 112-115)
+    // Leave editing, current, parent and the other document's draft alone; only the tree may change, and only when the
+    // branch on screen is where the saved document lives. If a tree request is pending, its listing may predate this
+    // Save: mark the branch `stale` and branch() fetches it once more when that request settles (comments 127-132).
+    const home = row.parent_id || null; let refreshed = "";
+    if (shown === home && (home || row.kind === mode)) {
+      if (inFlight !== null) stale = home;
+      else try { await branch(home, false); } catch (error) { refreshed = " (the tree did not refresh: " + error.message + ")"; }
+    }
+    return notice("Saved " + row.title + refreshed + ". The document you moved to was left as it is.");
+  }
   current = row; editing = row.id; parent = row.parent_id;
   if (editorState() === submitted) dropDraft(); else keepDraft();
   if (!row.parent_id && row.kind !== mode) {     // a root document is listed under its own kind
