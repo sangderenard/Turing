@@ -37,6 +37,21 @@ def test_scheduler_due_cooldown_and_pid_reuse(tmp_path, monkeypatch):
     assert {row["kind"] for row in presence._run_records(tmp_path, now)["codex"]} == {"run", "console"}
 
 
+def test_non_object_records_do_not_hide_a_valid_run(tmp_path, monkeypatch):
+    now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
+    running = tmp_path / "running"
+    running.mkdir()
+    for index, value in enumerate(([], None, "bad")):
+        (running / f"invalid-{index}.json").write_text(json.dumps(value))
+    (running / "run-agents-codex-12.json").write_text(json.dumps({"agent": "codex", "kind": "run", "pid": 12,
+        "started": datetime.fromtimestamp(now - 100, timezone.utc).isoformat()}))
+    monkeypatch.setattr(presence, "_process_started", lambda pid: now - 110)
+    snapshot = presence.snapshot(tmp_path / "missing.db", tmp_path, now=now)
+    codex = next(agent for agent in snapshot["agents"] if agent["username"] == "codex")
+    assert codex["channels"]["local"]["state"] == "active"
+    assert [run["kind"] for run in codex["runs"]] == ["run"]
+
+
 def test_checkout_location_is_last_observed_and_outbound_unknown(tmp_path):
     db = tmp_path / "accounts.db"
     with sqlite3.connect(db) as conn:

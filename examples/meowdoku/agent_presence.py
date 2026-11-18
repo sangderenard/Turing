@@ -78,6 +78,8 @@ def _run_records(days: Path, now: float) -> dict[str, list[dict]]:
     for file in directory.glob("*.json"):
         try:
             record = json.loads(file.read_text(encoding="utf-8-sig"))
+            if not isinstance(record, dict):
+                continue
             name = record.get("agent") or next((n for n, (account, _) in AGENTS.items() if record.get("account") == account), None)
             started, pid = _stamp(record.get("started")), record.get("pid")
             if name not in found or started is None or type(pid) is not int:
