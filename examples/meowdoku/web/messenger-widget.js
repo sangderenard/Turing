@@ -145,7 +145,8 @@ async function start() {
   async function loadContacts() {
     state.contacts = await api("/api/messages/contacts");
     setUnread(countUnread(state.contacts));
-    if (state.open && !state.peer) renderBody();   // an open thread re-renders itself; rebuilding here looped loadThread
+    if (state.open && state.peer) updatePeerHeader();
+    else if (state.open) renderBody();   // rebuilding an open thread here looped loadThread
   }
   async function lightCheck() { if (!state.open) { try { await loadContacts(); } catch (e) { /* keep the last badge */ } } }
   lightCheck();
@@ -210,6 +211,15 @@ async function start() {
       "aria-label": `Verified ${p.verified_role} permission` });
   }
   function nameBlock(p) { return el("span", { class: "name" }, document.createTextNode(label(p)), verifiedBadge(p)); }
+  function updatePeerHeader() {
+    if (!titleEl) return;
+    const info = state.contacts && state.contacts.contacts.find((x) => x.username === state.peer);
+    titleEl.textContent = info ? label(info) : state.peer;
+    if (info) {
+      const badge = verifiedBadge(info);
+      if (badge) titleEl.appendChild(badge);
+    }
+  }
 
   async function act(action, username, okNote) {
     try { await api("/api/messages/contacts", { username, action }); note(okNote || ""); await loadContacts(); }
@@ -264,12 +274,7 @@ async function start() {
     state.view = view;
     const active = () => state.open && state.peer === peer && state.view === view;
     const viewNote = text => { if (active()) note(text); };
-    const info = state.contacts && state.contacts.contacts.find((x) => x.username === peer);
-    titleEl.textContent = info ? label(info) : peer;
-    if (info) {
-      const badge = verifiedBadge(info);
-      if (badge) titleEl.appendChild(badge);
-    }
+    updatePeerHeader();
     threadEl = el("div");
     olderBtn = el("button", { type: "button", class: "small", text: "Load older", hidden: "", on: { click: () => loadThread(true) } });
     bodyEl.appendChild(olderBtn); bodyEl.appendChild(threadEl);
