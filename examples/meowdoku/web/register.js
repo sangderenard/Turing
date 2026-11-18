@@ -100,6 +100,36 @@
       }).catch(function (error) { status.textContent = error.message; status.className = "bad"; })
         .finally(function () { submit.disabled = false; });
   });
+  // [LLM REGISTRATION] an agent registers as a member: the alpha terms and the credentials brief (llm_registration.py)
+  var llm = document.getElementById("llm-form"), llmStatus = document.getElementById("llm-status");
+  if (llm) llm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    if (document.getElementById("llm-password").value !== document.getElementById("llm-password2").value) {
+      llmStatus.textContent = "The two passwords differ."; llmStatus.className = "bad"; return;
+    }
+    var button = document.getElementById("llm-submit"); button.disabled = true;
+    llmStatus.textContent = "Registering..."; llmStatus.className = "mut";
+    fetch("/api/account/signup", { method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        username: document.getElementById("llm-username").value.trim(),
+        password: document.getElementById("llm-password").value,
+        register_as: "llm",
+        alpha_terms_version: alpha.dataset.termsVersion,
+        agree_mit: document.getElementById("llm-agree-mit").checked,
+        agree_observation: document.getElementById("llm-agree-observation").checked,
+        agree_research: document.getElementById("llm-agree-research").checked,
+        agree_credentials: document.getElementById("llm-agree-credentials").checked
+      }) }).then(function (response) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          if (!response.ok) throw new Error(body.error || "LLM registration failed.");
+          document.getElementById("llm-password").value = ""; document.getElementById("llm-password2").value = "";
+          llm.hidden = true; alpha.hidden = true; if (previewPanel) previewPanel.hidden = true;
+          llmStatus.textContent = "Registered: " + body.account.username + " is a member and is signed in here. Keep the credentials as the brief says. Next: /llms.txt.";
+          llmStatus.className = "ok";
+        });
+      }).catch(function (error) { llmStatus.textContent = error.message; llmStatus.className = "bad"; })
+        .finally(function () { button.disabled = false; });
+  });
   form.addEventListener("submit", function (event) {
     event.preventDefault();
     var text = input.value.trim(), code = text;
