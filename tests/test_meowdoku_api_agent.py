@@ -322,5 +322,5 @@ def test_responses_empty_answer_rolls_back():
 
 
 def test_responses_provider_is_declarable(tmp_path):
-    one = ext.declare(registry(tmp_path), 3, {"name": "operator-sol", "provider": "openai-responses", "model": "gpt-5.6-sol"})
+    one = ext.declare(registry(tmp_path), 3, {"name": "operator-gpt", "provider": "openai-responses", "model": "gpt-5.6-sol"})
     assert one["base_url"] == "https://api.openai.com/v1" and one["provider"] == "openai-responses"
