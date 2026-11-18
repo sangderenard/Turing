@@ -56,6 +56,22 @@ ALPHA_TERMS_VERSION = "alpha-2026-11-15"
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _SCRYPT_DKLEN = 2 ** 14, 8, 1, 32
 
 
+# An account's private state, by user_id: what a preview wipe and an account purge remove. Public posts and audit rows stay.
+PRIVATE_TABLES = (
+    "oauth_mcp_codes", "oauth_mcp_tokens", "guest_post_queue",
+    "guest_test_evidence", "guest_qualification", "guest_actor_kind",
+    "orientation_state", "account_prefs", "account_instances",
+    "account_roles", "account_permission_grants",
+    "account_capability_modifiers", "account_nodus_grants",
+    "account_content_invitations", "account_content_members", "account_git_identity",
+    "msg_contacts", "msg_cursor", "msg_image_consent", "msg_suspended",
+    "relay_addresses", "user_file_keys", "research_affirmations",
+    "research_ballots", "research_eligible", "research_surveys",
+    "radio_requests", "radio_turns", "radio_votes",
+    "owned_assets", "sessions", "preview_recovery", "temporary_accounts",
+)
+
+
 class AccountError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -294,26 +310,44 @@ class Accounts:
                 raise AccountError("frozen preview not found", 404)
             if row[0] != expected_username:
                 raise AccountError("preview name does not match", 409)
-            private_tables = (
-                "oauth_mcp_codes", "oauth_mcp_tokens", "guest_post_queue",
-                "guest_test_evidence", "guest_qualification", "guest_actor_kind",
-                "orientation_state", "account_prefs", "account_instances",
-                "account_roles", "account_permission_grants",
-                "account_capability_modifiers", "account_nodus_grants",
-                "account_content_invitations", "account_content_members", "account_git_identity",
-                "msg_contacts", "msg_cursor", "msg_image_consent", "msg_suspended",
-                "relay_addresses", "user_file_keys", "research_affirmations",
-                "research_ballots", "research_eligible", "research_surveys",
-                "radio_requests", "radio_turns", "radio_votes",
-                "owned_assets", "sessions", "preview_recovery", "temporary_accounts",
-            )
             try:
                 present = {item[0] for item in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")}
-                for table in private_tables:
+                for table in PRIVATE_TABLES:
                     if table in present:
                         self._conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
                 self._conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def purge_account(self, user_id: int, expected_username: str) -> None:
+        """Remove a permanent account's private state and seal it; its public posts and audit rows stay.
+
+        The users row stays as a tombstone, so what the account posted still names a valid owner (no foreign key is
+        left dangling): renamed ``purged-<id>``, shown as "(purged account)", with a password hash nothing can match,
+        and every private row (PRIVATE_TABLES, alpha_agreements) deleted. The old name is free again.
+        Only an ordinary account: one with any role row or group grant, or a temporary preview (wipe_preview), is refused.
+        """
+        with self.lock:
+            row = self._conn.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
+            if row is None:
+                raise AccountError("account not found", 404)
+            if row[0] != expected_username:
+                raise AccountError("account name does not match", 409)
+            if self._conn.execute("SELECT 1 FROM temporary_accounts WHERE user_id=?", (user_id,)).fetchone():
+                raise AccountError("a temporary preview is wiped, not purged", 409)
+            present = {item[0] for item in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("account_roles", "account_permission_grants"):
+                if table in present and self._conn.execute(f"SELECT 1 FROM {table} WHERE user_id=?", (user_id,)).fetchone():
+                    raise AccountError("an account with a role or a group grant is not purged here", 409)
+            try:
+                for table in PRIVATE_TABLES + ("alpha_agreements",):
+                    if table in present:
+                        self._conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+                self._conn.execute("UPDATE users SET username=?, display_name=?, password_hash=? WHERE id=?",
+                                   (f"purged-{user_id}", "(purged account)", "!", user_id))
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
