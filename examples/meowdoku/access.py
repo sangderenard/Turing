@@ -66,7 +66,8 @@ LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
     "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fe80::/10", "fc00::/7"))
 
 # The shader tier's whole world: these files (the page, the panel script that draws the animation, its decoder) and three small APIs.
-SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js")
+SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js",
+                "/llms.txt")              # [LLMS] directions for agents (llmstxt.org), for anyone, case 7ab138b9813e4cceb687b9fc47149329
 SHADER_PAGE = "/shader.html"
 # Public sign-in, preview, and consented alpha registration (server.py _shader_request / _login_post).
 SHADER_LOGIN_FILES = ("/login.html", "/login.js", "/messenger-widget.js", "/site-nav.js")   # the widget renders nothing without the message capability
