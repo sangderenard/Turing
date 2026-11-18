@@ -78,7 +78,7 @@ def test_forwarding_headers_are_ignored():
 
 # ---------------------------------------------------------------- the policy
 def test_policy_defaults_and_overrides(tmp_path):
-    assert A.load_config(None)["policy"] == {"lan": "edit", "ip": "dev", "dns": "shader"}
+    assert A.load_config(None)["policy"] == {"lan": "edit", "ip": "shader", "dns": "shader"}
     path = tmp_path / "access.json"
     assert A.Access(path).config()["policy"] == A.DEFAULT_POLICY                       # missing file
     path.write_text(json.dumps({"policy": {"ip": "shader", "dns": "play", "lan": "bogus", "moon": "edit"}}), encoding="utf-8")
@@ -91,11 +91,12 @@ def test_policy_defaults_and_overrides(tmp_path):
 def test_policy_file_is_reread_on_change(tmp_path):
     path = tmp_path / "access.json"
     access = A.Access(path)
-    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "dev")
+    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "shader")
     assert access.decide("8.8.8.8", "cats.example.org") == ("dns", "shader")
     assert access.decide("127.0.0.1", "cats.example.org") == ("lan", "edit")
-    path.write_text(json.dumps({"policy": {"ip": "shader"}}), encoding="utf-8")
-    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "shader")
+    path.write_text(json.dumps({"policy": {"dns": "play", "ip": "play"}}), encoding="utf-8")
+    assert access.decide("8.8.8.8", "cats.example.org") == ("dns", "play")
+    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "play")
 
 
 def test_public_ip_lookup_is_cached_and_fails_soft():
