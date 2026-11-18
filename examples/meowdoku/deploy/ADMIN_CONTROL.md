@@ -48,5 +48,7 @@ prompt and written as that account to its own `~\<name>.key` (DPAPI for the agen
 the agent (`api_agent.py --check`); the character profile; then `Start-AgentDay.ps1 -Register`. The key passes to the
 agent's process on standard input only and is never logged. `Install-ExternalAgent.ps1 -Name <name> -RotateKey`
 replaces the key, `Start-AgentDay.ps1 -RunOne <name>` starts one work run, and the page's Withdraw (`agent_withdraw`)
-stops scheduling it (its accounts and key stay; remove them by hand if wanted). There is no `stm` command (issue
-3b8a5c6f). The script is not in the action catalogue because it prompts for the key.
+stops scheduling it (its accounts and key stay; remove them by hand if wanted). The owner's own `stm` shortcut
+(`stm agent install|key|run|withdraw <name>`) calls these same scripts, but it is the owner's untracked `~\stm.ps1`,
+not part of this repository, so the page shows the script itself (issue 3b8a5c6f). The script is not in the action
+catalogue because it prompts for the key.

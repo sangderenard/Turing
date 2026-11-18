@@ -173,7 +173,8 @@ def test_declare_defaults_and_limits(tmp_path):
     assert two["minute"] == 30 and two["base_url"] == "https://api.anthropic.com/v1", "the next free minute"
     columns = [row[1] for row in db.execute("PRAGMA table_info(external_agents)")]
     assert not [c for c in columns if any(w in c for w in ("key", "secret", "password"))], "no secret column"
-    for bad, why in (({"name": "gemini"}, "reserved"), ({"name": "operator-x"}, "reserved"), ({"name": "A"}, "name"),
+    assert ext.declare(db, 3, {"name": "operator-gpt", "provider": "openai", "model": "gpt-5.4-mini"})["name"] == "operator-gpt"
+    for bad, why in (({"name": "gemini"}, "reserved"), ({"name": "svc-x"}, "reserved"), ({"name": "A"}, "name"),
                      ({"name": "waytoolongname1"}, "name")):
         with pytest.raises(ext.ExternalAgentError):
             ext.declare(db, 3, {"provider": "openai", "model": "m", **bad})

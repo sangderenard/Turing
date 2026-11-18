@@ -15,7 +15,8 @@ refuses every non-conversation (unknown, self, not accepted, blocked) with the s
 only ever returned as a JSON string; nothing here produces HTML.
 
 SERVER-MEDIATED AND OPERATOR-READABLE.  Every message passes through and is stored by the server; there is no peer-to-peer channel and
-no address of one user is ever handed to another.  A user's responses expose about another user ONLY username and display_name (no id,
+no address of one user is ever handed to another.  A user's responses expose about another user only username, display_name and
+current verified operator/admin role (no id,
 presence, last-seen, typing, or read receipt: ``read_at`` only feeds the recipient's own unread count).  An admin (capability
 account_manage) may read any thread, soft-delete a message (removed_at/removed_by: participants then see body "" and removed true) and
 suspend an account (msg_suspended: it cannot send or request contacts); each admin action is a ``msg_audit`` row.
@@ -312,12 +313,17 @@ def remove(db, me: int, peer_username) -> dict:
 
 def contacts(db, me: int) -> dict:
     """{contacts: [{username, display_name, unread, last}], requests: [...], outgoing: [...], blocked: [...]}.
-    Only ``me``'s own rows: contacts are mutual peers; no one else's list is ever visible."""
+    Only ``me``'s own rows: contacts are mutual peers; no one else's list is ever visible. Verified roles come from
+    current server permission groups, never from a peer's name or display name."""
+    from meowdoku import permission_groups
     mine = db.execute("SELECT c.peer_id, c.state, c.created, u.username, u.display_name FROM msg_contacts c "
                       "JOIN users u ON u.id = c.peer_id WHERE c.user_id = ? ORDER BY u.username COLLATE NOCASE", (me,)).fetchall()
     out = {"contacts": [], "requests": [], "outgoing": [], "blocked": []}
     for row in mine:
-        item = {"username": row["username"], "display_name": row["display_name"]}
+        role = permission_groups.authority(db, row["peer_id"])["highest"]
+        verified_role = role if role in ("operator", "admin") else None
+        item = {"username": row["username"], "display_name": row["display_name"],
+                "verified_role": verified_role}
         theirs = _state(db, row["peer_id"], me)
         if row["state"] == "blocked":
             out["blocked"].append({"username": row["username"]})
@@ -330,7 +336,7 @@ def contacts(db, me: int) -> dict:
                               "OR (sender_id = ? AND recipient_id = ?)", (me, row["peer_id"], row["peer_id"], me)).fetchone()[0]
             out["contacts"].append({**item, "unread": unread, "last": last})
         elif theirs == "requested":
-            out["outgoing"].append({"username": row["username"]})
+            out["outgoing"].append({"username": row["username"], "verified_role": verified_role})
     return out
 
 

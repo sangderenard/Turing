@@ -37,8 +37,8 @@ if str(HERE / "deploy") not in sys.path:      # last, so a deploy script's name 
 from api_agent import PROVIDERS, AgentError, check_base_url  # noqa: E402
 from gemini_agent import DEFAULT_TOOLS  # noqa: E402
 
-# The install command the page shows. There is no `stm` command on this computer (issue 3b8a5c6f): the install is
-# this script, run by the owner from an elevated shell.
+# The install command the page shows: this script, run by the owner from an elevated shell. The owner's `stm agent
+# install` calls it too, but stm is the owner's untracked ~\stm.ps1, not in this repository (issue 3b8a5c6f).
 INSTALL_SCRIPT = HERE / "deploy" / "Install-ExternalAgent.ps1"
 
 SCHEMA = """
@@ -51,10 +51,11 @@ CREATE TABLE IF NOT EXISTS external_agents (
 NAME = re.compile(r"[a-z][a-z0-9-]{1,12}\Z")
 TOOL = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}\Z")
-# The agents Start-AgentDay declares itself, the people's operator accounts and the service's own names.
+# Built-in agents and service accounts retain their exact names. Operator authority is checked from account grants,
+# not inferred from an operator- prefix.
 RESERVED = {"claude", "codex", "gemini", "llama", "dot", "admin", "system", "guest", "guest_agent", "agents", "root",
             "administrator", "operator"}
-RESERVED_PREFIXES = ("operator-", "svc-", "agents")
+RESERVED_PREFIXES = ("svc-", "agents")
 BUILTIN_MINUTES = (0, 20, 40)        # claude, codex, gemini
 STATUSES = ("declared", "installed", "failed", "withdrawn")
 MAX_AGENTS = 24
