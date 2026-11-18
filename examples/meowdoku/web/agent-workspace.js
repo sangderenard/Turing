@@ -46,13 +46,15 @@ function itemButton(label, action) { const button = document.createElement("butt
 // branch(id) shows a branch and makes it where "New here" puts documents. branch(id, false) only redraws the tree and
 // leaves `parent` alone (the refresh after a save or delete). Only the latest request draws, so a slow answer cannot
 // replace the branch the visitor moved to while it was pending.
-let treeRequest = 0;
+// `shown` is the branch the tree last drew (null for the root list of `mode`; undefined before the first draw).
+let treeRequest = 0, shown;
 async function branch(id = null, navigate = true) {
   if (navigate) parent = id;
   const request = ++treeRequest;
   const query = new URLSearchParams(); if (id) query.set("parent", id); if (!id) query.set("kind", mode);
   const result = await api("/api/agent-workspace/children?" + query);
   if (request !== treeRequest) return;
+  shown = id;
   $("tree").replaceChildren();
   if (id) $("tree").append(itemButton("← Parent branch", async () => { const row = await api("/api/agent-workspace/document/" + id); await branch(row.parent_id); }));
   for (const row of result.documents) {
@@ -106,7 +108,14 @@ async function save() {
     throw new Error("Not saved: " + error.message + ". Your title and body are still here and kept in this browser's draft; press Save again.");
   }
   finally { saving = false; $("save").disabled = false; }
-  if (session !== started) return notice("Saved " + row.title + ". The document you moved to was left as it is.");
+  if (session !== started) {                           // the editor has switched (review 3817e271, comments 112-115)
+    // Leave editing, current, parent and the other document's draft alone. Only redraw the tree, and only when the
+    // branch it shows is where the saved document lives, so the saved document appears without moving the visitor.
+    const home = row.parent_id || null; let refreshed = "";
+    if (shown === home && (home || row.kind === mode))
+      try { await branch(home, false); } catch (error) { refreshed = " (the tree did not refresh: " + error.message + ")"; }
+    return notice("Saved " + row.title + refreshed + ". The document you moved to was left as it is.");
+  }
   current = row; editing = row.id; parent = row.parent_id;
   if (editorState() === submitted) dropDraft(); else keepDraft();
   if (!row.parent_id && row.kind !== mode) {     // a root document is listed under its own kind
