@@ -55,7 +55,7 @@ $agent = Registry @('show', $Name)
 Write-Host ("{0}: {1} {2} at {3}, minute :{4:00}, {5} tool(s), status {6}" -f $agent.name, $agent.provider, $agent.model,
     $agent.base_url, $agent.minute, $agent.tools.Count, $agent.status)
 if ($agent.status -eq 'withdrawn') { throw "$Name is withdrawn; declare it again on the operator page first" }
-if ($RotateKey -and $agent.status -ne 'installed') { throw "-RotateKey is for an installed agent; $Name is $($agent.status)" }
+if ($RotateKey -and $agent.status -notin @('installed', 'failed')) { throw "-RotateKey needs an installed or failed agent; $Name is $($agent.status)" }
 if (-not $RotateKey -and $agent.status -eq 'installed') { throw "$Name is installed already; use -RotateKey for a new key" }
 $account = $agent.account
 
@@ -83,26 +83,31 @@ if (-not $plain) { Fail 'key' 'no key was typed' }
 $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plain))
 $plain = $null; $secure.Dispose()
 # The catch prints a fixed line: an error message must never carry the script's text, which holds the key.
-$write = @"
-`$ErrorActionPreference = 'Stop'
-try {
-    `$k = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded'))
-    ConvertTo-SecureString -String `$k -AsPlainText -Force | ConvertFrom-SecureString | Set-Content -LiteralPath (Join-Path `$HOME '$Name.key') -Encoding ascii
-    `$k = `$null
-    'KEY WRITTEN'
-} catch { 'KEY NOT WRITTEN'; exit 1 }
-"@
+# Invoke-AsAgent feeds pwsh -Command - on stdin. Keep the compound try/catch on
+# one input line so pwsh executes it as one statement.
+$write = @(
+    "`$ErrorActionPreference = 'Stop'; try {"
+    "`$k = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded'));"
+    "ConvertTo-SecureString -String `$k -AsPlainText -Force | ConvertFrom-SecureString | Set-Content -LiteralPath (Join-Path `$HOME '$Name.key') -Encoding ascii;"
+    "`$k = `$null; 'KEY WRITTEN'"
+    "} catch { 'KEY NOT WRITTEN ' + `$_.Exception.GetType().Name + ' ' + `$_.CategoryInfo.Category; exit 1 }"
+) -join ' '
 $encoded = $null
-$result = Invoke-AsAgent $credential $write $Workspace 120
+$result = Invoke-AsAgent $credential $write $Workspace 120 -GrantDesktopAccess
 $write = $null
-if ($result.ExitCode -ne 0 -or $result.Output -notmatch 'KEY WRITTEN') { Fail 'key' "the key file was not written as $account" }
+if ($result.ExitCode -ne 0 -or $result.Output -notmatch 'KEY WRITTEN') {
+    $safeReason = if ($result.Output -match 'KEY NOT WRITTEN ([A-Za-z0-9]+) ([A-Za-z0-9]+)') {
+        "$($Matches[1]) $($Matches[2])"
+    } else { 'no write result' }
+    Fail 'key' "the key file was not written as $account (exit $($result.ExitCode), timeout $($result.TimedOut), $safeReason)"
+}
 Write-Host "written to $account's own profile as $Name.key (DPAPI for $account; not shown)"
 
 Step "5. the key, proved as $account"
 $q = { param($v) "'" + ($v -replace "'", "''") + "'" }
 $prove = "& $(& $q $Python) $(& $q (Join-Path $PSScriptRoot 'api_agent.py')) --name $(& $q $Name) --provider $(& $q $agent.provider) " +
          "--base-url $(& $q $agent.base_url) --check 2>&1`nexit `$LASTEXITCODE"
-$check = Invoke-AsAgent $credential $prove $Workspace 120
+$check = Invoke-AsAgent $credential $prove $Workspace 120 -GrantDesktopAccess
 Write-Host $check.Output
 if ($check.ExitCode -ne 0) { Fail 'key check' (($check.Output -split "`n" | Select-Object -Last 1) -replace '\s+', ' ') }
 if ($RotateKey) { Write-Host "`nNew key in place for $Name."; exit 0 }

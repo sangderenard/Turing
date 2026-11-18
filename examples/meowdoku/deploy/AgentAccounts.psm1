@@ -34,16 +34,26 @@ function Start-AsAgent([pscredential]$Credential, [string]$File, [string[]]$Argu
 
 # Run a PowerShell script as an agent account, hidden, the script given on standard input. Returns its exit code, its
 # output (stdout then stderr) and whether it ran past the timeout (then it is stopped).
-function Invoke-AsAgent([pscredential]$Credential, [string]$Script, [string]$Directory, [int]$TimeoutSeconds = 1200) {
-    $process = Start-AsAgent $Credential (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-NonInteractive', '-Command', '-') $Directory -Hidden -Redirect
-    $out = $process.StandardOutput.ReadToEndAsync()
-    $err = $process.StandardError.ReadToEndAsync()
-    $process.StandardInput.Write(($Script -replace "`r", '') + "`n")
-    $process.StandardInput.Close()
-    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
-    if ($timedOut) { try { $process.Kill($true) } catch { } ; $process.WaitForExit() }
-    $text = ($out.Result.TrimEnd(), $err.Result.TrimEnd() | Where-Object { $_ }) -join "`n"
-    [pscustomobject]@{ ExitCode = $(if ($timedOut) { $null } else { $process.ExitCode }); Output = $text; TimedOut = $timedOut }
+function Invoke-AsAgent([pscredential]$Credential, [string]$Script, [string]$Directory, [int]$TimeoutSeconds = 1200,
+                        [switch]$GrantDesktopAccess) {
+    $lease = $null
+    if ($GrantDesktopAccess) {
+        if (-not ('AgentDesktopAccess' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'AgentDesktopAccess.cs') }
+        $lease = [AgentDesktopAccess]::Grant($Credential.UserName)
+    }
+    try {
+        $process = Start-AsAgent $Credential (Join-Path $PSHOME 'pwsh.exe') @('-NoProfile', '-NonInteractive', '-Command', '-') $Directory -Hidden -Redirect
+        $out = $process.StandardOutput.ReadToEndAsync()
+        $err = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write(($Script -replace "`r", '') + "`n")
+        $process.StandardInput.Close()
+        $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+        if ($timedOut) { try { $process.Kill($true) } catch { } ; $process.WaitForExit() }
+        $text = ($out.Result.TrimEnd(), $err.Result.TrimEnd() | Where-Object { $_ }) -join "`n"
+        [pscustomobject]@{ ExitCode = $(if ($timedOut) { $null } else { $process.ExitCode }); Output = $text; TimedOut = $timedOut }
+    } finally {
+        if ($lease) { $lease.Dispose() }
+    }
 }
 
 # ---------------------------------------------------------------- what is running as the agents
