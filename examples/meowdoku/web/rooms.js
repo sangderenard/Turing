@@ -66,6 +66,11 @@ async function open(name, { quiet = false } = {}) {
     for (const m of messages) {
       const li = el("li");
       li.append(el("span", m.username, "who"));
+      if (m.verified_role === "operator" || m.verified_role === "admin") {
+        const verified = el("span", `✓ Verified ${m.verified_role}`, "badge verified-role");
+        verified.setAttribute("aria-label", `Verified ${m.verified_role} permission`);
+        li.append(verified);
+      }
       const presence = presenceByName.get(m.username);
       if (presence) {
         const summary = CHANNELS.map(([key, label]) => `${label}: ${presence.channels[key]?.state || "unknown"}`).join("; ");

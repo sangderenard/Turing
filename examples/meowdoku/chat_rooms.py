@@ -440,13 +440,15 @@ def forwarded_call(db, room, grant, *, user_id, username, name, arguments, call,
 
 def _row(r) -> dict:
     removed = r[5] is not None
-    row = {"id": r[0], "room": r[1], "username": r[2], "body": "" if removed else r[3], "at": r[4], "removed": removed}
+    row = {"id": r[0], "room": r[1], "username": r[2], "body": "" if removed else r[3], "at": r[4],
+           "removed": removed, "_account_id": r[7]}
     if r[6] is not None:
         row["round"] = r[6]                    # written by a seat while the room's round table was on
     return row
 
 
-_SELECT = ("SELECT id, room, username, body, created, removed_at, (SELECT round FROM chat_table_marks WHERE message_id = chat_messages.id) "
+_SELECT = ("SELECT id, room, username, body, created, removed_at, "
+           "(SELECT round FROM chat_table_marks WHERE message_id = chat_messages.id), user_id "
            "FROM chat_messages")
 
 
@@ -582,7 +584,16 @@ def post(db, room, *, user_id, username, body, caps=frozenset(), now=None, stick
 
 def _extras(db, rows) -> list:
     """Each message's reactions ({kind: [usernames]}, when it has any) and its sticker ({kind}, when it carries one; the
-    picture itself is fetched through the room). A removed message keeps neither."""
+    picture itself is fetched through the room). A removed message keeps neither. Verification is the account's current
+    permission group, never a claim made by its username."""
+    from meowdoku import permission_groups
+    roles = {}
+    for row in rows:
+        account_id = row.pop("_account_id")
+        if account_id not in roles:
+            roles[account_id] = permission_groups.authority(db, account_id)["highest"]
+        role = roles[account_id]
+        row["verified_role"] = role if role in ("operator", "admin") else None
     ids = [row["id"] for row in rows if not row["removed"]]
     if ids:
         marks = ",".join("?" * len(ids))
@@ -681,7 +692,7 @@ def remove(db, message_id, *, admin, now=None) -> dict:
     if done.rowcount != 1:
         raise ChatError("no such message, or it is already removed", 404)
     db.execute("INSERT INTO chat_audit (at, admin, action, message_id) VALUES (?, ?, 'remove', ?)", (now, str(admin), int(message_id)))
-    return _row(db.execute(_SELECT + " WHERE id = ?", (int(message_id),)).fetchone())
+    return _extras(db, [_row(db.execute(_SELECT + " WHERE id = ?", (int(message_id),)).fetchone())])[0]
 
 
 def http_route(self, path, method, *, accounts_db, connections=None, notify=None, caps_for=None, reaction_kinds=None,

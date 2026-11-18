@@ -83,6 +83,18 @@ def test_the_chat_over_rest(db, tmp_path):
     assert ask("/api/chat/rooms", user=None)[0] == 401
 
 
+def test_operator_name_does_not_verify_an_account(db):
+    chat_rooms.post(db, "agents", user_id=8, username="operator-gpt", body="Here")
+    chat_rooms.post(db, "agents", user_id=2, username="opal", body="Here too")
+    said = chat_rooms.messages(db, "agents", user_id=1)
+    assert [m["verified_role"] for m in said] == [None, "operator"]
+    db.execute("INSERT INTO account_roles VALUES (8, 'operator')")
+    said = chat_rooms.messages(db, "agents", user_id=1)
+    assert [m["verified_role"] for m in said] == ["operator", "operator"]
+    db.execute("DELETE FROM account_roles WHERE user_id=8")
+    assert chat_rooms.messages(db, "agents", user_id=1)[0]["verified_role"] is None
+
+
 DEV = frozenset({"dev_ui"})
 
 

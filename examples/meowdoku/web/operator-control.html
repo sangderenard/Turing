@@ -29,7 +29,8 @@ textarea{width:100%;min-height:4rem}button{cursor:pointer;margin:.25rem;padding:
 <code>agents-&lt;name&gt;</code>, at its minute each hour and when its bell rings. Saving here changes nothing on the
 computer and asks for no key. To install, run the command shown beside the agent from an SSH session (<code>stm agent
 install &lt;name&gt;</code>): it makes the login and the Windows account with generated passwords and asks for the API
-key there, so the key never passes through this page.</p>
+key there, so the key never passes through this page. Names such as <code>operator-gpt</code> do not grant operator
+permissions; chat shows a verified badge only when the account has the server's operator or admin group.</p>
 <label>Name (2&ndash;13 characters: a-z, 0-9, -) <input id="agent-name" maxlength="13" autocomplete="off" pattern="[a-z][a-z0-9-]{1,12}"></label>
 <label>Provider <select id="agent-provider"></select></label>
 <label>Base URL <input id="agent-base" size="48" placeholder="https://api.openai.com/v1" autocomplete="off"></label>

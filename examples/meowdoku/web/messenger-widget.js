@@ -62,6 +62,7 @@ input { background: #0b0e14; color: #e8ecf4; border: 1px solid #556; border-radi
 .body { flex: 1; overflow-y: auto; padding: 6px 10px; }
 .item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; margin: 2px 0; }
 .item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.verified-role { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 8px; background: #153d35; color: #b8f3dd; font-size: 11px; font-weight: 600; }
 .unread { background: #d33; border-radius: 10px; padding: 0 6px; font-size: 12px; }
 .note { color: #9aa4b8; font-size: 12px; padding: 4px 10px; }
 .msg { max-width: 85%; margin: 4px 0; padding: 5px 8px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; background: #232b3d; }
@@ -181,7 +182,7 @@ async function start() {
     if (c.requests.length) {
       bodyEl.appendChild(el("h3", { text: "Requests" }));
       for (const r of c.requests) {
-        bodyEl.appendChild(el("div", { class: "row" }, el("span", { class: "name", text: label(r) }),
+        bodyEl.appendChild(el("div", { class: "row" }, nameBlock(r),
           el("button", { type: "button", class: "small", text: "Accept", on: { click: () => act("accept", r.username) } }),
           el("button", { type: "button", class: "small", text: "Decline", on: { click: () => act("decline", r.username) } })));
       }
@@ -189,13 +190,13 @@ async function start() {
     bodyEl.appendChild(el("h3", { text: "Contacts" }));
     if (!c.contacts.length) bodyEl.appendChild(el("div", { class: "note", text: "No contacts yet." }));
     for (const p of c.contacts) {
-      const item = el("button", { type: "button", class: "item", on: { click: () => selectPeer(p.username) } }, el("span", { class: "name", text: label(p) }));
+      const item = el("button", { type: "button", class: "item", on: { click: () => selectPeer(p.username) } }, nameBlock(p));
       if (p.unread) item.appendChild(el("span", { class: "unread", text: String(p.unread) }));
       bodyEl.appendChild(item);
     }
     if (c.outgoing.length) {
       bodyEl.appendChild(el("h3", { text: "Waiting for a reply" }));
-      for (const o of c.outgoing) bodyEl.appendChild(el("div", { class: "note", text: o.username }));
+      for (const o of c.outgoing) bodyEl.appendChild(el("div", { class: "note" }, nameBlock(o)));
     }
     const input = el("input", { type: "text", placeholder: "Add contact by username", "aria-label": "Add contact by username", maxlength: "200", autocomplete: "off" });
     const add = () => { const v = input.value.trim(); if (v) { input.value = ""; act("request", v, "If that account exists, a request was sent."); } };
@@ -203,6 +204,12 @@ async function start() {
     footEl.appendChild(el("div", { class: "row" }, input, el("button", { type: "button", text: "Add", on: { click: add } })));
   }
   function label(p) { return p.display_name && p.display_name !== p.username ? p.display_name + " (" + p.username + ")" : p.username; }
+  function verifiedBadge(p) {
+    if (p.verified_role !== "operator" && p.verified_role !== "admin") return null;
+    return el("span", { class: "verified-role", text: `✓ Verified ${p.verified_role}`,
+      "aria-label": `Verified ${p.verified_role} permission` });
+  }
+  function nameBlock(p) { return el("span", { class: "name" }, document.createTextNode(label(p)), verifiedBadge(p)); }
 
   async function act(action, username, okNote) {
     try { await api("/api/messages/contacts", { username, action }); note(okNote || ""); await loadContacts(); }
@@ -259,6 +266,10 @@ async function start() {
     const viewNote = text => { if (active()) note(text); };
     const info = state.contacts && state.contacts.contacts.find((x) => x.username === peer);
     titleEl.textContent = info ? label(info) : peer;
+    if (info) {
+      const badge = verifiedBadge(info);
+      if (badge) titleEl.appendChild(badge);
+    }
     threadEl = el("div");
     olderBtn = el("button", { type: "button", class: "small", text: "Load older", hidden: "", on: { click: () => loadThread(true) } });
     bodyEl.appendChild(olderBtn); bodyEl.appendChild(threadEl);

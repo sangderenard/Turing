@@ -47,10 +47,11 @@ CREATE TABLE IF NOT EXISTS external_agents (
 NAME = re.compile(r"[a-z][a-z0-9-]{1,12}\Z")
 TOOL = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}\Z")
-# The agents Start-AgentDay declares itself, the people's operator accounts and the service's own names.
+# Built-in agents and service accounts retain their exact names. Operator authority is checked from account grants,
+# not inferred from an operator- prefix.
 RESERVED = {"claude", "codex", "gemini", "llama", "dot", "admin", "system", "guest", "guest_agent", "agents", "root",
             "administrator", "operator"}
-RESERVED_PREFIXES = ("operator-", "svc-", "agents")
+RESERVED_PREFIXES = ("svc-", "agents")
 BUILTIN_MINUTES = (0, 20, 40)        # claude, codex, gemini
 STATUSES = ("declared", "installed", "failed", "withdrawn")
 MAX_AGENTS = 24
