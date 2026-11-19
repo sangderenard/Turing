@@ -123,7 +123,7 @@ except ImportError:
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
         "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit",
-        "operator_workspace", "agent_scratch", "private_read")
+        "operator_workspace", "agent_scratch", "private_read", "agent_execute")
 ROLES = ("admin", "member", "dev", "service", "operator", "intern", "guest")
 KIOSK_ROLES = ("intern",)      # answered only on catalog endpoints declared kiosk (see KIOSK above)
 ORIGINS = ("lan", "ip", "dns")
@@ -299,6 +299,11 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
     for cap in principal.modifiers:
         if cap == "message" and principal.role == "intern":
             caps.add(cap)
+    # This permission is account-specific, never inherited from a role, tier or
+    # broad policy file. Llama and every non-agent identity remain excluded.
+    caps.discard("agent_execute")
+    if "execution" in principal.groups and principal.role != "intern":
+        caps.add("agent_execute")
     if principal.origin != "lan":
         caps.discard("lifecycle_admin")
     if principal.role != "admin":

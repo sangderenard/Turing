@@ -107,6 +107,7 @@ from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
 from meowdoku import agent_decisions as agent_decisions_mod  # noqa: E402  [DECISIONS]
 from meowdoku import agent_guidance as agent_guidance_mod  # noqa: E402  [GUIDANCE]
 from meowdoku import agent_runs as agent_runs_mod  # noqa: E402
+from meowdoku import agent_execution as agent_execution_mod  # noqa: E402
 from meowdoku import agent_training_arena as agent_training_arena_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
@@ -1843,6 +1844,36 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": str(error)}, error.status)
             except (OSError, sqlite3.Error):
                 return self._json({"error": "agent run queue unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _agent_execution_route(self, path: str, method: str) -> None:
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if not self._require("agent_execute"):
+                return
+            principal = self._principal()
+            if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+            db = None
+            try:
+                db = agent_execution_mod.connect(sessions.accounts_db)
+                if method == "GET" and path.startswith("/api/agent-execution/"):
+                    return self._json(agent_execution_mod.read(db, principal.user_id, path.rsplit("/", 1)[1]))
+                if method == "POST" and path in ("/api/agent-execution/exec", "/api/agent-execution/python"):
+                    body = self._body_json(limit=agent_execution_mod.MAX_SOURCE_BYTES + 1024)
+                    if body is None:
+                        return
+                    if not isinstance(body, dict) or set(body) != {"source"}:
+                        raise agent_execution_mod.ExecutionError("expected source")
+                    return self._json(agent_execution_mod.submit(db, principal.user_id, principal.username,
+                                                                  path.rsplit("/", 1)[1], body["source"]))
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except agent_execution_mod.ExecutionError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error):
+                return self._json({"error": "agent execution queue unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -3741,6 +3772,8 @@ def make_handler(sessions: Sessions):
                 return self._memory_route(path, "GET")
             if path == "/api/agent-runs" or path.startswith("/api/agent-runs/"):
                 return self._agent_runs_route(path, "GET")
+            if path.startswith("/api/agent-execution/"):
+                return self._agent_execution_route(path, "GET")
             if path == "/api/agent-training-arena" or path.startswith("/api/agent-training-arena/"):
                 return self._agent_training_arena_route(path, "GET")
             if path in ("/api/file-keys/me", "/api/file-keys/peer"):
@@ -4424,6 +4457,8 @@ def make_handler(sessions: Sessions):
                 return self._memory_route(path0, "POST")
             if path0 == "/api/agent-runs" or path0 in ("/api/agent-runs/claim", "/api/agent-runs/complete"):
                 return self._agent_runs_route(path0, "POST")
+            if path0 in ("/api/agent-execution/exec", "/api/agent-execution/python"):
+                return self._agent_execution_route(path0, "POST")
             if path0 in ("/api/agent-training-arena", "/api/agent-training-arena/claim", "/api/agent-training-arena/heartbeat", "/api/agent-training-arena/complete"):
                 return self._agent_training_arena_route(path0, "POST")
             if path0 == "/api/file-keys/me":

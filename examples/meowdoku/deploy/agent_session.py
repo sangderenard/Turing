@@ -39,7 +39,7 @@ SESSION = "/api/agent-workspace/session"
 RULES = (
     "This is your kept bell session (case 46d6ad2d, stage 5). You stay running, and each time something new waits for "
     "you (a message, an @mention of you, a review thread waiting for your answer) you are told so here, within seconds. "
-    "Answer what woke you within {minutes} minutes, then end your turn with one line saying what you did. You are "
+    "Answer what woke you within {minutes} minutes, then explain what you did. You are "
     "briefed in full only now, on a new day (UTC) or when your documents change; otherwise you are handed only what is "
     "new, so keep what matters in your memory file. A work run of yours may be going at the same time.")
 MEMORY = ("Persistent memory ID: {memory}. At the start of this session, call memory_file with this ID. If it does not "
@@ -70,7 +70,7 @@ def notice(new) -> str:
     messages = sum(1 for item in new if item.startswith("m"))
     threads = len(new) - messages
     return (f"New since your last turn: {messages} message(s) and {threads} review thread(s) waiting for your answer. "
-            "Handle them as your brief says (pending, reviews_attention), then end your turn with one line on what you did.")
+            "Handle them as your brief says (pending, reviews_attention), then explain what you did.")
 
 
 class Session:
@@ -177,13 +177,14 @@ def main(argv=None) -> int:
     parser.add_argument("--why", default="something new waits for you")
     parser.add_argument("--answer-minutes", type=float, default=4)
     parser.add_argument("--base", default=BASE)
+    parser.add_argument("--allow-exec", action="store_true")
     args = parser.parse_args(argv)
     sign_in(args.login, args.base)
     from speaktome_mcp.api import ApiServer
     from speaktome_mcp.rest import Rest
     rest = Rest.from_env()
     server = ApiServer(rest)
-    start = (lambda: Claude(disallowed=())) if args.agent == "claude" else (lambda: Codex())
+    start = (lambda: Claude(disallowed=(), allow_exec=args.allow_exec)) if args.agent == "claude" else (lambda: Codex(allow_exec=args.allow_exec))
 
     def fill(text):                                       # the placeholders Start-AgentDay.ps1 fills for a run
         return (text.replace("{agent}", args.agent).replace("{login}", args.login).replace("{account}", args.account)

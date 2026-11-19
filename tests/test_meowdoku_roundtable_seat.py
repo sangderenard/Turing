@@ -71,7 +71,8 @@ def test_codex_app_server_one_thread_one_turn_approvals_declined():
                       {"method": "item/completed", "params": {"turnId": "t1", "item": {"type": "agentMessage", "id": "b", "text": "Final words."}}},
                       {"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed", "items": []}}})
     codex = seat.Codex("codex.exe", popen=popen_of(process), seconds=5)
-    assert process.args == ["codex.exe", "app-server"] and codex.thread == "th1"
+    assert process.args == ["codex.exe", "app-server", "--disable", "shell_tool", "--disable", "unified_exec"]
+    assert codex.thread == "th1"
     assert codex.ask("your turn", 5) == "Final words.", "the turn's last agent message is the answer"
     sent = process.sent()
     assert [m.get("method") for m in sent[:4]] == ["initialize", "initialized", "thread/start", "turn/start"]
@@ -147,7 +148,8 @@ def test_a_turn_gives_the_last_messages_and_posts_the_answer_as_the_agent():
     assert "round table" not in agent.asked[1], "later turns carry only the messages"
     assert s.turn({"op": "turn", "turn": 10})["op"] == "error"
     s.turn({"op": "turn", "turn": 14})
-    assert len(world.posted[-1]) <= seat.MAX_POST and world.posted[-1].endswith("length limit]")
+    assert all(len(part) <= seat.MAX_POST for part in world.posted[1:])
+    assert "".join(world.posted[1:]) == "x" * 5000
 
 
 def test_waiting_for_the_owner():

@@ -35,6 +35,12 @@ MODIFIER_AUDIT_DDL = """CREATE TABLE IF NOT EXISTS account_capability_modifier_a
     id INTEGER PRIMARY KEY, actor_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
     capability TEXT NOT NULL, enabled INTEGER NOT NULL, created_at REAL NOT NULL
 )"""
+AGENT_EXEC_DDL = """CREATE TABLE IF NOT EXISTS account_agent_execution (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    actor_id INTEGER NOT NULL REFERENCES users(id),
+    updated_at REAL NOT NULL
+)"""
 NODUS_DDL = """CREATE TABLE IF NOT EXISTS account_nodus_grants (
     user_id INTEGER PRIMARY KEY REFERENCES users(id),
     granted_by INTEGER NOT NULL REFERENCES users(id),
@@ -48,6 +54,7 @@ def prepare(db):
     db.execute(NODUS_DDL)
     db.execute(MODIFIER_DDL)
     db.execute(MODIFIER_AUDIT_DDL)
+    db.execute(AGENT_EXEC_DDL)
 
 
 def authority(db, user_id):
@@ -65,6 +72,9 @@ def authority(db, user_id):
     role = role_row[0] if role_row else "member"
     modifiers = {cap: bool(enabled) for cap, enabled in db.execute(
         "SELECT capability, enabled FROM account_capability_modifiers WHERE user_id=?", (user_id,))}
+    execution = db.execute("SELECT enabled FROM account_agent_execution WHERE user_id=?", (user_id,)).fetchone()
+    if execution is not None:
+        modifiers["execution"] = bool(execution[0])
     if role == KIOSK:
         return {"highest": KIOSK, "direct": [KIOSK], "groups": [KIOSK], "service": False, "modifiers": modifiers}
     direct = {"member"}
@@ -75,14 +85,20 @@ def authority(db, user_id):
     highest = max(direct, key=RANKS.__getitem__)
     groups = [name for name in ORDER if RANKS[name] <= RANKS[highest]]
     nodus = db.execute("SELECT 1 FROM account_nodus_grants WHERE user_id=?", (user_id,)).fetchone() is not None
-    return {"highest": highest, "direct": [*sorted(direct, key=RANKS.__getitem__), *(["nodus"] if nodus else [])],
-            "groups": [*groups, *(["nodus"] if nodus else [])], "service": role == "service", "modifiers": modifiers}
+    from meowdoku import agent_execution
+    name = db.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()[0]
+    db_path = db.execute("PRAGMA database_list").fetchone()[2]
+    execution_group = agent_execution.server_owned(db_path, name) and modifiers.get("execution", True)
+    return {"highest": highest, "direct": [*sorted(direct, key=RANKS.__getitem__), *(["nodus"] if nodus else []),
+                                           *(["execution"] if execution_group else [])],
+            "groups": [*groups, *(["nodus"] if nodus else []), *(["execution"] if execution_group else [])],
+            "service": role == "service", "modifiers": modifiers}
 
 
 def set_grant(db, actor_id, user_id, group_name, enabled):
-    """Admin-only caller sets a dev/operator grant; admin uses grant_admin."""
-    if group_name not in ("dev", "operator", "nodus", "message") or type(enabled) is not bool:
-        raise ValueError("expected dev, operator, nodus or message and boolean enabled")
+    """Admin-only caller sets a group grant; admin uses grant_admin."""
+    if group_name not in ("dev", "operator", "nodus", "message", "execution") or type(enabled) is not bool:
+        raise ValueError("expected dev, operator, nodus, message or execution and boolean enabled")
     actor = authority(db, actor_id)
     if actor["highest"] != "admin":
         raise PermissionError("admin permission group required")
@@ -90,6 +106,23 @@ def set_grant(db, actor_id, user_id, group_name, enabled):
         raise LookupError("account not found")
     if group_name == "message":
         return set_modifier(db, actor_id, user_id, group_name, enabled)
+    if group_name == "execution":
+        from meowdoku import agent_execution
+        name = db.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()[0]
+        db_path = db.execute("PRAGMA database_list").fetchone()[2]
+        if not agent_execution.server_owned(db_path, name):
+            raise PermissionError("execution is for installed server-owned agents except Llama")
+        if authority(db, user_id)["highest"] == KIOSK:
+            raise PermissionError("an intern account cannot join the execution group")
+        db.execute("INSERT INTO account_agent_execution(user_id,enabled,actor_id,updated_at) VALUES(?,?,?,?) "
+                   "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled,actor_id=excluded.actor_id,"
+                   "updated_at=excluded.updated_at", (user_id, int(enabled), actor_id, time.time()))
+        if not enabled and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_execution_jobs'").fetchone():
+            db.execute("UPDATE agent_execution_jobs SET status='failed',output='execution permission removed',finished=? "
+                       "WHERE user_id=? AND status='queued'", (time.time(), user_id))
+        db.execute("INSERT INTO account_capability_modifier_audit(actor_id,user_id,capability,enabled,created_at) "
+                   "VALUES(?,?,?,?,?)", (actor_id, user_id, group_name, int(enabled), time.time()))
+        return authority(db, user_id)
     if enabled and authority(db, user_id)["highest"] == KIOSK:
         raise PermissionError("an intern account takes no permission group; change its role instead")
     if group_name == "nodus":
