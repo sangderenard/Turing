@@ -220,7 +220,8 @@ class Service:
             if version != row['version']:
                 raise IssueError('ticket changed; refresh before updating',409)
             now=time.time()
-            if db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
                 raise IssueError('too many updates; wait before trying again',429)
             db.execute('UPDATE issue_tickets SET status=?,version=version+1,updated_at=? WHERE id=?',(status,now,ticket_id))
             db.execute('INSERT INTO issue_ticket_events(ticket_id,actor_id,created_at,status,note,version) VALUES(?,?,?,?,?,?)',(ticket_id,actor,now,status,note,version+1))
@@ -262,7 +263,8 @@ class Service:
             if old==set(ids):
                 return {'id':ticket_id,'version':version,'assignees':self.assignees(db,ticket_id)}
             now=time.time()
-            if db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
                 raise IssueError('too many updates; wait before trying again',429)
             db.execute('DELETE FROM issue_ticket_assignees WHERE ticket_id=?',(ticket_id,))
             db.executemany('INSERT INTO issue_ticket_assignees VALUES(?,?,?,?)',

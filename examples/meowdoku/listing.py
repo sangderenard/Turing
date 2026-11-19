@@ -611,7 +611,8 @@ def browse(path_and_query: str, accept: str, client: str, caps: frozenset, ctx: 
                            "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src 'self'",
                            "Content-Disposition": f'{disposition}; filename="{segs[-1]}"' if disposition == "attachment" else "inline"}
                 return 200, headers, node.path
-        if not (limiter or LIMITER).allow(client):
+        from meowdoku import rate_limits
+        if rate_limits.enabled() and not (limiter or LIMITER).allow(client):
             return _respond(429, "application/json", b'{"error": "listing rate limit: 10 per second"}', {"Retry-After": "1"})
         fmt = negotiate(params, accept or "")
         if fmt == "html":

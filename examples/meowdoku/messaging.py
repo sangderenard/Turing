@@ -138,7 +138,9 @@ class Hub:
 
     def enter(self, account_id: int) -> None:
         with self.cond:
-            if sum(self._waiters.values()) >= MAX_WAITERS or self._waiters.get(account_id, 0) >= MAX_WAITERS_PER_ACCOUNT:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and (sum(self._waiters.values()) >= MAX_WAITERS or
+                                          self._waiters.get(account_id, 0) >= MAX_WAITERS_PER_ACCOUNT):
                 raise MessagingError("too many open message polls", 429)
             self._waiters[account_id] = self._waiters.get(account_id, 0) + 1
 
@@ -588,9 +590,10 @@ def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | 
             raise MessagingError("enable images in this chat before sending an image", 403)
         minute = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 60)).fetchone()[0]
         day = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 86400)).fetchone()[0]
-        if minute >= MAX_PER_MINUTE:
+        from meowdoku import rate_limits
+        if rate_limits.enabled() and minute >= MAX_PER_MINUTE:
             raise MessagingError(f"at most {MAX_PER_MINUTE} messages per minute", 429)
-        if day >= MAX_PER_DAY:
+        if rate_limits.enabled() and day >= MAX_PER_DAY:
             raise MessagingError(f"at most {MAX_PER_DAY} messages per day", 429)
         if attachment:
             owned = db.execute("SELECT COALESCE(SUM(length(data)),0) FROM msg_images WHERE sender_id=?", (me,)).fetchone()[0]

@@ -5028,7 +5028,8 @@ def make_handler(sessions: Sessions):
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}") if length else {}
                     if path == "/api/share":
-                        if not self._share_rate_ok():
+                        from meowdoku import rate_limits
+                        if rate_limits.enabled() and not self._share_rate_ok():
                             raise share_mod.ShareError("too many shares from this address", 429)
                         return self._json({"id": sessions.shares.put(body.get("view"))})
                     self._table()                                # the owner's cookie session names the owner

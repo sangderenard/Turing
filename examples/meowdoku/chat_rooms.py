@@ -429,7 +429,8 @@ def forwarded_call(db, room, grant, *, user_id, username, name, arguments, call,
     try:
         recent = db.execute("SELECT count(*) FROM chat_grant_calls WHERE grant_id = ? AND caller_id = ? AND at > ?",
                             (str(grant), int(user_id), now - 3600.0)).fetchone()[0]
-        if recent >= CALLS_PER_HOUR:
+        from meowdoku import rate_limits
+        if rate_limits.enabled() and recent >= CALLS_PER_HOUR:
             raise ChatError(f"at most {CALLS_PER_HOUR} forwarded calls an hour per member and grant", 429)
         slot = db.execute("INSERT INTO chat_grant_calls (at, grant_id, caller_id, caller, tool, ok) VALUES (?,?,?,?,?,0)",
                           (now, str(grant), int(user_id), str(username), name)).lastrowid
