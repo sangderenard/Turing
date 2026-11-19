@@ -6770,6 +6770,7 @@ def _build_shell_hierarchy_plan(
         )
         region_node_set = set(region_nodes)
         numerical_dtype_metadata = {}
+        numerical_contract_keyword_metadata: dict[int, dict[str, str]] = {}
         numerical_constructor_dimension_cells = {}
 
         def numerical_region_parents(
@@ -6979,6 +6980,32 @@ def _build_shell_hierarchy_plan(
                             )
                         numerical_dtype_metadata[int(node_id)] = target_layout.name
                         continue
+                if (
+                    operation == "pad"
+                    and str(role) == "kw:mode"
+                    and str(parent_data.get("type")) in {
+                        "Const", "const", "Constant",
+                    }
+                ):
+                    # ``a.pad(pad=(1, 1), value=0, mode="constant")``: the
+                    # mode spelling selects pad's kernel, as a dtype spelling
+                    # selects a cast's.  It is not a runtime operand: as a
+                    # region capture it had no dtype and refused ("region
+                    # value 5 has no settled dtype in the region's value
+                    # records", 2026-11-18, case 6393486c).  Project the
+                    # exact literal onto the line as ``mode``; lowering
+                    # admits "constant" and refuses every other mode.
+                    mode_literal = _constant_value(parent_data)
+                    if mode_literal not in _OPERATOR_CONTRACT_STRING_KEYWORDS[
+                        ("pad", "kw:mode")
+                    ]:
+                        raise ValueError(
+                            f"pad has no admitted mode {mode_literal!r}"
+                        )
+                    numerical_contract_keyword_metadata.setdefault(
+                        int(node_id), {},
+                    )["mode"] = mode_literal
+                    continue
                 identity_row = attributes.get("source_python_identity_row")
                 if identity_row is not None:
                     from .concordance_declarations import (
@@ -7324,6 +7351,9 @@ def _build_shell_hierarchy_plan(
                     line_attributes["intrinsic_named_call_id"] = int(value)
             if int(value) in numerical_dtype_metadata:
                 line_attributes["dtype"] = numerical_dtype_metadata[int(value)]
+            line_attributes.update(
+                numerical_contract_keyword_metadata.get(int(value), {})
+            )
             if int(value) in numerical_constructor_dimension_cells:
                 line_attributes["numerical_constructor_dimension_cell"] = (
                     numerical_constructor_dimension_cells[int(value)]
@@ -8014,8 +8044,9 @@ def _build_shell_hierarchy_plan(
                         dtype = parent_dtypes[0]
                 # DomainNode historically pads scalars with unit axes. If it
                 # says scalar but a canonical tensor op consumes a shaped
-                # tensor, carry that shape through.
-                if operation in {
+                # tensor, carry that shape through.  The unary elementwise
+                # vocabulary is the one table, _ELEMENTWISE_UNARY_OPERATIONS.
+                if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
                     "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
                     "floor", "ceil", "isfinite", "isnan", "isinf",
                     "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
@@ -12479,14 +12510,15 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             and isinstance(_constant_value(parent_data), str)
         ):
             continue
-        # Scatter's reduction name is part of the numerical operator contract.
-        # It must stay attached to the executable region so tensor SSA lowering
-        # can select the matching kernel (or refuse it precisely); treating the
-        # string as a Python object dependency erased the whole scatter node.
-        if (
-            str(role) == "kw:reduce"
-            and str(data.get("op") or node_type) == "scatter"
-            and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
+        # A string keyword that names part of the numerical operator contract
+        # (scatter's reduction, pad's mode) stays attached to the executable
+        # region, so tensor SSA lowering can select the matching kernel or
+        # refuse it precisely.  Treated as a Python object dependency, the
+        # string erased the whole node: scatter, and ``a.pad(pad=(1, 1),
+        # value=0, mode="constant")``, whose root then returned nothing
+        # (2026-11-18, case 6393486c).  The declared table is the proof.
+        if _constant_value(parent_data) in _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
+            (str(data.get("op") or node_type), str(role)), frozenset()
         ):
             continue
         # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
@@ -27254,6 +27286,40 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "bitand", "bitor", "bitxor", "shl", "shr",
 })
 
+#: The unary elementwise operations: one result element per operand element,
+#: so the result keeps its operand's shape. This is the unary vocabulary the
+#: DomainNode carry-shape rule already lists. The two tensor-descriptor sites
+#: (``_tensor_descriptor_rule`` and ``_fold_callsite_structural_values``) each
+#: kept a hand-written subset of it (neg, abs, sin, cos, tan, exp, log, sqrt,
+#: tanh), so round, floor, sign, the inverse and hyperbolic functions, invert,
+#: logical_not and the finiteness predicates got no descriptor: their result's
+#: physical span was never posted and the final concordance refused "elementwise
+#: span input has no matching physical span result" (2026-11-18, case 6393486c).
+_ELEMENTWISE_UNARY_OPERATIONS = frozenset({
+    "neg", "abs", "sqrt", "exp", "log", "round", "trunc", "floor", "ceil",
+    "sign", "tanh", "sin", "cos", "tan", "asin", "acos", "atan", "sinh",
+    "cosh", "asinh", "acosh", "atanh", "invert", "logical_not",
+    "isfinite", "isnan", "isinf",
+    # The activations: one result element per operand element, float.
+    # Absent here, ``a.sigmoid()`` and ``a.log_softmax(dim=-1)`` carried no
+    # dtype and refused "has no settled dtype" (2026-11-18, case 6393486c).
+    "sigmoid", "softmax", "log_softmax",
+})
+
+#: The unary elementwise operations whose result is a truth value: the operand's
+#: shape, but the dtype is bool (the unary counterpart of the predicates below).
+_ELEMENTWISE_UNARY_PREDICATE_OPERATIONS = frozenset({
+    "logical_not", "isfinite", "isnan", "isinf",
+})
+
+#: String-valued keywords that are part of an operator's numerical contract,
+#: by (operation, parent role): the strings each admits.  Read by the
+#: dispatch-metadata rule; lowering selects a kernel for each or refuses it.
+_OPERATOR_CONTRACT_STRING_KEYWORDS: dict[tuple[str, str], frozenset[str]] = {
+    ("scatter", "kw:reduce"): frozenset({"sum", "mean", "max", "min"}),
+    ("pad", "kw:mode"): frozenset({"constant", "reflect", "replicate", "circular"}),
+}
+
 #: The elementwise binary operations whose result is a truth value.
 _ELEMENTWISE_PREDICATE_OPERATIONS = frozenset({
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
@@ -28271,6 +28337,89 @@ def _topk_named_member_descriptor(graph, receiver, field_name, seen=None):
             "metadata_state": "dynamic",
         })
     return result
+
+
+def pad_extents(pad: Any, dims: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """AbstractTensor's pad convention: the (left, right) extent per axis.
+
+    The pairs apply from the LAST dimension backward, exactly as the C
+    backend's ``pad_`` states them: ``left[dims-k+i] = pad[-2(i+1)]`` and
+    ``right[dims-k+i] = pad[-2(i+1)+1]`` for ``k = len(pad) // 2``.  A pad
+    that is not a sequence of integers of even length refuses by name.
+    """
+
+    if not isinstance(pad, (tuple, list)) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in pad
+    ):
+        raise ValueError(
+            f"pad has no admitted non-constant or non-integer pad tuple {pad!r}"
+        )
+    if len(pad) % 2 != 0:
+        raise ValueError("pad has no admitted odd-length pad tuple")
+    count = len(pad) // 2
+    if count > int(dims):
+        raise ValueError(
+            "pad tuple pads more dimensions than the operand has"
+        )
+    left = [0] * int(dims)
+    right = [0] * int(dims)
+    for index in range(count):
+        left[int(dims) - count + index] = int(pad[-2 * (index + 1)])
+        right[int(dims) - count + index] = int(pad[-2 * (index + 1) + 1])
+    if any(extent < 0 for extent in (*left, *right)):
+        raise ValueError("pad has no admitted negative pad extent")
+    return tuple(left), tuple(right)
+
+
+def _pad_result_descriptor(graph: Any, data: Mapping, seen: Any) -> dict[str, Any] | None:
+    """``a.pad(pad=..., value=..., mode="constant")``: the operand's dtype,
+    every axis widened by its declared (left, right) extents.
+
+    The pad tuple is the node's constant ``kw:pad`` operand; mode is its
+    constant ``kw:mode`` operand.  A non-constant pad or a mode other than
+    ``"constant"`` refuses by name.
+    """
+
+    parents = tuple(
+        (int(parent), str(role)) for parent, role in data.get("parents") or ()
+        if int(parent) in graph.G
+    )
+    source_id = next((
+        parent for parent, role in parents
+        if role.casefold() in {"operand", "arg:0", "self", "receiver", "base"}
+    ), None)
+    source = (
+        _tensor_descriptor(graph, source_id, seen)
+        if source_id is not None else None
+    )
+    if source is None or not descriptor_states_a_shape(source):
+        return None
+    pad_parent = next((parent for parent, role in parents if role == "kw:pad"), None)
+    mode_parent = next((parent for parent, role in parents if role == "kw:mode"), None)
+    if pad_parent is None:
+        raise ValueError("pad has no kw:pad operand")
+    try:
+        pad = _constant_value(graph.G.nodes[pad_parent])
+    except KeyError:
+        raise ValueError("pad has no admitted non-constant pad tuple") from None
+    if mode_parent is not None:
+        try:
+            mode = _constant_value(graph.G.nodes[mode_parent])
+        except KeyError:
+            raise ValueError("pad has no admitted non-constant mode") from None
+        if mode != "constant":
+            raise ValueError(f"pad has no admitted mode {mode!r}")
+    shape = tuple(map(int, source.get("shape") or ()))
+    left, right = pad_extents(pad, len(shape))
+    new_shape = tuple(
+        extent + before + after
+        for extent, before, after in zip(shape, left, right)
+    )
+    return {
+        "shape": new_shape,
+        "dtype": _recorded_dtype(source.get("dtype"), "pad source tensor", source_id),
+        "rank": len(new_shape),
+    }
 
 
 def _tensor_descriptor_rule(
@@ -29575,6 +29724,10 @@ def _tensor_descriptor_rule(
                         "rank": 1,
                         "metadata_state": "dynamic",
                     }
+        if operation == "pad":
+            pad_descriptor = _pad_result_descriptor(graph, data, seen)
+            if pad_descriptor is not None:
+                return pad_descriptor
         if operation in {"reshape", "view"}:
             parents = data.get("parents") or ()
             source_id = next((
@@ -30768,9 +30921,8 @@ def _tensor_descriptor_rule(
                     if selected_dtype is not None:
                         return {**normalized, "dtype": selected_dtype}
                     return normalized
-        if operation in {
-            "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
-            "tanh", "clone", "copy", "identity", "real", "imag", "conj",
+        if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
+            "clone", "copy", "identity", "real", "imag", "conj",
             # A prefix scan is not a reduction: it emits one element per
             # input element, so it keeps its operand's shape exactly.  With
             # no rule here it answered nothing, its result was never proven,
@@ -30790,7 +30942,13 @@ def _tensor_descriptor_rule(
                 and int(parent) in graph.G
             )
             if len(parents) == 1:
-                return _tensor_descriptor(graph, parents[0], seen)
+                inherited = _tensor_descriptor(graph, parents[0], seen)
+                if (
+                    inherited is not None
+                    and operation in _ELEMENTWISE_UNARY_PREDICATE_OPERATIONS
+                ):
+                    return {**inherited, "dtype": "bool"}
+                return inherited
         if operation == "cast_like":
             # ``value.cast_like(reference)`` keeps the VALUE's extents and
             # takes the REFERENCE's dtype.  Neither operand is optional: with
@@ -34599,9 +34757,9 @@ def _fold_callsite_structural_values(
                     )
                 )
                 and (
-                    operation in {
-                        "neg", "abs", "sin", "cos", "tan", "exp", "log",
-                        "sqrt", "tanh", "clone", "copy", "identity", "indexedstore",
+                    operation in _ELEMENTWISE_UNARY_OPERATIONS
+                    or operation in {
+                        "clone", "copy", "identity", "indexedstore",
                         "index_set", "setitem", "indexed", "getitem",
                         "subscript", "real", "imag", "conj",
                     }

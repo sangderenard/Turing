@@ -31217,6 +31217,15 @@ def lower_control_sections_to_ssa(
                     None if instruction.res is None else int(instruction.res.id)
                 )
                 argument_ids = tuple(int(value.id) for value in instruction.args)
+                # ``&``, ``|`` and ``^`` over bool operands are closed over bool (logical_and/or/xor): they are not
+                # integer evidence. As unconditional seeds they retyped a bool mask's result to int64, so its physical
+                # span was never posted (2026-11-18, case 6393486c: ``a & b`` on bool rows).
+                if (
+                    instruction.op in {"And", "Or", "Xor", "bitand", "bitor", "bitxor"}
+                    and instruction.args
+                    and all(str(getattr(value, "dtype", "")) == "bool" for value in instruction.args)
+                ):
+                    continue
                 if instruction.op in integer_ops:
                     candidates = (*argument_ids, *((result_id,) if result_id is not None else ()))
                 elif instruction.op in arithmetic_ops and (
