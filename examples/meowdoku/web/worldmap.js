@@ -165,7 +165,11 @@ function startPage() {
     const box = $("agent-locations");
     try {
       const { status, body } = await getJson("/api/worldmap/presence");
-      if (status !== 200 || !body) { box.textContent = status === 403 ? "Developer access is required for agent activity." : `Agent activity unavailable (${status}).`; return; }
+      if (status !== 200 || !body) {
+        S.presence = null; renderAgentMapEntities(); draw();
+        box.textContent = status === 403 ? "Developer access is required for agent activity." : `Agent activity unavailable (${status}).`;
+        return;
+      }
       S.presence = body;
       renderAgentMapEntities();
       renderAgentPresence(box, body, { locations: true, onLocation: place => {
@@ -174,7 +178,7 @@ function startPage() {
         else setStatus("That last checkout file is absent from this generated map or belongs to another repository.", true);
       }});
       draw();
-    } catch (_) { box.textContent = "Agent activity unavailable."; }
+    } catch (_) { S.presence = null; renderAgentMapEntities(); draw(); box.textContent = "Agent activity unavailable."; }
   }
   const setStatus = (text, bad) => { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : "mut"; };
 
