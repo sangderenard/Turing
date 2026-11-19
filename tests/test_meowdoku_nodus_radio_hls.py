@@ -93,5 +93,16 @@ class RadioHlsTests(unittest.TestCase):
         self.assertTrue(calls[0][1]['env']['PATH'].startswith(str(self.root) + os.pathsep))
         self.assertEqual(process.stdin.getvalue(), 'START\n')
 
+    def test_native_startup_failure_reports_exit_and_bounded_diagnostic(self):
+        class Process:
+            stdout = iter(['Radio file-source configuration failed\n'])
+            stdin = io.StringIO()
+            def poll(self): return 0xC0000135
+        track = NativeTrack({'executable': 'radio.exe', 'scope_dll': 'scope.dll',
+                             'fft_dll': 'fft.dll', 'spectrum_port': 47701,
+                             'pcm_port': 49002}, {'path': 'song.wav'}, popen=lambda *a, **k: Process())
+        with self.assertRaisesRegex(RuntimeError, 'exit=3221225781, diagnostics=Radio file-source configuration failed'):
+            track.start(threading.Event())
+
 
 if __name__ == '__main__': unittest.main()
