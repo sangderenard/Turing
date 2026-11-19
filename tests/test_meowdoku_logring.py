@@ -112,6 +112,49 @@ def test_bad_persisted_lines_are_skipped_not_fatal(tmp_path):
     assert len(list(tmp_path.glob("ring.jsonl.bad-*"))) == 1
 
 
+def test_failed_evidence_copy_leaves_the_file_as_found(tmp_path, monkeypatch):
+    """Ticket f62934c8, review eab6c75f (codex): no rewrite may drop the unreadable lines before an evidence copy of them exists,
+    and an append after a cut-off tail must not fuse with it into one unreadable line."""
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    for i in range(5):
+        a.add(f"n{i}")
+    cut = a.cipher.seal(b'{"seq": 6, "ts": 1.0, "src": "server", "text": "n5"}')[:30]   # no newline: an append cut off by a kill
+    p.write_bytes(p.read_bytes() + b"enc:v1:not-a-token\n" + cut)
+    found = p.read_bytes()
+
+    def failing_copy(src, dst, *args, **kwargs):
+        Path(dst).write_bytes(b"partial")                                     # a copy that fails after creating its file
+        raise OSError("disk full")
+    monkeypatch.setattr(L.shutil, "copyfile", failing_copy)
+    b = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    texts = [e["text"] for e in b.fetch(0)["entries"]]
+    assert texts[:5] == [f"n{i}" for i in range(5)]                           # startup still works from the readable lines
+    assert texts[5].startswith("[logring] skipped 2 unreadable line(s)") and "could not be written" in texts[5]
+    assert p.read_bytes().startswith(found)                                   # the original bytes are untouched
+    assert not list(tmp_path.glob("ring.jsonl.bad-*"))                        # no partial evidence left behind
+    b.add("after")
+    c = L.Ring(cap_bytes=5000, path=p, key_path=key)                          # restart while the copy still fails
+    texts = [e["text"] for e in c.fetch(0)["entries"]]
+    assert texts[:7] == [f"n{i}" for i in range(5)] + [texts[5], "after"]    # the records appended after the cut tail survive
+    assert texts[7].startswith("[logring] skipped 2 unreadable line(s)")      # still only the original bad lines
+    assert p.read_bytes().startswith(found)
+
+    c._written = 2 * c.cap + 1                                                # an oversize rewrite while the copy fails: appended
+    c.add("still failing")
+    assert p.read_bytes().startswith(found) and not list(tmp_path.glob("ring.jsonl.bad-*"))
+    monkeypatch.undo()                                                        # the copy works again: evidence first, then the rewrite
+    before = p.read_bytes()
+    c.add("copy works")
+    evidence = list(tmp_path.glob("ring.jsonl.bad-*"))
+    assert len(evidence) == 1 and evidence[0].read_bytes() == before and before.startswith(found)
+    assert not p.read_bytes().startswith(found)                               # rewritten from the ring
+    d = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    assert [e["text"] for e in d.fetch(0)["entries"]] == [e["text"] for e in c.fetch(0)["entries"]]
+    assert len(list(tmp_path.glob("ring.jsonl.bad-*"))) == 1                 # the rewritten ring reloads clean
+
+
 def test_oversize_rewrite_is_atomic(tmp_path):
     p = tmp_path / "ring.jsonl"
     key = tmp_path / "secrets" / "records.key"
