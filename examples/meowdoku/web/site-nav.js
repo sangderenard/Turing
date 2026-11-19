@@ -642,10 +642,13 @@ async function main() {
   let who;
   try { who = await getJson("/api/whoami"); } catch (e) { return; }
   const caps = new Set(who.capabilities || []);
+  // Sign in from any page returns to that page: login.js reads ?next= and accepts only a same-site path.
+  const signInHref = () => location.pathname === "/login.html" ? "/login.html"
+    : "/login.html?next=" + encodeURIComponent(location.pathname + location.search + location.hash);
 
   if (!who.signed_in) {
     actions.append(el("a", { class: "chip", href: "/palette.html", text: "Color game" }),
-      el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }),
+      el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: signInHref(), text: "Sign in" }),
       el("button", { class: "chip quiet", type: "button", disabled: "", text: "Register", title: "General registration is not open" }),
       el("a", { class: "chip quiet", href: "/register.html#alpha-form", text: "Alpha user request" }));
     reserveSpace();
