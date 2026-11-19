@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import sqlite3
 import subprocess
@@ -14,6 +15,31 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 SUP = ROOT / "examples" / "meowdoku" / "deploy" / "apache_supervisor.py"
 
 from meowdoku import lowering_library as lib  # noqa: E402
+
+
+def test_hosted_task_follows_supervisor_start_and_stop(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("hosted_task_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / "instances.json"
+    config.write_text(json.dumps({"hosted_tasks": ["SpeakToMe hosted llama"], "instances": []}))
+    assert module.instances_hosted_tasks(config) == ["SpeakToMe hosted llama"]
+    supervisor = module.Supervisor(tmp_path / "accounts.db", config, tmp_path / "state")
+    supervisor.hosted_tasks = module.instances_hosted_tasks(config)
+    calls = []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(module.subprocess, "run", command)
+    supervisor.task_action("start")
+    supervisor.task_action("stop")
+    if os.name == "nt":
+        assert calls == [["schtasks.exe", "/Run", "/TN", "SpeakToMe hosted llama"],
+                         ["schtasks.exe", "/End", "/TN", "SpeakToMe hosted llama"]]
+    else:
+        assert calls == []
 
 
 def _spec(child_code, **extra):

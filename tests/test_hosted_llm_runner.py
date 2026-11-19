@@ -82,6 +82,36 @@ def test_operator_goal_enters_chat_setting_and_controls_refresh():
     assert "Current operator goal:\nAnswer questions about the site" in guide.setting()
 
 
+def test_disabled_control_stops_model_and_resumes_only_when_enabled():
+    class Process:
+        def __init__(self):
+            self.running = False
+            self.events = []
+
+        def start(self):
+            if not self.running:
+                self.events.append("start")
+                self.running = True
+
+        def stop(self):
+            if self.running:
+                self.events.append("stop")
+                self.running = False
+
+    class Memory:
+        goal = ""
+
+        def flush(self):
+            pass
+
+    model, guide = Process(), Memory()
+    assert runner.apply_controls(model, guide, {"enabled": True, "goal": "Help"})
+    assert not runner.apply_controls(model, guide, {"enabled": False, "goal": "Help"})
+    assert not runner.apply_controls(model, guide, {"enabled": False, "goal": "Help"})
+    assert runner.apply_controls(model, guide, {"enabled": True, "goal": "Help"})
+    assert model.events == ["start", "stop", "start"] and guide.goal == "Help"
+
+
 def test_room_bootstrap_then_replies_once_without_self_loop_and_remembers_it():
     runner._MODES.clear()
     db, rest, model = database(), Rest(), Model()

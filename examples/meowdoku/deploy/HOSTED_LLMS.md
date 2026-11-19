@@ -56,8 +56,9 @@ The operator's **Agent controls** page (`/agent-controls.html`) stores a per-acc
 enabled switch and current goal at `/api/hosted-agents/<account>/controls`.
 Hosted agents default to enabled with no extra goal. Llama checks the setting
 about every ten seconds: disabled pauses chat replies and queued profile work;
-the goal is included in its chat setting when enabled. This does not stop the
-isolated Windows task or llama.cpp process. The page also exposes the existing
+the goal is included in its chat setting when enabled. Disabling also stops the
+llama.cpp model process while the isolated Windows task remains running to watch
+for re-enabling. The page also exposes the existing
 last-word modes. Goal text is conversation guidance, not model training.
 
 ## Model, memory and storage
@@ -82,11 +83,27 @@ It writes the file at most once a minute and keeps it under 24 KiB by dropping t
 memory file yet, the first write creates one.
 
 `Run-HostedLlm.ps1` places its cursors, logs and state in the isolated `agents-llama` Windows profile.
-`Start-HostedLlm.ps1` registers a boot task under that account with restart on failure.
+`Start-HostedLlm.ps1` registers an on-demand task under that account. It has no
+independent boot trigger or Task Scheduler restart policy.
+The Apache piped-log supervisor starts it when the stack starts and stops it
+before the other instances when the stack shuts down. Registration grants only
+the Apache service account read and execute rights on that task, so the
+supervisor can control it without Llama's password. The supervisor asks Task
+Scheduler to keep it running while the stack is up. If the site becomes
+unavailable unexpectedly, the runner stops its llama.cpp process.
+The runner also joins the stack's kill-on-close Windows job, so Task Scheduler
+ending the task closes its llama.cpp child even if Python cannot run `finally`.
 
 After both repositories' changes are reviewed and deployed, the operator must
 run `Set-AgentBox.ps1 -Apply -CreateAgentAccount -AgentAccount agents-llama
 -AgentLogins llama` in elevated PowerShell. Then run
-`Start-HostedLlm.ps1 -GrantRead` and `Start-HostedLlm.ps1 -Register` there.
-`Start-HostedLlm.ps1 -Run` starts it without waiting for the next boot.
+`Start-HostedLlm.ps1 -GrantRead` there. `Start-HostedLlm.ps1 -Register`
+can be run for a new installation; `stm restart` also runs it automatically.
+The owner-local `stm restart` shortcut performs `-Register` before its first
+reset, then stops the Llama task, restarts Apache, and starts the task with the
+stack. It checks that the previous model listener has closed before restarting.
+This updates an older boot-triggered task without a separate operator step.
+Later Apache service resets use the supervisor's task start/stop lifecycle.
+With the agent disabled in Agent controls, the restarted task stays alive to
+watch the switch but does not start llama.cpp.
 The read grant is confined to the model and the pinned llama.cpp files; Llama has no access to operator credentials.

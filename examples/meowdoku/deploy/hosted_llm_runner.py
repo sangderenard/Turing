@@ -360,6 +360,17 @@ def controls(rest, username, now=None):
     return value
 
 
+def apply_controls(model, guide, control):
+    """Keep the model process in the operator-selected state, including while idle."""
+    guide.goal = control["goal"]
+    if not control["enabled"]:
+        model.stop()
+        guide.flush()
+        return False
+    model.start()
+    return True
+
+
 def mode(rest, username, scope, place, now=None):
     """The effective last-word setting, asked at most every MODE_SECONDS per place (a 1 s cycle must not ask each pass)."""
     now = time.monotonic() if now is None else now
@@ -456,6 +467,13 @@ def run(args):
     username = os.environ.get("SPEAKTOME_USER")
     if not username:
         raise RuntimeError("SPEAKTOME_USER is required")
+    if os.name == "nt":
+        # The scheduled task can end this runner abruptly. Reuse the stack's kill-on-close
+        # Windows job so its llama.cpp child cannot outlive the task at stack shutdown.
+        from meowdoku.deploy.apache_supervisor import tie_children_to_this_process
+        bound = tie_children_to_this_process()
+        if "are tied" not in bound:
+            raise RuntimeError(bound)
     rest = Rest.from_env()
     db_path = Path(args.state_dir) / "hosted-llm.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,17 +482,18 @@ def run(args):
     guide = Guide(rest)
     model = LocalModel(Path(args.llama_server), Path(args.model), args.port, Path(args.state_dir) / "logs", args.batch_slots)
     try:
-        model.start()
         room = ""
         until = 0
         rooms, rooms_due, profiles_due = [], 0.0, 0.0
         while True:
             try:
                 tick = time.monotonic()
-                control = controls(rest, username, tick)
-                guide.goal = control["goal"]
-                if not control["enabled"]:
-                    guide.flush()
+                try:
+                    control = controls(rest, username, tick)
+                except (RestError, OSError, ValueError, KeyError):
+                    model.stop()  # the site went away: do not keep llama.cpp running outside the stack
+                    raise
+                if not apply_controls(model, guide, control):
                     time.sleep(POLL_SECONDS)
                     continue
                 if tick >= profiles_due:
