@@ -15,7 +15,7 @@ body{margin:0;background:#0e1119;color:#e8eaf3;font:15px/1.5 system-ui,sans-seri
 <label><input id="attach-details" type="checkbox" checked> Attach this page's path and browser details</label><p class="muted">Do not include passwords, session tokens or other secrets. This form does not capture Studio scene state or server logs.</p>
 <div class="actions"><button id="send" type="submit">Send ticket</button><button id="cancel" type="button">Cancel</button></div><p id="create-status" role="status"></p></form></section>
 <div class="grid"><section class="panel"><h2>Tickets</h2><label for="scope">Show</label><select id="scope"><option value="mine">My tickets</option><option id="assigned-option" value="assigned" hidden>Assigned to me</option><option id="all-option" value="all" hidden>All tickets (administrator)</option></select>
-<label for="filter">Status</label><select id="filter"><option value="all">All statuses</option><option value="open">Open</option><option value="investigating">Investigating</option><option value="resolved">Resolved</option></select>
+<label for="filter">Status</label><select id="filter"><option value="all">All statuses</option><option value="active">Active (open and investigating)</option><option value="open">Open</option><option value="investigating">Investigating</option><option value="resolved">Finished (resolved)</option></select>
 <div id="list"></div><button id="more" type="button" hidden>Load more</button></section>
 <section id="detail" class="panel" aria-label="Ticket details"><p>Select a ticket.</p></section></div>
 </section></main>

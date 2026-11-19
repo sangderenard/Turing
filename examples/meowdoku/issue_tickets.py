@@ -171,7 +171,7 @@ class Service:
             return {'id':ticket_id,'created':True}
 
     def list(self, token, *, scope='mine', status='all', offset=0):
-        if scope not in ('mine','assigned','all') or status not in (*STATUSES,'all') or type(offset) is not int or not 0 <= offset <= 1_000_000:
+        if scope not in ('mine','assigned','all') or status not in (*STATUSES,'all','active') or type(offset) is not int or not 0 <= offset <= 1_000_000:
             raise IssueError('invalid list filter')
         with self.transaction(token) as (db,actor,admin):
             operator = self.is_operator(db,actor)
@@ -187,8 +187,8 @@ class Service:
             params = (actor,) if scope != 'all' else ()
             rows=db.execute(
                 'SELECT id,owner_id,title,status,version,created_at,updated_at FROM issue_tickets '
-                'WHERE '+visibility+' AND (?=\'all\' OR status=?) ORDER BY updated_at DESC,id DESC LIMIT 51 OFFSET ?',
-                (*params,status,status,offset)).fetchall()
+                'WHERE '+visibility+' AND (?=\'all\' OR (?=\'active\' AND status IN (\'open\',\'investigating\')) OR status=?) ORDER BY updated_at DESC,id DESC LIMIT 51 OFFSET ?',
+                (*params,status,status,status,offset)).fetchall()
             tickets=[dict(r) for r in rows[:50]]
             for ticket in tickets:
                 ticket['assignees']=self.assignees(db,ticket['id'])
