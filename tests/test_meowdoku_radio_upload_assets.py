@@ -1,15 +1,17 @@
 import hashlib
 from io import BytesIO
+from email.message import Message
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from meowdoku.state_paths import StatePaths
 from meowdoku.nodus_radio_jukebox import Jukebox
-from meowdoku.radio_upload_assets import upload, owned, ControlError
+from meowdoku.radio_upload_assets import upload, owned, route, ControlError
 
 # A valid FLAC marker and STREAMINFO for one second of mono 44.1 kHz PCM.
 STREAM = ((44100 << 44) | (0 << 41) | (15 << 36) | 44100).to_bytes(8, "big")
@@ -35,6 +37,40 @@ class RadioUploadTests(unittest.TestCase):
         self.assertEqual(catalogue[receipt["id"]]["title"], "Lantern")
         self.assertEqual(Path(catalogue[receipt["id"]]["path"]).read_bytes(), FLAC)
         self.assertFalse(self.state.radio_json.exists())
+
+    def test_shared_library_ceiling_refuses_second_upload(self):
+        def decode(_state, _source, destination, _mode):
+            destination.write_bytes(b"RIFF")
+
+        with (patch("meowdoku.suno_radio_assets.run_codec", side_effect=decode),
+              patch("meowdoku.radio_upload_assets.LIBRARY_CAP_BYTES", len(FLAC))):
+            upload(self.state, self.db, 7, "First", BytesIO(FLAC), len(FLAC))
+            with self.assertRaises(ControlError) as refused:
+                upload(self.state, self.db, 8, "Second", BytesIO(FLAC), len(FLAC))
+        self.assertEqual(refused.exception.status, 507)
+        self.assertEqual(len(owned(self.db, 7)), 1)
+        self.assertEqual(owned(self.db, 8), [])
+        self.assertEqual(len(list(self.state.users_dir.rglob("*.flac"))), 1)
+
+    def test_refused_post_closes_connection_with_unread_body(self):
+        headers = Message()
+        headers["Host"] = "example.test"
+        headers["Origin"] = "https://example.test"
+        headers["X-Meowdoku-Radio"] = "1"
+        headers["Content-Type"] = "audio/flac"
+        headers["Content-Length"] = "1"
+        handler = SimpleNamespace(
+            headers=headers, path="/api/radio/uploads?title=Short", rfile=BytesIO(b"x"),
+            close_connection=False, _classify=lambda: None,
+            _principal=lambda: SimpleNamespace(user_id=7), _is_secure=lambda: True,
+            _json=lambda body, status=200: (status, body),
+        )
+        sessions = SimpleNamespace(state=self.state, accounts_db=self.db)
+        status, body = route(handler, sessions, "POST")
+        self.assertEqual(status, 400)
+        self.assertIn("too short", body["error"])
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(handler.rfile.read(), b"x")
 
     def test_missing_codec_refuses_publication(self):
         with self.assertRaises(OSError):

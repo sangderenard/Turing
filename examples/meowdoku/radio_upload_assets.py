@@ -1,9 +1,9 @@
 """Direct, account-owned FLAC admission to the shared Nodus Radio catalogue.
 
 The FLAC original is the library object. Radio uploads have no private-file or
-Suno per-owner quota; the bounded request and available library disk are the
-storage limits. Playback creates only a temporary WAV through the existing
-Nodus codec row.
+Suno per-owner quota; each request is bounded and the shared FLAC library
+has a 10 GiB ceiling. Playback creates only a temporary WAV through the
+existing Nodus codec row.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from meowdoku.nodus_radio_control import ControlError
 from meowdoku.suno_radio_assets import MAX_MEDIA_BYTES
 
 MAX_DURATION_SECONDS = 900
+LIBRARY_CAP_BYTES = 10 * 1024 * 1024 * 1024
 _READ_CHUNK = 1024 * 1024
 
 
@@ -66,7 +67,9 @@ def upload(state, db_path, owner, title, stream, length):
         raise ControlError("Sign in to upload Radio audio", 401)
     if not isinstance(title, str) or not 1 <= len(title.strip()) <= 200 or any(ord(c) < 32 for c in title):
         raise ControlError("Give the track a title of 1 to 200 characters", 400)
-    if type(length) is not int or not 42 <= length <= MAX_MEDIA_BYTES:
+    if type(length) is not int or length < 42:
+        raise ControlError("FLAC is too short", 400)
+    if length > MAX_MEDIA_BYTES:
         raise ControlError("FLAC exceeds the Radio media limit", 413)
     asset_id = secrets.token_hex(16)
     final = _asset_path(state, owner, asset_id)
@@ -97,6 +100,10 @@ def upload(state, db_path, owner, title, stream, length):
         finally:
             verified.unlink(missing_ok=True)
         with _connect(db_path) as db:
+            db.execute("BEGIN IMMEDIATE")  # serialize admission against the shared byte ceiling
+            used = db.execute("SELECT COALESCE(SUM(bytes), 0) FROM radio_upload_assets").fetchone()[0]
+            if used + length > LIBRARY_CAP_BYTES:
+                raise ControlError("Radio library is full (10 GiB shared limit)", 507)
             os.replace(stage, final)
             published = True
             db.execute("INSERT INTO radio_upload_assets(id,owner_id,title,bytes,sha256) VALUES(?,?,?,?,?)",
@@ -110,7 +117,10 @@ def upload(state, db_path, owner, title, stream, length):
     finally:
         stage.unlink(missing_ok=True)
         if not final.exists():
-            final.parent.rmdir()
+            try:
+                final.parent.rmdir()
+            except OSError:
+                pass
 
 
 def owned(db_path, owner):
@@ -136,6 +146,8 @@ def route(handler, sessions, method):
     handler._classify()
     owner = handler._principal().user_id
     if owner is None:
+        if method != "GET":
+            handler.close_connection = True  # the refused request body is unread
         return handler._json({"error": "Sign in to upload Radio audio"}, 401)
     try:
         if method == "GET":
@@ -159,6 +171,10 @@ def route(handler, sessions, method):
             raise ControlError("One track title is required", 400)
         return handler._json(upload(sessions.state, sessions.accounts_db, owner, titles[0], handler.rfile, length))
     except ControlError as error:
+        if method != "GET":
+            handler.close_connection = True  # an upload may leave its body unread
         return handler._json({"error": str(error)}, error.status)
     except (OSError, sqlite3.Error, schema_version.SchemaVersionError):
+        if method != "GET":
+            handler.close_connection = True
         return handler._json({"error": "Radio upload unavailable"}, 503)

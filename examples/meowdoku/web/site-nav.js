@@ -303,8 +303,9 @@ function mountRadio(wrap, host, canControl = false) {
         method: "POST", credentials: "same-origin", cache: "no-store",
         headers: {"Content-Type": "audio/flac", "X-Meowdoku-Radio": "1"}, body: file
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Radio upload failed");
+      const isJson = response.headers.get("content-type")?.includes("application/json");
+      const data = isJson ? await response.json() : {};
+      if (!response.ok) throw new Error(data.error || "Radio upload failed (HTTP " + response.status + ")");
       uploadStatus.textContent = "Added " + data.title + " to the jukebox · SHA-256 " + data.sha256;
       uploadFile.value = "";
       const latest = await getJson("/api/radio/jukebox");

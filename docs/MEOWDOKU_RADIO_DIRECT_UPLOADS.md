@@ -18,11 +18,14 @@ codec installation is required. After validation, the server retains the origina
 under `users/account/<owner>/assets/radio_upload/<id>/audio.flac` and records
 owner, title, bytes, SHA-256 and creation time in SQLite. This path satisfies
 the existing codec work-root constraint. These assets do not use the private
-file or Suno per-owner storage quotas. Available Radio library disk space is
-the aggregate capacity; playback WAVs are temporary.
+file or Suno per-owner storage quotas. The shared FLAC library has a 10 GiB
+ceiling across all accounts. Admission checks the sum of stored originals in
+a serialized SQLite transaction; a full library returns HTTP 507 without
+publishing the file. Playback WAVs are temporary.
 
-`GET /api/radio/uploads` lists the caller's uploads. The shared jukebox
-catalogue includes their completed records with server-generated IDs. An
+`GET /api/radio/uploads` lists the caller's uploads. A validated upload is
+published immediately in the shared jukebox catalogue with a server-generated
+ID; there is no separate moderation step. An
 upload does not request the song, resume the station, start server speakers,
 or expose the original as a private inventory file. Existing jukebox request,
 rating and operator playback controls still govern use.
