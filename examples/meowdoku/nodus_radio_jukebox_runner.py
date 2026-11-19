@@ -3,6 +3,7 @@
 Construction/GET never launches a source. Operator catalogue paths only; the
 producer is silent (SDL dummy), while its real NRAD and PCM outputs are retained.
 """
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ class NativeTrack:
         self.process = None
         self.error = None
         self.lines = queue.Queue(maxsize=64)
+        self.diagnostics = deque(maxlen=8)
         self.reader = None
         self.spectrum_peer = None
         self.on_pcm = None
@@ -52,6 +54,8 @@ class NativeTrack:
                 if line.startswith(('radio_pcm_source_port=', 'radio_waiting_for_start=', 'radio_udp_source_port=')):
                     try: self.lines.put_nowait(line)
                     except queue.Full: self.error = 'Native source readiness overflow'
+                elif line.strip() and not line.startswith('DEBUG:'):
+                    self.diagnostics.append(line.strip()[:240])
         self.reader = threading.Thread(target=read, daemon=True, name='radio-source-output')
         self.reader.start()
         deadline = time.perf_counter() + 10
@@ -59,8 +63,12 @@ class NativeTrack:
         ready = False
         while not (pin and ready):
             if cancel.is_set(): return
-            if self.process.poll() is not None or time.perf_counter() >= deadline:
-                raise RuntimeError('Native source did not announce a gated PCM stream')
+            code = self.process.poll()
+            if code is not None or time.perf_counter() >= deadline:
+                self.reader.join(timeout=.2)
+                detail = '; '.join(self.diagnostics)
+                raise RuntimeError('Native source did not announce a gated PCM stream'
+                                   f' (exit={code}, diagnostics={detail or "none"})')
             try: line = self.lines.get(timeout=.05)
             except queue.Empty: continue
             match = re.fullmatch(r'radio_pcm_source_port=(\d+) rtp_payload=96 encoding=L16 rate=48000 channels=2 ssrc=(\d+)\s*', line)

@@ -330,6 +330,20 @@
       ]
     },
     {
+      "name": "udp-router-radio",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-radio-router",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
+        "127.0.0.1",
+        "47698"
+      ]
+    },
+    {
       "name": "relay",
       "kind": "command",
       "port": null,
