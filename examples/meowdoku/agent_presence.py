@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 AGENTS = {"claude": ("agents", 0), "codex": ("agents-codex", 20), "gemini": ("agents-gemini", 40)}
+# Accounts with no Start-AgentDay slot: hosted Llama and the two app operators.
+UNSCHEDULED_AGENTS = ("llama", "operator-claude", "operator-codex")
 # Installed external API agents (external_agents.py, case 989e507e), read beside the accounts database at each snapshot.
 _external: dict[str, tuple[str, int]] = {}
 RECENT_SECONDS = 30
@@ -44,7 +46,7 @@ def known_agents(accounts_db: Path | None = None) -> dict[str, tuple[str, int]]:
 
 def note_inbound(username: str, *, mcp: bool, now: float | None = None) -> None:
     """Record an authenticated API request; a call is only 'recent', not 'running'."""
-    if username not in AGENTS and username not in _external and username not in ("operator-claude", "operator-codex"):
+    if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
         return
     with _lock:
         _recent[(username, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
@@ -146,7 +148,7 @@ def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
         return []
     seen, out = set(), []
     for username, repository, path, at in rows:
-        if username not in AGENTS and username not in _external and username not in ("operator-claude", "operator-codex"):
+        if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
             continue
         if username in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
             continue
@@ -169,7 +171,7 @@ def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | Non
                     "api_out": {"state": "unknown"}, "mcp_out": {"state": "unknown"},
                     "local": {"state": "active" if runs else "unobserved" if records_available else "unknown", "since": min((r["started"] for r in runs), default=None)}}
         agents.append({"username": name, "account": account, "runs": runs, "schedule": _schedule(days, name, minute, now), "channels": channels})
-    for name in ("operator-claude", "operator-codex"):
+    for name in UNSCHEDULED_AGENTS:
         agents.append({"username": name, "account": None, "runs": [], "schedule": None,
                        "channels": {**_observed(name, now), "api_out": {"state": "unknown"},
                                     "mcp_out": {"state": "unknown"}, "local": {"state": "unknown"}}})

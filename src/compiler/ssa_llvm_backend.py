@@ -5776,6 +5776,14 @@ def _emit_repository_call_module(
                         and operation in _INTEGER_COMPARISON
                         else "double"
                     )
+                    # The logical templates are spelled over i1, as the scalar
+                    # lane already computes them.  Program: ``a.logical_not()``
+                    # on a bool tensor: the operand was converted to double
+                    # and fed to ``xor i1`` ("defined with type 'double' but
+                    # expected 'i1'", 2026-11-18, case 6393486c).  An operand in
+                    # another storage is coerced to its truth value.
+                    if operation in {"LAnd", "LOr", "LNot"}:
+                        compute_type = "i1"
                 # Program: ``(ep + t).sum()`` with ``ep`` (3, 2) and ``t``
                 # (2,) (scratch lit2r/c2).  Wrong record: every span operand
                 # was loaded at the result's flat index, so the (2,) row was

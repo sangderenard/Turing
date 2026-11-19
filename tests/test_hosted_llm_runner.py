@@ -271,6 +271,38 @@ def test_profile_context_rejects_contract_that_cannot_fit():
         raise AssertionError("oversized character contract was silently truncated")
 
 
+def test_both_model_callers_send_the_repetition_penalty(monkeypatch):
+    """Ticket 5166f79d: the runner, not only the server, must emit the sampler fields. A recording stub stands in
+    for llama-server's /v1/chat/completions; the chat reply and the profile run both go through LocalModel._complete."""
+    import io
+    import json
+
+    sent = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        assert request.full_url.endswith("/v1/chat/completions")
+        sent.append(json.loads(request.data.decode("utf-8")))
+        return Response(json.dumps({"choices": [{"message": {"content": " An answer. "}}]}).encode("utf-8"))
+
+    monkeypatch.setattr(runner.urllib.request, "urlopen", urlopen)
+    model = runner.LocalModel(Path("llama-server"), Path("base-model.gguf"), 11435, Path("logs"))
+    model.count_tokens = len
+    assert model.answer("agents", [{"id": 1, "username": "bob", "body": "hi"}]) == "An answer."
+    assert model.answer_profile({"preamble": "contract", "prompt": "job", "memory": ""}) == "An answer."
+    assert len(sent) == 2
+    for body, max_tokens in zip(sent, (160, 256)):
+        assert body["repeat_penalty"] == runner.REPEAT_PENALTY == 1.15
+        assert body["repeat_last_n"] == runner.REPEAT_LAST_N == 256
+        assert body["max_tokens"] == max_tokens and body["model"] == "base-model"
+
+
 def test_a_one_second_cycle_spaces_out_the_slow_checks():
     assert runner.POLL_SECONDS == 1
     assert runner.PROFILE_SECONDS >= 5 and runner.ROOM_LIST_SECONDS >= 30 and runner.MODE_SECONDS >= 10

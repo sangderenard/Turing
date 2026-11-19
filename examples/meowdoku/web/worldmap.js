@@ -1,4 +1,4 @@
-import { renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
+import { CHANNELS, renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
 // /worldmap.html: a compact repository world map.  Regions (folders) nest as a squarified treemap by bytes, rooms (files) are the
 // cells inside them, portals (cross-file references) are curves drawn only for the selected room.  Plain ES module, canvas 2D, no libraries;
 // everything is set with textContent / createElement, never innerHTML.  The layout functions at the top are pure and exported so Node can test them.
@@ -133,19 +133,52 @@ function startPage() {
     if (!S.map || !place || String(S.map.repo || "").split("/").pop().toLowerCase() !== String(place.repository || "").toLowerCase()) return -1;
     return S.map.rooms.findIndex((_, m) => roomPath(m) === place.path);
   };
+  function renderAgentMapEntities() {
+    const shelf = $("agent-map-entities");
+    shelf.replaceChildren();
+    if (!S.presence?.agents) return;
+    const places = new Map((S.presence.locations || []).map(place => [place.username, place]));
+    for (const agent of S.presence.agents) {
+      const place = places.get(agent.username), room = placeRoom(place);
+      const item = el(room >= 0 ? "button" : "span", null, "agent-map-entity");
+      for (const [key, label] of CHANNELS) {
+        const state = agent.channels?.[key]?.state || "unknown";
+        const lit = state === "active" || state === "recent";
+        const light = el("span", lit ? "■" : "□", lit ? "agent-map-light active" : "agent-map-light");
+        light.title = `${label}: ${state}${state === "recent" ? " (authenticated call in the last 30 seconds)" : ""}`;
+        item.append(light);
+      }
+      item.append(document.createTextNode(" " + agent.username));
+      if (room >= 0) {
+        item.type = "button";
+        item.title = `Last checkout file: ${place.repository}/${place.path}; click to find it`;
+        item.addEventListener("click", () => jumpTo(room));
+      } else {
+        item.title = place ? `Last checkout in ${place.repository}/${place.path}; absent from this map` : "Repository location unknown";
+        item.append(el("span", place ? " elsewhere" : " location unknown", "agent-map-where"));
+      }
+      item.setAttribute("aria-label", `${agent.username}; ${CHANNELS.map(([key, label]) => `${label}: ${agent.channels?.[key]?.state || "unknown"}`).join("; ")}; ${place ? `last checkout ${place.repository}/${place.path}` : "repository location unknown"}`);
+      shelf.append(item);
+    }
+  }
   async function loadPresence() {
     const box = $("agent-locations");
     try {
       const { status, body } = await getJson("/api/worldmap/presence");
-      if (status !== 200 || !body) { box.textContent = status === 403 ? "Developer access is required for agent activity." : `Agent activity unavailable (${status}).`; return; }
+      if (status !== 200 || !body) {
+        S.presence = null; renderAgentMapEntities(); draw();
+        box.textContent = status === 403 ? "Developer access is required for agent activity." : `Agent activity unavailable (${status}).`;
+        return;
+      }
       S.presence = body;
+      renderAgentMapEntities();
       renderAgentPresence(box, body, { locations: true, onLocation: place => {
         const m = placeRoom(place);
         if (m >= 0) jumpTo(m);
         else setStatus("That last checkout file is absent from this generated map or belongs to another repository.", true);
       }});
       draw();
-    } catch (_) { box.textContent = "Agent activity unavailable."; }
+    } catch (_) { S.presence = null; renderAgentMapEntities(); draw(); box.textContent = "Agent activity unavailable."; }
   }
   const setStatus = (text, bad) => { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : "mut"; };
 
@@ -181,7 +214,7 @@ function startPage() {
     $("stats").textContent = body.regions.length + " regions, " + body.rooms.length + " rooms, " + (body.portals || []).length + " portals, " +
       (body.unresolved_count || 0) + " unresolved, commit " + String(body.commit || "").slice(0, 8) + ", generated " + when;
     setStatus("");
-    relayout(); renderPanel(); draw(); loadPresence();
+    relayout(); renderPanel(); renderAgentMapEntities(); draw(); loadPresence();
   }
 
   function relayout() {
