@@ -15,12 +15,12 @@
   button { cursor:pointer; } button.link { border:0; background:none; padding:0; text-align:left; color:var(--acc); word-break:break-all; } button.crumb { padding:.1rem .4rem; }
   .layout { display:grid; grid-template-columns:minmax(0,1fr) 22rem; gap:1rem; align-items:start; }
   @media (max-width:800px) { .layout { grid-template-columns:minmax(0,1fr); } }
-  .stage { position:relative; background:var(--card); border:1px solid var(--line); border-radius:6px; overflow:hidden; } canvas { display:block; touch-action:none; }
-  .agent-map-shelf { position:absolute; right:.5rem; bottom:.5rem; max-width:min(25rem,80%); max-height:35%; overflow:auto; padding:.3rem .5rem; background:rgba(20,26,36,.94); border:1px solid #60728c; border-radius:6px; font-size:.75rem; }
+  .stage { background:var(--card); border:1px solid var(--line); border-radius:6px; overflow:hidden; } canvas { display:block; touch-action:none; }
+  .agent-map-shelf { max-height:10rem; overflow:auto; padding:.3rem .5rem; border-top:1px solid #60728c; font-size:.75rem; }
   .agent-map-shelf summary { cursor:pointer; font-weight:600; }
   #agent-map-entities { display:flex; flex-wrap:wrap; gap:.2rem .4rem; padding-top:.3rem; }
   .agent-map-entity { display:inline-flex; gap:.2rem; align-items:center; padding:.1rem .25rem; border:1px solid #505b70; border-radius:3px; background:#1d2531; white-space:nowrap; font-size:.75rem; }
-  .agent-map-entity button { cursor:pointer; } .agent-map-light.active { color:#9ce8af; } .agent-map-where { color:#b7c5d7; }
+  .agent-map-light.active { color:#9ce8af; } .agent-map-where { color:#b7c5d7; }
   #panel { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.5rem 1rem; max-height:78vh; overflow:auto; }
   .plist { list-style:none; margin:0; padding:0; } .plist li { padding:.15rem 0; border-bottom:1px solid var(--line); }
   .chip { display:inline-flex; align-items:center; gap:.3rem; margin-right:.7rem; font-size:.85rem; } .chip i { width:.8rem; height:.8rem; display:inline-block; border-radius:2px; }

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 AGENTS = {"claude": ("agents", 0), "codex": ("agents-codex", 20), "gemini": ("agents-gemini", 40)}
-# Hosted Llama has a SpeakToMe account but no Start-AgentDay scheduler slot.
+# Accounts with no Start-AgentDay slot: hosted Llama and the two app operators.
 UNSCHEDULED_AGENTS = ("llama", "operator-claude", "operator-codex")
 # Installed external API agents (external_agents.py, case 989e507e), read beside the accounts database at each snapshot.
 _external: dict[str, tuple[str, int]] = {}

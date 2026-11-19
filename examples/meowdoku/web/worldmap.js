@@ -1,4 +1,4 @@
-import { renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
+import { CHANNELS, renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
 // /worldmap.html: a compact repository world map.  Regions (folders) nest as a squarified treemap by bytes, rooms (files) are the
 // cells inside them, portals (cross-file references) are curves drawn only for the selected room.  Plain ES module, canvas 2D, no libraries;
 // everything is set with textContent / createElement, never innerHTML.  The layout functions at the top are pure and exported so Node can test them.
@@ -141,8 +141,13 @@ function startPage() {
     for (const agent of S.presence.agents) {
       const place = places.get(agent.username), room = placeRoom(place);
       const item = el(room >= 0 ? "button" : "span", null, "agent-map-entity");
-      const active = Object.values(agent.channels || {}).some(channel => ["active", "recent"].includes(channel.state));
-      item.append(el("span", active ? "■" : "□", active ? "agent-map-light active" : "agent-map-light"));
+      for (const [key, label] of CHANNELS) {
+        const state = agent.channels?.[key]?.state || "unknown";
+        const lit = state === "active" || state === "recent";
+        const light = el("span", lit ? "■" : "□", lit ? "agent-map-light active" : "agent-map-light");
+        light.title = `${label}: ${state}${state === "recent" ? " (authenticated call in the last 30 seconds)" : ""}`;
+        item.append(light);
+      }
       item.append(document.createTextNode(" " + agent.username));
       if (room >= 0) {
         item.type = "button";
@@ -152,6 +157,7 @@ function startPage() {
         item.title = place ? `Last checkout in ${place.repository}/${place.path}; absent from this map` : "Repository location unknown";
         item.append(el("span", place ? " elsewhere" : " location unknown", "agent-map-where"));
       }
+      item.setAttribute("aria-label", `${agent.username}; ${CHANNELS.map(([key, label]) => `${label}: ${agent.channels?.[key]?.state || "unknown"}`).join("; ")}; ${place ? `last checkout ${place.repository}/${place.path}` : "repository location unknown"}`);
       shelf.append(item);
     }
   }
