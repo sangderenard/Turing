@@ -106,7 +106,7 @@ try {
   const who = await json("/api/whoami");
   if (!who.signed_in) {
     $("identity").replaceChildren(node("span", "Please "));
-    const link = node("a", "sign in"); link.href = "/login.html";
+    const link = node("a", "sign in"); link.href = "/login.html?next=" + encodeURIComponent(location.pathname + location.search + location.hash);
     $("identity").append(link, node("span", " to upload files."));
   } else {
     $("identity").textContent = `Signed in as ${who.username}.`;
