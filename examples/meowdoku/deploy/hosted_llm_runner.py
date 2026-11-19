@@ -29,6 +29,7 @@ POLL_SECONDS = 1                 # owner, 2026-11-17: Llama on a 1 s cycle (dire
 PROFILE_SECONDS = 5               # queued agent runs are claimed at most this often
 ROOM_LIST_SECONDS = 30            # the rooms Llama is hosted in are listed again at most this often
 MODE_SECONDS = 10                 # a last-word setting is asked again at most this often
+CONTROL_SECONDS = 10              # operator enabled/goal changes reach the chat runner promptly
 QUIET_SECONDS = 12
 ROOM_SECONDS = 180
 MAX_ROOM_REPLIES = 3
@@ -146,6 +147,7 @@ class Guide:
 
     def __init__(self, rest):
         self.rest, self.orientation, self.memory, self.memory_id = rest, "", "", None
+        self.goal = ""
         self.read_at = self.flushed_at = 0.0
         self.pending = []
 
@@ -176,7 +178,8 @@ class Guide:
             pass
 
     def setting(self):
-        return (self.orientation or FALLBACK_SETTING) + "\n\n" + RUNNER_RULES
+        goal = "\n\nCurrent operator goal:\n" + self.goal if self.goal else ""
+        return (self.orientation or FALLBACK_SETTING) + goal + "\n\n" + RUNNER_RULES
 
     def remember(self, place, who, heard, said, now=None):
         stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() if now is None else now))
@@ -337,6 +340,28 @@ def run_profile_batch(rest, model, parallel, limit=16):
 
 
 _MODES = {}
+_CONTROLS = {}
+
+
+def controls(rest, username, now=None):
+    now = time.monotonic() if now is None else now
+    cached = _CONTROLS.get(username)
+    if cached is not None and now < cached[1]:
+        return cached[0]
+    value = rest.call(f"/api/hosted-agents/{key(username)}/controls")
+    _CONTROLS[username] = (value, now + CONTROL_SECONDS)
+    return value
+
+
+def apply_controls(model, guide, control):
+    """Keep the model process in the operator-selected state, including while idle."""
+    guide.goal = control["goal"]
+    if not control["enabled"]:
+        model.stop()
+        guide.flush()
+        return False
+    model.start()
+    return True
 
 
 def mode(rest, username, scope, place, now=None):
@@ -435,6 +460,13 @@ def run(args):
     username = os.environ.get("SPEAKTOME_USER")
     if not username:
         raise RuntimeError("SPEAKTOME_USER is required")
+    if os.name == "nt":
+        # The scheduled task can end this runner abruptly. Reuse the stack's kill-on-close
+        # Windows job so its llama.cpp child cannot outlive the task at stack shutdown.
+        from meowdoku.deploy.apache_supervisor import tie_children_to_this_process
+        bound = tie_children_to_this_process()
+        if "are tied" not in bound:
+            raise RuntimeError(bound)
     rest = Rest.from_env()
     db_path = Path(args.state_dir) / "hosted-llm.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -443,13 +475,20 @@ def run(args):
     guide = Guide(rest)
     model = LocalModel(Path(args.llama_server), Path(args.model), args.port, Path(args.state_dir) / "logs", args.batch_slots)
     try:
-        model.start()
         room = ""
         until = 0
         rooms, rooms_due, profiles_due = [], 0.0, 0.0
         while True:
             try:
                 tick = time.monotonic()
+                try:
+                    control = controls(rest, username, tick)
+                except (RestError, OSError, ValueError, KeyError):
+                    model.stop()  # the site went away: do not keep llama.cpp running outside the stack
+                    raise
+                if not apply_controls(model, guide, control):
+                    time.sleep(POLL_SECONDS)
+                    continue
                 if tick >= profiles_due:
                     profiles_due = tick + PROFILE_SECONDS
                     run_profile_batch(rest, model, args.batch_slots, args.batch_limit)

@@ -60,6 +60,7 @@ MAX_RESTARTS, RESTART_WINDOW = 5, 600.0
 START_TIMEOUT = {"meowdoku": 300.0, "nodus": 60.0}
 EXIT_RESTART = lifecycle_mod.EXIT_RESTART
 LOAN_CHECK_S = 10.0                                 # [LOAN] how often the branch loans are compared with the running loan instances
+HOSTED_CHECK_S = 30.0                               # on-demand tasks are kept running only while this supervisor owns the stack
 
 DDL = """
 CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT,
@@ -141,6 +142,15 @@ def instances_restart_account(path):
     if not isinstance(data, dict) or not isinstance(data.get("restart_account"), str) or not data["restart_account"]:
         return None, None
     return data["restart_account"], str(data.get("restart_account_display_name") or data["restart_account"])
+
+
+def instances_hosted_tasks(path):
+    """Windows tasks running isolated hosted agents, owned by this stack's lifecycle."""
+    data = _read_instances(path)
+    tasks = data.get("hosted_tasks", []) if isinstance(data, dict) else []
+    if not isinstance(tasks, list) or any(not isinstance(name, str) or not name for name in tasks):
+        raise ValueError("hosted_tasks must be a list of task names")
+    return tasks
 
 
 def instances_state_dir(path):
@@ -679,6 +689,19 @@ class Supervisor:
         self.restart_display = "the restart account"
         self.secrets_restricted = False
         self._lock_file = None
+        self.hosted_tasks = []
+
+    def task_action(self, action, *, quiet=False):
+        """Use the registered agent account task; never launch its model under Apache's identity."""
+        if os.name != "nt":
+            return
+        flag = "/Run" if action == "start" else "/End"
+        for name in self.hosted_tasks:
+            result = subprocess.run(["schtasks.exe", flag, "/TN", name], capture_output=True, text=True, timeout=35)
+            if result.returncode:
+                self.log(f"hosted task {name!r} {action} failed: {(result.stderr or result.stdout).strip()}")
+            elif not quiet:
+                self.log(f"hosted task {name!r} {action} requested")
 
     def log(self, text):
         line = time.strftime("%Y-%m-%d %H:%M:%S ") + f"[apache_supervisor] {text}"
@@ -763,6 +786,7 @@ class Supervisor:
         if manage:
             self.log(tie_children_to_this_process())       # [JOB] before the first instance starts
             specs = load_instances(self.instances_path)
+            self.hosted_tasks = instances_hosted_tasks(self.instances_path)
             self.system_events = instances_system_events(self.instances_path)
             account, display = instances_restart_account(self.instances_path)
             if account:
@@ -780,8 +804,12 @@ class Supervisor:
                 except Exception as error:
                     inst.state = "failed"
                     self.log(f"{inst.name}: start failed: {error!r}")
-            loans_due = 0.0
+            self.task_action("start")
+            loans_due, hosted_due = 0.0, time.monotonic() + HOSTED_CHECK_S
             while not self.stop.wait(1.0):
+                if time.monotonic() >= hosted_due:
+                    hosted_due = time.monotonic() + HOSTED_CHECK_S
+                    self.task_action("start", quiet=True)
                 if time.monotonic() >= loans_due:           # [LOAN] before the requests, so a loan's restart finds its instance
                     loans_due = time.monotonic() + LOAN_CHECK_S
                     try:
@@ -934,6 +962,7 @@ class Supervisor:
             instance_control.mark_announced(db, item["id"], 2 if cancelled else 1)
 
     def shutdown(self):
+        self.task_action("stop")
         self.log("stopping instances")
         for inst in self.instances:
             if inst.state in ("starting", "running", "backoff"):

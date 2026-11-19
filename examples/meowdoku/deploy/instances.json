@@ -6,6 +6,7 @@
   ],
   "restart_account": "svc-pale-horse",
   "restart_account_display_name": "Pale Horse",
+  "hosted_tasks": ["SpeakToMe hosted llama"],
   "instances": [
     {
       "name": "meowdoku-a",

@@ -1,5 +1,5 @@
 #Requires -Version 7
-# Register the isolated, continuously running Llama intern under its own Windows account.
+# Register the isolated Llama task under its own Windows account; Apache's supervisor owns when it runs.
 param([switch]$Register, [switch]$Status, [switch]$GrantRead, [switch]$Run)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AgentAccounts.psm1') -Force
@@ -61,15 +61,32 @@ if ($Register) {
     }
     $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') `
         -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$(Join-Path $PSScriptRoot 'Run-HostedLlm.ps1')`""
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
-        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
     $password = $credential.GetNetworkCredential().Password
     try {
-        Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Settings $settings `
+        Register-ScheduledTask -TaskName $task -Action $action -Settings $settings `
             -User "$env:COMPUTERNAME\$account" -Password $password -Force | Out-Null
     } finally { $password = $null }
-    Write-Host "Registered $task to run as $account at boot and restart on failure."
+    # Apache's piped-log supervisor owns stack startup/shutdown. Give only its Windows service account
+    # read+execute on this task, so it can Run/Stop the isolated agent without its password.
+    $apacheSid = (Get-LocalUser -Name 'svc-meowdoku').SID
+    $schedule = New-Object -ComObject 'Schedule.Service'
+    $schedule.Connect()
+    $registered = $schedule.GetFolder('\').GetTask($task)
+    $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($registered.GetSecurityDescriptor(4))
+    $mask = 0x1200a9
+    $allowed = @($descriptor.DiscretionaryAcl | Where-Object {
+        $_.SecurityIdentifier -eq $apacheSid -and $_.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed -and
+        ($_.AccessMask -band $mask) -eq $mask
+    })
+    if (-not $allowed) {
+        $ace = [System.Security.AccessControl.CommonAce]::new(
+            [System.Security.AccessControl.AceFlags]::None,
+            [System.Security.AccessControl.AceQualifier]::AccessAllowed, $mask, $apacheSid, $false, $null)
+        $descriptor.DiscretionaryAcl.InsertAce(0, $ace)
+        $registered.SetSecurityDescriptor($descriptor.GetSddlForm([System.Security.AccessControl.AccessControlSections]::Access), 0)
+    }
+    Write-Host "Registered $task for $account and allowed svc-meowdoku to start and stop it with the stack."
     exit 0
 }
 if ($Run) {
