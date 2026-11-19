@@ -22,6 +22,7 @@ UNSCHEDULED_AGENTS = ("llama", "operator-claude", "operator-codex")
 _external: dict[str, tuple[str, int]] = {}
 RECENT_SECONDS = 30
 REQUEST_CHANNELS = ("api_in", "mcp_in")
+OUTBOUND_CHANNELS = ("api_out", "mcp_out")
 _lock = threading.Lock()
 _recent: dict[tuple[str, str], float] = {}
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9_./-]{1,400}$")
@@ -52,11 +53,21 @@ def note_inbound(username: str, *, mcp: bool, now: float | None = None) -> None:
         _recent[(username, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
 
 
+def note_outbound(username: str, channel: str, *, now: float | None = None) -> bool:
+    """Record a bounded observation from an authenticated agent's real client call site."""
+    if channel not in OUTBOUND_CHANNELS or (username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS):
+        return False
+    with _lock:
+        _recent[(username, channel)] = time.time() if now is None else now
+    return True
+
+
 def _observed(username: str, now: float) -> dict:
     with _lock:
-        recent = {channel: _recent.get((username, channel)) for channel in REQUEST_CHANNELS}
-    return {channel: {"state": "recent" if at is not None and 0 <= now - at <= RECENT_SECONDS else "unobserved",
-                      "at": at} for channel, at in recent.items()}
+        recent = {channel: _recent.get((username, channel)) for channel in (*REQUEST_CHANNELS, *OUTBOUND_CHANNELS)}
+    return {channel: {"state": "recent" if at is not None and 0 <= now - at <= RECENT_SECONDS else
+                      "unknown" if at is None and channel in OUTBOUND_CHANNELS else "unobserved", "at": at}
+            for channel, at in recent.items()}
 
 
 def _stamp(value) -> float | None:
@@ -167,13 +178,11 @@ def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | Non
     agents = []
     for name, (account, minute) in known.items():
         runs = records[name]
-        channels = {"api_in": _observed(name, now)["api_in"], "mcp_in": _observed(name, now)["mcp_in"],
-                    "api_out": {"state": "unknown"}, "mcp_out": {"state": "unknown"},
+        channels = {**_observed(name, now),
                     "local": {"state": "active" if runs else "unobserved" if records_available else "unknown", "since": min((r["started"] for r in runs), default=None)}}
         agents.append({"username": name, "account": account, "runs": runs, "schedule": _schedule(days, name, minute, now), "channels": channels})
     for name in UNSCHEDULED_AGENTS:
         agents.append({"username": name, "account": None, "runs": [], "schedule": None,
-                       "channels": {**_observed(name, now), "api_out": {"state": "unknown"},
-                                    "mcp_out": {"state": "unknown"}, "local": {"state": "unknown"}}})
+                       "channels": {**_observed(name, now), "local": {"state": "unknown"}}})
     return {"as_of": now, "agents": agents, "locations": checkout_locations(accounts_db, now),
-            "note": "Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound channels have no shared observation source."}
+            "note": "Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound lights come only from instrumented agent call sites; unknown means this server has no such observation."}

@@ -83,6 +83,18 @@ def test_hosted_and_app_agents_have_truthful_unscheduled_badges(tmp_path):
         assert by_name[name]["channels"]["api_out"]["state"] == "unknown"
 
 
+def test_outbound_requires_known_agent_and_real_channel():
+    with presence._lock:
+        presence._recent.clear()
+    assert presence._observed("codex", 100)["api_out"]["state"] == "unknown"
+    assert not presence.note_outbound("random-user", "api_out", now=100)
+    assert not presence.note_outbound("codex", "api_in", now=100)
+    assert presence.note_outbound("codex", "api_out", now=100)
+    assert presence._observed("codex", 129)["api_out"] == {"state": "recent", "at": 100}
+    assert presence._observed("codex", 131)["api_out"]["state"] == "unobserved"
+    assert presence._observed("codex", 100)["mcp_out"]["state"] == "unknown"
+
+
 def test_inbound_is_recent_only(monkeypatch):
     with presence._lock:
         presence._recent.clear()

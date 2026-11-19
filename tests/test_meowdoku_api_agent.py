@@ -134,8 +134,11 @@ class Opener:
                                                     ("anthropic", "X-api-key", "sk-secret")])
 def test_key_only_in_its_header(provider, header, value):
     opener = Opener()
-    call = agent.caller_for(provider, agent.check_base_url(provider, None), "sk-secret", opener)
+    observed = []
+    call = agent.caller_for(provider, agent.check_base_url(provider, None), "sk-secret", opener,
+                            on_request=lambda channel: observed.append(channel))
     assert agent.check(call, provider) == 2
+    assert observed == ["api_out"]
     request = opener.requests[0]
     assert request.get_header(header) == value
     assert "sk-secret" not in request.full_url

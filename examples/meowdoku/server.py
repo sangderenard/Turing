@@ -2822,6 +2822,22 @@ def make_handler(sessions: Sessions):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        def _worldmap_outbound_post(self) -> None:
+            # A signed-in agent reports only the channel. Identity and time come from the server.
+            if not self._require("dev_ui"):
+                return
+            if self.headers.get("Sec-Fetch-Site") == "cross-site" or self.headers.get("X-Meowdoku-Activity") != "1":
+                return self._json({"error": "activity header or same-origin request required"}, HTTPStatus.FORBIDDEN)
+            body = self._body_json(256)
+            if body is None:
+                return
+            if set(body) != {"channel"} or body["channel"] not in agent_presence_mod.OUTBOUND_CHANNELS:
+                return self._json({"error": "invalid outbound channel"}, HTTPStatus.BAD_REQUEST)
+            username = self._principal().username
+            agent_presence_mod.known_agents(sessions.accounts_db)
+            if not agent_presence_mod.note_outbound(username, body["channel"]):
+                return self._json({"error": "agent account required"}, HTTPStatus.FORBIDDEN)
+            return self._json({"ok": True})
         # ---- end [WORLDMAP]
 
         # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
@@ -4451,6 +4467,8 @@ def make_handler(sessions: Sessions):
                          "/api/agent-workspace/decisions/at", "/api/agent-workspace/guidance",
                          "/api/agent-workspace/session"):
                 return self._agent_workspace_route(path0, "POST")
+            if path0 == "/api/worldmap/presence/outbound":
+                return self._worldmap_outbound_post()
             if path0 == "/api/scratch":
                 return self._scratch_route(path0, "POST")
             if path0 == "/api/memory":

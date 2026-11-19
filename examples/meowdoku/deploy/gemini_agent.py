@@ -79,7 +79,18 @@ def read_key(path: str) -> str:
 
 
 # ---------------------------------------------------------------- Gemini over HTTPS
-def gemini_caller(key: str, opener=None, timeout: float = 120):
+def report_activity(rest, channel: str) -> None:
+    """Best-effort, content-free observation at a real client call site."""
+    if rest is None:
+        return
+    try:
+        rest.call("/api/worldmap/presence/outbound", {"channel": channel}, timeout=2,
+                  headers={"X-Meowdoku-Activity": "1"})
+    except Exception:
+        pass  # Telemetry cannot change the provider or MCP call's result.
+
+
+def gemini_caller(key: str, opener=None, timeout: float = 120, on_request=None):
     """A function (method, path, body) -> answer that sends the key only in the x-goog-api-key header."""
     opener = opener or urllib.request.build_opener()
 
@@ -98,6 +109,9 @@ def gemini_caller(key: str, opener=None, timeout: float = 120):
             raise AgentError(f"Gemini refused ({error.code}): {detail or error.reason}") from None
         except urllib.error.URLError as error:
             raise AgentError(f"cannot reach Gemini: {error.reason}") from None
+        finally:
+            if on_request:
+                on_request("api_out")
 
     return call
 
@@ -155,8 +169,8 @@ def arguments_for(tool: dict, given: dict) -> dict:
 class SpeakToMe:
     """The speaktome MCP's tool table, called in process through its own JSON-RPC handler."""
 
-    def __init__(self, server):
-        self.server, self.next_id = server, 0
+    def __init__(self, server, on_call=None):
+        self.server, self.next_id, self.on_call = server, 0, on_call
         started = self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                                            "clientInfo": {"name": "gemini_agent", "version": "1"}})
         self.instructions = started.get("instructions", "")
@@ -170,7 +184,11 @@ class SpeakToMe:
         return answer["result"]
 
     def call(self, name: str, arguments: dict) -> dict:
-        done = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        try:
+            done = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        finally:
+            if self.on_call:
+                self.on_call("mcp_out")
         texts = [part.get("text", "") for part in done.get("content", []) if part.get("type") == "text"]
         try:
             result = json.loads(texts[0]) if texts else {}
@@ -261,7 +279,9 @@ def main(argv=None) -> int:
         print(line, file=sys.stderr, flush=True)
 
     try:
-        call = gemini_caller(read_key(args.key_file))
+        activity_rest = [None]
+        observe = lambda channel: report_activity(activity_rest[0], channel)
+        call = gemini_caller(read_key(args.key_file), on_request=observe)
         if args.list_models:
             listed = call("GET", "/models?pageSize=200")
             for model in listed.get("models", []):
@@ -283,7 +303,8 @@ def main(argv=None) -> int:
         except ImportError:
             raise AgentError("speaktome_mcp is not importable: put the speaktome checkout on PYTHONPATH", 2) from None
         try:
-            world = SpeakToMe(ApiServer(Rest.from_env()))
+            activity_rest[0] = Rest.from_env()
+            world = SpeakToMe(ApiServer(activity_rest[0]), on_call=observe)
         except RestError as error:
             raise AgentError(f"speaktome: {error.message}", 2) from None
         reply, calls = run(world, call, args.model, prompt, room=args.room, tail=args.tail,

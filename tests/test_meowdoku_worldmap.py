@@ -18,6 +18,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 from meowdoku import authz  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
 from meowdoku import worldmap as wm  # noqa: E402
+from meowdoku import agent_presence as presence  # noqa: E402
 
 PASSWORD = "correct horse 12"
 OUTSIDE = {"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https", "Host": "cats.example.org"}
@@ -102,6 +103,26 @@ def test_dev_gets_index_and_map(server):
     snapshot = json.loads(body)
     assert {agent["username"] for agent in snapshot["agents"]} >= {"claude", "codex", "gemini"}
     assert all(agent["channels"]["api_out"]["state"] == "unknown" for agent in snapshot["agents"])
+
+
+def test_outbound_observation_uses_authenticated_agent_identity(server):
+    with presence._lock:
+        presence._recent.clear()
+    path = "/api/worldmap/presence/outbound"
+    member = _cookie(server, "member-outbound", "member")
+    assert _call(server.port, path, "POST", {**member, "X-Meowdoku-Activity": "1"}, {"channel": "api_out"})[0] == 403
+    operator = _cookie(server, "operator-outbound", "operator")
+    assert _call(server.port, path, "POST", {**operator, "X-Meowdoku-Activity": "1"}, {"channel": "api_out"})[0] == 403
+    agent = _cookie(server, "codex", "dev")
+    assert _call(server.port, path, "POST", agent, {"channel": "api_out"})[0] == 403
+    headers = {**agent, "X-Meowdoku-Activity": "1"}
+    assert _call(server.port, path, "POST", headers, {"channel": "api_out", "username": "claude"})[0] == 400
+    assert _call(server.port, path, "POST", headers, {"channel": "mcp_out"})[0] == 200
+    status, _, snapshot = _call(server.port, "/api/worldmap/presence", headers=agent)
+    assert status == 200
+    by_name = {row["username"]: row for row in snapshot["agents"]}
+    assert by_name["codex"]["channels"]["mcp_out"]["state"] == "recent"
+    assert by_name["claude"]["channels"]["mcp_out"]["state"] == "unknown"
 
 
 def test_gzip_honoured(server):

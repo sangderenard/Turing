@@ -105,6 +105,18 @@ def test_no_text_is_an_error():
         agent.run(World(), call, "m", "p")
 
 
+def test_activity_report_is_content_free_and_nonfatal():
+    class Rest:
+        def __init__(self): self.calls = []
+        def call(self, path, body, **kwargs):
+            self.calls.append((path, body, kwargs))
+            raise RuntimeError("telemetry unavailable")
+    rest = Rest()
+    agent.report_activity(rest, "mcp_out")
+    assert rest.calls == [("/api/worldmap/presence/outbound", {"channel": "mcp_out"},
+                           {"timeout": 2, "headers": {"X-Meowdoku-Activity": "1"}})]
+
+
 def test_the_key_goes_only_in_its_header():
     seen = {}
 
@@ -113,7 +125,10 @@ def test_the_key_goes_only_in_its_header():
             seen["url"], seen["headers"] = request.full_url, dict(request.header_items())
             return io.BytesIO(json.dumps({"models": []}).encode("utf-8"))
 
-    agent.gemini_caller("secret-key-123", opener=Opener())("GET", "/models?pageSize=200")
+    observed = []
+    agent.gemini_caller("secret-key-123", opener=Opener(),
+                        on_request=lambda channel: observed.append(channel))("GET", "/models?pageSize=200")
+    assert observed == ["api_out"]
     assert "secret-key-123" not in seen["url"]
     assert seen["headers"].get("X-goog-api-key") == "secret-key-123"
 
