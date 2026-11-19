@@ -3568,7 +3568,7 @@ def make_handler(sessions: Sessions):
             if path == "/api/palette":
                 from meowdoku import palette_feedback
                 return palette_feedback.route(self, path, "GET", accounts_db=sessions.accounts_db)
-            if path.startswith("/api/hosted-agents/") and path.endswith("/last-word"):
+            if path.startswith("/api/hosted-agents/") and path.endswith(("/last-word", "/controls")):
                 from meowdoku import hosted_agent_modes
                 return hosted_agent_modes.http_route(self, path, "GET", accounts_db=sessions.accounts_db)
             if path == "/api/pages" or path.startswith("/api/pages/") or path.startswith("/p/") or path.startswith("/site/programs/"):
@@ -4263,7 +4263,7 @@ def make_handler(sessions: Sessions):
             if path0 in ("/api/palette/rank", "/api/palette/feedback"):
                 from meowdoku import palette_feedback
                 return palette_feedback.route(self, path0, "POST", accounts_db=sessions.accounts_db)
-            if path0.startswith("/api/hosted-agents/") and path0.endswith("/last-word"):
+            if path0.startswith("/api/hosted-agents/") and path0.endswith(("/last-word", "/controls")):
                 from meowdoku import hosted_agent_modes
                 return hosted_agent_modes.http_route(self, path0, "POST", accounts_db=sessions.accounts_db)
             if path0 == "/api/pages" or path0.startswith("/api/pages/"):

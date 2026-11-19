@@ -34,3 +34,18 @@ def test_last_word_scope_precedence_and_actor_gate(tmp_path):
         modes.set_mode(db, agent_id=2, actor_id=1, actor_role="operator",
                        scope="global", key="", mode="inherit")
     db.close()
+
+
+def test_general_controls_default_goal_and_operator_gate(tmp_path):
+    db = sqlite3.connect(tmp_path / "accounts.db", isolation_level=None)
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE)")
+    db.executemany("INSERT INTO users(id,username) VALUES(?,?)", [(1, "boss"), (2, "llama")])
+    assert modes.controls(db, 2) == {"enabled": True, "goal": ""}
+    with pytest.raises(modes.ModeError, match="operator or admin"):
+        modes.set_controls(db, agent_id=2, actor_id=2, actor_role="member", enabled=False, goal="Pause")
+    assert modes.set_controls(db, agent_id=2, actor_id=1, actor_role="operator", enabled=False,
+                              goal="Help with the current project") == {"enabled": False, "goal": "Help with the current project"}
+    assert db.execute("SELECT count(*) FROM hosted_agent_control_audit").fetchone()[0] == 1
+    with pytest.raises(modes.ModeError, match="enabled must be boolean"):
+        modes.set_controls(db, agent_id=2, actor_id=1, actor_role="operator", enabled="yes", goal="")
+    db.close()
