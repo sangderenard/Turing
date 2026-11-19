@@ -6,6 +6,15 @@ account_content_groups never enter this calculation.
 """
 import sqlite3
 import time
+from pathlib import Path
+
+try:
+    from meowdoku import agent_execution
+except ImportError:  # authz.py also runs directly for deployment script authorization
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("meowdoku_agent_execution", Path(__file__).with_name("agent_execution.py"))
+    agent_execution = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(agent_execution)
 
 
 RANKS = {"member": 10, "dev": 20, "operator": 30, "admin": 40}
@@ -85,7 +94,6 @@ def authority(db, user_id):
     highest = max(direct, key=RANKS.__getitem__)
     groups = [name for name in ORDER if RANKS[name] <= RANKS[highest]]
     nodus = db.execute("SELECT 1 FROM account_nodus_grants WHERE user_id=?", (user_id,)).fetchone() is not None
-    from meowdoku import agent_execution
     name = db.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()[0]
     db_path = db.execute("PRAGMA database_list").fetchone()[2]
     execution_group = agent_execution.server_owned(db_path, name) and modifiers.get("execution", True)
@@ -107,7 +115,6 @@ def set_grant(db, actor_id, user_id, group_name, enabled):
     if group_name == "message":
         return set_modifier(db, actor_id, user_id, group_name, enabled)
     if group_name == "execution":
-        from meowdoku import agent_execution
         name = db.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()[0]
         db_path = db.execute("PRAGMA database_list").fetchone()[2]
         if not agent_execution.server_owned(db_path, name):
