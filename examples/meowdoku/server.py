@@ -3660,6 +3660,9 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/radio/jukebox":
                 return self._radio_jukebox("GET")
+            if path == "/api/radio/uploads":
+                from meowdoku.radio_upload_assets import route
+                return route(self, sessions, "GET")
             if path == "/api/radio/suno/assets":
                 from meowdoku.suno_radio_assets import route
                 return route(self, sessions, path, "GET")
@@ -4270,6 +4273,9 @@ def make_handler(sessions: Sessions):
                 return self._pages_route(path0, "POST")
             if path0 == "/api/radio/jukebox":
                 return self._radio_jukebox("POST")
+            if path0 == "/api/radio/uploads":
+                from meowdoku.radio_upload_assets import route
+                return route(self, sessions, "POST")
             if path0 == "/api/radio/suno/import":
                 from meowdoku.suno_radio_assets import route
                 return route(self, sessions, path0, "POST")

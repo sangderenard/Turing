@@ -279,6 +279,43 @@ function mountRadio(wrap, host, canControl = false) {
   let jukeboxBusy = false, currentPlay = null;
   request.disabled = vote.disabled = true;
   panel.append(queueStatus, search, songs, request, rating, vote, queue, charts);
+  const uploadFile = el("input", {type: "file", accept: ".flac,audio/flac", "aria-label": "FLAC master to add to the jukebox"});
+  const uploadTitle = el("input", {type: "text", maxlength: "200", placeholder: "Track title", "aria-label": "Jukebox track title"});
+  const uploadButton = el("button", {class: "chip", type: "button", text: "Upload FLAC to jukebox"});
+  const uploadStatus = el("p", {role: "status", text: "Choose a FLAC master to offer to the shared jukebox. Upload requires the server Radio codec to be configured."});
+  uploadFile.addEventListener("change", () => {
+    if (uploadFile.files?.[0] && !uploadTitle.value.trim()) uploadTitle.value = uploadFile.files[0].name.replace(/\.flac$/i, "");
+  });
+  uploadButton.addEventListener("click", async () => {
+    const file = uploadFile.files?.[0], name = uploadTitle.value.trim();
+    if (!file || !/\.flac$/i.test(file.name) || !name || name.length > 200) {
+      uploadStatus.textContent = "Choose a FLAC file and enter a track title.";
+      return;
+    }
+    if (file.size < 42 || file.size > 256 * 1024 * 1024) {
+      uploadStatus.textContent = "FLAC must be between 42 bytes and 256 MiB.";
+      return;
+    }
+    uploadButton.disabled = true;
+    uploadStatus.textContent = "Uploading " + file.name + "…";
+    try {
+      const response = await fetch("/api/radio/uploads?title=" + encodeURIComponent(name), {
+        method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "audio/flac", "X-Meowdoku-Radio": "1"}, body: file
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Radio upload failed");
+      uploadStatus.textContent = "Added " + data.title + " to the jukebox · SHA-256 " + data.sha256;
+      uploadFile.value = "";
+      const latest = await getJson("/api/radio/jukebox");
+      if (!panel.hidden) showJukebox(latest);
+    } catch (error) {
+      uploadStatus.textContent = String(error.message || error);
+    } finally {
+      uploadButton.disabled = false;
+    }
+  });
+  panel.append(el("strong", {text: "Add a lossless track"}), uploadFile, uploadTitle, uploadButton, uploadStatus);
   let availableSongs = [];
   function filterSongs() {
     const selected = songs.value;

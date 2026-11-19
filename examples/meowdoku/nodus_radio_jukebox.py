@@ -60,6 +60,8 @@ class Jukebox:
             if self.state is not None:
                 from meowdoku.suno_radio_assets import station_catalogue
                 result.update(station_catalogue(self.state, self.db_path))
+                from meowdoku.radio_upload_assets import station_catalogue as uploaded_catalogue
+                result.update(uploaded_catalogue(self.state, self.db_path))
             return result
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             raise ControlError('Radio song catalogue is not configured', 503)
