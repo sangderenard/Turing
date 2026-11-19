@@ -8014,8 +8014,9 @@ def _build_shell_hierarchy_plan(
                         dtype = parent_dtypes[0]
                 # DomainNode historically pads scalars with unit axes. If it
                 # says scalar but a canonical tensor op consumes a shaped
-                # tensor, carry that shape through.
-                if operation in {
+                # tensor, carry that shape through.  The unary elementwise
+                # vocabulary is the one table, _ELEMENTWISE_UNARY_OPERATIONS.
+                if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
                     "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
                     "floor", "ceil", "isfinite", "isnan", "isinf",
                     "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
@@ -27254,6 +27255,32 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "bitand", "bitor", "bitxor", "shl", "shr",
 })
 
+#: The unary elementwise operations: one result element per operand element,
+#: so the result keeps its operand's shape. This is the unary vocabulary the
+#: DomainNode carry-shape rule already lists. The two tensor-descriptor sites
+#: (``_tensor_descriptor_rule`` and ``_fold_callsite_structural_values``) each
+#: kept a hand-written subset of it (neg, abs, sin, cos, tan, exp, log, sqrt,
+#: tanh), so round, floor, sign, the inverse and hyperbolic functions, invert,
+#: logical_not and the finiteness predicates got no descriptor: their result's
+#: physical span was never posted and the final concordance refused "elementwise
+#: span input has no matching physical span result" (2026-11-18, case 6393486c).
+_ELEMENTWISE_UNARY_OPERATIONS = frozenset({
+    "neg", "abs", "sqrt", "exp", "log", "round", "trunc", "floor", "ceil",
+    "sign", "tanh", "sin", "cos", "tan", "asin", "acos", "atan", "sinh",
+    "cosh", "asinh", "acosh", "atanh", "invert", "logical_not",
+    "isfinite", "isnan", "isinf",
+    # The activations: one result element per operand element, float.
+    # Absent here, ``a.sigmoid()`` and ``a.log_softmax(dim=-1)`` carried no
+    # dtype and refused "has no settled dtype" (2026-11-18, case 6393486c).
+    "sigmoid", "softmax", "log_softmax",
+})
+
+#: The unary elementwise operations whose result is a truth value: the operand's
+#: shape, but the dtype is bool (the unary counterpart of the predicates below).
+_ELEMENTWISE_UNARY_PREDICATE_OPERATIONS = frozenset({
+    "logical_not", "isfinite", "isnan", "isinf",
+})
+
 #: The elementwise binary operations whose result is a truth value.
 _ELEMENTWISE_PREDICATE_OPERATIONS = frozenset({
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
@@ -30768,9 +30795,8 @@ def _tensor_descriptor_rule(
                     if selected_dtype is not None:
                         return {**normalized, "dtype": selected_dtype}
                     return normalized
-        if operation in {
-            "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
-            "tanh", "clone", "copy", "identity", "real", "imag", "conj",
+        if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
+            "clone", "copy", "identity", "real", "imag", "conj",
             # A prefix scan is not a reduction: it emits one element per
             # input element, so it keeps its operand's shape exactly.  With
             # no rule here it answered nothing, its result was never proven,
@@ -30790,7 +30816,13 @@ def _tensor_descriptor_rule(
                 and int(parent) in graph.G
             )
             if len(parents) == 1:
-                return _tensor_descriptor(graph, parents[0], seen)
+                inherited = _tensor_descriptor(graph, parents[0], seen)
+                if (
+                    inherited is not None
+                    and operation in _ELEMENTWISE_UNARY_PREDICATE_OPERATIONS
+                ):
+                    return {**inherited, "dtype": "bool"}
+                return inherited
         if operation == "cast_like":
             # ``value.cast_like(reference)`` keeps the VALUE's extents and
             # takes the REFERENCE's dtype.  Neither operand is optional: with
@@ -34599,9 +34631,9 @@ def _fold_callsite_structural_values(
                     )
                 )
                 and (
-                    operation in {
-                        "neg", "abs", "sin", "cos", "tan", "exp", "log",
-                        "sqrt", "tanh", "clone", "copy", "identity", "indexedstore",
+                    operation in _ELEMENTWISE_UNARY_OPERATIONS
+                    or operation in {
+                        "clone", "copy", "identity", "indexedstore",
                         "index_set", "setitem", "indexed", "getitem",
                         "subscript", "real", "imag", "conj",
                     }

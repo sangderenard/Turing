@@ -3007,6 +3007,41 @@ def _int64_binary_kernel(
     )
 
 
+_FLOAT_KERNEL_DTYPES = frozenset({
+    "float64", "f64", "double", "float", "float32", "f32", "float16", "f16",
+})
+
+
+def _reference_kernel_lacks_dtype(
+    operation: str, result: Any, operands: Any, *, owner: Any, book: Any,
+) -> bool:
+    """Whether no repository reference kernel has this elementwise op's dtype.
+
+    The reference's elementwise kernels are double kernels (``binary_double``,
+    ``unary_double``); the only other is ``binary_int64`` for int64
+    add/sub/mul/mod (``_int64_binary_kernel``).  Program: ``a & b`` and
+    ``a << b`` on int64 tensors, ``a < b`` (a bool result) and ``a & b`` on
+    bool tensors.  Wrong record: the op name alone selected ``binary_double``,
+    the int64 lanes came back as double bit patterns (1 as 4607182418800017408)
+    and the bool results were stored eight bytes wide (2026-11-18, case
+    6393486c).  Rule: the kernel's dtype is part of its identity.  A double
+    kernel stands for the op only when its result and every data operand are
+    float; otherwise (and outside the int64 kernel) the op stays the
+    instruction itself, which each backend's elementwise span loop spells on
+    its own dtype, as int64 neg/abs already do.
+    """
+
+    operands = list(operands or ())
+    if all(
+        str(value.dtype or "").casefold() in _FLOAT_KERNEL_DTYPES
+        for value in (result, *operands)
+    ):
+        return False
+    return not _int64_binary_kernel(
+        operation, result, operands, owner=owner, book=book,
+    )
+
+
 def _int64_lane_stays_elementwise(
     instruction: Any, operation: str, result: Any, operands: Any,
     *, owner: Any, book: Any,
@@ -12346,6 +12381,13 @@ def lower_tensor_calls_to_repository_ssa(
                                 book=_opcode_book,
                                 physical={
                                     "physical_dtype": (
+                                        str(result.dtype) if _reference_kernel_lacks_dtype(
+                                            operation, result, data_args,
+                                            owner=_opcode_owner, book=_opcode_book,
+                                        ) and not _int64_lane_stays_elementwise(
+                                            instruction, operation, result, data_args,
+                                            owner=_opcode_owner, book=_opcode_book,
+                                        ) else
                                         "int64" if _int64_lane_stays_elementwise(
                                             instruction, operation, result, data_args,
                                             owner=_opcode_owner, book=_opcode_book,
@@ -12441,9 +12483,18 @@ def lower_tensor_calls_to_repository_ssa(
                 # before any descriptor is created.  Doing this only while
                 # constructing the eventual Call is too late: byte_size has
                 # already been frozen as one byte per semantic bool.
+                _stays_instruction = (
+                    opcode_contract is not None
+                    and lowering_at[0] is not None
+                    and _reference_kernel_lacks_dtype(
+                        operation, result, data_args,
+                        owner=lowering_at[0], book=identity_book(module),
+                    )
+                )
                 for value in (*data_args, result):
                     if (
-                        tuple(value.shape or ())
+                        not _stays_instruction
+                        and tuple(value.shape or ())
                         and str(value.dtype or "").casefold() in {"bool", "i1"}
                     ):
                         _post_double_backed_boolean(
@@ -15059,6 +15110,25 @@ def lower_tensor_calls_to_repository_ssa(
                     )
 
                 elif operation == "stack" and data_args:
+                    # Program: ``AbstractTensor.stack([a, b], dim=0)``.  As for
+                    # ``cat`` below, the region carve passes ``dim`` as a
+                    # trailing integer scalar formal, so it sat in
+                    # ``data_args``, failed the equal-shape test and left
+                    # ``stack`` unlowered (2026-11-18, case 6393486c).  Stack
+                    # (unlike cat) accepts 0-d operands, so the trailing
+                    # operand is the axis only when it is a 0-d integer and
+                    # every other operand is a shaped tensor of one shape.
+                    if len(data_args) > 1:
+                        *stacked, trailing = data_args
+                        stacked_shapes = {tuple(value.shape or ()) for value in stacked}
+                        if (
+                            tuple(trailing.shape or ()) == ()
+                            and str(trailing.dtype or "").startswith(("int", "uint"))
+                            and len(stacked_shapes) == 1
+                            and next(iter(stacked_shapes)) != ()
+                        ):
+                            data_args = list(stacked)
+                            source = data_args[0]
                     operand_shape = tuple(source.shape or ())
                     statically_known = (
                         bool(operand_shape)
@@ -15680,6 +15750,21 @@ def lower_tensor_calls_to_repository_ssa(
                         post_unary_geometry(operation, source, result, unary_geometry)
                         if private_dynamic_result(result):
                             own_dynamic_tensor(result, unary_geometry[0][2], "int64", prefix)
+                    rewritten.extend(prefix)
+                    rewritten.append(instruction)
+                    continue
+
+                elif (
+                    c_tensor_opcode(operation) is not None
+                    and source is not None
+                    and _reference_kernel_lacks_dtype(
+                        operation, result, data_args, owner=function, book=book,
+                    )
+                ):
+                    # The op stays the instruction itself: no reference kernel
+                    # has its dtype (``_reference_kernel_lacks_dtype``).
+                    if unary_geometry is not None:
+                        post_unary_geometry(operation, source, result, unary_geometry)
                     rewritten.extend(prefix)
                     rewritten.append(instruction)
                     continue
