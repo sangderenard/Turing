@@ -34,6 +34,9 @@ class NativeTrack:
                 str(c['spectrum_port']), '0', '5', '1024', self.song['path'],
                 '0', str(c['pcm_port']), '1']
         environment = dict(os.environ, SDL_AUDIODRIVER='dummy')
+        dll_dirs = c.get('codec', {}).get('dll_dirs', [])
+        if dll_dirs:
+            environment['PATH'] = os.pathsep.join(dll_dirs) + os.pathsep + environment.get('PATH', '')
         if c.get('hls_env'):
             from meowdoku import nodus_radio_hls
             nodus_radio_hls.clear_output(c['hls_state'])
