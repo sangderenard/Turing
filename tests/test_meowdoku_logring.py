@@ -89,6 +89,41 @@ def test_persistence_survives_restart(tmp_path):
     assert b.seq == 10 and b.add("after") == 11 and len(b.fetch(0)["entries"]) == 11
 
 
+def test_bad_persisted_lines_are_skipped_not_fatal(tmp_path):
+    """Ticket f62934c8: one cut-off or corrupt line must not stop the server from starting."""
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    for i in range(5):
+        a.add(f"n{i}")
+    good = p.read_bytes()
+    cut = a.cipher.seal(b'{"seq": 6, "ts": 1.0, "src": "server", "text": "n5"}')[:30]   # an append cut off by a kill
+    p.write_bytes(good + b"enc:v1:not-a-token\n" + cut)
+    found = p.read_bytes()
+    b = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    texts = [e["text"] for e in b.fetch(0)["entries"]]
+    assert texts[:5] == [f"n{i}" for i in range(5)]
+    assert texts[5].startswith("[logring] skipped 2 unreadable line(s)") and b.seq == 6
+    evidence = list(tmp_path.glob("ring.jsonl.bad-*"))
+    assert len(evidence) == 1 and evidence[0].read_bytes() == found          # the file as found is kept
+    assert not list(tmp_path.glob("ring.jsonl.rewrite-*"))                    # no temporary left behind
+    c = L.Ring(cap_bytes=5000, path=p, key_path=key)                          # the rewritten ring reloads clean
+    assert [e["text"] for e in c.fetch(0)["entries"]] == texts
+    assert len(list(tmp_path.glob("ring.jsonl.bad-*"))) == 1
+
+
+def test_oversize_rewrite_is_atomic(tmp_path):
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=600, path=p, key_path=key)
+    for i in range(200):                                                      # forces several rewrites (written > 2 * cap)
+        a.add(f"line {i:03d} " + "x" * 20)
+    assert not list(tmp_path.glob("ring.jsonl.rewrite-*"))
+    b = L.Ring(cap_bytes=600, path=p, key_path=key)
+    assert b.seq == 200 and b.fetch(0)["entries"][-1]["text"].startswith("line 199")
+    assert not list(tmp_path.glob("ring.jsonl.bad-*"))
+
+
 def test_tee_keeps_stdout_and_files_lines(monkeypatch):
     real = io.StringIO()
     monkeypatch.setattr(sys, "stdout", real)
