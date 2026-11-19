@@ -72,6 +72,17 @@ def test_checkout_location_is_last_observed_and_outbound_unknown(tmp_path):
     assert codex["channels"]["local"]["state"] == "unobserved"
 
 
+def test_hosted_and_app_agents_have_truthful_unscheduled_badges(tmp_path):
+    now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
+    result = presence.snapshot(tmp_path / "missing.db", tmp_path, now=now)
+    by_name = {agent["username"]: agent for agent in result["agents"]}
+    for name in ("llama", "operator-claude", "operator-codex"):
+        assert name in by_name
+        assert by_name[name]["schedule"] is None
+        assert by_name[name]["channels"]["local"]["state"] == "unknown"
+        assert by_name[name]["channels"]["api_out"]["state"] == "unknown"
+
+
 def test_inbound_is_recent_only(monkeypatch):
     with presence._lock:
         presence._recent.clear()

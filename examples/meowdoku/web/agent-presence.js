@@ -8,6 +8,12 @@ export const remaining = (due, now) => {
   if (!seconds) return "due, waiting for the scheduler";
   return `in ${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m ${seconds % 60}s`;
 };
+export const pauseRemaining = (until, now) => {
+  if (until == null) return "no bell pause recorded";
+  const seconds = Math.max(0, Math.ceil(until - now));
+  if (!seconds) return "bell pause ended";
+  return `bell paused for ${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m ${seconds % 60}s`;
+};
 
 export function renderAgentPresence(target, data, { locations = false, onLocation = null } = {}) {
   target.replaceChildren();
@@ -32,10 +38,18 @@ export function renderAgentPresence(target, data, { locations = false, onLocatio
       const line = node("small", null, "agent-schedule");
       line.append(document.createTextNode("Routine check-in "));
       const countdown = node("span", remaining(schedule.next_due, data.as_of));
-      countdown.dataset.due = String(schedule.next_due); countdown.dataset.asOf = String(data.as_of);
-      countdown.dataset.readAt = String(performance.now());
+      if (schedule.next_due != null) {
+        countdown.dataset.due = String(schedule.next_due); countdown.dataset.asOf = String(data.as_of);
+        countdown.dataset.readAt = String(performance.now());
+      }
       line.append(countdown);
-      line.append(document.createTextNode(schedule.bell_off_until ? ` · bell paused until ${ago(schedule.bell_off_until)}` : " · no bell pause recorded"));
+      line.append(document.createTextNode(" · "));
+      const bell = node("span", pauseRemaining(schedule.bell_off_until, data.as_of));
+      if (schedule.bell_off_until != null) {
+        bell.dataset.pauseUntil = String(schedule.bell_off_until); bell.dataset.asOf = String(data.as_of);
+        bell.dataset.readAt = String(performance.now());
+      }
+      line.append(bell);
       line.append(document.createTextNode(" · provider cooldown unknown"));
       row.append(line);
     } else row.append(node("small", "Routine schedule unknown", "agent-schedule"));
@@ -53,8 +67,10 @@ export function renderAgentPresence(target, data, { locations = false, onLocatio
 }
 
 export function tickAgentCountdowns(target) {
-  for (const span of target.querySelectorAll("[data-due]")) {
+  for (const span of target.querySelectorAll("[data-due], [data-pause-until]")) {
     const now = Number(span.dataset.asOf) + (performance.now() - Number(span.dataset.readAt)) / 1000;
-    span.textContent = remaining(Number(span.dataset.due), now);
+    span.textContent = span.dataset.due === undefined
+      ? pauseRemaining(Number(span.dataset.pauseUntil), now)
+      : remaining(Number(span.dataset.due), now);
   }
 }
