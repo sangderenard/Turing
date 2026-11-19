@@ -12480,14 +12480,15 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             and isinstance(_constant_value(parent_data), str)
         ):
             continue
-        # Scatter's reduction name is part of the numerical operator contract.
-        # It must stay attached to the executable region so tensor SSA lowering
-        # can select the matching kernel (or refuse it precisely); treating the
-        # string as a Python object dependency erased the whole scatter node.
-        if (
-            str(role) == "kw:reduce"
-            and str(data.get("op") or node_type) == "scatter"
-            and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
+        # A string keyword that names part of the numerical operator contract
+        # (scatter's reduction, pad's mode) stays attached to the executable
+        # region, so tensor SSA lowering can select the matching kernel or
+        # refuse it precisely.  Treated as a Python object dependency, the
+        # string erased the whole node: scatter, and ``a.pad(pad=(1, 1),
+        # value=0, mode="constant")``, whose root then returned nothing
+        # (2026-11-18, case 6393486c).  The declared table is the proof.
+        if _constant_value(parent_data) in _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
+            (str(data.get("op") or node_type), str(role)), frozenset()
         ):
             continue
         # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
@@ -27280,6 +27281,14 @@ _ELEMENTWISE_UNARY_OPERATIONS = frozenset({
 _ELEMENTWISE_UNARY_PREDICATE_OPERATIONS = frozenset({
     "logical_not", "isfinite", "isnan", "isinf",
 })
+
+#: String-valued keywords that are part of an operator's numerical contract,
+#: by (operation, parent role): the strings each admits.  Read by the
+#: dispatch-metadata rule; lowering selects a kernel for each or refuses it.
+_OPERATOR_CONTRACT_STRING_KEYWORDS: dict[tuple[str, str], frozenset[str]] = {
+    ("scatter", "kw:reduce"): frozenset({"sum", "mean", "max", "min"}),
+    ("pad", "kw:mode"): frozenset({"constant", "reflect", "replicate", "circular"}),
+}
 
 #: The elementwise binary operations whose result is a truth value.
 _ELEMENTWISE_PREDICATE_OPERATIONS = frozenset({

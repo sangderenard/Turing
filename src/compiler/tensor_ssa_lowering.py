@@ -7110,9 +7110,24 @@ def lower_tensor_calls_to_repository_ssa(
                 # int64 storage. A missing input proof remains missing for
                 # the adapter/physical-call gate to resolve or refuse.
                 is_output = position == output_argument or position == len(arguments)
+                # An input stored in a narrower lossless form of the formal's
+                # (bool, int32 or float32 into float64) is converted at the
+                # kernel boundary by the call-input adapter
+                # (ssa_call_input_adapters), which already does this for a
+                # read-only span actual.  Program: ``AbstractTensor.where(mask,
+                # b, c)`` with a bool program feed: the mask's ProgramABI bool
+                # was refused here before the adapter could convert it
+                # (2026-11-18, case 6393486c).  Any other mismatch, such as a
+                # float64 buffer into an int64 formal, stays refused.
+                adapter_converts = (
+                    expected_physical == "float64"
+                    and current is not None
+                    and current.physical_dtype in {"bool", "int32", "float32"}
+                )
                 if (not is_output and current is not None
                         and current.physical_dtype is not None
-                        and current.physical_dtype != expected_physical):
+                        and current.physical_dtype != expected_physical
+                        and not adapter_converts):
                     raise ValueError(
                         "selected tensor kernel input physical dtype conflicts with source"
                     )
@@ -12491,12 +12506,29 @@ def lower_tensor_calls_to_repository_ssa(
                         owner=lowering_at[0], book=identity_book(module),
                     )
                 )
+                # The stamp is for values this lowering mints (the result).  An
+                # operand whose storage its producer or the ProgramABI already
+                # posted keeps it; a call-input adapter converts it at the kernel
+                # boundary (ssa_call_input_adapters).  Program:
+                # ``AbstractTensor.where(mask, b, c)`` with a bool program feed:
+                # the stamp revised the feed's own row to float64 against its
+                # ProgramABI bool ("physical concordance disagreement ...
+                # 'float64' versus 'bool'", 2026-11-18, case 6393486c).
+                from .ssa_record_return_state import (
+                    posted_ssa_value_fact as _posted_operand_fact,
+                )
                 for value in (*data_args, result):
                     if (
                         not _stays_instruction
                         and tuple(value.shape or ())
                         and str(value.dtype or "").casefold() in {"bool", "i1"}
                     ):
+                        if value is not result and lowering_at[0] is not None:
+                            _operand_fact = _posted_operand_fact(
+                                lowering_at[0], int(value.id), book=identity_book(module),
+                            )
+                            if _operand_fact is not None and _operand_fact.physical_dtype:
+                                continue
                         _post_double_backed_boolean(
                             lowering_at[0], value, module,
                         )
@@ -13287,7 +13319,10 @@ def lower_tensor_calls_to_repository_ssa(
                             fill_value, "float64"
                         )
                         prefix.append(scalar_def)
-                    elif operation in {"fill", "full"} and len(args) > 1:
+                    # ``full_like(tensor, fill_value)`` (creation.py) takes its fill
+                    # as the second operand, as ``full`` does; left out, a runtime
+                    # fill emitted nothing (2026-11-18, case 6393486c).
+                    elif operation in {"fill", "full", "full_like"} and len(args) > 1:
                         fill_operand = args[1]
                     if fill_operand is not None and count is not None:
                         emitted.append(call(
@@ -13372,6 +13407,41 @@ def lower_tensor_calls_to_repository_ssa(
                         posted_ssa_value_fact as _copy_source_fact,
                     )
                     copy_source_fact = _copy_source_fact(function, source.id, book=book)
+                    # The cast kernel's dtypes are part of its identity, as for
+                    # elementwise ops (_reference_kernel_lacks_dtype).  The
+                    # reference casts read and write double storage, plus the
+                    # int64 kernels.  Program: ``a.to_dtype('uint64')`` on a
+                    # uint32 tensor, ``a.to_dtype('int64')`` on int32 and
+                    # ``a.to_dtype('float64')`` on uint64.  Wrong record: the
+                    # substring match above picked a double kernel ("int" is
+                    # in "uint64"), so "storage types are immutable" refused
+                    # the uint32/uint64 operands (2026-11-18, case 6393486c).
+                    # Rule: a cast whose source is stored neither as float nor
+                    # as int64, or whose target is a narrower or unsigned
+                    # integer, stays the instruction, which the backend's cast
+                    # span loop emits on the real types.  Double-backed
+                    # logical values (a bool target, a float-stored source)
+                    # keep the reference kernels.
+                    _source_storage = str(
+                        (copy_source_fact.physical_dtype if copy_source_fact is not None
+                         and copy_source_fact.physical_dtype else None)
+                        or source.dtype or ""
+                    ).casefold()
+                    _native_integer = {
+                        "int8", "int16", "int32", "i32", "uint8", "uint16",
+                        "uint32", "uint64", "u32", "u64",
+                    }
+                    if operation == "to_dtype" and (
+                        dtype_hint in _native_integer
+                        or (
+                            _source_storage not in _FLOAT_KERNEL_DTYPES
+                            and _source_storage not in {"int64", "i64", "long"}
+                            and _source_storage not in {"bool", "i1"}
+                        )
+                    ):
+                        rewritten.extend(prefix)
+                        rewritten.append(instruction)
+                        continue
                     if (
                         operation == "to_dtype"
                         and dtype_hint in {"int64", "long"}
