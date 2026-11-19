@@ -241,7 +241,13 @@ def test_installer_q_block_runs_under_constrained_language():
     probe = "a b'c\u2018d\u2019e\u201af\u201bg"
     body = installer_q_line() + ("; $lit = & $q $env:Q_PROBE; $back = Invoke-Expression $lit; "
                                  "$ExecutionContext.SessionState.LanguageMode; ([int[]][char[]]$back) -join ','")
-    command = "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; Invoke-Expression $env:Q_BODY"
+    # codex (review d183299f, comments 229-230): a fresh pwsh may already start in ConstrainedLanguage, where assigning
+    # the mode again is an error; errors are terminating so one cannot pass unseen, and the mode is asserted first.
+    command = ("$ErrorActionPreference = 'Stop'; "
+               "if ($ExecutionContext.SessionState.LanguageMode -ne 'ConstrainedLanguage') "
+               "{ $ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage' }; "
+               "if ($ExecutionContext.SessionState.LanguageMode -ne 'ConstrainedLanguage') { throw 'not constrained' }; "
+               "Invoke-Expression $env:Q_BODY")
     out = subprocess.run([_pwsh(), "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
                          text=True, encoding="utf-8", timeout=60, env={**os.environ, "Q_PROBE": probe, "Q_BODY": body})
     assert out.returncode == 0, out.stderr
@@ -261,10 +267,13 @@ def test_installer_retry_hint_keeps_the_register_exit_code():
     assert lines[start + 1].startswith("$registerExit = $LASTEXITCODE"), "kept on the very next line"
     hint = next(i for i in range(start, len(lines)) if "Start-AgentDay -Register exited" in lines[i])
     assert "$LASTEXITCODE" not in "\n".join(lines[start + 2:hint + 1])
-    fail = "& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -Command 'exit 7' | Out-Host"
+    # The failing child is the same pwsh the test found (review d183299f, comments 223 and 226), not $PSHOME/pwsh.exe,
+    # which does not exist off Windows.
+    fail = "& $env:PWSH_EXE -NoProfile -NonInteractive -Command 'exit 7' | Out-Host"
     script = "\n".join([installer_q_line(), "$PSScriptRoot = 'C:\\x'", fail, *lines[start + 1:hint + 1]])
     out = subprocess.run([_pwsh(), "-NoProfile", "-NonInteractive", "-Command", "-"], input=script,
-                         capture_output=True, text=True, encoding="utf-8", timeout=60, env=dict(os.environ))
+                         capture_output=True, text=True, encoding="utf-8", timeout=60,
+                         env={**os.environ, "PWSH_EXE": _pwsh()})
     assert "Start-AgentDay -Register exited 7;" in out.stdout, out.stdout + out.stderr
 
 
