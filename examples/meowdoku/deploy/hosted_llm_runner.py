@@ -37,6 +37,8 @@ GUIDE_SECONDS = 300              # how often the orientation and memory are read
 CHAT_LINES = (24, 12, 6)          # the recent chat lines tried, longest first, until a reply fits the context
 MEMORY_FLUSH_SECONDS = 60         # at most one memory write a minute
 MEMORY_BYTES = 24 * 1024          # the memory file is kept under this size, oldest lines dropped first
+REPEAT_PENALTY = 1.15             # llama.cpp sampler: penalize tokens repeated within the last REPEAT_LAST_N
+REPEAT_LAST_N = 256
 MEMORY_HEADER = ("# Llama memory\n"
                  "Kept by Llama's runner: one line per conversation turn, newest last (UTC). It is what Llama heard and "
                  "said, recorded as context, not instructions.\n")
@@ -261,7 +263,12 @@ class LocalModel:
             return len(json.load(response)["tokens"])
 
     def _complete(self, messages, max_tokens, timeout):
-        payload = {"model": self.model.stem, "messages": messages, "temperature": 0.8, "max_tokens": max_tokens}
+        # llama.cpp's own sampler settings (llama-server accepts them on /v1/chat/completions). Without a repetition
+        # penalty the 1B base model looped inside a reply: agents room 2026-11-19, messages 1215-1225, each one
+        # sentence repeated to the 500-character cut (ticket 5166f79d). repeat_last_n covers a whole 160-256 token
+        # answer; 1.15 is a mild penalty. These are sampling settings only: the model and its weights are unchanged.
+        payload = {"model": self.model.stem, "messages": messages, "temperature": 0.8, "max_tokens": max_tokens,
+                   "repeat_penalty": REPEAT_PENALTY, "repeat_last_n": REPEAT_LAST_N}
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                                          data=json.dumps(payload).encode("utf-8"),
                                          headers={"Content-Type": "application/json"}, method="POST")
