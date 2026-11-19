@@ -53,6 +53,8 @@ def test_non_object_records_do_not_hide_a_valid_run(tmp_path, monkeypatch):
 
 
 def test_checkout_location_is_last_observed_and_outbound_unknown(tmp_path):
+    with presence._lock:
+        presence._recent.clear()
     db = tmp_path / "accounts.db"
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE checkout_calls (id INTEGER PRIMARY KEY, at REAL, username TEXT, repository TEXT, path TEXT, operation TEXT, ok INTEGER)")
