@@ -6770,6 +6770,7 @@ def _build_shell_hierarchy_plan(
         )
         region_node_set = set(region_nodes)
         numerical_dtype_metadata = {}
+        numerical_contract_keyword_metadata: dict[int, dict[str, str]] = {}
         numerical_constructor_dimension_cells = {}
 
         def numerical_region_parents(
@@ -6979,6 +6980,32 @@ def _build_shell_hierarchy_plan(
                             )
                         numerical_dtype_metadata[int(node_id)] = target_layout.name
                         continue
+                if (
+                    operation == "pad"
+                    and str(role) == "kw:mode"
+                    and str(parent_data.get("type")) in {
+                        "Const", "const", "Constant",
+                    }
+                ):
+                    # ``a.pad(pad=(1, 1), value=0, mode="constant")``: the
+                    # mode spelling selects pad's kernel, as a dtype spelling
+                    # selects a cast's.  It is not a runtime operand: as a
+                    # region capture it had no dtype and refused ("region
+                    # value 5 has no settled dtype in the region's value
+                    # records", 2026-11-18, case 6393486c).  Project the
+                    # exact literal onto the line as ``mode``; lowering
+                    # admits "constant" and refuses every other mode.
+                    mode_literal = _constant_value(parent_data)
+                    if mode_literal not in _OPERATOR_CONTRACT_STRING_KEYWORDS[
+                        ("pad", "kw:mode")
+                    ]:
+                        raise ValueError(
+                            f"pad has no admitted mode {mode_literal!r}"
+                        )
+                    numerical_contract_keyword_metadata.setdefault(
+                        int(node_id), {},
+                    )["mode"] = mode_literal
+                    continue
                 identity_row = attributes.get("source_python_identity_row")
                 if identity_row is not None:
                     from .concordance_declarations import (
@@ -7324,6 +7351,9 @@ def _build_shell_hierarchy_plan(
                     line_attributes["intrinsic_named_call_id"] = int(value)
             if int(value) in numerical_dtype_metadata:
                 line_attributes["dtype"] = numerical_dtype_metadata[int(value)]
+            line_attributes.update(
+                numerical_contract_keyword_metadata.get(int(value), {})
+            )
             if int(value) in numerical_constructor_dimension_cells:
                 line_attributes["numerical_constructor_dimension_cell"] = (
                     numerical_constructor_dimension_cells[int(value)]
@@ -28309,6 +28339,89 @@ def _topk_named_member_descriptor(graph, receiver, field_name, seen=None):
     return result
 
 
+def pad_extents(pad: Any, dims: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """AbstractTensor's pad convention: the (left, right) extent per axis.
+
+    The pairs apply from the LAST dimension backward, exactly as the C
+    backend's ``pad_`` states them: ``left[dims-k+i] = pad[-2(i+1)]`` and
+    ``right[dims-k+i] = pad[-2(i+1)+1]`` for ``k = len(pad) // 2``.  A pad
+    that is not a sequence of integers of even length refuses by name.
+    """
+
+    if not isinstance(pad, (tuple, list)) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in pad
+    ):
+        raise ValueError(
+            f"pad has no admitted non-constant or non-integer pad tuple {pad!r}"
+        )
+    if len(pad) % 2 != 0:
+        raise ValueError("pad has no admitted odd-length pad tuple")
+    count = len(pad) // 2
+    if count > int(dims):
+        raise ValueError(
+            "pad tuple pads more dimensions than the operand has"
+        )
+    left = [0] * int(dims)
+    right = [0] * int(dims)
+    for index in range(count):
+        left[int(dims) - count + index] = int(pad[-2 * (index + 1)])
+        right[int(dims) - count + index] = int(pad[-2 * (index + 1) + 1])
+    if any(extent < 0 for extent in (*left, *right)):
+        raise ValueError("pad has no admitted negative pad extent")
+    return tuple(left), tuple(right)
+
+
+def _pad_result_descriptor(graph: Any, data: Mapping, seen: Any) -> dict[str, Any] | None:
+    """``a.pad(pad=..., value=..., mode="constant")``: the operand's dtype,
+    every axis widened by its declared (left, right) extents.
+
+    The pad tuple is the node's constant ``kw:pad`` operand; mode is its
+    constant ``kw:mode`` operand.  A non-constant pad or a mode other than
+    ``"constant"`` refuses by name.
+    """
+
+    parents = tuple(
+        (int(parent), str(role)) for parent, role in data.get("parents") or ()
+        if int(parent) in graph.G
+    )
+    source_id = next((
+        parent for parent, role in parents
+        if role.casefold() in {"operand", "arg:0", "self", "receiver", "base"}
+    ), None)
+    source = (
+        _tensor_descriptor(graph, source_id, seen)
+        if source_id is not None else None
+    )
+    if source is None or not descriptor_states_a_shape(source):
+        return None
+    pad_parent = next((parent for parent, role in parents if role == "kw:pad"), None)
+    mode_parent = next((parent for parent, role in parents if role == "kw:mode"), None)
+    if pad_parent is None:
+        raise ValueError("pad has no kw:pad operand")
+    try:
+        pad = _constant_value(graph.G.nodes[pad_parent])
+    except KeyError:
+        raise ValueError("pad has no admitted non-constant pad tuple") from None
+    if mode_parent is not None:
+        try:
+            mode = _constant_value(graph.G.nodes[mode_parent])
+        except KeyError:
+            raise ValueError("pad has no admitted non-constant mode") from None
+        if mode != "constant":
+            raise ValueError(f"pad has no admitted mode {mode!r}")
+    shape = tuple(map(int, source.get("shape") or ()))
+    left, right = pad_extents(pad, len(shape))
+    new_shape = tuple(
+        extent + before + after
+        for extent, before, after in zip(shape, left, right)
+    )
+    return {
+        "shape": new_shape,
+        "dtype": _recorded_dtype(source.get("dtype"), "pad source tensor", source_id),
+        "rank": len(new_shape),
+    }
+
+
 def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -29611,6 +29724,10 @@ def _tensor_descriptor_rule(
                         "rank": 1,
                         "metadata_state": "dynamic",
                     }
+        if operation == "pad":
+            pad_descriptor = _pad_result_descriptor(graph, data, seen)
+            if pad_descriptor is not None:
+                return pad_descriptor
         if operation in {"reshape", "view"}:
             parents = data.get("parents") or ()
             source_id = next((

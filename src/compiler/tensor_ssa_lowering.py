@@ -15245,6 +15245,78 @@ def lower_tensor_calls_to_repository_ssa(
                             result, instruction, output_argument=5,
                         ))
 
+                elif operation == "pad" and source is not None:
+                    # ``a.pad(pad=(1, 1), value=0, mode="constant")``: the
+                    # reference ``pad_double_nd(input, output, shape,
+                    # new_shape, left_pad, dims, value)``.  The pad tuple and
+                    # mode are the line's structural attributes (the graph
+                    # node's literal keywords; the planner projects
+                    # ``kw:mode`` onto ``mode``), read as ``cat`` reads its
+                    # ``dim``.  Extents follow AbstractTensor's convention
+                    # (``pad_extents``, the C backend's ``pad_``).
+                    from .glsl_deployment_strategy import pad_extents
+
+                    pad_spec = _attribute(instruction.attributes, "pad")
+                    pad_mode = _attribute(instruction.attributes, "mode")
+                    operand_shape = tuple(map(int, source.shape or ()))
+                    pad_refusal = None
+                    if pad_mode is not None and pad_mode != "constant":
+                        pad_refusal = f"pad has no admitted mode {pad_mode!r}"
+                    elif not isinstance(pad_spec, (tuple, list)):
+                        pad_refusal = "pad has no admitted non-constant pad tuple"
+                    elif not operand_shape:
+                        pad_refusal = "pad has no admitted operand without a static shape"
+                    roles = tuple(map(str, instruction.arg_roles or ()))
+                    value_operand = next((
+                        argument for argument, role in zip(args, roles)
+                        if role == "kw:value"
+                    ), None) if len(roles) == len(args) else None
+                    authored_value = _attribute(instruction.attributes, "value")
+                    pad_value_operand = None
+                    if pad_refusal is None:
+                        if value_operand is not None and int(value_operand.id) in constants:
+                            authored_value = constants[int(value_operand.id)]
+                        if isinstance(authored_value, (int, float)) and not isinstance(
+                            authored_value, bool,
+                        ):
+                            pad_value_operand, value_def = constant(
+                                float(authored_value), "float64",
+                            )
+                            prefix.append(value_def)
+                        elif value_operand is not None and str(
+                            value_operand.dtype or ""
+                        ) == "float64" and not tuple(value_operand.shape or ()):
+                            pad_value_operand = value_operand
+                        elif authored_value is None and value_operand is None:
+                            pad_value_operand, value_def = constant(0.0, "float64")
+                            prefix.append(value_def)
+                        else:
+                            pad_refusal = "pad has no admitted fill value operand"
+                    if pad_refusal is None:
+                        left, right = pad_extents(tuple(pad_spec), len(operand_shape))
+                        new_shape = tuple(
+                            extent + before + after
+                            for extent, before, after in zip(operand_shape, left, right)
+                        )
+                        result.shape = new_shape
+                        shape_value, shape_def = int_vector(operand_shape)
+                        new_shape_value, new_shape_def = int_vector(new_shape)
+                        left_value, left_def = int_vector(left)
+                        dims_value, dims_def = constant(len(operand_shape), "int32")
+                        prefix.extend((shape_def, new_shape_def, left_def, dims_def))
+                        emitted.append(call(
+                            "pad_double_nd",
+                            [
+                                source, result, shape_value, new_shape_value,
+                                left_value, dims_value, pad_value_operand,
+                            ],
+                            result, instruction, output_argument=1,
+                        ))
+                    else:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation, pad_refusal,
+                        ))
+
                 elif operation in {"cat", "concat", "concatenate"} and data_args:
                     # Program: ``AbstractTensor.cat([a, b], dim=1)``.  The
                     # region carve passes ``dim`` as a trailing integer
