@@ -1,5 +1,6 @@
 const list = document.getElementById("list"), detail = document.getElementById("detail"), message = document.getElementById("message");
-let selected = null, canEdit = false;
+// showGeneration counts detail requests; only the latest one may render (see show()).
+let selected = null, canEdit = false, showGeneration = 0;
 const el = (tag, text, className) => { const node = document.createElement(tag); node.textContent = text; if (className) node.className = className; return node; };
 async function request(url, options) {
   const response = await fetch(url, { cache: "no-store", ...options });
@@ -17,6 +18,7 @@ async function load() {
     for (const ticket of result.tickets) {
       const row = el("button", `${ticket.status.toUpperCase()} · ${ticket.id}\n${(ticket.note || "(no note)").slice(0, 85)}`, "row");
       row.append(el("small", new Date(ticket.created * 1000).toLocaleString() + ` · ${ticket.peer}`));
+      row.type = "button"; row.dataset.id = ticket.id;
       row.onclick = () => show(ticket.id); list.append(row);
     }
     if (!result.tickets.length) list.append(el("p", "No tickets yet."));
@@ -25,15 +27,25 @@ async function load() {
   } catch (error) { message.textContent = error.message; }
 }
 async function show(id) {
+  const generation = ++showGeneration;
   try {
     selected = id; const { ticket } = await request(`/api/tickets?id=${encodeURIComponent(id)}`);
+    // A later selection was made while this request was in flight (A then B, or A then B then A):
+    // drop this answer, so a late response cannot replace the detail or move aria-current back.
+    if (generation !== showGeneration) return;
+    // Mark the open ticket in the list, so sighted and screen-reader users can see which one the detail shows.
+    for (const row of list.querySelectorAll(".row")) { if (row.dataset.id === id) row.setAttribute("aria-current", "true"); else row.removeAttribute("aria-current"); }
     const heading = el("h2", `Ticket ${ticket.id}`), meta = el("p", `${ticket.status} · ${new Date(ticket.created * 1000).toLocaleString()} · ${ticket.peer} · log sequence ${ticket.log_seq}`);
     const logLink = el("a", "Open server log near this report"); logLink.href = `log.html?since=${Math.max(0, ticket.log_seq - 100)}`; logLink.style.color = "#9bd";
     const note = el("textarea", ticket.handling_note || ""); note.placeholder = "Investigation notes";
     const status = document.createElement("select"); for (const value of ["open", "investigating", "resolved"]) { const opt = el("option", value); opt.value = value; status.append(opt); } status.value = ticket.status;
-    const save = el("button", "Save status and note"); save.disabled = !canEdit;
+    note.setAttribute("aria-label", "Investigation notes"); status.setAttribute("aria-label", "Ticket status");
+    const save = el("button", "Save status and note"); save.type = "button"; save.disabled = !canEdit;
+    // A disabled button alone does not say why; name the missing permission.
+    if (!canEdit) { status.disabled = true; note.readOnly = true; save.title = "Your account may read tickets but not change them (it lacks edit)."; }
     save.onclick = async () => { try { await request("/api/tickets/status", { method: "POST", headers: { "Content-Type": "application/json", "X-Meowdoku-Ticket": "1" }, body: JSON.stringify({ id, status: status.value, note: note.value }) }); message.textContent = "Saved"; await load(); } catch (error) { message.textContent = error.message; } };
     const actions = el("div", "", "actions"); actions.id = "actions"; actions.append(status, save);
+    if (!canEdit) actions.append(el("small", "Read only: your account may not change tickets.", "muted"));
     const r = ticket.report || {}, c = r.compute || {}, p = r.particles || {}, phone = r.phone || {}, d = c.diag || {};
     const facts = el("div", "", "facts");
     for (const [name, value] of [
@@ -48,7 +60,7 @@ async function show(id) {
     const raw = el("pre", JSON.stringify({ report: ticket.report, server_state: ticket.server_state, server_log: ticket.server_log }, null, 2));
     const rawDetails = document.createElement("details"); rawDetails.append(el("summary", "Full state and logs"), raw);
     detail.replaceChildren(heading, meta, facts, logLink, actions, note, rawDetails);
-  } catch (error) { message.textContent = error.message; }
+  } catch (error) { if (generation === showGeneration) message.textContent = error.message; }
 }
 document.getElementById("refresh").onclick = load;
 load();
