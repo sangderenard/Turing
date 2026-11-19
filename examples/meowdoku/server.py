@@ -602,7 +602,8 @@ def make_handler(sessions: Sessions):
                 user = sessions.oauth_mcp.user_for_token(authorization[0][7:])
                 if user is not None:
                     self._oauth_internal = True
-                    agent_presence_mod.note_inbound(user["username"], mcp=True)
+                    if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
+                        agent_presence_mod.note_inbound(user["username"], mcp=True)
                     return user
                 return None
             if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
@@ -611,7 +612,8 @@ def make_handler(sessions: Sessions):
                 user = sessions.accounts.user_for_token(authorization[0][8:])
                 if user is not None and user.get("temporary"):
                     self._mcp_preview_internal = True
-                    agent_presence_mod.note_inbound(user["username"], mcp=True)
+                    if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
+                        agent_presence_mod.note_inbound(user["username"], mcp=True)
                     return user
                 return None
             if self.path.partition("?")[0].startswith("/api/messages/"):
@@ -625,14 +627,16 @@ def make_handler(sessions: Sessions):
                         return None
                     user = sessions.accounts.user_for_token(parts[1])
                     if user is not None:
-                        agent_presence_mod.note_inbound(user["username"], mcp=False)
+                        if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
+                            agent_presence_mod.note_inbound(user["username"], mcp=False)
                     return user
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
             user = sessions.accounts.user_for_token(token)
             if user is not None:                                  # [LOG] an `activity` line when this account was quiet IDLE_SECONDS
                 logring_mod.note_activity(user["id"], user["username"], getattr(self, "_client_ip", None))
-                if self.path.partition("?")[0].startswith("/api/"):
+                if (self.path.partition("?")[0].startswith("/api/") and
+                    self.path.partition("?")[0] != "/api/worldmap/presence/outbound"):
                     agent_presence_mod.note_inbound(user["username"], mcp=False)
             return user
 
