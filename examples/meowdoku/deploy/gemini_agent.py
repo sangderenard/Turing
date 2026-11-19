@@ -79,6 +79,18 @@ def read_key(path: str) -> str:
 
 
 # ---------------------------------------------------------------- Gemini over HTTPS
+def optional_activity_rest():
+    """Connect provider-only commands to presence when SpeakToMe is configured."""
+    try:
+        from speaktome_mcp.rest import Rest, RestError
+    except ImportError:
+        return None
+    try:
+        return Rest.from_env()
+    except RestError:
+        return None
+
+
 def report_activity(rest, channel: str) -> None:
     """Best-effort, content-free observation at a real client call site."""
     if rest is None:
@@ -283,6 +295,7 @@ def main(argv=None) -> int:
         observe = lambda channel: report_activity(activity_rest[0], channel)
         call = gemini_caller(read_key(args.key_file), on_request=observe)
         if args.list_models:
+            activity_rest[0] = optional_activity_rest()
             listed = call("GET", "/models?pageSize=200")
             for model in listed.get("models", []):
                 if "generateContent" in model.get("supportedGenerationMethods", []):

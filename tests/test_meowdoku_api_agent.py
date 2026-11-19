@@ -146,6 +146,23 @@ def test_key_only_in_its_header(provider, header, value):
     assert "sk-secret" not in json.dumps(others)
 
 
+def test_check_reports_provider_request_when_presence_is_configured(monkeypatch):
+    seen = []
+    class Rest:
+        def call(self, path, body, **kwargs):
+            seen.append((path, body))
+    monkeypatch.setattr(agent, "read_key", lambda path: "test-key")
+    monkeypatch.setattr(agent.gemini_agent, "optional_activity_rest", lambda: Rest())
+    def caller(provider, base, key, opener=None, on_request=None):
+        def call(method, path, body=None):
+            on_request("api_out")
+            return {"data": [{"id": "model"}]}
+        return call
+    monkeypatch.setattr(agent, "caller_for", caller)
+    assert agent.main(["--name", "test", "--provider", "openai", "--check"]) == 0
+    assert seen == [("/api/worldmap/presence/outbound", {"channel": "api_out"})]
+
+
 def test_base_url_rules():
     assert agent.check_base_url("openai", "https://api.mistral.ai/v1/") == "https://api.mistral.ai/v1"
     assert agent.check_base_url("openai", "http://localhost:11434/v1") == "http://localhost:11434/v1"

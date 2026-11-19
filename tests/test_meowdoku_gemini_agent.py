@@ -117,6 +117,23 @@ def test_activity_report_is_content_free_and_nonfatal():
                            {"timeout": 2, "headers": {"X-Meowdoku-Activity": "1"}})]
 
 
+def test_list_models_reports_provider_request_when_presence_is_configured(monkeypatch):
+    seen = []
+    class Rest:
+        def call(self, path, body, **kwargs):
+            seen.append((path, body))
+    monkeypatch.setattr(agent, "read_key", lambda path: "test-key")
+    monkeypatch.setattr(agent, "optional_activity_rest", lambda: Rest())
+    def caller(key, opener=None, timeout=120, on_request=None):
+        def call(method, path, body=None):
+            on_request("api_out")
+            return {"models": []}
+        return call
+    monkeypatch.setattr(agent, "gemini_caller", caller)
+    assert agent.main(["--list-models"]) == 0
+    assert seen == [("/api/worldmap/presence/outbound", {"channel": "api_out"})]
+
+
 def test_the_key_goes_only_in_its_header():
     seen = {}
 

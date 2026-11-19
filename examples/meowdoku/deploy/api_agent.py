@@ -331,6 +331,7 @@ def main(argv=None) -> int:
         observe = lambda channel: gemini_agent.report_activity(activity_rest[0], channel)
         call = caller_for(args.provider, base, read_key(key_file), on_request=observe)
         if args.check:
+            activity_rest[0] = gemini_agent.optional_activity_rest()
             print(f"key accepted by {args.provider} at {base}: {check(call, args.provider)} model(s) listed")
             return 0
         if not args.model:
