@@ -9,9 +9,12 @@ control handles this request; the binary body is not an MCP tool argument.
 
 The server streams at most 256 MiB into a staged file. It checks FLAC
 STREAMINFO and the 900-second codec ceiling, then uses the host-declared
-Nodus audio codec row to decode the complete file. The codec must already be
-configured in `run/nodus_radio.json`; without it, the upload fails and the
-stage is removed. After validation, the server retains the original FLAC once
+Nodus audio codec row to decode the complete file. The existing Nodus exec node invokes the already installed FFmpeg for this
+check. The node's executable and FFmpeg paths must be declared in
+`run/nodus_radio.json`; without that configuration, the upload fails and the
+stage is removed. During playback, Nodus consumes the temporary PCM WAV and
+its `exec.radio.hls` row uses FFmpeg to produce AAC/HLS for listeners. No new
+codec installation is required. After validation, the server retains the original FLAC once
 under `users/account/<owner>/assets/radio_upload/<id>/audio.flac` and records
 owner, title, bytes, SHA-256 and creation time in SQLite. This path satisfies
 the existing codec work-root constraint. These assets do not use the private
