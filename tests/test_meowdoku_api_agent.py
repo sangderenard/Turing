@@ -134,13 +134,33 @@ class Opener:
                                                     ("anthropic", "X-api-key", "sk-secret")])
 def test_key_only_in_its_header(provider, header, value):
     opener = Opener()
-    call = agent.caller_for(provider, agent.check_base_url(provider, None), "sk-secret", opener)
+    observed = []
+    call = agent.caller_for(provider, agent.check_base_url(provider, None), "sk-secret", opener,
+                            on_request=lambda channel: observed.append(channel))
     assert agent.check(call, provider) == 2
+    assert observed == ["api_out"]
     request = opener.requests[0]
     assert request.get_header(header) == value
     assert "sk-secret" not in request.full_url
     others = {k: v for k, v in request.header_items() if k != header}
     assert "sk-secret" not in json.dumps(others)
+
+
+def test_check_reports_provider_request_when_presence_is_configured(monkeypatch):
+    seen = []
+    class Rest:
+        def call(self, path, body, **kwargs):
+            seen.append((path, body))
+    monkeypatch.setattr(agent, "read_key", lambda path: "test-key")
+    monkeypatch.setattr(agent.gemini_agent, "optional_activity_rest", lambda: Rest())
+    def caller(provider, base, key, opener=None, on_request=None):
+        def call(method, path, body=None):
+            on_request("api_out")
+            return {"data": [{"id": "model"}]}
+        return call
+    monkeypatch.setattr(agent, "caller_for", caller)
+    assert agent.main(["--name", "test", "--provider", "openai", "--check"]) == 0
+    assert seen == [("/api/worldmap/presence/outbound", {"channel": "api_out"})]
 
 
 def test_base_url_rules():
