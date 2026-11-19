@@ -30,6 +30,17 @@ AUDIT_DDL = """CREATE TABLE IF NOT EXISTS hosted_agent_mode_audit (
     scope TEXT NOT NULL, scope_key TEXT NOT NULL, mode TEXT NOT NULL,
     created_at REAL NOT NULL
 )"""
+CONTROL_DDL = """CREATE TABLE IF NOT EXISTS hosted_agent_controls (
+    agent_id INTEGER PRIMARY KEY REFERENCES users(id),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    goal TEXT NOT NULL,
+    actor_id INTEGER NOT NULL REFERENCES users(id),
+    updated_at REAL NOT NULL
+)"""
+CONTROL_AUDIT_DDL = """CREATE TABLE IF NOT EXISTS hosted_agent_control_audit (
+    id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, actor_id INTEGER NOT NULL,
+    enabled INTEGER NOT NULL, goal TEXT NOT NULL, created_at REAL NOT NULL
+)"""
 
 
 class ModeError(Exception):
@@ -39,9 +50,32 @@ class ModeError(Exception):
 
 
 def prepare(db):
-    schema_version.declare(db, "hosted_agent_modes", 1)
+    schema_version.declare(db, "hosted_agent_modes", 2)
     db.execute(DDL)
     db.execute(AUDIT_DDL)
+    db.execute(CONTROL_DDL)
+    db.execute(CONTROL_AUDIT_DDL)
+
+
+def controls(db, agent_id):
+    prepare(db)
+    row = db.execute("SELECT enabled,goal FROM hosted_agent_controls WHERE agent_id=?", (agent_id,)).fetchone()
+    return {"enabled": bool(row[0]) if row else True, "goal": row[1] if row else ""}
+
+
+def set_controls(db, *, agent_id, actor_id, actor_role, enabled, goal):
+    if actor_role not in ("operator", "admin"):
+        raise ModeError("operator or admin required", 403)
+    if not isinstance(enabled, bool) or not isinstance(goal, str) or len(goal) > 4000:
+        raise ModeError("enabled must be boolean and goal must be at most 4000 characters")
+    goal = goal.strip()
+    db.execute("INSERT INTO hosted_agent_controls(agent_id,enabled,goal,actor_id,updated_at) VALUES(?,?,?,?,?) "
+               "ON CONFLICT(agent_id) DO UPDATE SET enabled=excluded.enabled,goal=excluded.goal,"
+               "actor_id=excluded.actor_id,updated_at=excluded.updated_at",
+               (agent_id, int(enabled), goal, actor_id, time.time()))
+    db.execute("INSERT INTO hosted_agent_control_audit(agent_id,actor_id,enabled,goal,created_at) VALUES(?,?,?,?,?)",
+               (agent_id, actor_id, int(enabled), goal, time.time()))
+    return controls(db, agent_id)
 
 
 def target(db, username):
@@ -114,10 +148,32 @@ def http_route(handler, path, method, *, accounts_db):
     principal = handler._principal()
     if principal.user_id is None:
         return handler._json({"error": "sign in first"}, 401)
-    username = path[len("/api/hosted-agents/"):-len("/last-word")]
+    is_controls = path.endswith("/controls")
+    username = path[len("/api/hosted-agents/"):-len("/controls" if is_controls else "/last-word")]
     db = sqlite3.connect(str(accounts_db), timeout=10, isolation_level=None)
     try:
         agent_id, canonical = target(db, username)
+        if is_controls:
+            if method == "GET":
+                if principal.user_id != agent_id and principal.role not in ("operator", "admin"):
+                    raise ModeError("only this agent or an operator may read its controls", 403)
+                return handler._json({"agent": canonical, **controls(db, agent_id)})
+            if principal.role not in ("operator", "admin"):
+                raise ModeError("operator or admin required", 403)
+            expected_origin = ("https://" if handler._is_secure() else "http://") + handler.headers.get("Host", "")
+            if handler.headers.get("Origin") not in (None, expected_origin) or handler.headers.get("Sec-Fetch-Site") == "cross-site":
+                raise ModeError("cross-origin control writes are not allowed", 403)
+            body = handler._body_json()
+            if body is None:
+                return
+            if not isinstance(body, dict) or set(body) != {"enabled", "goal"}:
+                raise ModeError("expected enabled and goal")
+            prepare(db)
+            db.execute("BEGIN IMMEDIATE")
+            answer = set_controls(db, agent_id=agent_id, actor_id=principal.user_id,
+                                  actor_role=principal.role, **body)
+            db.commit()
+            return handler._json({"agent": canonical, **answer})
         if method == "GET":
             if principal.user_id != agent_id and principal.role not in ("operator", "admin"):
                 raise ModeError("only this agent or an operator may read its mode", 403)

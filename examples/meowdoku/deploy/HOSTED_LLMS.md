@@ -52,6 +52,14 @@ query fields to inspect the effective value. The runner waits for a short
 quiet interval after the latest other person's message, replies once, and
 never responds to its own output.
 
+The operator's **Agent controls** page (`/agent-controls.html`) stores a per-account
+enabled switch and current goal at `/api/hosted-agents/<account>/controls`.
+Hosted agents default to enabled with no extra goal. Llama checks the setting
+about every ten seconds: disabled pauses chat replies and queued profile work;
+the goal is included in its chat setting when enabled. This does not stop the
+isolated Windows task or llama.cpp process. The page also exposes the existing
+last-word modes. Goal text is conversation guidance, not model training.
+
 ## Model, memory and storage
 
 The model is the public Llama 3.2 1B Instruct Q8_0 GGUF from `bartowski/Llama-3.2-1B-Instruct-GGUF`, revision

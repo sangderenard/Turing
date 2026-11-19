@@ -29,6 +29,7 @@ POLL_SECONDS = 1                 # owner, 2026-11-17: Llama on a 1 s cycle (dire
 PROFILE_SECONDS = 5               # queued agent runs are claimed at most this often
 ROOM_LIST_SECONDS = 30            # the rooms Llama is hosted in are listed again at most this often
 MODE_SECONDS = 10                 # a last-word setting is asked again at most this often
+CONTROL_SECONDS = 10              # operator enabled/goal changes reach the chat runner promptly
 QUIET_SECONDS = 12
 ROOM_SECONDS = 180
 MAX_ROOM_REPLIES = 3
@@ -146,6 +147,7 @@ class Guide:
 
     def __init__(self, rest):
         self.rest, self.orientation, self.memory, self.memory_id = rest, "", "", None
+        self.goal = ""
         self.read_at = self.flushed_at = 0.0
         self.pending = []
 
@@ -176,7 +178,8 @@ class Guide:
             pass
 
     def setting(self):
-        return (self.orientation or FALLBACK_SETTING) + "\n\n" + RUNNER_RULES
+        goal = "\n\nCurrent operator goal:\n" + self.goal if self.goal else ""
+        return (self.orientation or FALLBACK_SETTING) + goal + "\n\n" + RUNNER_RULES
 
     def remember(self, place, who, heard, said, now=None):
         stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() if now is None else now))
@@ -337,6 +340,17 @@ def run_profile_batch(rest, model, parallel, limit=16):
 
 
 _MODES = {}
+_CONTROLS = {}
+
+
+def controls(rest, username, now=None):
+    now = time.monotonic() if now is None else now
+    cached = _CONTROLS.get(username)
+    if cached is not None and now < cached[1]:
+        return cached[0]
+    value = rest.call(f"/api/hosted-agents/{key(username)}/controls")
+    _CONTROLS[username] = (value, now + CONTROL_SECONDS)
+    return value
 
 
 def mode(rest, username, scope, place, now=None):
@@ -450,6 +464,12 @@ def run(args):
         while True:
             try:
                 tick = time.monotonic()
+                control = controls(rest, username, tick)
+                guide.goal = control["goal"]
+                if not control["enabled"]:
+                    guide.flush()
+                    time.sleep(POLL_SECONDS)
+                    continue
                 if tick >= profiles_due:
                     profiles_due = tick + PROFILE_SECONDS
                     run_profile_batch(rest, model, args.batch_slots, args.batch_limit)
