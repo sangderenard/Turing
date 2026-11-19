@@ -1,7 +1,7 @@
 """The admin's view of accounts: every account with its authority, and the SpeakToMe tools that authority gives it.
 
 Read-only. Granting and removing a permission group stays with the existing routes, POST /api/account/authority/grant
-(dev, operator, nodus) and POST /api/account/admin/grant|revoke (admin), which check and audit it. Tools follow the
+(dev, operator, nodus, execution) and POST /api/account/admin/grant|revoke (admin), which check and audit it. Tools follow the
 groups: an account's tools are the catalog entries its capabilities allow, the same rule /api/index answers its own
 caller with and the speaktome MCP turns into tools (an entry declared as a tool, sent as JSON, allowed).
 
@@ -29,8 +29,10 @@ def people(db_path) -> list:
                             "FROM users u LEFT JOIN account_roles r ON r.user_id = u.id "
                             "LEFT JOIN temporary_accounts t ON t.user_id=u.id "
                             "WHERE t.user_id IS NULL ORDER BY u.username COLLATE NOCASE").fetchall()
+        from meowdoku import agent_execution
         return [{"id": uid, "username": name, "display_name": shown, "created_at": created, "role_row": role,
-                 "role_granted_by": granted, "authority": permission_groups.authority(conn, uid)}
+                 "role_granted_by": granted, "server_agent": agent_execution.server_owned(db_path, name),
+                 "authority": permission_groups.authority(conn, uid)}
                 for uid, name, shown, created, role, granted in rows]
     finally:
         conn.close()

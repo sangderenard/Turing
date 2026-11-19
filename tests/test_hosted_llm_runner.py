@@ -10,6 +10,13 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+def test_long_reply_is_sent_in_full_across_message_parts():
+    answer = "a" * 8100
+    parts = runner.reply_parts(answer)
+    assert [len(part) for part in parts] == [4000, 4000, 100]
+    assert "".join(parts) == answer
+
+
 class Model:
     def __init__(self):
         self.calls = []
@@ -297,7 +304,7 @@ def test_both_model_callers_send_the_repetition_penalty(monkeypatch):
     assert model.answer("agents", [{"id": 1, "username": "bob", "body": "hi"}]) == "An answer."
     assert model.answer_profile({"preamble": "contract", "prompt": "job", "memory": ""}) == "An answer."
     assert len(sent) == 2
-    for body, max_tokens in zip(sent, (160, 256)):
+    for body, max_tokens in zip(sent, (1024, 256)):
         assert body["repeat_penalty"] == runner.REPEAT_PENALTY == 1.15
         assert body["repeat_last_n"] == runner.REPEAT_LAST_N == 256
         assert body["max_tokens"] == max_tokens and body["model"] == "base-model"

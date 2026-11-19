@@ -108,6 +108,8 @@ function Open-Seat([string]$key, [string]$agent, [string]$kind, [string[]]$order
     $memoryId = ''
     $instanceId = ''
     if ($kind -eq 'seat') {
+        $permission = & $Python (Join-Path $PSScriptRoot '..\agent_execution.py') --db $AccountsDb allowed --agent $declared.login
+        if ($LASTEXITCODE -eq 0 -and ($permission -join "`n" | ConvertFrom-Json).allowed) { $arguments += '--allow-exec' }
         $profile = (& $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --job roundtable) -join "`n"
         if ($LASTEXITCODE -ne 0) { throw "Roundtable profile resolution failed for $agent (exit $LASTEXITCODE)" }
         $memoryPath = Join-Path $AgentDays "$agent\persistence.id"
