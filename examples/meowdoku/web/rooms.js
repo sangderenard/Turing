@@ -96,10 +96,18 @@ async function open(name, { quiet = false } = {}) {
     // One post per press: while a post is in flight the composer is busy (Send disabled, text read-only), so a slow or
     // paused server cannot turn impatient presses or repeated Enter into two or three copies of the same message.
     const busy = on => { send.disabled = text.readOnly = on; send.textContent = on ? "Sending…" : "Send"; compose.setAttribute("aria-busy", String(on)); };
+    let pendingSend = null;
+    text.addEventListener("input", () => { pendingSend = null; });
     send.onclick = async () => { if (send.disabled || !text.value.trim()) return;
+      if (!pendingSend || pendingSend.body !== text.value)
+        pendingSend = { body: text.value, idempotency_key: crypto.randomUUID() };
       busy(true);
-      try { await request(`/api/chat/rooms/${name}`, { body: text.value }); text.value = ""; busy(false); await open(name); }
-      catch (error) { busy(false); status(`Not sent: ${error.message}`); } };
+      try {
+        await request(`/api/chat/rooms/${name}`, pendingSend);
+        pendingSend = null; text.value = ""; busy(false); await open(name);
+      } catch (error) {
+        busy(false); status(`Delivery unconfirmed: ${error.message}. Retry sends this message once.`);
+      } };
     text.addEventListener("keydown", event => {                                        // Enter sends; Shift+Enter is a new line
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); send.click(); }
     });

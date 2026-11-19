@@ -36,7 +36,7 @@ it (the jobs list's own rule), and the picture is then served to everyone who ma
 (GET .../sticker/<id>), never by its digest. Nobody posts another account's photo. (The studio's shared catalogue of
 marble objects holds designs, not pictures, so it gives no stickers yet.)
 
-Tables in accounts.db (schema module ``chat_rooms`` 4; this module is their one writer):
+Tables in accounts.db (schema module ``chat_rooms`` 6; this module is their one writer):
     chat_messages      (id, room, user_id, username, body, created, removed_at, removed_by)
     chat_audit         (at, admin, action, message_id)
     chat_room_defs     (room, title, about, owner_id, owner_name, stage, write, objects, bridges, created, updated)
@@ -46,6 +46,7 @@ Tables in accounts.db (schema module ``chat_rooms`` 4; this module is their one 
     chat_table_marks   (message_id, round)   the round a seat's message was written in, while its table was on
     chat_reactions     (message_id, user_id, username, kind, at)   one per account and emoji kind
     chat_stickers      (message_id, kind, digest, name, owner_id)   the picture a message carries
+    chat_post_keys     (room, user_id, key, payload, message_id)   one intended send, including removed messages
 
 Text is stored stripped and only ever returned as a JSON string. Who is asking always comes from the authenticated session.
 
@@ -82,7 +83,7 @@ from contextlib import contextmanager
 
 from meowdoku import schema_version
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_REACTION_KINDS = 64
 STICKER_KINDS = ("photo",)
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -132,6 +133,9 @@ DDL = (
     "seats TEXT NOT NULL, owner TEXT NOT NULL, switched_by TEXT NOT NULL, switched_at REAL NOT NULL, turn TEXT, "
     "round INTEGER NOT NULL DEFAULT 0, turn_at REAL, note TEXT NOT NULL DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS chat_table_marks (message_id INTEGER PRIMARY KEY, round INTEGER NOT NULL)",
+    # version 6: one durable result per client-generated send key
+    "CREATE TABLE IF NOT EXISTS chat_post_keys (room TEXT NOT NULL, user_id INTEGER NOT NULL, key TEXT NOT NULL, "
+    "payload TEXT NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY (room, user_id, key))",
     # version 4: reactions and stickers
     "CREATE TABLE IF NOT EXISTS chat_reactions (message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT NOT NULL, "
     "kind TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (message_id, user_id, kind))",
@@ -564,8 +568,10 @@ def _sticker(value, photo_owned) -> dict:
     return {"kind": "photo", "digest": digest, "name": name}
 
 
-def post(db, room, *, user_id, username, body, caps=frozenset(), now=None, sticker=None, photo_owned=None) -> dict:
-    _enter(db, room, user_id, caps, write=True)
+def post(db, room, *, user_id, username, body, caps=frozenset(), now=None, sticker=None, photo_owned=None,
+         checked=False) -> dict:
+    if not checked:
+        _enter(db, room, user_id, caps, write=True)
     body = "" if body is None and sticker is not None else body
     if not isinstance(body, str) or len(body) > MAX_BODY or (sticker is None and not body.strip()):
         raise ChatError(f"a message must be text of 1 to {MAX_BODY} characters (or a sticker)")
@@ -580,6 +586,35 @@ def post(db, room, *, user_id, username, body, caps=frozenset(), now=None, stick
         db.execute("INSERT INTO chat_stickers (message_id, kind, digest, name, owner_id) VALUES (?, ?, ?, ?, ?)",
                    (cursor.lastrowid, chosen["kind"], chosen["digest"], chosen["name"], int(user_id)))
     return _extras(db, [_row(db.execute(_SELECT + " WHERE id = ?", (cursor.lastrowid,)).fetchone())])[0]
+
+
+def post_once(db, room, *, key, user_id, username, body, caps=frozenset(), sticker=None,
+              photo_owned=None) -> tuple[dict, bool]:
+    """Return the first result for a client send key; serialize competing requests for that key."""
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", key):
+        raise ChatError("idempotency_key must be 8 to 100 letters, digits, hyphens or underscores")
+    _enter(db, room, user_id, caps, write=True)
+    payload = json.dumps({"body": body, "sticker": sticker}, sort_keys=True, separators=(",", ":"))
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        previous = db.execute(
+            "SELECT payload, message_id FROM chat_post_keys WHERE room = ? AND user_id = ? AND key = ?",
+            (room, int(user_id), key)).fetchone()
+        if previous is not None:
+            if previous[0] != payload:
+                raise ChatError("idempotency_key was already used for a different message", 409)
+            made = _extras(db, [_row(db.execute(_SELECT + " WHERE id = ?", (previous[1],)).fetchone())])[0]
+            db.commit()
+            return made, True
+        made = post(db, room, user_id=user_id, username=username, body=body, caps=caps,
+                    sticker=sticker, photo_owned=photo_owned, checked=True)
+        db.execute("INSERT INTO chat_post_keys(room, user_id, key, payload, message_id) VALUES (?, ?, ?, ?, ?)",
+                   (room, int(user_id), key, payload, made["id"]))
+        db.commit()
+        return made, False
+    except BaseException:
+        db.rollback()
+        raise
 
 
 def _extras(db, rows) -> list:
@@ -757,14 +792,24 @@ def http_route(self, path, method, *, accounts_db, connections=None, notify=None
             from meowdoku import mentions
             if body.get("sticker") is not None and photo_owned is None:
                 return self._json({"error": "this server offers no stickers"}, 503)
-            made = post(db, room, **me, username=principal.username, body=body.get("body"), sticker=body.get("sticker"),
-                        photo_owned=photo_owned)
-            told = mentions.tell(db, writer_id=principal.user_id, writer=principal.username, body=made["body"],
-                                 where=f"the room {room}", answer=f"chat_post room={room}, or /rooms.html?room={room}",
-                                 may_read=lambda account: may_enter(db, room, user_id=account["id"],
-                                                                    caps=caps_for(account) if caps_for else frozenset()),
-                                 notify=notify, kind="room", ref=room)
-            return self._json({"message": made, "mentioned": told})
+            if "idempotency_key" in body:
+                made, duplicate = post_once(db, room, **me, username=principal.username, body=body.get("body"),
+                                            sticker=body.get("sticker"), photo_owned=photo_owned,
+                                            key=body["idempotency_key"])
+            else:
+                made = post(db, room, **me, username=principal.username, body=body.get("body"),
+                            sticker=body.get("sticker"), photo_owned=photo_owned)
+                duplicate = False
+            told = [] if duplicate else mentions.tell(
+                db, writer_id=principal.user_id, writer=principal.username, body=made["body"],
+                where=f"the room {room}", answer=f"chat_post room={room}, or /rooms.html?room={room}",
+                may_read=lambda account: may_enter(db, room, user_id=account["id"],
+                                                   caps=caps_for(account) if caps_for else frozenset()),
+                notify=notify, kind="room", ref=room)
+            result = {"message": made, "mentioned": told}
+            if "idempotency_key" in body:
+                result["duplicate"] = duplicate
+            return self._json(result)
         if room and rest == ["react"]:
             if reaction_kinds is None:
                 return self._json({"error": "this server offers no reactions"}, 503)
