@@ -125,9 +125,9 @@ def test_failed_evidence_copy_leaves_the_file_as_found(tmp_path, monkeypatch):
     found = p.read_bytes()
 
     def failing_copy(src, dst, *args, **kwargs):
-        Path(dst).write_bytes(b"partial")                                     # a copy that fails after creating its file
+        dst.write(b"partial")                                                 # a copy that fails after writing into its file
         raise OSError("disk full")
-    monkeypatch.setattr(L.shutil, "copyfile", failing_copy)
+    monkeypatch.setattr(L.shutil, "copyfileobj", failing_copy)
     b = L.Ring(cap_bytes=5000, path=p, key_path=key)
     texts = [e["text"] for e in b.fetch(0)["entries"]]
     assert texts[:5] == [f"n{i}" for i in range(5)]                           # startup still works from the readable lines
@@ -153,6 +153,43 @@ def test_failed_evidence_copy_leaves_the_file_as_found(tmp_path, monkeypatch):
     d = L.Ring(cap_bytes=5000, path=p, key_path=key)
     assert [e["text"] for e in d.fetch(0)["entries"]] == [e["text"] for e in c.fetch(0)["entries"]]
     assert len(list(tmp_path.glob("ring.jsonl.bad-*"))) == 1                 # the rewritten ring reloads clean
+
+
+def test_same_second_failed_copy_keeps_the_earlier_snapshot(tmp_path, monkeypatch):
+    """Ticket f62934c8, review 0ea3e90b (codex): two captures in the same second must not share a destination; a failed later copy
+    must neither truncate nor remove the earlier snapshot, and must leave the damaged ring as found (no rewrite)."""
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    monkeypatch.setattr(L.time, "time", lambda: 1795000000.0)                # every capture below falls in the same second
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    for i in range(5):
+        a.add(f"n{i}")
+    p.write_bytes(p.read_bytes() + b"enc:v1:not-a-token\n")
+    found = p.read_bytes()
+    L.Ring(cap_bytes=5000, path=p, key_path=key)                              # the first capture succeeds
+    first = tmp_path / "ring.jsonl.bad-1795000000"
+    assert first.read_bytes() == found
+
+    p.write_bytes(p.read_bytes() + b"enc:v1:not-a-token-either\n")            # damaged again, same second
+    found2 = p.read_bytes()
+    real_copy = L.shutil.copyfileobj
+
+    def failing_copy(src, dst, *args, **kwargs):
+        dst.write(b"partial")
+        raise OSError("disk full")
+    monkeypatch.setattr(L.shutil, "copyfileobj", failing_copy)
+    c = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    assert "could not be written" in c.fetch(0)["entries"][-1]["text"]
+    assert first.read_bytes() == found                                        # the earlier snapshot is intact
+    assert list(tmp_path.glob("ring.jsonl.bad-*")) == [first]                 # the failed attempt left nothing behind
+    assert p.read_bytes().startswith(found2)                                  # the damaged ring is left as found
+
+    monkeypatch.setattr(L.shutil, "copyfileobj", real_copy)                   # the copy works again, still the same second
+    before = p.read_bytes()
+    L.Ring(cap_bytes=5000, path=p, key_path=key)
+    second = tmp_path / "ring.jsonl.bad-1795000000-1"
+    assert first.read_bytes() == found and second.read_bytes() == before and before.startswith(found2)
+    assert sorted(tmp_path.glob("ring.jsonl.bad-*")) == sorted([first, second])
 
 
 def test_oversize_rewrite_is_atomic(tmp_path):

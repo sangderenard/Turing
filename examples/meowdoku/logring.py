@@ -123,19 +123,33 @@ class Ring:
     _needs_separator = False    # the file ends in a cut-off line: the next append first writes a newline
 
     def _keep_evidence(self) -> Path | None:
-        """Copies the file as found to ``<name>.bad-<time>``.  On failure no partial copy is left and the evidence stays pending, so
-        no rewrite (at load or when the file outgrows the cap) may drop the unreadable lines before a copy of them exists."""
-        evidence = self.path.with_name(f"{self.path.name}.bad-{int(time.time())}")
-        try:
-            shutil.copyfile(self.path, evidence)
-        except OSError:
+        """Copies the file as found to ``<name>.bad-<time>`` (``-1``, ``-2`` ... when that name is taken).  Each attempt reserves a
+        name of its own (O_EXCL), so it never overwrites or removes an earlier snapshot, even one made in the same second.  On failure
+        only the name this attempt created is removed and the evidence stays pending, so no rewrite (at load or when the file outgrows
+        the cap) may drop the unreadable lines before a copy of them exists."""
+        stem = f"{self.path.name}.bad-{int(time.time())}"
+        for n in range(1000):
+            evidence = self.path.with_name(stem if n == 0 else f"{stem}-{n}")
             try:
-                evidence.unlink(missing_ok=True)
+                fd = os.open(evidence, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+            except FileExistsError:
+                continue                                              # an earlier snapshot holds this name: never touch it
             except OSError:
-                pass
-            return None
-        self._evidence_pending = False
-        return evidence
+                return None
+            try:
+                with os.fdopen(fd, "wb") as out, self.path.open("rb") as found:
+                    shutil.copyfileobj(found, out)
+                    out.flush()
+                    os.fsync(out.fileno())
+            except OSError:
+                try:
+                    evidence.unlink(missing_ok=True)                  # only the name this attempt reserved
+                except OSError:
+                    pass
+                return None
+            self._evidence_pending = False
+            return evidence
+        return None
 
     def _rewrite(self) -> None:
         """Writes the whole ring to a temporary file beside the ring, then replaces the ring with it: never a half-written ring."""
