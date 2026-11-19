@@ -45,20 +45,29 @@ def known_agents(accounts_db: Path | None = None) -> dict[str, tuple[str, int]]:
     return {**AGENTS, **_external}
 
 
+def _agent_name(username: str) -> str | None:
+    """Map the signed-in account to the badge name shown by snapshot()."""
+    if username in AGENTS or username in _external or username in UNSCHEDULED_AGENTS:
+        return username
+    return next((name for name, (account, _) in {**AGENTS, **_external}.items() if username == account), None)
+
+
 def note_inbound(username: str, *, mcp: bool, now: float | None = None) -> None:
     """Record an authenticated API request; a call is only 'recent', not 'running'."""
-    if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
+    name = _agent_name(username)
+    if name is None:
         return
     with _lock:
-        _recent[(username, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
+        _recent[(name, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
 
 
 def note_outbound(username: str, channel: str, *, now: float | None = None) -> bool:
     """Record a bounded observation from an authenticated agent's real client call site."""
-    if channel not in OUTBOUND_CHANNELS or (username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS):
+    name = _agent_name(username)
+    if channel not in OUTBOUND_CHANNELS or name is None:
         return False
     with _lock:
-        _recent[(username, channel)] = time.time() if now is None else now
+        _recent[(name, channel)] = time.time() if now is None else now
     return True
 
 
@@ -159,12 +168,13 @@ def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
         return []
     seen, out = set(), []
     for username, repository, path, at in rows:
-        if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
+        name = _agent_name(username)
+        if name is None:
             continue
-        if username in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
+        if name in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
             continue
-        seen.add(username)
-        out.append({"username": username, "repository": repository, "path": path.replace("\\", "/"), "at": at,
+        seen.add(name)
+        out.append({"username": name, "repository": repository, "path": path.replace("\\", "/"), "at": at,
                     "age_seconds": max(0, now - at)})
     return out
 

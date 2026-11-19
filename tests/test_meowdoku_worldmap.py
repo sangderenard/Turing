@@ -113,7 +113,7 @@ def test_outbound_observation_uses_authenticated_agent_identity(server):
     assert _call(server.port, path, "POST", {**member, "X-Meowdoku-Activity": "1"}, {"channel": "api_out"})[0] == 403
     operator = _cookie(server, "operator-outbound", "operator")
     assert _call(server.port, path, "POST", {**operator, "X-Meowdoku-Activity": "1"}, {"channel": "api_out"})[0] == 403
-    agent = _cookie(server, "codex", "dev")
+    agent = _cookie(server, "agents-codex", "dev")
     assert _call(server.port, path, "POST", agent, {"channel": "api_out"})[0] == 403
     headers = {**agent, "X-Meowdoku-Activity": "1"}
     assert _call(server.port, path, "POST", headers, {"channel": "api_out", "username": "claude"})[0] == 400

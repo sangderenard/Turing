@@ -58,7 +58,7 @@ def test_checkout_location_is_last_observed_and_outbound_unknown(tmp_path):
         conn.execute("CREATE TABLE checkout_calls (id INTEGER PRIMARY KEY, at REAL, username TEXT, repository TEXT, path TEXT, operation TEXT, ok INTEGER)")
         conn.executemany("INSERT INTO checkout_calls(at,username,repository,path,operation,ok) VALUES (?,?,?,?,?,?)", [
             (10, "codex", "turing", "examples/meowdoku/server.py", "read", 1),
-            (20, "codex", "turing", "examples/meowdoku/worldmap.py", "write", 1),
+            (20, "agents-codex", "turing", "examples/meowdoku/worldmap.py", "write", 1),
             (30, "claude", "turing", "../secret", "read", 1),
             (40, "gemini", "turing", "src/compiler/fortran_c_shell.py", "read", 0),
         ])
@@ -89,8 +89,10 @@ def test_outbound_requires_known_agent_and_real_channel():
     assert presence._observed("codex", 100)["api_out"]["state"] == "unknown"
     assert not presence.note_outbound("random-user", "api_out", now=100)
     assert not presence.note_outbound("codex", "api_in", now=100)
-    assert presence.note_outbound("codex", "api_out", now=100)
+    assert presence.note_outbound("agents-codex", "api_out", now=100)
+    presence.note_inbound("agents-codex", mcp=True, now=100)
     assert presence._observed("codex", 129)["api_out"] == {"state": "recent", "at": 100}
+    assert presence._observed("codex", 129)["mcp_in"] == {"state": "recent", "at": 100}
     assert presence._observed("codex", 131)["api_out"]["state"] == "unobserved"
     assert presence._observed("codex", 100)["mcp_out"]["state"] == "unknown"
 
