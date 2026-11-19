@@ -235,6 +235,9 @@ def test_execution_is_a_separate_server_agent_group_and_llama_is_excluded(db):
     assert "execution" in claude.groups and "agent_execute" in authz.capabilities(claude, authz.DEFAULT_POLICY)
     assert "execution" not in llama.groups and "agent_execute" not in authz.capabilities(llama, authz.DEFAULT_POLICY)
     assert agent_execution.allowed(db, "claude") and not agent_execution.allowed(db, "llama")
+    direct = subprocess.run([sys.executable, str(AUTHZ), "show", "--db", str(db), "claude"],
+                            capture_output=True, text=True)
+    assert direct.returncode == 0, direct.stderr
     authz.grant_admin(db, "alice", "operator:test")
     with authz._connect(db) as conn:
         with pytest.raises(PermissionError):
