@@ -301,7 +301,10 @@ IOTA = ("pid",)                        # columns the generated shader derives fr
 #: ``ke``..``n_drop`` are the law's DIAGNOSTICS: reduced by a fixed-order tree, so element 0 holds the total over all ids
 #: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
 #: chamber, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
-DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop")
+#: ``n_out_x``, ``n_out_y``, ``n_out_z`` and ``n_sdf_gone`` say WHY ids are ``n_out`` in the chamber law: past a side
+#: wall, under the floor, past the plexiglass, on the wrong side of the SDF.  An id may meet more than one test, so they
+#: need not add up to ``n_out`` (case a0e9535f).  With an ``environment`` its own ``contains`` decides, and they are 0.
+DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop", "n_out_x", "n_out_y", "n_out_z", "n_sdf_gone")
 OUTPUTS = tuple(f"{s}_next" for s in STATE) + ("cr", "cg", "cb", "rad", "shown") + DIAGNOSTICS
 ARGUMENTS = STATE + CONSTANTS + UNIFORMS
 #: The HINGED BODY (the waterwheel), the 2-D law's (``fountain.py``) in 3-D: present only in the BODY VARIANT of the law (``make_law(.., body=True)``),
@@ -1569,10 +1572,12 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             * as_float(wxn.abs() < 1.0e30) * as_float(wyn.abs() < 1.0e30) * as_float(wzn.abs() < 1.0e30)
         placed = finite * as_float((xn.abs() + yn.abs() + zn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
         if environment is None:
-            inside_box = (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)) \
-                * (1.0 - as_float(zn.abs() > dh + radius)) * (1.0 - sdf_gone)
+            past_x, past_y, past_z = as_float(xn.abs() > half + radius), as_float(yn < -radius), as_float(zn.abs() > dh + radius)
+            inside_box = (1.0 - past_x) * (1.0 - past_y) * (1.0 - past_z) * (1.0 - sdf_gone)
+            c_out_x, c_out_y, c_out_z, c_sdf = placed * past_x, placed * past_y, placed * past_z, placed * sdf_gone
         else:
             inside_box = environment.contains((xn, yn, zn), radius, a)
+            c_out_x = c_out_y = c_out_z = c_sdf = vxn * 0.0
         outside = placed * (1.0 - inside_box)
         c_nan = 1.0 - finite
         c_parked = finite * (1.0 - placed)
@@ -1594,6 +1599,10 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             c_out = c_out + c_out.index_select(0, partner) * gate
             c_live = c_live + c_live.index_select(0, partner) * gate
             c_drop = c_drop + c_drop.index_select(0, partner) * gate
+            c_out_x = c_out_x + c_out_x.index_select(0, partner) * gate
+            c_out_y = c_out_y + c_out_y.index_select(0, partner) * gate
+            c_out_z = c_out_z + c_out_z.index_select(0, partner) * gate
+            c_sdf = c_sdf + c_sdf.index_select(0, partner) * gate
             v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
         if body:
             # ---- the BODY's step, in engine_toy's order (DrivetrainSolver): the applied torques first (the grains' reaction, from the reduction's
@@ -1608,9 +1617,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             th1 = a["bth"] + om2 * dt
             th2 = th1 - TAU * (th1 * (1.0 / TAU) + 0.5).floor()
             return (xn, yn, zn, vxn, vyn, vzn, wxn, wyn, wzn, age_next, rs_next, th2, om2, cr, cg, cb, radius, act,
-                    ke, v2, c_nan, c_out, c_parked, c_live, c_drop, th2, om2, tau_c)
+                    ke, v2, c_nan, c_out, c_parked, c_live, c_drop, c_out_x, c_out_y, c_out_z, c_sdf, th2, om2, tau_c)
         return (xn, yn, zn, vxn, vyn, vzn, wxn, wyn, wzn, age_next, rs_next, cr, cg, cb, radius, act,
-                ke, v2, c_nan, c_out, c_parked, c_live, c_drop)
+                ke, v2, c_nan, c_out, c_parked, c_live, c_drop, c_out_x, c_out_y, c_out_z, c_sdf)
 
     return fountain_step
 
