@@ -1,5 +1,6 @@
 import json
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -61,7 +62,8 @@ class RadioHlsTests(unittest.TestCase):
         asset = self.root / 'asset.wav'
         asset.write_bytes(b'fixture')
         native = {key: str(asset) for key in ('executable', 'scope_dll', 'fft_dll')}
-        native.update(router_port=10001, pcm_port=10002, spectrum_port=10003, hls=self.hls)
+        native.update(router_port=10001, pcm_port=10002, spectrum_port=10003, hls=self.hls,
+                      codec={'dll_dirs': [str(self.root)]})
         self.config.write_text(json.dumps({'enabled': True, 'source': 'file',
             'jukebox': {'native': native, 'songs': []}}), encoding='utf-8')
         runner = Runner(None, self.config, None, state=self.state)
@@ -88,6 +90,7 @@ class RadioHlsTests(unittest.TestCase):
         track.start(threading.Event())
         self.assertEqual(calls[0][0][-2:], ['1', '1'])
         self.assertEqual(calls[0][1]['env']['NODUS_EXEC_ROWS'], prepared['hls_env']['NODUS_EXEC_ROWS'])
+        self.assertTrue(calls[0][1]['env']['PATH'].startswith(str(self.root) + os.pathsep))
         self.assertEqual(process.stdin.getvalue(), 'START\n')
 
 
