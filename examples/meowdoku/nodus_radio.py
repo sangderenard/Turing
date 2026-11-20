@@ -52,7 +52,8 @@ def snapshot(config_path, accounts_db, *, now=None, station=None):
         config['title'] = station['title']
     if type(address) is not int or type(owner) is not int or not isinstance(peer, str) or not peer:
         raise ValueError('invalid Radio station configuration')
-    state = {**empty, 'title': str(config.get('title', 'Nodus Radio'))[:160], 'status': 'waiting', 'audio': audio}
+    state = {**empty, 'title': str(config.get('title', 'Nodus Radio'))[:160], 'status': 'waiting', 'audio': audio,
+             'song_id': station.get('song_id') if station else None}
     # Read-only view of the existing bounded relay table. Validate the real
     # owner's open address, then inspect only its newest retained record.
     uri = accounts_db.resolve().as_uri() + '?mode=ro'

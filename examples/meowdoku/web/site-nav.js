@@ -5,7 +5,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 11;
+const VERSION = 12;
 
 function allowed() {
   const here = import.meta.url;
@@ -163,8 +163,8 @@ function mountControlSuite(wrap, host, spec) {
   };
 }
 
-// Nodus owns capture/FFT; Python reads its existing UDP relay inbox.
-// This widget shows NRAD bands and an opt-in HLS player for the authored file station.
+// Nodus analyzes uploaded tracks once; the browser reads their stored NRAD bands
+// against the HLS media clock. The live relay remains a station diagnostic.
 function mountRadio(wrap, host, canControl = false) {
   const chip = el("button", {class: "chip", type: "button", text: "Nodus Radio", "aria-expanded": "false"});
   const panel = el("section", {class: "suite", hidden: "", "aria-label": "Nodus Radio"});
@@ -183,7 +183,7 @@ function mountRadio(wrap, host, canControl = false) {
   let wantsAudio = false;
   try { wantsAudio = sessionStorage.getItem(listeningKey) === "1"; } catch (_error) {}
   let hlsEngine = null, audioEpoch = 0, audioAvailable = false, connecting = false;
-  let fftFrames = [], fftTitle = null, historyBusy = false, historyTimer = null;
+  let analysisView = null, analysisSong = null, analysisRequest = 0, analysisRetryAt = 0, audibleRms = null;
   function renderBands(frame) {
     bands.replaceChildren();
     for (const [index, value] of (frame.bands || []).slice(0, 128).entries()) {
@@ -208,7 +208,8 @@ function mountRadio(wrap, host, canControl = false) {
     if (hlsEngine) { hlsEngine.destroy(); hlsEngine = null; }
     audio.removeAttribute("src"); audio.load();
     audio.hidden = true;
-    fftFrames = []; fftTitle = null;
+    audibleRms = null;
+    bands.replaceChildren();
     updateAudioControls();
   }
   async function tryPlay(epoch) {
@@ -286,36 +287,59 @@ function mountRadio(wrap, host, canControl = false) {
   audio.addEventListener("pause", updateAudioControls);
   audio.addEventListener("ended", updateAudioControls);
   function showAudibleFrame() {
-    if (audio.paused || !Number.isFinite(audio.currentTime) || !fftFrames.length) return;
-    // Both NRAD captured_frames and HLS audio PTS start at the file-source
-    // sample origin. Select by media time, rather than packet arrival time.
-    const target = audio.currentTime;
-    let selected = null;
-    for (const frame of fftFrames) {
-      if (Number(frame.frame) / frame.sample_rate <= target) selected = frame;
-      else break;
+    if (audio.paused || !Number.isFinite(audio.currentTime) || !analysisView) return;
+    // NRAD frames use the source's 48 kHz clock, which also starts HLS PTS.
+    const view = analysisView, count = view.byteLength / 48;
+    const target = audio.currentTime * 48000;
+    let lo = 0, hi = count;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (Number(view.getBigUint64(mid * 48 + 16, true)) <= target) lo = mid + 1;
+      else hi = mid;
     }
-    if (!selected || target - Number(selected.frame) / selected.sample_rate > 0.25) return;
-    window.dispatchEvent(new CustomEvent("nodus-radio-audible-frame", {detail: selected}));
+    if (!lo) return;
+    const at = (lo - 1) * 48, frameNumber = Number(view.getBigUint64(at + 16, true));
+    if (target - frameNumber > 12000) return;
+    const frame = {status: "live", sample_rate: 48000, frame: String(frameNumber),
+      rms: view.getFloat32(at + 24, true), bands: Array.from({length: 5}, (_, n) => view.getFloat32(at + 28 + 4 * n, true))};
+    audibleRms = frame.rms;
+    renderBands(frame);
+    window.dispatchEvent(new CustomEvent("nodus-radio-audible-frame", {detail: frame}));
   }
-  async function pollHistory(epoch) {
-    if (epoch !== generation || panel.hidden) return;
-    if (!historyBusy && audioAvailable) {
-      historyBusy = true;
-      try {
-        const data = await getJson("/api/radio/history");
-        if (epoch === generation && !panel.hidden) {
-          if (fftTitle !== data.title) fftFrames = [];
-          fftTitle = data.title;
-          fftFrames = data.frames || [];
-          showAudibleFrame();
-        }
-      } catch (_error) { if (epoch === generation) fftFrames = []; }
-      finally { historyBusy = false; }
-    }
-    if (epoch === generation && !panel.hidden) historyTimer = setTimeout(() => pollHistory(epoch), 250);
+  async function loadLevels(songId) {
+    if (songId === analysisSong && (analysisView || Date.now() < analysisRetryAt)) return;
+    analysisSong = songId; analysisView = null;
+    analysisRetryAt = Date.now() + 5000;
+    audibleRms = null;
+    bands.replaceChildren();
+    const requestId = ++analysisRequest;
+    if (!songId?.startsWith("upload:") && !songId?.startsWith("suno:")) return;
+    try {
+      const response = await fetch("/api/radio/levels?id=" + encodeURIComponent(songId),
+        {credentials: "same-origin", cache: "force-cache"});
+      if (!response.ok) return;
+      if (response.headers.get("X-Radio-Track-Id") !== songId ||
+          response.headers.get("X-Radio-Analysis-Version") !== "1" ||
+          response.headers.get("X-Radio-Frame-Hop") !== "256" ||
+          response.headers.get("X-Radio-Band-Count") !== "5" ||
+          response.headers.get("X-Radio-Sample-Rate") !== "48000") return;
+      const buffer = await response.arrayBuffer();
+      if (requestId !== analysisRequest || !buffer.byteLength || buffer.byteLength > 16 * 1024 * 1024 || buffer.byteLength % 48) return;
+      const view = new DataView(buffer);
+      if (view.getUint32(0, true) !== 0x4441524e || view.getUint32(4, true) !== 1 ||
+          view.getUint32(8, true) !== 5 || view.getUint32(12, true) !== 48000) return;
+      analysisView = view;
+      showAudibleFrame();
+    } catch (_error) { /* The station still plays if stored levels are unavailable. */ }
   }
-  audio.addEventListener("timeupdate", showAudibleFrame);
+  let meterFrame = 0;
+  function tickMeters() {
+    showAudibleFrame();
+    if (!audio.paused && !audio.ended) meterFrame = requestAnimationFrame(tickMeters);
+    else meterFrame = 0;
+  }
+  audio.addEventListener("playing", () => { if (!meterFrame) meterFrame = requestAnimationFrame(tickMeters); });
+  audio.addEventListener("seeked", showAudibleFrame);
   const queueStatus = el("p", {role: "status", text: "Jukebox: checking configuration"});
   const search = el("input", {type: "search", placeholder: "Search station tracks", "aria-label": "Search station tracks"});
   const songs = el("select", {"aria-label": "Song to request"});
@@ -559,13 +583,16 @@ function mountRadio(wrap, host, canControl = false) {
       title.textContent = data.title || "Nodus Radio";
       const available = data.audio === true;
       audioAvailable = available;
+      loadLevels(data.song_id || null);
       if (!available && (audio.getAttribute("src") || hlsEngine)) stopAudio();
       updateAudioControls();
-      status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
+      status.textContent = !audio.paused && audibleRms !== null ? "Listening · RMS " + audibleRms.toFixed(3)
+        : !audio.paused && !analysisView ? "Listening · stored levels unavailable"
+        : data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
         : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
         : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
-      // Keep the visible meters on the live NRAD feed even when HLS history has no matching audio frame.
-      renderBands(data);
+      if (!analysisView) renderBands({bands: [], status: "waiting"});
+      else showAudibleFrame();
     } catch (error) {
       if (epoch !== generation || panel.hidden) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
@@ -579,10 +606,10 @@ function mountRadio(wrap, host, canControl = false) {
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
     generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
-    clearTimeout(historyTimer); historyTimer = null; clearTimeout(sunoTimer); sunoTimer = null;
+    clearTimeout(sunoTimer); sunoTimer = null;
     if (!open && audio.paused) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
-    if (open) {poll(generation); pollPA(generation); pollHistory(generation); if (!sunoLoaded) loadPlaylists(false); pollSunoJob(generation);}
+    if (open) {poll(generation); pollPA(generation); if (!sunoLoaded) loadPlaylists(false); pollSunoJob(generation);}
   }
   chip.addEventListener("click", () => setOpen(panel.hidden));
   close.addEventListener("click", () => {setOpen(false); chip.focus();});
@@ -602,6 +629,7 @@ function mountRadio(wrap, host, canControl = false) {
   updateAudioControls();
   if (wantsAudio) getJson("/api/radio").then(data => {
     audioAvailable = data.audio === true;
+    loadLevels(data.song_id || null);
     updateAudioControls();
     if (wantsAudio && audioAvailable) startAudio();
   }).catch(() => {

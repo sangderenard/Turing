@@ -3714,6 +3714,37 @@ def make_handler(sessions: Sessions):
             if path == "/api/radio/uploads":
                 from meowdoku.radio_upload_assets import route
                 return route(self, sessions, "GET")
+            if path == "/api/radio/levels":
+                if not self._require("view_site"):
+                    return
+                self._classify()
+                if self._principal().user_id is None:
+                    return self._json({"error": "Sign in to see Radio levels"}, HTTPStatus.UNAUTHORIZED)
+                from urllib.parse import parse_qs
+                from meowdoku import radio_upload_assets
+                from meowdoku.nodus_radio_control import ControlError
+                ids = parse_qs(self.path.partition("?")[2]).get("id", [])
+                try:
+                    if len(ids) != 1:
+                        raise ControlError("Choose one Radio track", 400)
+                    data = radio_upload_assets.read_levels(sessions.state, sessions.accounts_db, ids[0])
+                except ControlError as error:
+                    return self._json({"error": str(error)}, error.status)
+                except (OSError, sqlite3.Error, radio_upload_assets.schema_version.SchemaVersionError):
+                    return self._json({"error": "Radio levels unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.send_header("X-Radio-Track-Id", ids[0])
+                self.send_header("X-Radio-Analysis-Version", "1")
+                self.send_header("X-Radio-Frame-Hop", "256")
+                self.send_header("X-Radio-Band-Count", "5")
+                self.send_header("X-Radio-Sample-Rate", "48000")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path == "/api/radio/suno/assets":
                 from meowdoku.suno_radio_assets import route
                 return route(self, sessions, path, "GET")
