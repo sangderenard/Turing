@@ -34017,13 +34017,26 @@ def _class_surface_ssa_program(
             # unplaced boundary's own value is a lowering shortfall naming
             # the callsite and the installer's reason.  A boundary called
             # only for its effect, or consumed by a region that computes it
-            # (c437), is not a source output and is untouched.
+            # (c437), is not a source output and is untouched; a boundary a
+            # live region computes itself (c922: ``return math.floor(x)``)
+            # has a producer and is untouched too.
+            region_computed_ids = {
+                int(node_id)
+                for region_index in control.region_indices
+                for subgraph in (tuple(getattr(
+                    shell, "dispatch_subgraphs", ()
+                ))[int(region_index)],)
+                for node_id in subgraph.G.graph.get(
+                    "deployment_nodes", ()
+                )
+            }
             unplaced_output_ids = {
                 int(graph_obj.nodes[int(callsite_id)].get(
                     "value_id", callsite_id
                 )): (int(callsite_id), str(reason))
                 for callsite_id, reason in external_reference_call_shortfalls
                 if int(callsite_id) in graph_obj
+                and int(callsite_id) not in region_computed_ids
             }
             lowering_failures.extend(
                 (
