@@ -5,7 +5,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 10;
+const VERSION = 11;
 
 function allowed() {
   const here = import.meta.url;
@@ -175,10 +175,14 @@ function mountRadio(wrap, host, canControl = false) {
   const audio = el("audio", {class: "radio-audio", controls: "", preload: "none", "aria-label": "Nodus Radio audio"});
   const nativeHls = !!audio.canPlayType("application/vnd.apple.mpegurl");
   const listen = el("button", {class: "chip", type: "button", text: "Listen in this browser"});
+  const stopListening = el("button", {class: "chip", type: "button", text: "Stop listening"});
   const audioNote = el("p", {role: "status", text: "Audio starts when you choose Listen."});
-  audio.hidden = audioNote.hidden = listen.hidden = true;
-  panel.append(close, title, status, bands, listen, audio, audioNote);
-  let hlsEngine = null, audioEpoch = 0, audioAvailable = false;
+  audio.hidden = audioNote.hidden = listen.hidden = stopListening.hidden = true;
+  panel.append(close, title, status, bands, listen, stopListening, audio, audioNote);
+  const listeningKey = "meowdoku.radio.listening";
+  let wantsAudio = false;
+  try { wantsAudio = sessionStorage.getItem(listeningKey) === "1"; } catch (_error) {}
+  let hlsEngine = null, audioEpoch = 0, audioAvailable = false, connecting = false;
   let fftFrames = [], fftTitle = null, historyBusy = false, historyTimer = null;
   function renderBands(frame) {
     bands.replaceChildren();
@@ -188,33 +192,62 @@ function mountRadio(wrap, host, canControl = false) {
         "aria-label": "Band " + (index + 1), title: "Band " + (index + 1) + ": " + level.toFixed(3)}));
     }
   }
+  function updateAudioControls() {
+    const playing = !audio.paused && !audio.ended;
+    chip.textContent = playing ? "Nodus Radio · listening" : wantsAudio ? "Nodus Radio · resume" : "Nodus Radio";
+    listen.textContent = wantsAudio ? "Resume listening" : "Listen in this browser";
+    listen.hidden = !audioAvailable || playing;
+    listen.disabled = connecting;
+    stopListening.hidden = !wantsAudio;
+    audioNote.hidden = !audioAvailable && !wantsAudio;
+  }
   function stopAudio() {
     audioEpoch++;
+    connecting = false;
     audio.pause();
     if (hlsEngine) { hlsEngine.destroy(); hlsEngine = null; }
     audio.removeAttribute("src"); audio.load();
     audio.hidden = true;
-    listen.disabled = false;
     fftFrames = []; fftTitle = null;
+    updateAudioControls();
   }
-  listen.addEventListener("click", async () => {
-    if (!audioAvailable) return;
+  async function tryPlay(epoch) {
+    try {
+      await audio.play();
+    } catch (error) {
+      if (epoch !== audioEpoch) return;
+      audioNote.textContent = error?.name === "NotAllowedError"
+        ? "Tap Resume listening to let this browser play Radio."
+        : "Could not start radio: " + String(error.message || error);
+      updateAudioControls();
+    }
+  }
+  async function startAudio() {
+    if (!wantsAudio || !audioAvailable || connecting) return;
     const epoch = ++audioEpoch;
-    listen.disabled = true;
+    if (audio.getAttribute("src") || hlsEngine) { await tryPlay(epoch); return; }
+    connecting = true;
     audioNote.textContent = "Connecting to the station…";
+    updateAudioControls();
     try {
       if (nativeHls) {
         audio.src = "/api/radio/hls/radio.m3u8";
         audio.hidden = false;
-        await audio.play();
+        connecting = false;
+        updateAudioControls();
+        await tryPlay(epoch);
       } else {
         const {default: Hls} = await import("./radio-hls.min.js");
         if (epoch !== audioEpoch || !audioAvailable) return;
         if (!Hls.isSupported()) throw new Error("This browser cannot decode the radio stream");
         hlsEngine = new Hls({lowLatencyMode: true});
-        hlsEngine.on(Hls.Events.MEDIA_ATTACHED, () => hlsEngine?.loadSource("/api/radio/hls/radio.m3u8"));
+        hlsEngine.on(Hls.Events.MEDIA_ATTACHED, () => { if (epoch === audioEpoch) hlsEngine?.loadSource("/api/radio/hls/radio.m3u8"); });
         hlsEngine.on(Hls.Events.MANIFEST_PARSED, () => {
-          if (epoch === audioEpoch) audio.play().catch(error => { audioNote.textContent = String(error.message || error); });
+          if (epoch === audioEpoch) {
+            connecting = false;
+            updateAudioControls();
+            tryPlay(epoch);
+          }
         });
         hlsEngine.on(Hls.Events.ERROR, (_event, data) => {
           if (epoch === audioEpoch && data.fatal) {
@@ -225,14 +258,33 @@ function mountRadio(wrap, host, canControl = false) {
         audio.hidden = false;
         hlsEngine.attachMedia(audio);
       }
-      if (epoch === audioEpoch) audioNote.textContent = "Listening here. Server speakers are separate.";
     } catch (error) {
       if (epoch === audioEpoch) {
         stopAudio();
         audioNote.textContent = "Could not start radio: " + String(error.message || error);
       }
-    } finally { listen.disabled = !!audio.getAttribute("src") || !!hlsEngine; }
+    }
+  }
+  listen.addEventListener("click", () => {
+    if (!audioAvailable) return;
+    wantsAudio = true;
+    try { sessionStorage.setItem(listeningKey, "1"); } catch (_error) {}
+    updateAudioControls();
+    startAudio();
   });
+  stopListening.addEventListener("click", () => {
+    wantsAudio = false;
+    try { sessionStorage.removeItem(listeningKey); } catch (_error) {}
+    stopAudio();
+    audioNote.textContent = "Audio starts when you choose Listen.";
+  });
+  audio.addEventListener("playing", () => {
+    connecting = false;
+    audioNote.textContent = "Listening here. Server speakers are separate.";
+    updateAudioControls();
+  });
+  audio.addEventListener("pause", updateAudioControls);
+  audio.addEventListener("ended", updateAudioControls);
   function showAudibleFrame() {
     if (audio.paused || !Number.isFinite(audio.currentTime) || !fftFrames.length) return;
     // Both NRAD captured_frames and HLS audio PTS start at the file-source
@@ -244,7 +296,6 @@ function mountRadio(wrap, host, canControl = false) {
       else break;
     }
     if (!selected || target - Number(selected.frame) / selected.sample_rate > 0.25) return;
-    renderBands({...selected, status: "live"});
     window.dispatchEvent(new CustomEvent("nodus-radio-audible-frame", {detail: selected}));
   }
   async function pollHistory(epoch) {
@@ -508,13 +559,12 @@ function mountRadio(wrap, host, canControl = false) {
       title.textContent = data.title || "Nodus Radio";
       const available = data.audio === true;
       audioAvailable = available;
-      listen.hidden = !available;
-      audioNote.hidden = !available;
       if (!available && (audio.getAttribute("src") || hlsEngine)) stopAudio();
+      updateAudioControls();
       status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
         : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
         : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
-      if (audio.paused) renderBands(data);
+      renderBands(data);
     } catch (error) {
       if (epoch !== generation || panel.hidden) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
@@ -524,12 +574,12 @@ function mountRadio(wrap, host, canControl = false) {
     if (epoch === generation && !panel.hidden) timer = setTimeout(() => poll(epoch), 100);
   }
   function setOpen(open) {
+    if (open === !panel.hidden) return;
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
     generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
     clearTimeout(historyTimer); historyTimer = null; clearTimeout(sunoTimer); sunoTimer = null;
-    if (!open) stopAudio();
-    if (!open) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
+    if (!open && audio.paused) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
     if (open) {poll(generation); pollPA(generation); pollHistory(generation); if (!sunoLoaded) loadPlaylists(false); pollSunoJob(generation);}
   }
@@ -540,8 +590,23 @@ function mountRadio(wrap, host, canControl = false) {
   });
   document.addEventListener("pointerdown", event => {if (!event.composedPath().includes(host)) setOpen(false);});
   window.addEventListener("pagehide", () => setOpen(false));
-  document.addEventListener("visibilitychange", () => {if (document.hidden) setOpen(false);});
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) setOpen(false);
+    else if (wantsAudio && audioAvailable && audio.paused) startAudio();
+  });
+  window.addEventListener("pageshow", event => {
+    if (event.persisted && wantsAudio && audioAvailable && audio.paused) startAudio();
+  });
   wrap.append(chip, panel);
+  updateAudioControls();
+  if (wantsAudio) getJson("/api/radio").then(data => {
+    audioAvailable = data.audio === true;
+    updateAudioControls();
+    if (wantsAudio && audioAvailable) startAudio();
+  }).catch(() => {
+    audioNote.textContent = "Radio is unavailable. Open the menu to check again.";
+    updateAudioControls();
+  });
 }
 
 // [NOTICE] The site's header notice (site_condition.py; GET /api/condition/notice, public). mountNotice is exported so a page
@@ -685,6 +750,7 @@ async function main() {
     : "/login.html?next=" + encodeURIComponent(location.pathname + location.search + location.hash);
 
   if (!who.signed_in) {
+    try { sessionStorage.removeItem("meowdoku.radio.listening"); } catch (_error) {}
     actions.append(el("a", { class: "chip", href: "/palette.html", text: "Color game" }),
       el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: signInHref(), text: "Sign in" }),
       el("button", { class: "chip quiet", type: "button", disabled: "", text: "Register", title: "General registration is not open" }),
@@ -816,7 +882,11 @@ async function main() {
     }
   }
   menu.append(note, el("div", { class: "sep" }),
-    el("button", { role: "menuitem", text: "Sign out", onclick: async () => { await postJson("/api/account/logout", {}); location.reload(); } }));
+    el("button", { role: "menuitem", text: "Sign out", onclick: async () => {
+      const result = await postJson("/api/account/logout", {});
+      if (result.status === 200) try { sessionStorage.removeItem("meowdoku.radio.listening"); } catch (_error) {}
+      location.reload();
+    } }));
 
   const dismiss = () => setOpen(false);
   function setOpen(open) {
