@@ -564,6 +564,7 @@ function mountRadio(wrap, host, canControl = false) {
       status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
         : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
         : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
+      // Keep the visible meters on the live NRAD feed even when HLS history has no matching audio frame.
       renderBands(data);
     } catch (error) {
       if (epoch !== generation || panel.hidden) return;
