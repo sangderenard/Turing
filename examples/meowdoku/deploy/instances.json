@@ -52,6 +52,7 @@
         {"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}
       ],
       "env": {
+        "SPEAKTOME_AGENT_DAYS": "C:/Users/alber/AgentDays",
         "SPEAKTOME_PUBLIC_ORIGIN": "https://stichka.duckdns.org:8766",
         "SPEAKTOME_MCP_ALLOWED_ORIGINS": "https://chatgpt.com",
         "GIT_CONFIG_COUNT": "5",
