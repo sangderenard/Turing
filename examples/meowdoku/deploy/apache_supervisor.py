@@ -770,7 +770,11 @@ class Supervisor:
             return
         flag = "/Run" if action == "start" else "/End"
         for name in self.hosted_tasks:
-            result = subprocess.run(["schtasks.exe", flag, "/TN", name], capture_output=True, text=True, timeout=35)
+            try:
+                result = subprocess.run(["schtasks.exe", flag, "/TN", name], capture_output=True, text=True, timeout=35)
+            except (subprocess.TimeoutExpired, OSError) as error:  # a slow Task Scheduler must never end the supervisor
+                self.log(f"hosted task {name!r} {action} did not answer: {error!r}")
+                continue
             if result.returncode:
                 self.log(f"hosted task {name!r} {action} failed: {(result.stderr or result.stdout).strip()}")
             elif not quiet:
