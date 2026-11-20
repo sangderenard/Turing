@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import math
+import time
 from pathlib import Path
 
 import pytest
@@ -323,6 +324,22 @@ def test_python_filesystem_uses_the_existing_shell_file_broker(target):
     assert decision.parameters["execution"] == "shell_io.file_broker"
     assert decision.parameters["shell_capability"] == "files"
     assert decision.parameters["shell_abi"] == "turing-shell-io-abi.files"
+
+
+@pytest.mark.parametrize(
+    ("target", "rule_id"),
+    [
+        (time.perf_counter, "native-performance-counter-scalar-result"),
+        (time.time, "native-wall-clock-scalar-result"),
+    ],
+)
+def test_clock_readings_return_an_inline_float64_scalar(target, rule_id):
+    decision = ExtractionContract(CONTRACT).decide(target)
+
+    assert decision.action is ExtractionAction.USE_NATIVE
+    assert decision.rule_id == rule_id
+    assert decision.parameters["result_dtype"] == "float64"
+    assert decision.parameters["runtime_owner"] == "shell"
 
 
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
