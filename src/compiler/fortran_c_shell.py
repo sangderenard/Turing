@@ -34007,6 +34007,39 @@ def _class_surface_ssa_program(
                 ),)
                 if history
             )
+            # Program: ``def entry() -> float: return time.time()`` (ticket
+            # b043a7c9, case 6b7d429f).  Wrong record: the contract gives
+            # ``time.time`` no ``result_dtype``, so
+            # ``_install_external_reference_calls`` left the callsite
+            # unplaced, nothing produced the returned value, and the first
+            # finding was final concordance's "a Ret ... returns none",
+            # which hides the cause.  Rule: a source output that is an
+            # unplaced boundary's own value is a lowering shortfall naming
+            # the callsite and the installer's reason.  A boundary called
+            # only for its effect, or consumed by a region that computes it
+            # (c437), is not a source output and is untouched.
+            unplaced_output_ids = {
+                int(graph_obj.nodes[int(callsite_id)].get(
+                    "value_id", callsite_id
+                )): (int(callsite_id), str(reason))
+                for callsite_id, reason in external_reference_call_shortfalls
+                if int(callsite_id) in graph_obj
+            }
+            lowering_failures.extend(
+                (
+                    symbol,
+                    SSALoweringShortfall(
+                        "control",
+                        "external-reference-result",
+                        symbol,
+                        f"source output value {value_id} is the result of "
+                        f"callsite {unplaced_output_ids[value_id][0]}: "
+                        f"{unplaced_output_ids[value_id][1]}",
+                    ),
+                )
+                for value_id in source_output_value_ids
+                if value_id in unplaced_output_ids
+            )
             lowered_source_value_ids = set(
                 _lowered_source_control_ids(control.root)
             )
