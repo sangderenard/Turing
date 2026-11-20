@@ -42,6 +42,60 @@ def test_hosted_task_follows_supervisor_start_and_stop(tmp_path, monkeypatch):
         assert calls == []
 
 
+def _tail_supervisor(tmp_path, monkeypatch, cipher_class, lines):
+    import io
+    spec = importlib.util.spec_from_file_location("tail_survive_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / "instances.json"
+    config.write_text(json.dumps({"instances": []}))
+    supervisor = module.Supervisor(tmp_path / "accounts.db", config, tmp_path / "state")
+    monkeypatch.setattr(module, "RecordCipher", cipher_class)
+    stdin = io.BytesIO(b"".join(lines))
+    monkeypatch.setattr(module.sys, "stdin", type("Stdin", (), {"buffer": stdin})())
+    return supervisor, stdin
+
+
+def test_tail_stdin_setup_failure_is_logged_and_stdin_is_drained(tmp_path, monkeypatch):
+    """Ticket f62934c8 hazard 2: a RecordCipher failure must not leave Apache's pipe unread."""
+    class Broken:
+        def __init__(self, *args, **kwargs):
+            raise OSError("records key unreadable")
+
+    lines = [f"GET /x{i} 200\n".encode() for i in range(5)]
+    supervisor, stdin = _tail_supervisor(tmp_path, monkeypatch, Broken, lines)
+    supervisor.tail_stdin()                       # returns at EOF instead of raising
+    assert stdin.tell() == len(b"".join(lines))   # every line was read, so httpd could not block
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "ACCESS LOG FAILED" in text and "records key unreadable" in text
+    assert "5 line(s) dropped unrecorded" in text
+
+
+def test_tail_stdin_seal_failure_mid_stream_keeps_draining(tmp_path, monkeypatch):
+    class SealFails:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def migrate(self, path):
+            pass
+
+        def seal(self, data):
+            self.calls += 1
+            if self.calls > 1:
+                raise OSError("disk full")
+            return data
+
+    lines = [f"GET /distinct-{i} 200\n".encode() for i in range(6)]
+    supervisor, stdin = _tail_supervisor(tmp_path, monkeypatch, SealFails, lines)
+    supervisor.tail_stdin()
+    assert stdin.tell() == len(b"".join(lines))
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "ACCESS LOG FAILED" in text and "disk full" in text
+    assert "dropped unrecorded" in text
+
+
 def _spec(child_code, **extra):
     return {"name": "standin", "kind": "command", "port": None, "route": "", "bind": "127.0.0.1",
             "account": "svc-standin", "args": [sys.executable, "-c", child_code], "leases": extra.get("leases", [])}
