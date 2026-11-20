@@ -42,6 +42,33 @@ def test_hosted_task_follows_supervisor_start_and_stop(tmp_path, monkeypatch):
         assert calls == []
 
 
+def test_hosted_task_timeout_is_logged_and_the_next_task_still_runs(tmp_path, monkeypatch):
+    """2026-11-19 22:28: a schtasks timeout escaped task_action and ended the supervisor with every instance."""
+    import pytest
+    if os.name != "nt":
+        pytest.skip("hosted tasks are Windows scheduled tasks")
+    spec = importlib.util.spec_from_file_location("hosted_task_timeout_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / "instances.json"
+    config.write_text(json.dumps({"hosted_tasks": ["first task", "second task"], "instances": []}))
+    supervisor = module.Supervisor(tmp_path / "accounts.db", config, tmp_path / "state")
+    supervisor.hosted_tasks = module.instances_hosted_tasks(config)
+    calls, logged = [], []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[-1] == "first task":
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(module.subprocess, "run", command)
+    monkeypatch.setattr(supervisor, "log", logged.append)
+    supervisor.task_action("start", quiet=True)
+    assert [argv[-1] for argv in calls] == ["first task", "second task"]
+    assert any("'first task'" in line and "start" in line and "TimeoutExpired" in line for line in logged)
+
+
 def _tail_supervisor(tmp_path, monkeypatch, cipher_class, lines):
     import io
     spec = importlib.util.spec_from_file_location("tail_survive_supervisor", SUP)
