@@ -2641,9 +2641,11 @@ def make_handler(sessions: Sessions):
                 return
             if self._is_viewer():
                 return self._refuse_viewer()
-            prefix = path[len("/api/link/ticket/"):]
+            udp = path.startswith("/api/link/rendezvous/")
+            prefix = path[len("/api/link/rendezvous/" if udp else "/api/link/ticket/"):]
             if not prefix or "/" in prefix or len(prefix) > 120:
-                return self._json({"error": "expected /api/link/ticket/<prefix>"}, HTTPStatus.BAD_REQUEST)
+                return self._json({"error": "expected /api/link/ticket/<prefix> or /api/link/rendezvous/<prefix>"},
+                                  HTTPStatus.BAD_REQUEST)
             body = self._body_json(2048)
             if body is None:
                 return
@@ -2656,6 +2658,15 @@ def make_handler(sessions: Sessions):
                 key = link_tickets.load_key(sessions.state.secrets_dir)
             except link_tickets.LinkKeyMissing:
                 return self._json({"error": "this instance holds no link key"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            if udp:
+                # [LINK] The UDP broker (link_broker.py, case a02ca4a5): a rendezvous key for this side, and where to say hello.
+                # The broker is reached at the name this request used, on the broker's UDP port.
+                from meowdoku import link_broker
+                answer = link_broker.rendezvous(key, prefix, str(body.get("direction")))
+                host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]") or "127.0.0.1"
+                answer["broker"] = {"host": host, "port": link_broker.PORT}
+                answer["account"] = int(grant["service_user_id"])
+                return self._json(answer)
             return self._json(link_tickets.issue(key, prefix, int(grant["service_user_id"])))
 
         def _relay_route(self, path: str, method: str) -> None:
@@ -4397,6 +4408,8 @@ def make_handler(sessions: Sessions):
             if path0.startswith("/api/relay/"):                   # [RELAY]
                 return self._relay_route(path0, "POST")
             if path0.startswith("/api/link/ticket/"):             # [LINK] Nodus link tickets from a peer grant
+                return self._link_ticket_route(path0)
+            if path0.startswith("/api/link/rendezvous/"):         # [LINK] UDP broker rendezvous from a peer grant
                 return self._link_ticket_route(path0)
             if path0 == "/api/fortune" or path0.startswith("/api/fortune/"):   # [FORTUNE]
                 return self._fortune_route(path0, "POST")
