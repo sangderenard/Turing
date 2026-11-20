@@ -169,7 +169,8 @@ class Service:
                     raise IssueError('submission key already used for different content',409)
                 return {'id':old['id'],'created':False}
             now=time.time()
-            if db.execute('SELECT COUNT(*) FROM issue_tickets WHERE owner_id=? AND created_at>?',(actor,now-600)).fetchone()[0] >= 10:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM issue_tickets WHERE owner_id=? AND created_at>?',(actor,now-600)).fetchone()[0] >= 10:
                 raise IssueError('too many tickets; wait before submitting another',429)
             ticket_id=uuid.uuid4().hex
             db.execute('INSERT INTO issue_tickets VALUES(?,?,?,?,?,?,?,\'open\',1,?,?,?,?)',
