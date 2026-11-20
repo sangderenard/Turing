@@ -146,6 +146,60 @@ def test_tail_stdin_drain_read_error_reports_partial_count_without_eof(tmp_path,
     assert "up to EOF" not in text
 
 
+_APPENDER = r'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("appender_supervisor", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+tag, count = sys.argv[3], int(sys.argv[4])
+with open(sys.argv[2], "ab") as out, module.AccessAppendLock(sys.argv[2] + ".lock", print) as lock:
+    for i in range(count):
+        lock.append(out, b"".join((f"{tag}{i:05d}:" + tag * 4000 + "\n").encode() for _ in range(3)))
+'''
+
+
+def test_access_append_lock_keeps_two_processes_records_whole(tmp_path):
+    """Ticket f62934c8 hazard 3: the manager and the log-sink supervisor both append to apache-access.log."""
+    target = tmp_path / "apache-access.log"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT), str(ROOT / "examples")])}
+    procs = [subprocess.Popen([sys.executable, "-c", _APPENDER, str(SUP), str(target), tag, "200"], env=env)
+             for tag in ("A", "B")]
+    assert [p.wait(timeout=120) for p in procs] == [0, 0]
+    lines = target.read_bytes().split(b"\n")
+    assert lines[-1] == b""
+    lines = lines[:-1]
+    assert len(lines) == 2 * 200 * 3
+    for line in lines:
+        tag = line[:1].decode()
+        assert line == f"{line[:6].decode()}:".encode() + tag.encode() * 4000
+    for tag in ("A", "B"):         # each append's three records stay together
+        seen = [line[:6] for line in lines if line[:1] == tag.encode()]
+        assert seen == [f"{tag}{i:05d}".encode() for i in range(200) for _ in range(3)]
+
+
+def test_access_append_lock_never_blocks_the_drain(tmp_path, monkeypatch):
+    """A lock another handle holds past WAIT_S: the append is still written, and the unlocked write is logged."""
+    spec = importlib.util.spec_from_file_location("append_timeout_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    lock_path, target, said = tmp_path / "access.log.lock", tmp_path / "access.log", []
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    with module.AccessAppendLock(lock_path, said.append) as holder:
+        assert holder._lock()
+        with open(target, "ab") as out, module.AccessAppendLock(lock_path, said.append, clock=lambda: now[0],
+                                                                 sleep=sleep) as waiter:
+            waiter.append(out, b"record\n")
+            assert waiter.unlocked == 1
+        holder._unlock()
+    assert target.read_bytes() == b"record\n"
+    assert now[0] >= module.AccessAppendLock.WAIT_S
+    assert any("WITHOUT the lock" in text for text in said)
+
+
 def _spec(child_code, **extra):
     return {"name": "standin", "kind": "command", "port": None, "route": "", "bind": "127.0.0.1",
             "account": "svc-standin", "args": [sys.executable, "-c", child_code], "leases": extra.get("leases", [])}
