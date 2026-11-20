@@ -342,6 +342,39 @@ def test_clock_readings_return_an_inline_float64_scalar(target, rule_id):
     assert decision.parameters["runtime_owner"] == "shell"
 
 
+def test_wall_clock_return_is_supplied_by_the_native_callsite_as_float64():
+    # Ticket b043a7c9 / case 6b7d429f: the contract's result_dtype must reach
+    # the lowered program, not stop at ExtractionContract.decide().
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, outputs, exports = lower_ast_source_to_ssa(
+            "import time\ndef entry():\n    return time.time()\n",
+            "entry", name="wall_clock",
+            extraction_contract=ExtractionContract(CONTRACT),
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+    assert exports == ("wall_clock__entry",)
+    returned, = outputs["wall_clock__entry"]
+    assert returned.dtype == "float64"
+    operations = tuple(
+        instruction
+        for block in module.functions["wall_clock__entry"].blocks.values()
+        for instruction in block.instrs
+    )
+    native, = (
+        instruction for instruction in operations
+        if (instruction.attributes or {}).get("external_reference")
+    )
+    assert native.attributes["external_identity"] == "time.time"
+    assert native.attributes["runtime_owner"] == "shell"
+    assert native.res.id == returned.id
+    assert native.res.dtype == "float64"
+    ret, = (instruction for instruction in operations if instruction.op == "Ret")
+    assert [value.id for value in ret.args] == [returned.id]
+
+
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
     contract = ExtractionContract(CONTRACT)
     graph = ProcessGraph(materialize_memory=False)
