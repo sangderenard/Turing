@@ -23,9 +23,11 @@ What the account gets:
 What it never gets: anything under <StateDir> (the stable state: secrets, private records, the encrypted logs) or the
 live checkouts. The last step lists every entry the account holds on those places, and fails when it finds one.
 
-NOT DONE HERE (a decision for the owner, recorded on the case): the branch servers share stable's accounts database
-(srv\state\sql\accounts.db) as the one identity authority. Giving this account access to that file is not done by this
-script, because that folder also holds private records.
+CURRENT DATABASE CONTRACT (Development case 07180e4d58f24156a477bfc263955668):
+Development and branch loans use the redacted Development accounts database
+(<DevState>\sql\accounts.db), selected explicitly by each child server command. The live accounts database
+(<StateDir>\sql\accounts.db) stays with Stable; this script grants the dev account no access to that file or its
+private-record folder. Verify the redacted database and per-instance command before starting the dev stack.
 
 .EXAMPLE   .\Setup-DevAccount.ps1 -WhatIf
 .EXAMPLE   .\Setup-DevAccount.ps1 -IssueTls
@@ -188,5 +190,5 @@ if ($WhatIf) {
 
 Write-Host ''
 Write-Host 'Next (Stage 4, the owner):'
-Write-Host '  - decide how the dev stack reaches the accounts database (the case records the question);'
+Write-Host '  - verify the redacted Development accounts database and the explicit child-server database path;'
 Write-Host '  - then the dev supervisor is registered as a scheduled task running as this account.'
