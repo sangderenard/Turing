@@ -72,18 +72,28 @@ def test_operator_api_shares_documents_but_scratch_remains_private(server):
                  {"action": "write", "name": "mine", "body": "member space"})[0] == 200
 
 
-def test_temporary_preview_scratch_stays_in_its_cookie(server):
+def test_temporary_preview_scratch_follows_account_into_membership(server):
     preview = server.sessions.accounts.create_preview()
     token = server.sessions.accounts.create_session(preview["id"])
     account_cookie = srv.ACCOUNT_COOKIE + "=" + token
     headers = {**PUBLIC_XFF, "Cookie": account_cookie, "X-Meowdoku-Workspace": "1"}
     status, out, cookies, _ = _call(server.port, "/api/scratch", "POST", headers,
                                     {"action": "write", "name": "clue", "body": "a temporary note"})
-    assert status == 200 and out["storage"] == "cookie", out
-    saved = next(c.split(";", 1)[0] for c in cookies if c.startswith(work.TEMP_COOKIE + "="))
-    assert _call(server.port, "/api/scratch/file?name=clue", headers={**headers, "Cookie": account_cookie + "; " + saved})[1]["body"] == "a temporary note"
-    assert _call(server.port, "/api/scratch/file?name=clue", headers=headers)[0] == 404
+    assert status == 200 and out["body"] == "a temporary note", out
+    assert not cookies
+    assert _call(server.port, "/api/scratch/file?name=clue", headers=headers)[1]["body"] == "a temporary note"
+    legacy = work.temp_cookie(preview["id"], {"old": "from the browser"}).split(";", 1)[0]
+    status, out, cookies, _ = _call(server.port, "/api/scratch/file?name=old",
+                                    headers={**headers, "Cookie": account_cookie + "; " + legacy})
+    assert status == 200 and out["body"] == "from the browser"
+    assert any(c.startswith(work.TEMP_COOKIE + "=;") for c in cookies)
+    assert _call(server.port, "/api/scratch/file?name=old", headers=headers)[1]["body"] == "from the browser"
     assert _call(server.port, "/api/agent-workspace", headers=headers)[0] == 403
+    server.sessions.accounts.keep_preview(preview["id"], "kept_scratch", "distinct-test-password",
+                                          alpha_terms_version="alpha-2026-11-15")
+    member_cookie = srv.ACCOUNT_COOKIE + "=" + server.sessions.accounts.create_session(preview["id"])
+    assert _call(server.port, "/api/scratch/file?name=clue",
+                 headers={**headers, "Cookie": member_cookie})[1]["body"] == "a temporary note"
 
 
 def test_titled_profiles_job_changes_and_operator_boundary(server):

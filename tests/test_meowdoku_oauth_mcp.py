@@ -109,6 +109,14 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         identity = json.loads(text)
         assert identity["username"] == "agentbot"
         assert identity["origin"] == "dns" and identity["tier"] == "play"
+        for rid, name, field in ((20, "research_cases", "cases"), (21, "reports_issues_list", "tickets")):
+            request = json.dumps({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                                  "params": {"name": name, "arguments": {}}})
+            response, body = call("POST", "/mcp", request, accept)
+            assert response.status == 200, body
+            result = json.loads(body)["result"]
+            assert not result["isError"], result
+            assert json.loads(result["content"][0]["text"])["data"][field] == []
         response, _ = call("POST", "/mcp", request, {**accept, "Origin": "https://evil.example"})
         assert response.status == 403
         response, _ = call("POST", "/mcp", request, {**accept, "MCP-Protocol-Version": "invalid"})
@@ -156,8 +164,32 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
 
         identity = guest_tool("whoami", {}, 11)
         assert identity["role"] == "trial" and identity["signed_in"]
+        # A direct loopback preview token determines the account even when a
+        # browser cookie names a different signed-in user; an invalid token
+        # cannot borrow that cookie's identity.
+        rival = sessions.accounts.create_preview()
+        rival_token = sessions.accounts.create_session(rival["id"])
+        agent_cookie = srv.ACCOUNT_COOKIE + "=" + sessions.accounts.create_session(
+            sessions.accounts.login("agentbot", "correcthorse1")["id"])
+        direct = http.client.HTTPSConnection("127.0.0.1", httpd.server_port, timeout=30,
+                                             context=ssl.create_default_context(cafile=str(tls_dir / "ca.crt")))
+        try:
+            direct.request("GET", "/api/whoami", headers={"Authorization": "Preview " + rival_token,
+                                                            "Cookie": agent_cookie})
+            reply = direct.getresponse()
+            assert reply.status == 200
+            assert json.loads(reply.read())["username"] == rival["username"]
+            direct.request("GET", "/api/whoami", headers={"Authorization": "Preview invalid",
+                                                            "Cookie": agent_cookie})
+            reply = direct.getresponse()
+            assert reply.status == 200
+            assert not json.loads(reply.read())["signed_in"]
+        finally:
+            direct.close()
+        assert guest_tool("research_cases", {}, 111)["data"]["cases"] == []
+        assert guest_tool("reports_issues_list", {}, 112)["data"]["tickets"] == []
         saved = guest_tool("scratch_change", {"action": "write", "name": "clue", "body": "cookie-backed"}, 115)
-        assert saved["data"]["storage"] == "cookie"
+        assert saved["data"]["body"] == "cookie-backed"
         assert guest_tool("scratch_file", {"name": "clue"}, 116)["data"]["body"] == "cookie-backed"
         listing = json.dumps({"jsonrpc": "2.0", "id": 12, "method": "tools/list"})
         response, body = call("POST", "/mcp/guest", listing, guest_headers)

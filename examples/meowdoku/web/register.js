@@ -75,7 +75,10 @@
     }
     submit.disabled = true;
     status.textContent = temporary ? "Keeping your account..." : "Creating your alpha account..."; status.className = "mut";
-    fetch(temporary ? "/api/account/keep" : "/api/account/signup", { method: "POST", credentials: "same-origin", cache: "no-store",
+    var imported = temporary ? fetch("/api/scratch", { credentials: "same-origin", cache: "no-store" }).then(function (response) {
+      if (!response.ok) throw new Error("Could not transfer your preview files. Try again before keeping this account.");
+    }) : Promise.resolve();
+    imported.then(function () { return fetch(temporary ? "/api/account/keep" : "/api/account/signup", { method: "POST", credentials: "same-origin", cache: "no-store",
       headers: temporary ? { "Content-Type": "application/json", "X-Meowdoku-Preview": "1" } : { "Content-Type": "application/json" }, body: JSON.stringify({
         username: document.getElementById("username").value.trim(),
         password: document.getElementById("password").value,
@@ -83,7 +86,7 @@
         agree_mit: document.getElementById("agree-mit").checked,
         agree_observation: document.getElementById("agree-observation").checked,
         agree_research: document.getElementById("agree-research").checked
-      }) }).then(function (response) {
+      }) }); }).then(function (response) {
         return response.json().catch(function () { return {}; }).then(function (body) {
           if (!response.ok) throw new Error(body.error || "Alpha registration failed.");
           document.getElementById("password").value = "";
