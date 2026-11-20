@@ -705,7 +705,10 @@ class Supervisor:
 
     def log(self, text):
         line = time.strftime("%Y-%m-%d %H:%M:%S ") + f"[apache_supervisor] {text}"
-        print(line, file=sys.stderr, flush=True)
+        try:                       # a closed or broken stderr must not stop the file record (or tail_stdin's drain)
+            print(line, file=sys.stderr, flush=True)
+        except (OSError, ValueError, AttributeError):
+            pass
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             with open(self.log_dir / "apache-supervisor.log", "a", encoding="utf-8") as f:
@@ -740,15 +743,25 @@ class Supervisor:
             self._tail_stdin_sealed()
         except Exception as error:
             import traceback
-            self.log(f"ACCESS LOG FAILED: {error!r}; Apache's access lines are now DROPPED (not recorded) until the "
-                     f"supervisor restarts. stdin is still drained so httpd does not block.\n{traceback.format_exc()}")
-            dropped = 0
+
+            def say(text):         # nothing in the failure path may raise before or during the drain
+                try:
+                    self.log(text)
+                except Exception:
+                    pass
+
+            say(f"ACCESS LOG FAILED: {error!r}; Apache's access lines are now DROPPED (not recorded) until the "
+                f"supervisor restarts. stdin is still drained so httpd does not block.\n{traceback.format_exc()}")
+            loss_note = "the line in flight and any buffered reducer entries may also be lost; this is not the total loss"
+            drained = 0
             try:
                 for _ in iter(sys.stdin.buffer.readline, b""):
-                    dropped += 1
+                    drained += 1
             except Exception as drain_error:
-                self.log(f"stdin drain failed too: {drain_error!r}")
-            self.log(f"access log: {dropped} line(s) dropped unrecorded after the failure, up to EOF")
+                say(f"stdin drain failed too: {drain_error!r}; {drained} line(s) drained unrecorded after the failure "
+                    f"before the read error, EOF not reached ({loss_note})")
+            else:
+                say(f"access log: {drained} line(s) drained unrecorded after the failure, up to EOF ({loss_note})")
         finally:
             self.stop.set()
 

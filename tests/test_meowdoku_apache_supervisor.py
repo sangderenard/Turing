@@ -69,7 +69,8 @@ def test_tail_stdin_setup_failure_is_logged_and_stdin_is_drained(tmp_path, monke
     assert supervisor.stop.is_set()
     text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
     assert "ACCESS LOG FAILED" in text and "records key unreadable" in text
-    assert "5 line(s) dropped unrecorded" in text
+    assert "5 line(s) drained unrecorded after the failure, up to EOF" in text
+    assert "not the total loss" in text
 
 
 def test_tail_stdin_seal_failure_mid_stream_keeps_draining(tmp_path, monkeypatch):
@@ -93,7 +94,56 @@ def test_tail_stdin_seal_failure_mid_stream_keeps_draining(tmp_path, monkeypatch
     assert supervisor.stop.is_set()
     text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
     assert "ACCESS LOG FAILED" in text and "disk full" in text
-    assert "dropped unrecorded" in text
+    assert "drained unrecorded after the failure, up to EOF" in text
+
+
+class _BrokenCipher:
+    def __init__(self, *args, **kwargs):
+        raise OSError("records key unreadable")
+
+
+def test_tail_stdin_drains_even_when_stderr_is_broken(tmp_path, monkeypatch):
+    """Review a5e4ae0f (codex): Supervisor.log printed to stderr unguarded, so a broken stderr raised in the failure
+    handler before the drain began, and Apache's pipe went unread again."""
+    class BrokenStderr:
+        def write(self, *args):
+            raise OSError("stderr closed")
+
+        def flush(self):
+            raise OSError("stderr closed")
+
+    lines = [f"GET /s{i} 200\n".encode() for i in range(4)]
+    supervisor, stdin = _tail_supervisor(tmp_path, monkeypatch, _BrokenCipher, lines)
+    monkeypatch.setattr(sys, "stderr", BrokenStderr())
+    supervisor.tail_stdin()
+    assert stdin.tell() == len(b"".join(lines))
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "ACCESS LOG FAILED" in text and "4 line(s) drained unrecorded after the failure, up to EOF" in text
+
+
+def test_tail_stdin_drain_read_error_reports_partial_count_without_eof(tmp_path, monkeypatch):
+    """Review a5e4ae0f (codex): a read error during the drain must not be reported as EOF."""
+    supervisor, _ = _tail_supervisor(tmp_path, monkeypatch, _BrokenCipher, [])
+
+    class OneLineThenFails:
+        def __init__(self):
+            self.reads = 0
+
+        def readline(self):
+            self.reads += 1
+            if self.reads == 1:
+                return b"GET /only 200\n"
+            raise OSError("pipe broken")
+
+    stdin = OneLineThenFails()
+    monkeypatch.setattr(sys, "stdin", type("Stdin", (), {"buffer": stdin})())
+    supervisor.tail_stdin()                       # returns instead of raising
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "stdin drain failed too" in text and "pipe broken" in text
+    assert "1 line(s) drained unrecorded after the failure before the read error, EOF not reached" in text
+    assert "up to EOF" not in text
 
 
 def _spec(child_code, **extra):
