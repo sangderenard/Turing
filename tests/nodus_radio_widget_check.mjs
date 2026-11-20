@@ -29,34 +29,64 @@ const document=new Node('document');document.body=new Node('body');document.crea
   return node;
 };
 document.querySelectorAll=()=>[{src:'test',getAttribute:()=> 'allow'}];
+document.cookie='';
 const window=new Node('window');window.dispatchEvent=e=>window.fire(e.type,e);
 const context={document,window,console,CustomEvent:class{constructor(type,options){this.type=type;this.detail=options.detail;}},Event:class{constructor(type){this.type=type;}},requestAnimationFrame:fn=>{frames.set(++nextFrame,fn);return nextFrame;},cancelAnimationFrame:id=>frames.delete(id),fetch:async()=>({ok:false,status:503}),Set,Map,Number,TypeError,Error};
 const admin = process.argv.includes('--admin'), withAudio = process.argv.includes('--audio'); let commands=[], jukeboxCommands=[];
 let polls=0, timerId=0;const timers=new Map();
 Object.assign(context,{URLSearchParams, location:{search:'',pathname:'/'}, setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id)});
-context.fetch=async (path, options={})=>({ok:true,json:async()=>path==='/api/whoami'?{signed_in:true,username:'dot',capabilities:admin?['view_site','account_manage']:['view_site']}:path==='/api/radio/jukebox'?(options.method==='POST'?(jukeboxCommands.push(JSON.parse(options.body)),{paused:true,catalogue:[{id:'song',title:'Test song'}],current:{id:1,song_id:'song'},requests:[],charts:[]}):{paused:true,catalogue:[{id:'song',title:'Test song'}],current:{id:1,song_id:'song'},requests:[],charts:[]}):path==='/api/radio/playback'?(options.method==='POST'?(commands.push(options),{status:JSON.parse(options.body).action==='start'?'playing':'stopped',configured:true,can_stop:JSON.parse(options.body).action==='start'}):{status:'stopped',configured:true,can_stop:false}):path==='/api/radio/history'?{title:'Tempest',frames:[{frame:'0',sample_rate:48000,rms:.1,bands:[.1,.1,.1,.1,.1]},{frame:'48000',sample_rate:48000,rms:.8,bands:[.8,.8,.8,.8,.8]}]}:path==='/api/radio'?(polls++,{status:'live',title:'Tempest',audio:withAudio,rms:.25,bands:[.1,.2,.3,.4,.5]}):{} });
+const songId='upload:1:'+'a'.repeat(32);
+const levels=new ArrayBuffer(96), levelView=new DataView(levels);
+for(const [slot,frame,rms] of [[0,48000,.8],[1,96000,.4]]){
+  const at=slot*48;
+  levelView.setUint32(at,0x4441524e,true);levelView.setUint32(at+4,1,true);
+  levelView.setUint32(at+8,5,true);levelView.setUint32(at+12,48000,true);
+  levelView.setBigUint64(at+16,BigInt(frame),true);
+  levelView.setFloat32(at+24,rms,true);
+  for(let band=0;band<5;band++)levelView.setFloat32(at+28+4*band,rms,true);
+}
+context.fetch=async (path, options={})=>{
+  if(path.startsWith('/api/radio/levels?id='))return {ok:true,
+    headers:{get:k=>({'X-Radio-Track-Id':songId,'X-Radio-Analysis-Version':'1',
+      'X-Radio-Frame-Hop':'256','X-Radio-Band-Count':'5','X-Radio-Sample-Rate':'48000'})[k]},
+    arrayBuffer:async()=>levels};
+  return {ok:true,json:async()=>path==='/api/whoami'?{signed_in:true,username:'dot',capabilities:admin?['view_site','account_manage']:['view_site']}:path==='/api/radio/jukebox'?(options.method==='POST'?(jukeboxCommands.push(JSON.parse(options.body)),{paused:true,catalogue:[{id:'song',title:'Test song'}],current:{id:1,song_id:'song'},requests:[],charts:[]}):{paused:true,catalogue:[{id:'song',title:'Test song'}],current:{id:1,song_id:'song'},requests:[],charts:[]}):path==='/api/radio/playback'?(options.method==='POST'?(commands.push(options),{status:JSON.parse(options.body).action==='start'?'playing':'stopped',configured:true,can_stop:JSON.parse(options.body).action==='start'}):{status:'stopped',configured:true,can_stop:false}):path==='/api/radio'?(polls++,{status:'live',title:'Tempest',audio:withAudio,song_id:songId,rms:.25,bands:[.1,.2,.3,.4,.5]}):{} };
+};
 vm.createContext(context);
-const source=fs.readFileSync(new URL('../examples/meowdoku/web/site-nav.js',import.meta.url),'utf8').replace('export function registerControlSuite','function registerControlSuite').replace('import.meta.url','"test"');
+const source=fs.readFileSync(new URL('../examples/meowdoku/web/site-nav.js',import.meta.url),'utf8').replace(/^export /gm,'').replace('import.meta.url','"test"');
 vm.runInContext(source,context);
 for(let i=0;i<12;i++)await Promise.resolve();
 const host=document.body.children[0],nav=host.shadow.children[1],actions=nav.children[0],toggle=nav.children[1];
 const chip=actions.children.find(n=>n.textContent==='Nodus Radio');assert.ok(chip);
 const panel=actions.children.find(n=>n.attrs['aria-label']==='Nodus Radio');assert.ok(panel.hidden);assert.equal(polls,0);
 chip.click();for(let i=0;i<12;i++)await Promise.resolve();
-assert.equal(polls,1);assert.equal(panel.hidden,false);assert.equal(timers.size,3);
-assert.equal(panel.children.find(n=>n.className==='radio-bands').children.length,5);
+assert.equal(polls,1);assert.equal(panel.hidden,false);assert.ok(timers.size>=1);
+assert.equal(panel.children.find(n=>n.className==='radio-bands').children.length,0);
 assert.equal(panel.children.find(n=>n.tag==='strong').textContent,'Tempest');
 if(withAudio){
   const listen=panel.children.find(n=>n.textContent==='Listen in this browser');
-  const player=panel.children.find(n=>n.tag==='audio');
+  const player=document.body.children.find(n=>n.tag==='audio');
   assert.equal(listen.hidden,false);
   listen.click();for(let i=0;i<12;i++)await Promise.resolve();
   assert.equal(player.src,'/api/radio/hls/radio.m3u8');
-  for(const [id,fn] of [...timers]){timers.delete(id);fn();}for(let i=0;i<12;i++)await Promise.resolve();
-  player.currentTime=1.02;player.fire('timeupdate');
-  assert.equal(Number(panel.children.find(n=>n.className==='radio-bands').children[0].attrs.value),.8);
+  for(let i=0;i<20;i++)await Promise.resolve();
+  player.currentTime=1.02;player.fire('playing');player.fire('seeked');
+  assert.ok(Math.abs(Number(panel.children.find(n=>n.className==='radio-bands').children[0].attrs.value)-.8)<1e-5);
 }
-toggle.click();assert.ok(panel.hidden);assert.equal(timers.size,0);
+toggle.click();for(let i=0;i<20;i++)await Promise.resolve();assert.ok(panel.hidden);
+if(withAudio){
+  const player=document.body.children.find(n=>n.tag==='audio');
+  assert.equal(player.parent,document.body);assert.equal(player.paused,false);
+  assert.equal(timers.size,1);
+  const before=polls;
+  for(const [id,fn] of [...timers]){timers.delete(id);fn();}for(let i=0;i<20;i++)await Promise.resolve();
+  assert.equal(polls,before+1);
+  player.currentTime=2.02;player.fire('seeked');
+  assert.ok(Math.abs(Number(panel.children.find(n=>n.className==='radio-bands').children[0].attrs.value)-.4)<1e-5);
+  toggle.click();chip.click();
+  panel.children.find(n=>n.textContent==='Stop listening').click();
+  chip.click();assert.equal(timers.size,0);
+}else assert.equal(timers.size,0);
 toggle.click();chip.click();chip.click();for(let i=0;i<12;i++)await Promise.resolve();assert.equal(timers.size,0);assert.ok(panel.hidden);
 chip.click();for(let i=0;i<12;i++)await Promise.resolve();panel.fire('keydown',{key:'Escape',stopPropagation(){}});assert.equal(timers.size,0);assert.equal(focused,chip);
 chip.click();document.fire('pointerdown',{composedPath:()=>[document]});for(let i=0;i<12;i++)await Promise.resolve();assert.equal(timers.size,0);

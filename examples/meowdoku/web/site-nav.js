@@ -172,17 +172,19 @@ function mountRadio(wrap, host, canControl = false) {
   const title = el("strong", {text: "Server station · Nodus Radio"});
   const status = el("p", {role: "status", text: "Waiting for Nodus"});
   const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
-  const audio = el("audio", {class: "radio-audio", controls: "", preload: "none", "aria-label": "Nodus Radio audio"});
+  const audio = el("audio", {class: "radio-audio", preload: "none", "aria-label": "Nodus Radio audio"});
   const nativeHls = !!audio.canPlayType("application/vnd.apple.mpegurl");
   const listen = el("button", {class: "chip", type: "button", text: "Listen in this browser"});
   const stopListening = el("button", {class: "chip", type: "button", text: "Stop listening"});
   const audioNote = el("p", {role: "status", text: "Audio starts when you choose Listen."});
   audio.hidden = audioNote.hidden = listen.hidden = stopListening.hidden = true;
-  panel.append(close, title, status, bands, listen, stopListening, audio, audioNote);
+  panel.append(close, title, status, bands, listen, stopListening, audioNote);
+  // Keep the media element outside the collapsible menu so iOS can keep playing.
+  document.body.append(audio);
   const listeningKey = "meowdoku.radio.listening";
   let wantsAudio = false;
   try { wantsAudio = sessionStorage.getItem(listeningKey) === "1"; } catch (_error) {}
-  let hlsEngine = null, audioEpoch = 0, audioAvailable = false, connecting = false;
+  let hlsEngine = null, audioEpoch = 0, audioAvailable = false, connecting = false, audioRetryAt = 0;
   let analysisView = null, analysisSong = null, analysisRequest = 0, analysisRetryAt = 0, audibleRms = null;
   function renderBands(frame) {
     bands.replaceChildren();
@@ -204,6 +206,7 @@ function mountRadio(wrap, host, canControl = false) {
   function stopAudio() {
     audioEpoch++;
     connecting = false;
+    audioRetryAt = Date.now() + 5000;
     audio.pause();
     if (hlsEngine) { hlsEngine.destroy(); hlsEngine = null; }
     audio.removeAttribute("src"); audio.load();
@@ -578,12 +581,14 @@ function mountRadio(wrap, host, canControl = false) {
   async function poll(epoch) {
     try {
       const data = await getJson("/api/radio");
-      if (epoch !== generation || panel.hidden) return;
+      if (epoch !== generation || (panel.hidden && !wantsAudio)) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: data}));
       title.textContent = data.title || "Nodus Radio";
       const available = data.audio === true;
       audioAvailable = available;
       loadLevels(data.song_id || null);
+      if (wantsAudio && available && audio.paused && !connecting &&
+          !audio.getAttribute("src") && !hlsEngine && Date.now() >= audioRetryAt) startAudio();
       if (!available && (audio.getAttribute("src") || hlsEngine)) stopAudio();
       updateAudioControls();
       status.textContent = !audio.paused && audibleRms !== null ? "Listening · RMS " + audibleRms.toFixed(3)
@@ -594,12 +599,12 @@ function mountRadio(wrap, host, canControl = false) {
       if (!analysisView) renderBands({bands: [], status: "waiting"});
       else showAudibleFrame();
     } catch (error) {
-      if (epoch !== generation || panel.hidden) return;
+      if (epoch !== generation || (panel.hidden && !wantsAudio)) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
       status.textContent = "Radio unavailable";
       bands.replaceChildren();
     }
-    if (epoch === generation && !panel.hidden) timer = setTimeout(() => poll(epoch), 100);
+    if (epoch === generation && (!panel.hidden || wantsAudio)) timer = setTimeout(() => poll(epoch), panel.hidden ? 1000 : 100);
   }
   function setOpen(open) {
     if (open === !panel.hidden) return;
@@ -610,6 +615,7 @@ function mountRadio(wrap, host, canControl = false) {
     if (!open && audio.paused) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
     if (open) {poll(generation); pollPA(generation); if (!sunoLoaded) loadPlaylists(false); pollSunoJob(generation);}
+    else if (wantsAudio) poll(generation);
   }
   chip.addEventListener("click", () => setOpen(panel.hidden));
   close.addEventListener("click", () => {setOpen(false); chip.focus();});
@@ -627,15 +633,7 @@ function mountRadio(wrap, host, canControl = false) {
   });
   wrap.append(chip, panel);
   updateAudioControls();
-  if (wantsAudio) getJson("/api/radio").then(data => {
-    audioAvailable = data.audio === true;
-    loadLevels(data.song_id || null);
-    updateAudioControls();
-    if (wantsAudio && audioAvailable) startAudio();
-  }).catch(() => {
-    audioNote.textContent = "Radio is unavailable. Open the menu to check again.";
-    updateAudioControls();
-  });
+  if (wantsAudio) poll(generation);
 }
 
 // [NOTICE] The site's header notice (site_condition.py; GET /api/condition/notice, public). mountNotice is exported so a page
