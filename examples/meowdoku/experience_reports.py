@@ -142,8 +142,9 @@ class Service:
                     raise ReportError('request_id reused with different report', 409)
                 return {'id': old['id'], 'created': False, 'say': 'Your existing report receipt was returned.'}
             now = time.time()
-            if db.execute('SELECT COUNT(*) FROM experience_reports WHERE owner_id=? AND created_at>?',
-                          (owner, now - 600)).fetchone()[0] >= 10:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM experience_reports WHERE owner_id=? AND created_at>?',
+                                                    (owner, now - 600)).fetchone()[0] >= 10:
                 raise ReportError('too many reports; wait before submitting another', 429)
             report_id = uuid.uuid4().hex
             db.execute('INSERT INTO experience_reports VALUES(?,?,?,?,?,?,?,?,?)',
