@@ -62,8 +62,9 @@ def text(value, name, maximum, *, empty=False):
 
 
 class Service:
-    def __init__(self, accounts):
+    def __init__(self, accounts, oauth_mcp=None):
         self.accounts = accounts
+        self.oauth_mcp = oauth_mcp
         # Follow the open incumbent connection, not a client path or mutable label.
         with accounts.lock:
             rows = accounts._conn.execute('PRAGMA database_list').fetchall()
@@ -77,6 +78,8 @@ class Service:
         if not isinstance(token, str) or not token or len(token) > 4096:
             raise IssueError('sign in to use issue tickets', 401)
         account = self.accounts.user_for_token(token)
+        if account is None and self.oauth_mcp is not None:
+            account = self.oauth_mcp.user_for_token(token)
         if account is None:
             raise IssueError('sign in to use issue tickets', 401)
         db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=10)
@@ -92,7 +95,11 @@ class Service:
             for statement in DDL:
                 db.execute(statement)
             current = db.execute('SELECT user_id FROM sessions WHERE token=? AND expires_at>=?', (token,time.time())).fetchone()
-            if current is None or current['user_id'] != account['id']:
+            if (current is None or current['user_id'] != account['id']) and not (
+                self.oauth_mcp is not None and
+                (oauth_account := self.oauth_mcp.user_for_token(token)) is not None and
+                oauth_account['id'] == account['id']
+            ):
                 raise IssueError('sign in to use issue tickets', 401)
             admin = False
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_roles'").fetchone():

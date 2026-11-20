@@ -592,14 +592,21 @@ def make_handler(sessions: Sessions):
 
         def _account(self) -> dict | None:
             """The logged-in account for this request (accounts.py), or None.
-            Cookie authentication is unchanged. Messenger REST also accepts the same
-            session token as Bearer, over verified HTTPS transport only. No token is minted here."""
+            Inspect cookie and explicit token independently; the token decides identity
+            when supplied. Messenger REST also accepts the session token as Bearer,
+            over verified HTTPS transport only. No token is minted here."""
             from http.cookies import SimpleCookie
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            cookie_token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+            cookie_user = sessions.accounts.user_for_token(cookie_token)
+            self._cookie_account = cookie_user
+            self._token_account = None
             authorization = self.headers.get_all("Authorization", [])
             if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
                 self.client_address[0] in ("127.0.0.1", "::1") and not getattr(self, "_via_proxy", False) and
                 len(authorization) == 1 and authorization[0].startswith("Bearer ")):
                 user = sessions.oauth_mcp.user_for_token(authorization[0][7:])
+                self._token_account = user
                 if user is not None:
                     self._oauth_internal = True
                     if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
@@ -610,6 +617,7 @@ def make_handler(sessions: Sessions):
                 self.client_address[0] in ("127.0.0.1", "::1") and not getattr(self, "_via_proxy", False) and
                 len(authorization) == 1 and authorization[0].startswith("Preview ")):
                 user = sessions.accounts.user_for_token(authorization[0][8:])
+                self._token_account = user if user is not None and user.get("temporary") else None
                 if user is not None and user.get("temporary"):
                     self._mcp_preview_internal = True
                     if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
@@ -626,13 +634,14 @@ def make_handler(sessions: Sessions):
                     if len(parts) != 2 or parts[0].lower() != "bearer":
                         return None
                     user = sessions.accounts.user_for_token(parts[1])
+                    self._token_account = user
                     if user is not None:
                         if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
                             agent_presence_mod.note_inbound(user["username"], mcp=False)
                     return user
-            jar = SimpleCookie(self.headers.get("Cookie", ""))
-            token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
-            user = sessions.accounts.user_for_token(token)
+            if authorization:
+                return None  # an explicit invalid or unsupported token never falls back to an ambient cookie
+            user = cookie_user
             if user is not None:                                  # [LOG] an `activity` line when this account was quiet IDLE_SECONDS
                 logring_mod.note_activity(user["id"], user["username"], getattr(self, "_client_ip", None))
                 if (self.path.partition("?")[0].startswith("/api/") and
@@ -1347,10 +1356,12 @@ def make_handler(sessions: Sessions):
                 return
             try:
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
-                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                token = (self.headers["Authorization"][7:] if self._oauth_internal else
+                         self.headers["Authorization"][8:] if self._mcp_preview_internal else
+                         jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
                 if self._account() is None:
                     raise issue_tickets_mod.IssueError("sign in to use issue tickets", 401)
-                service = issue_tickets_mod.Service(sessions.accounts)
+                service = issue_tickets_mod.Service(sessions.accounts, sessions.oauth_mcp)
                 if method == "GET":
                     query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
                     if path == "/api/issues":
@@ -1412,8 +1423,10 @@ def make_handler(sessions: Sessions):
                 return
             try:
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
-                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
-                service = ticket_research_mod.Service(sessions.accounts)
+                token = (self.headers["Authorization"][7:] if self._oauth_internal else
+                         self.headers["Authorization"][8:] if self._mcp_preview_internal else
+                         jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
+                service = ticket_research_mod.Service(sessions.accounts, sessions.oauth_mcp)
                 parts = path.removeprefix("/api/research/").split("/")
                 if not parts or parts[0] != "cases":
                     raise ticket_research_mod.ResearchError("not found", 404)
@@ -1720,46 +1733,32 @@ def make_handler(sessions: Sessions):
             query = parse_qs(self.path.partition("?")[2])
             db = None
             try:
+                db = agent_workspace_mod.connect(sessions.accounts_db)
                 if temporary:
                     files = agent_workspace_mod.temp_files(self.headers.get("Cookie"), owner_id)
-                    if method == "GET" and path == "/api/scratch":
-                        return self._json({"files": [{"name": name, "bytes": len(value.encode())} for name, value in sorted(files.items())],
-                                           "quota": {"total_bytes": agent_workspace_mod.MAX_TEMP_BYTES, "storage": "cookie"}})
-                    if method == "GET" and path == "/api/scratch/file":
-                        name = agent_workspace_mod._name((query.get("name") or [None])[0])
-                        if name not in files:
-                            raise agent_workspace_mod.WorkspaceError("scratch file not found", 404)
-                        return self._json({"name": name, "body": files[name]})
-                    if method == "POST" and path == "/api/scratch":
-                        body = self._body_json(limit=4096)
-                        if body is None:
-                            return
-                        name = agent_workspace_mod._name(body.get("name"))
-                        if body.get("action") == "write":
-                            files[name] = agent_workspace_mod._text(body.get("body"), "scratch file", agent_workspace_mod.MAX_TEMP_BYTES)
-                        elif body.get("action") == "delete":
-                            if name not in files:
-                                raise agent_workspace_mod.WorkspaceError("scratch file not found", 404)
-                            del files[name]
-                        else:
-                            raise agent_workspace_mod.WorkspaceError("action must be write or delete")
-                        self._set_cookie.append(agent_workspace_mod.temp_cookie(owner_id, files))
-                        return self._json({"name": name, "stored": body["action"] == "write", "storage": "cookie"})
-                else:
-                    db = agent_workspace_mod.connect(sessions.accounts_db)
-                    if method == "GET" and path == "/api/scratch":
-                        return self._json(agent_workspace_mod.scratch_list(db, owner_id))
-                    if method == "GET" and path == "/api/scratch/file":
-                        return self._json(agent_workspace_mod.scratch_read(db, owner_id, (query.get("name") or [None])[0]))
-                    if method == "POST" and path == "/api/scratch":
-                        body = self._body_json(limit=agent_workspace_mod.MAX_SCRATCH_FILE_BYTES + 8192)
-                        if body is None:
-                            return
-                        if body.get("action") == "write":
-                            return self._json(agent_workspace_mod.scratch_write(db, owner_id, body.get("name"), body.get("body")))
-                        if body.get("action") == "delete":
-                            return self._json(agent_workspace_mod.scratch_delete(db, owner_id, body.get("name")))
-                        raise agent_workspace_mod.WorkspaceError("action must be write or delete")
+                    if files:
+                        for name, value in files.items():
+                            try:
+                                agent_workspace_mod.scratch_read(db, owner_id, name)
+                            except agent_workspace_mod.WorkspaceError as error:
+                                if error.status != 404:
+                                    raise
+                                agent_workspace_mod.scratch_write(db, owner_id, name, value)
+                        self._set_cookie.append(agent_workspace_mod.TEMP_COOKIE +
+                                                "=; Path=/api/scratch; Max-Age=0; HttpOnly; SameSite=Lax; Secure")
+                if method == "GET" and path == "/api/scratch":
+                    return self._json(agent_workspace_mod.scratch_list(db, owner_id))
+                if method == "GET" and path == "/api/scratch/file":
+                    return self._json(agent_workspace_mod.scratch_read(db, owner_id, (query.get("name") or [None])[0]))
+                if method == "POST" and path == "/api/scratch":
+                    body = self._body_json(limit=agent_workspace_mod.MAX_SCRATCH_FILE_BYTES + 8192)
+                    if body is None:
+                        return
+                    if body.get("action") == "write":
+                        return self._json(agent_workspace_mod.scratch_write(db, owner_id, body.get("name"), body.get("body")))
+                    if body.get("action") == "delete":
+                        return self._json(agent_workspace_mod.scratch_delete(db, owner_id, body.get("name")))
+                    raise agent_workspace_mod.WorkspaceError("action must be write or delete")
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             except agent_workspace_mod.WorkspaceError as error:
                 return self._json({"error": str(error)}, error.status)
