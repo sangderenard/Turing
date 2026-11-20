@@ -676,6 +676,79 @@ class Instance:
             self.record(stopped=time.time())
 
 
+class AccessAppendLock:
+    """[APPEND] ticket f62934c8, hazard 3: both supervisors (the manager and the log sink, docstring above) append to
+    apache-access.log.  On Windows an O_APPEND write is "seek to the end, then write" and is not atomic across
+    processes, so two appenders can overwrite or splice each other's records.  Each append (one stdin line's sealed
+    records, written and flushed) is therefore made under an OS lock on ``<logs>/apache-access.log.lock``, the same
+    one-byte msvcrt/fcntl lock acquire_lock uses.  The lock is held only for that write.  A lock that cannot be opened
+    or taken within WAIT_S never stops the append (the drain must not block httpd); it is written unlocked and logged."""
+    WAIT_S = 2.0
+    RETRY_S = 0.005
+
+    def __init__(self, path, log, clock=time.monotonic, sleep=time.sleep):
+        self.log, self.clock, self.sleep = log, clock, sleep
+        self.unlocked = 0
+        try:
+            self.file = open(path, "a+b")
+        except OSError as error:
+            self.file = None
+            log(f"access log lock {path} could not be opened ({error!r}); appends are written unlocked")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.file is not None:
+            self.file.close()
+        return False
+
+    def _lock(self) -> bool:
+        if self.file is None:
+            return False
+        deadline = self.clock() + self.WAIT_S
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.file.seek(0)
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if self.clock() >= deadline:
+                    return False
+                self.sleep(self.RETRY_S)
+
+    def _unlock(self):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.file.seek(0)
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.file, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+    def append(self, out, data: bytes):
+        """Write and flush ``data`` to ``out`` (opened "ab") while holding the lock."""
+        locked = self._lock()
+        try:
+            out.write(data)
+            out.flush()
+        finally:
+            if locked:
+                self._unlock()
+        if not locked:
+            self.unlocked += 1
+            if self.unlocked == 1 or self.unlocked % 1000 == 0:
+                self.log(f"access log: {self.unlocked} append(s) written WITHOUT the lock (not taken within {self.WAIT_S}s)")
+
+
 class Supervisor:
     def __init__(self, db_path, instances_path, state_dir):
         """state_dir: a StatePaths, or a plain directory (the old meaning: the legacy layout rooted there)."""
@@ -774,14 +847,15 @@ class Supervisor:
         # <logs>/log_filter.json, is read whenever it changes (log_reduce.py). Reduced before sealing.
         from meowdoku import log_reduce
         reducer = log_reduce.Reducer(line_filter=log_reduce.LineFilter(self.log_dir / "log_filter.json"))
-        with open(path, "ab") as out:
+        # [APPEND] hazard 3: each line's records are one locked append, so the other supervisor cannot splice into them.
+        with open(path, "ab") as out, AccessAppendLock(self.log_dir / "apache-access.log.lock", self.log) as appender:
             for line in iter(sys.stdin.buffer.readline, b""):
-                for text in reducer.feed(line.decode("utf-8", "replace")):
-                    out.write(cipher.seal(text.encode("utf-8")))
-                out.flush()
-            for text in reducer.flush():
-                out.write(cipher.seal(text.encode("utf-8")))
-            out.flush()
+                sealed = b"".join(cipher.seal(text.encode("utf-8")) for text in reducer.feed(line.decode("utf-8", "replace")))
+                if sealed:
+                    appender.append(out, sealed)
+            sealed = b"".join(cipher.seal(text.encode("utf-8")) for text in reducer.flush())
+            if sealed:
+                appender.append(out, sealed)
 
     def route_args(self):
         """[ROUTE] ``--routes a,b --stable-route a --dev-route b`` for every meowdoku child: built from the ENABLED meowdoku instances
