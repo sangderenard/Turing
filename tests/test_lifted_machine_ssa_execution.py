@@ -194,6 +194,30 @@ def test_a_call_to_an_address_no_lifted_function_enters_is_refused():
         _run(module, arg0=1, arg1=2)
 
 
+def _jmp_rel32(at, target):
+    return b"\xe9" + (target - (at + 5)).to_bytes(4, "little", signed=True)
+
+
+def test_a_tail_jump_runs_the_destination_with_the_whole_state():
+    # add rdi, rdi; jmp 0x2000.  The callee's return is the caller's.
+    module = _call_module(b"\x48\x01\xff" + _jmp_rel32(0x1003, 0x2000))
+    (terminator,) = [
+        item for block in module.functions["subject"].blocks.values()
+        for item in block.instrs if item.op == "Br"
+    ]
+    layout = terminator.attributes["transfer_state_layout"]
+    assert len(terminator.args) == len(layout) and "flag.cf" in layout
+    assert _run(module, arg0=5, arg1=7)[0] == 17
+
+
+def test_a_conditional_tail_jump_transfers_only_when_taken():
+    # test edi, edi; je 0x2000; mov eax, 5; ret
+    caller = b"\x85\xff\x0f\x84" + (0x2000 - 0x1008).to_bytes(4, "little", signed=True)
+    module = _call_module(caller + b"\xb8\x05\x00\x00\x00\xc3")
+    assert _run(module, arg0=0, arg1=9)[0] == 9
+    assert _run(module, arg0=3, arg1=9)[0] == 5
+
+
 def _shared_libpython():
     import sysconfig
     from pathlib import Path
@@ -347,3 +371,77 @@ def test_lifted_code_addr2line_and_its_callee_match_the_native_export(libpython)
             )[0] & 0xFFFFFFFF
             signed = returned - (1 << 32) if returned >> 31 else returned
             assert signed == function(id(code), offset), offset
+
+
+class _PyBuffer(ctypes.Structure):
+    _fields_ = [
+        ("buf", ctypes.c_void_p), ("obj", ctypes.c_void_p),
+        ("len", ctypes.c_ssize_t), ("itemsize", ctypes.c_ssize_t),
+        ("readonly", ctypes.c_int), ("ndim", ctypes.c_int),
+        ("format", ctypes.c_char_p), ("shape", ctypes.c_void_p),
+        ("strides", ctypes.c_void_p), ("suboffsets", ctypes.c_void_p),
+        ("internal", ctypes.c_void_p),
+    ]
+
+
+def _buffer_cases(rng):
+    """Py_buffer layouts: C, Fortran and broken strides, some suboffsets."""
+
+    for _ in range(150):
+        ndim, itemsize = rng.randrange(4), rng.choice((1, 2, 4, 8))
+        shape = [rng.randrange(4) for _ in range(ndim)]
+        layout = rng.randrange(4)
+        strides = None
+        if layout:
+            strides, step = [0] * ndim, itemsize
+            dims = range(ndim) if layout == 2 else reversed(range(ndim))
+            for dim in dims:
+                strides[dim], step = step, step * max(shape[dim], 1)
+            if layout == 3 and ndim:
+                strides[rng.randrange(ndim)] += itemsize
+        suboffsets = (
+            [rng.choice((-1, 0)) for _ in range(ndim)]
+            if ndim and rng.random() < 0.2 else None
+        )
+        yield ndim, itemsize, shape, strides, suboffsets
+
+
+@_LINUX_LIBPYTHON
+def test_lifted_buffer_contiguity_with_tail_jumps_matches_the_native_export(libpython):
+    from src.compiler.cpython_compile_ssa import lift_elf_export_to_ssa
+
+    path, _image, memory, _external, native = libpython
+    function = native.PyBuffer_IsContiguous
+    function.restype = ctypes.c_int
+    function.argtypes = [ctypes.c_void_p, ctypes.c_char]
+    lifted = lift_elf_export_to_ssa(path, root_symbol="PyBuffer_IsContiguous")
+    assert lifted.blockers == ()
+    # It ends in jumps to the C- and Fortran-order checks.
+    assert any(
+        "transfer_state_layout" in item.attributes
+        for block in lifted.module.functions[lifted.root_function].blocks.values()
+        for item in block.instrs
+    )
+    for ndim, itemsize, shape, strides, suboffsets in _buffer_cases(random.Random(5)):
+        arrays = [
+            (ctypes.c_ssize_t * len(values))(*values)
+            for values in (shape, strides, suboffsets) if values
+        ]
+        pointers = iter(ctypes.addressof(item) for item in arrays)
+        view = _PyBuffer(
+            None, None, itemsize, itemsize, 0, ndim, None,
+            *(next(pointers) if values else None
+              for values in (shape, strides, suboffsets)),
+            None,
+        )
+        mapped = memory.map_bytes(ctypes.addressof(view), bytes(view))
+        for item in arrays:
+            mapped = mapped.map_bytes(ctypes.addressof(item), bytes(item))
+        for order in b"CFA":
+            returned = _run(
+                lifted.module, lifted.root_function, memory=mapped,
+                arg0=ctypes.addressof(view), arg1=order,
+            )[0] & 0xFFFFFFFF
+            assert returned == function(ctypes.addressof(view), bytes((order,))), (
+                shape, strides, suboffsets, chr(order),
+            )
