@@ -128,7 +128,9 @@ def run(args):
         return 1
     exe = Path(args.hermes_exe) if args.hermes_exe else _program(args.program_dir)
     environment = dict(os.environ, HERMES_HOME=str(home), PYTHONUTF8="1")
-    process = subprocess.Popen([str(exe), "chat", "-q", args.prompt], env=environment, **spawn_kwargs())
+    # Hermes loads context files (AGENTS.md, .hermes.md, .cursorrules) from its working directory: start it in the
+    # account's own home so no repository's guidance becomes the agent's (2026-11-20: turing's AGENTS.md leaked in).
+    process = subprocess.Popen([str(exe), "chat", "-q", args.prompt], env=environment, cwd=str(home), **spawn_kwargs())
     try:
         return process.wait(timeout=args.timeout_seconds)
     except subprocess.TimeoutExpired:
