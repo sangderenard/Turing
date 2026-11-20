@@ -2815,7 +2815,9 @@ def make_handler(sessions: Sessions):
                 if path == "/api/worldmap/index":
                     return self._json(worldmap_mod.index(sessions.state))
                 if path == "/api/worldmap/presence":
-                    return self._json(agent_presence_mod.snapshot(sessions.accounts_db))
+                    # The scheduler may run under a different Windows account from this web service.
+                    days = os.environ.get("SPEAKTOME_AGENT_DAYS") or None
+                    return self._json(agent_presence_mod.snapshot(sessions.accounts_db, agent_days=days))
                 if path != "/api/worldmap/map":
                     return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
