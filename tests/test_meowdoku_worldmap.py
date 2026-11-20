@@ -105,19 +105,6 @@ def test_dev_gets_index_and_map(server):
     assert all(agent["channels"]["api_out"]["state"] == "unknown" for agent in snapshot["agents"])
 
 
-def test_presence_uses_explicit_scheduler_directory(server, tmp_path, monkeypatch):
-    days = tmp_path / "scheduler-days"
-    (days / "state").mkdir(parents=True)
-    (days / "state" / "codex.json").write_text(json.dumps({"last_hourly": "2026-11-20T12:00:00-06:00"}))
-    monkeypatch.setenv("SPEAKTOME_AGENT_DAYS", str(days))
-    h = _cookie(server, "devschedule", "operator")
-    status, _, body = _raw(server.port, "/api/worldmap/presence", headers=h)
-    assert status == 200
-    codex = next(row for row in json.loads(body)["agents"] if row["username"] == "codex")
-    assert abs(codex["schedule"]["observed_at"] - time.time()) < 180
-    assert codex["schedule"]["next_due"] is not None
-
-
 def test_gzip_honoured(server):
     h = {**_cookie(server, "dev2", "operator"), "Accept-Encoding": "gzip"}
     status, headers, body = _raw(server.port, "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT), headers=h)
@@ -148,3 +135,16 @@ def test_module_rules(tmp_path):
     with pytest.raises(wm.WorldMapError) as e:
         wm.map_path(paths, "..__..", "f" * 40)
     assert e.value.status == 400
+
+
+def test_presence_uses_explicit_scheduler_directory(server, tmp_path, monkeypatch):
+    days = tmp_path / "scheduler-days"
+    (days / "state").mkdir(parents=True)
+    (days / "state" / "codex.json").write_text(json.dumps({"last_hourly": "2026-11-20T12:00:00-06:00"}))
+    monkeypatch.setenv("SPEAKTOME_AGENT_DAYS", str(days))
+    h = _cookie(server, "devschedule", "operator")
+    status, _, body = _raw(server.port, "/api/worldmap/presence", headers=h)
+    assert status == 200
+    codex = next(row for row in json.loads(body)["agents"] if row["username"] == "codex")
+    assert abs(codex["schedule"]["observed_at"] - time.time()) < 180
+    assert codex["schedule"]["next_due"] is not None
