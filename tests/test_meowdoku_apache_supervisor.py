@@ -172,7 +172,9 @@ def test_access_append_lock_keeps_two_processes_records_whole(tmp_path):
     for line in lines:
         tag = line[:1].decode()
         assert line == f"{line[:6].decode()}:".encode() + tag.encode() * 4000
-    for tag in ("A", "B"):         # each append's three records stay together
+    for k in range(0, len(lines), 3):  # each append's three records stay together (review f70723f0, codex)
+        assert len({line[:6] for line in lines[k:k + 3]}) == 1, lines[k][:6]
+    for tag in ("A", "B"):         # and each writer's appends keep their order
         seen = [line[:6] for line in lines if line[:1] == tag.encode()]
         assert seen == [f"{tag}{i:05d}".encode() for i in range(200) for _ in range(3)]
 
