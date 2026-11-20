@@ -49,17 +49,24 @@ def _asset_path(state, owner, song_id, storage):
     return state.users_dir / "account" / str(owner) / "assets" / "suno_radio" / song_id / ("audio." + suffix)
 
 
+def _analysis_path(state, owner, song_id, storage):
+    return _asset_path(state, owner, song_id, storage).with_name("levels.nrad")
+
+
 @contextmanager
 def _connect(db_path):
     db = sqlite3.connect(str(db_path), timeout=10)
     try:
         db.row_factory = sqlite3.Row
-        schema_version.declare(db, "suno_radio_assets", 1)
         db.execute("CREATE TABLE IF NOT EXISTS suno_radio_assets ("
                    "owner_id INTEGER NOT NULL, song_id TEXT NOT NULL, title TEXT NOT NULL, "
-                   "storage TEXT NOT NULL, bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, "
+                   "storage TEXT NOT NULL, bytes INTEGER NOT NULL, analysis_bytes INTEGER NOT NULL DEFAULT 0, "
+                   "sha256 TEXT NOT NULL, "
                    "state TEXT NOT NULL, created REAL NOT NULL DEFAULT (unixepoch()), "
                    "PRIMARY KEY(owner_id,song_id))")
+        if "analysis_bytes" not in {row[1] for row in db.execute("PRAGMA table_info(suno_radio_assets)")}:
+            db.execute("ALTER TABLE suno_radio_assets ADD COLUMN analysis_bytes INTEGER NOT NULL DEFAULT 0")
+        schema_version.declare(db, "suno_radio_assets", 2)
         yield db
         db.commit()
     except BaseException:
@@ -79,7 +86,7 @@ def owned(state, db_path, owner):
 def station_catalogue(state, db_path):
     """Resolve paths from the SQL owner and UUID; never accept an HTTP path."""
     with _connect(db_path) as db:
-        rows = db.execute("SELECT owner_id,song_id,title,storage,bytes FROM suno_radio_assets "
+        rows = db.execute("SELECT owner_id,song_id,title,storage,bytes,analysis_bytes FROM suno_radio_assets "
                           "WHERE state='ready'").fetchall()
     songs = {}
     for row in rows:
@@ -87,7 +94,8 @@ def station_catalogue(state, db_path):
         if path.is_file() and path.stat().st_size == row["bytes"]:
             key = f"suno:{row['owner_id']}:{row['song_id']}"
             songs[key] = {"id": key, "title": row["title"], "path": str(path),
-                          "storage": row["storage"]}
+                          "storage": row["storage"], "analysis": row["analysis_bytes"] > 0 and
+                          _analysis_path(state, row["owner_id"], row["song_id"], row["storage"]).is_file()}
     return songs
 
 
@@ -199,7 +207,11 @@ def import_song(state, db_path, owner, song_id, storage, confirm_credit, service
     folder.mkdir(parents=True, exist_ok=True)
     raw = folder / ("." + secrets.token_hex(8) + (".mp3" if storage == "mp3" else ".wav"))
     final = _asset_path(state, owner, song_id, storage)
+    levels = _analysis_path(state, owner, song_id, storage)
     encoded = folder / ("." + secrets.token_hex(8) + ".flac")
+    verified = folder / ("." + secrets.token_hex(8) + ".wav")
+    analysis_stage = folder / ("." + secrets.token_hex(8) + ".nrad")
+    published = False
     try:
         detail = _payload(service.call(owner, "suno", "audio-retrieve", {"id": song_id}))
         if detail.get("id") != song_id or detail.get("status") != "complete":
@@ -224,26 +236,47 @@ def import_song(state, db_path, owner, song_id, storage, confirm_credit, service
         if storage == "flac":
             if signature[:4] != b"RIFF" or signature[8:12] != b"WAVE":
                 raise ControlError("Suno media is not WAV", 502)
+            from meowdoku import radio_upload_assets
+            analysis_bytes = radio_upload_assets._analyze(state, raw, analysis_stage)
             run_codec(state, raw, encoded, "flac_encode")
             raw.unlink()
             raw = encoded
             size = raw.stat().st_size
             digest = hashlib.sha256(raw.read_bytes()).hexdigest()
+        else:
+            run_codec(state, raw, verified, "mp3_decode")
+            from meowdoku import radio_upload_assets
+            analysis_bytes = radio_upload_assets._analyze(state, verified, analysis_stage)
+        # Both catalogues share one derived-data ceiling, independent of owner media quotas.
+        with radio_upload_assets._connect(db_path):
+            pass
         with _connect(db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
             total = db.execute("SELECT COALESCE(SUM(bytes),0) FROM suno_radio_assets "
                                "WHERE owner_id=? AND state='ready'", (owner,)).fetchone()[0]
             if total + size > MAX_OWNER_BYTES:
                 raise ControlError("Radio asset storage quota reached", 413)
+            if radio_upload_assets.analysis_used(db) + analysis_bytes > radio_upload_assets.ANALYSIS_CAP_BYTES:
+                raise ControlError("Radio analysis storage is full (1 GiB shared limit)", 507)
             os.replace(raw, final)
-            db.execute("UPDATE suno_radio_assets SET title=?,bytes=?,sha256=?,state='ready' "
+            published = True
+            os.replace(analysis_stage, levels)
+            db.execute("UPDATE suno_radio_assets SET title=?,bytes=?,analysis_bytes=?,sha256=?,state='ready' "
                        "WHERE owner_id=? AND song_id=? AND state='pending'",
-                       (title, size, digest, owner, song_id))
+                       (title, size, analysis_bytes, digest, owner, song_id))
             db.commit()
         return {"status": "ready", "song_id": song_id, "title": title,
                 "storage": storage, "bytes": size}
+    except BaseException:
+        if published:
+            final.unlink(missing_ok=True)
+            levels.unlink(missing_ok=True)
+        raise
     finally:
         raw.unlink(missing_ok=True)
         encoded.unlink(missing_ok=True)
+        verified.unlink(missing_ok=True)
+        analysis_stage.unlink(missing_ok=True)
         with _connect(db_path) as db:
             db.execute("DELETE FROM suno_radio_assets WHERE owner_id=? AND song_id=? AND state='pending'",
                        (owner, song_id))

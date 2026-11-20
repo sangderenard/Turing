@@ -169,7 +169,8 @@ class Runner:
     def station(self):
         with self.lock:
             if self.current_track is None or self.current_track.spectrum_peer is None: return None
-            return {"peer": self.current_track.spectrum_peer, "title": self.current_song["title"]}
+            return {"peer": self.current_track.spectrum_peer, "title": self.current_song["title"],
+                    "song_id": self.current_song["id"]}
 
     def _config(self):
         try:
@@ -251,6 +252,13 @@ class Runner:
                     from meowdoku.suno_radio_assets import run_codec
                     playback_wav = path.parent / ('.playback-' + secrets.token_hex(12) + '.wav')
                     run_codec(self.state, path, playback_wav, song['storage'] + '_decode')
+                    if not song.get('analysis'):
+                        try:
+                            from meowdoku.radio_upload_assets import ensure_analysis
+                            if ensure_analysis(self.state, self.store.db_path, song, playback_wav):
+                                song['analysis'] = True
+                        except Exception as exc:
+                            print(f'[radio-jukebox] Levels unavailable for {song["id"]}: {exc}', flush=True)
                     song['path'] = str(playback_wav)
                 owned = self.track(config, song)
                 owned.on_pcm = self._publish_pcm
