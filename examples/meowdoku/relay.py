@@ -141,7 +141,8 @@ def send(db, address, *, user_id, to, body, kind="datagram", config, now=None) -
     now = time.time() if now is None else now
     recent = db.execute("SELECT COUNT(*) FROM relay_packages WHERE address = ? AND direction = 'out' AND created_at > ?",
                         (address, now - 60.0)).fetchone()[0]
-    if recent >= config["rate_per_minute"]:
+    from meowdoku import rate_limits
+    if rate_limits.enabled() and recent >= config["rate_per_minute"]:
         raise RelayError(f"this address has sent {config['rate_per_minute']} packages in the last minute; wait", 429)
     if to.isdigit():                             # address to address: no socket, any kind, delivered at once
         target = int(to)

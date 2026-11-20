@@ -120,7 +120,8 @@ def route(handler, path, method, *, accounts_db):
                     raise PaletteError("feedback must match the current palette and say good or bad", 409)
                 daily = db.execute("SELECT COUNT(*) FROM palette_feedback WHERE owner=? AND created>?",
                                    (owner, time.time() - 86400)).fetchone()[0]
-                if daily >= 60:
+                from meowdoku import rate_limits
+                if rate_limits.enabled() and daily >= 60:
                     raise PaletteError("feedback limit reached for today", 429)
                 db.execute("INSERT INTO palette_feedback(owner,color,rating,created) VALUES (?,?,?,?)",
                            (owner, candidate, 1 if rating == "good" else -1, time.time()))
