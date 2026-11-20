@@ -729,7 +729,30 @@ class Supervisor:
             return False
 
     def tail_stdin(self):
-        """Apache's access-log lines -> apache-access.log.  Returns on EOF (= httpd is shutting down)."""
+        """Apache's access-log lines -> apache-access.log.  Returns on EOF (= httpd is shutting down).
+
+        [SURVIVE] ticket f62934c8, hazard 2: this reader is the only consumer of the piped CustomLog.  Before this, an
+        exception in RecordCipher/migrate/seal/write ended the daemon thread silently; nobody read the pipe any more,
+        so httpd blocked writing access lines once its pipe buffer filled, and the supervisor never saw EOF.  Now a
+        failure is logged loudly (apache-supervisor.log and stderr) and stdin is drained to EOF, unrecorded, so httpd
+        keeps serving; the loss is counted in the log.  EOF still sets ``stop`` as before."""
+        try:
+            self._tail_stdin_sealed()
+        except Exception as error:
+            import traceback
+            self.log(f"ACCESS LOG FAILED: {error!r}; Apache's access lines are now DROPPED (not recorded) until the "
+                     f"supervisor restarts. stdin is still drained so httpd does not block.\n{traceback.format_exc()}")
+            dropped = 0
+            try:
+                for _ in iter(sys.stdin.buffer.readline, b""):
+                    dropped += 1
+            except Exception as drain_error:
+                self.log(f"stdin drain failed too: {drain_error!r}")
+            self.log(f"access log: {dropped} line(s) dropped unrecorded after the failure, up to EOF")
+        finally:
+            self.stop.set()
+
+    def _tail_stdin_sealed(self):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         path = self.log_dir / "apache-access.log"
         cipher = RecordCipher(self.paths.records_key, existing_streams=(path, self.paths.log_ring))
@@ -746,7 +769,6 @@ class Supervisor:
             for text in reducer.flush():
                 out.write(cipher.seal(text.encode("utf-8")))
             out.flush()
-        self.stop.set()
 
     def route_args(self):
         """[ROUTE] ``--routes a,b --stable-route a --dev-route b`` for every meowdoku child: built from the ENABLED meowdoku instances
