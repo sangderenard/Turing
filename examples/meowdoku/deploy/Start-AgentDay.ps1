@@ -307,12 +307,43 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
         ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $AgentDays 'runs.jsonl') -Encoding utf8
 }
 
+# One Python call that cannot outlive -Seconds: on timeout its whole process tree is killed and the call reports exit
+# -1. A tick's own time limit does not reach it: Task Scheduler stops the headless conhost the task started, not the
+# pwsh under it, so a call hung on a locked or slow disk kept its tick alive (2026-11-20: ~190 ticks piled up behind
+# the execution-queue claim while icacls rewrote the tree's permissions).
+function Invoke-BoundedPython([string[]]$Arguments, [int]$Seconds = 60, [string]$InputText = $null) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Python)
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.RedirectStandardInput = $null -ne $InputText
+    $utf8 = [Text.UTF8Encoding]::new($false)                  # Python here speaks UTF-8 (PYTHONIOENCODING above)
+    $info.StandardOutputEncoding = $utf8
+    $info.StandardErrorEncoding = $utf8
+    if ($null -ne $InputText) { $info.StandardInputEncoding = $utf8 }
+    $process = [Diagnostics.Process]::Start($info)
+    $out = $process.StandardOutput.ReadToEndAsync()
+    $err = $process.StandardError.ReadToEndAsync()
+    if ($null -ne $InputText) { $process.StandardInput.Write($InputText); $process.StandardInput.Close() }
+    if (-not $process.WaitForExit($Seconds * 1000)) {
+        try { $process.Kill($true) } catch { }
+        $process.WaitForExit()
+        return [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true }
+    }
+    $process.WaitForExit()
+    [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $out.Result; TimedOut = $false; Error = $err.Result }
+}
+
 function Invoke-AgentExecution([string]$name, $declared) {
     # HTTP queued this agent's own command. The existing owner task, which already
     # holds the saved account credential, starts it through Invoke-AsAgent.
     $queue = Join-Path $PSScriptRoot '..\agent_execution.py'
-    $claimed = & $Python $queue --db $AccountsDb claim --agent $declared.login
-    if ($LASTEXITCODE -ne 0) { Log "${name}: execution queue could not be read"; return $false }
+    $claim = Invoke-BoundedPython @($queue, '--db', $AccountsDb, 'claim', '--agent', $declared.login)
+    if ($claim.TimedOut) { Log "${name}: execution queue did not answer in 60 s; stopped"; return $false }
+    if ($claim.ExitCode -ne 0) { Log "${name}: execution queue could not be read"; return $false }
+    $claimed = $claim.Output
     $job = ($claimed -join "`n") | ConvertFrom-Json
     if (-not $job) { return $false }
     $result = $null
@@ -333,8 +364,8 @@ function Invoke-AgentExecution([string]$name, $declared) {
     } catch {
         $result = @{ output = $_.Exception.Message; exit_code = 1; timed_out = $false }
     }
-    $result | ConvertTo-Json -Compress -Depth 3 | & $Python $queue --db $AccountsDb complete --id $job.id | Out-Null
-    if ($LASTEXITCODE -ne 0) { Log "${name}: execution $($job.id) completion could not be saved" }
+    $done = Invoke-BoundedPython @($queue, '--db', $AccountsDb, 'complete', '--id', [string]$job.id) 60 ($result | ConvertTo-Json -Compress -Depth 3)
+    if ($done.ExitCode -ne 0) { Log "${name}: execution $($job.id) completion could not be saved$(if ($done.TimedOut) { ' (no answer in 60 s; stopped)' })" }
     return $true
 }
 
@@ -405,9 +436,13 @@ if ($RunOne) {
 # ---------------------------------------------------------------- one tick for one agent
 if (-not $Agents.Contains($Agent)) { Write-Host "-Tick needs -Agent, one of: $($Agents.Keys -join ', ')"; exit 2 }
 $declared = $Agents[$Agent]
-if (Invoke-AgentExecution $Agent $declared) { exit 0 }
 $running = Join-Path $AgentDays 'running'
 New-Item -ItemType Directory -Force -Path $running | Out-Null
+# One tick at a time reads this agent's execution queue; a tick that finds that step taken leaves this minute to it, so
+# ticks never stack behind a slow claim (the step before the decision lock below had no lock of its own).
+try { $gate = [IO.File]::Open((Join-Path $running "$Agent.queue.lock"), 'OpenOrCreate', 'ReadWrite', 'None') } catch { exit 0 }
+try { $executed = Invoke-AgentExecution $Agent $declared } finally { $gate.Dispose() }
+if ($executed) { exit 0 }
 # One tick decides at a time for this agent; another tick that finds the lock held leaves it to that one.
 try { $lock = [IO.File]::Open((Join-Path $running "$Agent.lock"), 'OpenOrCreate', 'ReadWrite', 'None') } catch { exit 0 }
 $run = $null
