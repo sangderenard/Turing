@@ -1533,6 +1533,8 @@ __all__ = [
     "webgpublas_gemm",
     "emit_pairwise_reduce_module", "emit_tensor_program_module",
     "lower_elementwise_kernel_calls",
+    "inline_region_calls", "lower_tensor_lane_kernel_calls", "emit_tensor_lane_module",
+    "WGSLLaneFeed", "WGSLLaneOutput", "WGSLTensorLaneProgram", "MAX_LANE_COMPONENTS",
 ]
 
 
@@ -1840,6 +1842,536 @@ def emit_tensor_program_module(
         artifact.shortfalls = tuple(shortfalls) + tuple(artifact.shortfalls)
         artifact.complete = False
     return artifact
+
+
+# ---------------------------------------------------------------------------
+# Tensor lanes: a LOWERED AbstractTensor program as one invocation per element
+# of its leading axis.
+#
+# ``lower_ast_source_to_ssa`` plans a tensor program into a root function and
+# ``planned_region_N`` functions of repository kernel Calls
+# (binary/binary_scalar/unary/reduce_dim/broadcast ``_double``), threaded
+# together by ``GetElementPtr``/``Load`` projections of each call's returned
+# aggregate.  The elementwise lowering above refuses that form by name.  This
+# lowering accepts it under three explicit decisions:
+#
+# 1. REGIONS ARE INLINED into the root first (``inline_region_calls``; the same
+#    substitution as ``ssa_glsl_compute_backend._fuse_loop_body``: formals are
+#    replaced by actuals and each projection is resolved to the value the
+#    region returned), so one straight-line body remains.
+# 2. LANES are the leading extent ``count``.  A value of shape ``(count, ...)``
+#    is a LANE value: each trailing element (a "component", row-major over the
+#    trailing extents, at most ``MAX_LANE_COMPONENTS``) becomes its own scalar
+#    of the per-lane program, so ``P[N, 2]`` and ``H[N]`` share one lane space.
+#    Any other array (``F[2]``) is SHARED: every element is a uniform scalar
+#    every lane reads.  A rank-zero value is a uniform scalar.
+# 3. ``broadcast_double`` and ``reduce_dim_double`` over trailing axes become
+#    component selection / folds INSIDE a lane (no op is emitted for a
+#    broadcast: the result aliases the source components).  A reduction over
+#    the lane axis itself needs communication between invocations and is
+#    refused by name.
+#
+# Feeds and outputs are COMPONENT-MAJOR: lane value ``P[N, 2]`` is fed as two
+# formals ``P[:, 0]`` and ``P[:, 1]``; a published ``Q[N, 2]`` is two output
+# slots.  ``WGSLLaneFeed``/``WGSLLaneOutput`` state that layout.
+# ---------------------------------------------------------------------------
+
+#: the most components one lane value may hold (they are unrolled in a lane)
+MAX_LANE_COMPONENTS = 16
+
+#: tensor-operation name -> the scalar SSA opcode both the WGSL and the LLVM
+#: emitters spell (so the per-lane program can be run natively as well as
+#: emitted); any other operation keeps its lowercase repository name.
+_LANE_SCALAR_SPELLING = {
+    "add": "Add", "sub": "Sub", "mul": "Mul", "truediv": "Div",
+    "maximum": "Max", "minimum": "Min", "pow": "Pow", "floordiv": "FloorDiv",
+    "neg": "Neg", "abs": "Abs", "sqrt": "Sqrt", "tanh": "Tanh",
+}
+
+#: ``reduce_dim_double`` op code -> the binary tensor operation folding it
+_LANE_REDUCE_FOLD = {0: "add", 1: "mul", 2: "minimum", 3: "maximum"}
+
+
+@dataclass(frozen=True)
+class WGSLLaneFeed:
+    """One scalar formal of the per-lane program: component ``component`` of
+    source formal ``formal`` (shape ``shape``).  ``uniform`` formals are one
+    value every lane reads (element 0 of their slot)."""
+
+    formal: int
+    component: int
+    value: int
+    shape: tuple
+    uniform: bool
+
+
+@dataclass(frozen=True)
+class WGSLLaneOutput:
+    """One output slot: component ``component`` of published value ``output``."""
+
+    output: int
+    component: int
+    value: int
+    shape: tuple
+
+
+@dataclass
+class WGSLTensorLaneProgram:
+    """A WGSL compute shader for a lowered tensor program, with the per-lane
+    scalar program it was emitted from (``function``/``outputs``) and the
+    component-major feed and output layout."""
+
+    module: WGSLModule
+    function: Function
+    outputs: tuple
+    feeds: tuple
+    published: tuple
+    count: int
+
+    @property
+    def complete(self) -> bool:
+        return self.module.complete
+
+    @property
+    def source(self) -> str:
+        return self.module.source
+
+    @property
+    def shortfalls(self) -> tuple:
+        return self.module.shortfalls
+
+
+class _LaneRefusal(Exception):
+    """A lowered instruction the lane form does not spell, with the reason."""
+
+
+def inline_region_calls(
+    module: IRModule,
+    function_name: str,
+    outputs: Sequence[SSAValue] = (),
+) -> tuple[Function, tuple[SSAValue, ...], tuple[WGSLShortfall, ...]]:
+    """One straight-line function equal to ``function_name`` with every
+    planned-region call (``ssa.aggregate`` result) inlined.
+
+    Each region's formals are substituted by its actuals, its ``Ret`` operands
+    become the fields of the call's aggregate, and the root's
+    ``GetElementPtr``/``Load`` projections resolve to those fields.  Returns
+    the function (same formals), the resolved ``outputs`` (the root's ``Ret``
+    operands when none are given) and the shortfalls (a region with control
+    flow, a region called twice, a projection without a constant index)."""
+
+    root = module.functions[function_name]
+    shortfalls: list[WGSLShortfall] = []
+    emitted: list[Instr] = []
+    called: list[str] = []
+
+    def fail(operation: str, reason: str) -> None:
+        item = WGSLShortfall(function_name, operation, reason)
+        if item not in shortfalls:
+            shortfalls.append(item)
+
+    def walk(function: Function, bindings: dict[int, SSAValue], depth: int):
+        substitute = dict(bindings)
+        returned: dict[int, tuple] = {}
+        projection: dict[int, tuple[int, int]] = {}
+        constants = {
+            int(item.res.id): item.attributes.get("constant", item.attributes.get("value"))
+            for block in function.blocks.values() for item in block.instrs
+            if str(item.op) == "Const" and item.res is not None
+        }
+        result: tuple = ()
+
+        def resolved(value: SSAValue) -> SSAValue:
+            return substitute.get(int(value.id), value)
+
+        if set(function.blocks) != {"entry"} or depth > 16:
+            fail(function.name, "planned region is not one straight-line entry block")
+            return result, substitute
+        for item in function.blocks["entry"].instrs:
+            operation = str(item.op)
+            if operation in {"Ret", "ret"}:
+                result = tuple(resolved(value) for value in item.args)
+                continue
+            if operation in {"Call", "call"}:
+                callee = str(item.attributes.get("callee") or "")
+                region = module.functions.get(callee)
+                if region is not None and str(getattr(item.res, "dtype", "")) == "ssa.aggregate":
+                    if callee in called:
+                        fail(callee, "planned region is called twice; its values would collide")
+                        continue
+                    if len(region.args) != len(item.args):
+                        fail(callee, f"called with {len(item.args)} actuals for {len(region.args)} formals")
+                        continue
+                    called.append(callee)
+                    fields, _ = walk(
+                        region,
+                        {int(f.id): resolved(a) for f, a in zip(region.args, item.args)},
+                        depth + 1,
+                    )
+                    returned[int(item.res.id)] = fields
+                    continue
+            if operation == "GetElementPtr" and item.args and int(item.args[0].id) in returned:
+                index = constants.get(int(item.args[1].id)) if len(item.args) > 1 else None
+                if index is None:
+                    fail(operation, "projection of a region result has no constant field index")
+                    continue
+                projection[int(item.res.id)] = (int(item.args[0].id), int(index))
+                continue
+            if operation == "Load" and item.args and int(item.args[0].id) in projection:
+                aggregate, index = projection[int(item.args[0].id)]
+                fields = returned[aggregate]
+                if not 0 <= index < len(fields):
+                    fail(operation, f"projection of field {index} from a region returning {len(fields)}")
+                    continue
+                substitute[int(item.res.id)] = fields[index]
+                continue
+            emitted.append(Instr(
+                item.op, [resolved(value) for value in item.args], item.res,
+                arg_roles=list(item.arg_roles), attributes=dict(item.attributes),
+            ))
+        return result, substitute
+
+    returned_values, substitute = walk(root, {}, 0)
+    resolved_outputs = (
+        tuple(substitute.get(int(value.id), value) for value in outputs)
+        if outputs else tuple(returned_values)
+    )
+    flat = Function(
+        function_name, list(root.args),
+        {"entry": BasicBlock("entry", emitted)},
+        metadata=dict(root.metadata),
+    )
+    return flat, resolved_outputs, tuple(shortfalls)
+
+
+def lower_tensor_lane_kernel_calls(
+    module: IRModule,
+    function_name: str,
+    outputs: Sequence[SSAValue],
+    *,
+    count: int,
+) -> tuple[Function, tuple[SSAValue, ...], tuple[WGSLLaneFeed, ...],
+           tuple[WGSLLaneOutput, ...], tuple[int, ...], tuple[WGSLShortfall, ...]]:
+    """Lower a planned tensor program to the per-lane scalar form.
+
+    Returns the per-lane function (scalar formals, scalar instructions), its
+    lowered output scalars (component-major, in ``outputs`` order), the feed
+    and output layouts, the ids of the uniform formals, and the shortfalls."""
+
+    from itertools import product
+
+    flat, flat_outputs, shortfalls_in = inline_region_calls(module, function_name, outputs)
+    shortfalls: list[WGSLShortfall] = list(shortfalls_in)
+    names = _opcode_operation_names()
+    count = int(count)
+    instrs_in = list(flat.blocks["entry"].instrs)
+
+    def fail(operation: str, reason: str) -> None:
+        item = WGSLShortfall(function_name, operation, reason)
+        if item not in shortfalls:
+            shortfalls.append(item)
+
+    known = [int(value.id) for value in flat.args]
+    for item in instrs_in:
+        known.extend(int(value.id) for value in item.args)
+        if item.res is not None:
+            known.append(int(item.res.id))
+    next_id = [max(known, default=0) + 1]
+
+    def fresh(dtype: Any) -> SSAValue:
+        value = SSAValue(next_id[0], dtype, ())
+        next_id[0] += 1
+        return value
+
+    forms: dict[int, list[SSAValue]] = {}
+    kinds: dict[int, str] = {}
+    shapes: dict[int, tuple] = {}
+    constants: dict[int, Any] = {}
+    lane_instrs: list[Instr] = []
+
+    def classify(shape: tuple) -> tuple[str, tuple]:
+        if not shape:
+            return "scalar", ()
+        if int(shape[0]) == count:
+            return "lane", tuple(shape[1:])
+        return "shared", tuple(shape)
+
+    def size(extents: Sequence[int]) -> int:
+        total = 1
+        for extent in extents:
+            total *= int(extent)
+        return total
+
+    def define(value: SSAValue) -> list[SSAValue]:
+        shape = tuple(int(e) for e in (value.shape or ()))
+        kind, inner = classify(shape)
+        components = size(inner) if kind == "lane" else size(shape)
+        if components > MAX_LANE_COMPONENTS:
+            raise _LaneRefusal(
+                f"value %{value.id} of shape {shape} holds {components} components per lane; "
+                f"at most {MAX_LANE_COMPONENTS} are unrolled")
+        if components == 1:
+            made = [SSAValue(int(value.id), value.dtype, ())]
+        else:
+            made = [fresh(value.dtype) for _ in range(components)]
+        forms[int(value.id)], kinds[int(value.id)], shapes[int(value.id)] = made, kind, shape
+        return made
+
+    def form(value: SSAValue) -> list[SSAValue]:
+        found = forms.get(int(value.id))
+        if found is None:
+            raise _LaneRefusal(f"operand %{value.id} is not a lane-form value defined earlier")
+        return found
+
+    def spell(name: str) -> str:
+        return _LANE_SCALAR_SPELLING.get(name, name)
+
+    def constant(value: SSAValue) -> Any:
+        if int(value.id) not in constants:
+            raise _LaneRefusal(f"operand %{value.id} is not a compile-time constant")
+        return constants[int(value.id)]
+
+    def same_layout(result: SSAValue, *operands: SSAValue) -> None:
+        for operand in operands:
+            if kinds[int(operand.id)] != kinds[int(result.id)] or \
+                    len(forms[int(operand.id)]) != len(forms[int(result.id)]):
+                raise _LaneRefusal(
+                    f"operand %{operand.id} {shapes[int(operand.id)]} and result "
+                    f"%{result.id} {shapes[int(result.id)]} differ in lane layout")
+
+    def checked_name(table_kind: str, code: Any) -> str:
+        try:
+            name = names[(table_kind, int(code))]
+        except (KeyError, ValueError, TypeError):
+            raise _LaneRefusal("opcode is not a compile-time constant of the repository table")
+        if name in _NOT_FAITHFUL_IN_WGSL:
+            raise _LaneRefusal(
+                f"{name}: the repository's definition differs from WGSL's spelling; "
+                "refused rather than approximated")
+        return name
+
+    def kernel(callee: str, args: list[SSAValue], result: SSAValue) -> None:
+        if callee == "binary_double":
+            name = checked_name("binary", constant(args[4]))
+            first, second, out = form(args[0]), form(args[1]), define(result)
+            same_layout(result, args[0], args[1])
+            for x, y, z in zip(first, second, out):
+                lane_instrs.append(Instr(spell(name), [x, y], z))
+        elif callee == "binary_scalar_double":
+            name = checked_name("binary", constant(args[4]))
+            tensor, scalar, out = form(args[0]), form(args[1]), define(result)
+            if len(scalar) != 1 or shapes[int(args[1].id)]:
+                raise _LaneRefusal("the scalar operand is not rank zero")
+            same_layout(result, args[0])
+            reverse = bool(int(constant(args[5])))
+            for x, z in zip(tensor, out):
+                operands = [scalar[0], x] if reverse else [x, scalar[0]]
+                lane_instrs.append(Instr(spell(name), operands, z))
+        elif callee == "unary_double":
+            name = checked_name("unary", constant(args[3]))
+            tensor, out = form(args[0]), define(result)
+            same_layout(result, args[0])
+            for x, z in zip(tensor, out):
+                lane_instrs.append(Instr(spell(name), [x], z))
+        elif callee == "where_double":
+            condition, first, second, out = form(args[0]), form(args[1]), form(args[2]), define(result)
+            same_layout(result, args[0], args[1], args[2])
+            for c, x, y, z in zip(condition, first, second, out):
+                lane_instrs.append(Instr("where", [c, x, y], z))
+        elif callee == "broadcast_double":
+            # broadcast_double(input, OUTPUT, input_shape, input_ndim, output_shape, output_ndim)
+            in_shape = tuple(int(e) for e in constant(args[2]))[:int(constant(args[3]))]
+            out_shape = tuple(int(e) for e in constant(args[4]))[:int(constant(args[5]))]
+            source = form(args[0])
+            if tuple(shapes[int(args[0].id)]) != in_shape or tuple(result.shape or ()) != out_shape:
+                raise _LaneRefusal(
+                    f"declared shapes {in_shape} -> {out_shape} differ from the values' "
+                    f"{shapes[int(args[0].id)]} -> {tuple(result.shape or ())}")
+            out = define(result)
+            in_kind, in_inner = classify(in_shape)
+            out_kind, out_inner = classify(out_shape)
+            offset = len(out_shape) - len(in_shape)
+            if in_kind == "lane" and (out_kind != "lane" or offset != 0):
+                raise _LaneRefusal("a broadcast that moves the lane axis is not spelled")
+            if out_kind == "scalar":
+                raise _LaneRefusal("a broadcast to a rank-zero value")
+            walk_axes = out_inner if out_kind == "lane" else out_shape
+            picked: list[SSAValue] = []
+            for coordinate in product(*(range(e) for e in walk_axes)):
+                full = ((None,) + coordinate) if out_kind == "lane" else coordinate
+                taken = []
+                for in_axis in range(len(in_shape)):
+                    at = full[in_axis + offset]
+                    taken.append(0 if in_shape[in_axis] == 1 else at)
+                if in_kind == "lane":
+                    inside, extents = taken[1:], in_inner
+                else:
+                    if any(item is None for item in taken):
+                        raise _LaneRefusal("a shared operand varies along the lane axis")
+                    inside, extents = taken, in_shape
+                flat_index = 0
+                for at, extent in zip(inside, extents):
+                    flat_index = flat_index * int(extent) + int(at)
+                picked.append(source[flat_index])
+            if len(picked) != len(out):
+                raise _LaneRefusal("broadcast components do not match the result")
+            forms[int(result.id)] = picked
+        elif callee == "reduce_dim_double":
+            # reduce_dim_double(input, OUTPUT, shape, ndim, dim, op)
+            in_shape = tuple(int(e) for e in constant(args[2]))[:int(constant(args[3]))]
+            dim, code = int(constant(args[4])), int(constant(args[5]))
+            source = form(args[0])
+            in_kind, in_inner = classify(in_shape)
+            if in_kind != "lane" or dim == 0:
+                raise _LaneRefusal(
+                    "reduction across the lane axis needs communication between invocations "
+                    f"(shape {in_shape}, dim {dim}); only reductions over trailing axes inside "
+                    "a lane are spelled")
+            if code not in _LANE_REDUCE_FOLD:
+                raise _LaneRefusal(f"reduction op code {code} has no per-lane fold")
+            fold = _LANE_REDUCE_FOLD[code]
+            axis = dim - 1
+            out = define(result)
+            kept = [e for i, e in enumerate(in_inner) if i != axis]
+            if size(kept) != len(out):
+                raise _LaneRefusal("reduction components do not match the result")
+            for index, rest in enumerate(product(*(range(e) for e in kept))):
+                members = []
+                for at in range(in_inner[axis]):
+                    coordinate = list(rest)
+                    coordinate.insert(axis, at)
+                    flat_index = 0
+                    for c, extent in zip(coordinate, in_inner):
+                        flat_index = flat_index * int(extent) + c
+                    members.append(source[flat_index])
+                accumulator = members[0]
+                for position, member in enumerate(members[1:], start=1):
+                    last = position == len(members) - 1
+                    target = out[index] if last else fresh(result.dtype)
+                    lane_instrs.append(Instr(spell(fold), [accumulator, member], target))
+                    accumulator = target
+                if len(members) == 1:
+                    out[index] = members[0]
+            forms[int(result.id)] = out
+        else:
+            raise _LaneRefusal(
+                "is not a kernel the tensor-lane form spells (elementwise, broadcast and "
+                "trailing-axis reduce are; gathers, matmuls and fills are not)")
+
+    lane_args: list[SSAValue] = []
+    feeds: list[WGSLLaneFeed] = []
+    uniform_ids: list[int] = []
+    for formal in flat.args:
+        try:
+            made = define(formal)
+        except _LaneRefusal as refusal:
+            fail(f"formal %{formal.id}", str(refusal))
+            continue
+        uniform = kinds[int(formal.id)] != "lane"
+        for position, item in enumerate(made):
+            lane_args.append(item)
+            feeds.append(WGSLLaneFeed(
+                int(formal.id), position, int(item.id), shapes[int(formal.id)], uniform))
+            if uniform:
+                uniform_ids.append(int(item.id))
+    for item in instrs_in:
+        operation = str(item.op)
+        result = item.res
+        try:
+            if operation in {"Const", "const"}:
+                value = item.attributes.get("constant", item.attributes.get("value"))
+                if "values" in item.attributes:
+                    value = tuple(item.attributes["values"])
+                constants[int(result.id)] = value
+                if str(result.dtype or "").startswith(("int", "uint", "bool")):
+                    continue
+                if tuple(result.shape or ()):
+                    raise _LaneRefusal("an array-valued float constant is not spelled")
+                made = define(result)
+                lane_instrs.append(Instr("Const", [], made[0], attributes=dict(item.attributes)))
+            elif operation in {"reshape", "view"}:
+                source = form(item.args[0])
+                made = define(result)
+                if len(made) != len(source) or kinds[int(result.id)] != kinds[int(item.args[0].id)]:
+                    raise _LaneRefusal("a reshape that changes the lane layout is not spelled")
+                forms[int(result.id)] = source
+            elif operation in {"Call", "call"}:
+                callee = str(item.attributes.get("callee", ""))
+                try:
+                    kernel(callee, list(item.args), result)
+                except _LaneRefusal as refusal:
+                    raise _LaneRefusal(f"{callee} {refusal}" if str(refusal).startswith("is not") else f"{callee}: {refusal}")
+            elif result is not None and not tuple(result.shape or ()) and all(
+                    int(a.id) in forms and not shapes[int(a.id)] for a in item.args):
+                made = define(result)
+                lane_instrs.append(Instr(
+                    item.op, [forms[int(a.id)][0] for a in item.args], made[0],
+                    attributes=dict(item.attributes)))
+            else:
+                raise _LaneRefusal("instruction is not in the tensor-lane kernel-call form")
+        except _LaneRefusal as refusal:
+            fail(operation, str(refusal))
+    lowered_outputs: list[SSAValue] = []
+    published: list[WGSLLaneOutput] = []
+    for value in flat_outputs:
+        made = forms.get(int(value.id))
+        if made is None:
+            fail(f"output %{value.id}", "is not a value of the lane form")
+            continue
+        for position, item in enumerate(made):
+            lowered_outputs.append(item)
+            published.append(WGSLLaneOutput(
+                int(value.id), position, int(item.id), shapes[int(value.id)]))
+    function = Function(
+        function_name, lane_args, {"entry": BasicBlock("entry", lane_instrs)},
+        metadata={"lane_count": count},
+    )
+    return (function, tuple(lowered_outputs), tuple(feeds), tuple(published),
+            tuple(uniform_ids), tuple(shortfalls))
+
+
+def emit_tensor_lane_module(
+    module: IRModule,
+    function_name: str,
+    outputs: Sequence[SSAValue],
+    *,
+    count: int,
+    name: str | None = None,
+    preferred_local_size: int = 64,
+) -> WGSLTensorLaneProgram:
+    """A compute shader (one invocation per leading-axis element) from a
+    lowered tensor program: planned regions inlined, trailing axes unrolled
+    inside a lane, broadcasts and trailing-axis reductions resolved to
+    component selection and folds.  Feeds are the component-major scalars of
+    ``feeds`` (uniform ones are element 0 of their slot); the published
+    scalars of ``published`` are the packed output slots, in order.  The
+    caller sets the work contract (``fast``: float64 -> float32)."""
+
+    function, lowered_outputs, feeds, published, uniforms, shortfalls = \
+        lower_tensor_lane_kernel_calls(module, function_name, outputs, count=count)
+    if shortfalls:
+        # a half-lowered program would emit plausible WGSL that omits what was
+        # refused: say what was refused and publish no shader text at all
+        refused = WGSLModule(
+            name or function_name, "", False, tuple(shortfalls), None,
+            plan_wgsl_launch(int(count), preferred_local_size=preferred_local_size),
+        )
+        return WGSLTensorLaneProgram(
+            refused, function, lowered_outputs, feeds, published, int(count),
+        )
+    artifact = emit_module(
+        IRModule({function_name: function}),
+        name=name or function_name,
+        outputs={function_name: lowered_outputs},
+        count=count,
+        preferred_local_size=preferred_local_size,
+        packed_outputs=True,
+        uniform_args=uniforms,
+    )
+    return WGSLTensorLaneProgram(
+        artifact, function, lowered_outputs, feeds, published, int(count),
+    )
+
 
 
 # ---------------------------------------------------------------------------
