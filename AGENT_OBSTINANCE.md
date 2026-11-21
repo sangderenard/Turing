@@ -8,6 +8,10 @@ I first attached Llama's stop/start to `Apache-Service.ps1` and told the owner t
 
 I launched the hosted-agent focused tests in the same parallel tool batch as the required hazards-log read. The tests therefore began before I had read the current hazard receipt. The first run also used system Python and failed collection because `speaktome_mcp` was not on its path. I read the latest valid hazard receipt and the baseline opening, then reran the focused tests with the service Python and SpeakToMe path; 13 passed. The ordering mistake cost a redundant run and did not change service state.
 
+## 2026-11-21 - reading the Turing obstinance ledger after a supervisor edit
+
+I began the supervisor standby-takeover edit before reading this ledger, although `AGENTS.md` requires reading it first. I then read the ledger and the current hazard receipt, audited the edit against the existing Apache-owned lifecycle, and ran the focused supervisor tests. This reversed the required order and added an audit pass. The change remained in a review checkout; no live service was changed.
+
 ## 2026-11-16 - reading the Turing ledger after the preview queue edit
 
 I began the preview queue implementation before reading this ledger, although `AGENTS.md` requires the ledger first. The later audit found the cross-repository guest catalog requirement and prompted a coordinated SpeakToMe branch. The ordering error cost an additional review pass and catalog change; no production state was changed or discarded.
