@@ -302,6 +302,28 @@ def read_header(header: bytes) -> tuple[dict, bytes, bytes]:
     return manifest, body, signature
 
 
+def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
+    """Rebuild one generation's record directory from transport arrivals in arrival order (the link carries one record
+    per tensor, header first). Takes the header and the chunk count it names; returns (the generation directory, or None
+    while its records have not all arrived, and the arrivals not yet used). Nothing is verified here; accept does that."""
+    arrivals = [Path(a) for a in arrivals]
+    if not arrivals:
+        return None, []
+    manifest, _body, _signature = read_header(arrivals[0].read_bytes())
+    count = int(manifest["chunks"])
+    if len(arrivals) < 1 + count:
+        return None, arrivals
+    target = Path(incoming_dir) / f"{manifest['writer']}-{int(manifest['generation']):08d}"
+    work = Path(incoming_dir) / f".partial-{target.name}"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    for index, arrival in enumerate(arrivals[:1 + count]):
+        shutil.copyfile(arrival, work / f"{index:06d}.rec")
+    shutil.rmtree(target, ignore_errors=True)
+    os.replace(work, target)
+    return target, arrivals[1 + count:]
+
+
 def _records(generation_dir) -> list[Path]:
     paths = sorted(Path(generation_dir).glob("*.rec"))
     if not paths or paths[0].name != "000000.rec":

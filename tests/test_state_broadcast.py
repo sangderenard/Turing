@@ -119,3 +119,20 @@ def test_generations_rise_and_revocation_excludes(regions):
     assert second["recipients"] == ["owner-recovery"]
     with pytest.raises(sb.BroadcastError, match="not sealed to oracle"):
         sb.accept(regions["reader"], second["dir"], regions["tmp"] / "held")
+
+
+def test_assemble_rebuilds_a_generation_from_arrivals(regions):
+    """The link carries one record per tensor; arrivals are spooled in order and assembled back into a generation."""
+    packed = _pack(regions)
+    spool = regions["tmp"] / "spool"
+    spool.mkdir()
+    records = sorted(Path(packed["dir"]).glob("*.rec"))
+    for index, record in enumerate(records):
+        shutil.copyfile(record, spool / f"{index + 1:08d}.arrival")
+    # Not all arrived yet: nothing is assembled.
+    generation, rest = sb.assemble(sorted(spool.glob("*.arrival"))[:-1], regions["tmp"] / "incoming")
+    assert generation is None and len(rest) == len(records) - 1
+    (spool / "99999999.arrival").write_bytes(b"next generation's header would start here")
+    generation, rest = sb.assemble(sorted(spool.glob("*.arrival")), regions["tmp"] / "incoming")
+    assert generation is not None and [p.name for p in rest] == ["99999999.arrival"]
+    assert sb.accept(regions["reader"], generation, regions["tmp"] / "held")["accepted"]
