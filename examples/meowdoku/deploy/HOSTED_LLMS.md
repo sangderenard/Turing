@@ -107,3 +107,33 @@ Later Apache service resets use the supervisor's task start/stop lifecycle.
 With the agent disabled in Agent controls, the restarted task stays alive to
 watch the switch but does not start llama.cpp.
 The read grant is confined to the model and the pinned llama.cpp files; Llama has no access to operator credentials.
+
+## gemma (Hermes agent on a local Gemma 4 model)
+
+gemma is a SpeakToMe agent account run by the Hermes launcher (`hermes_agent.py`: prepare, run, cycle), not by
+`hosted_llm_runner.py`. It runs exactly the way Llama does, as its own isolated Windows account `agents-gemma`:
+
+- `Run-Gemma.ps1` runs inside that account. It starts `llama-server` (pinned llama.cpp b12416, model
+  `srv\state\models\gemma-4-26b-a4b\google_gemma-4-26B-A4B-it-Q4_K_M.gguf`, loopback port 11436, CUDA0, 65536 context,
+  one slot, mmap left on), waits for `/health`, runs `hermes_agent.py prepare` for gemma, then runs
+  `hermes_agent.py cycle` (the sleep cycle) in the foreground. When the cycle ends or the task is stopped it stops the
+  `llama-server` it started, with its whole process tree. It refuses to start if port 11436 is already listening.
+- `Start-Gemma.ps1` is the twin of `Start-HostedLlm.ps1` (`-GrantRead`, `-Register`, `-Status`, `-Run`). `-Register` makes the
+  on-demand task `SpeakToMe gemma` under `agents-gemma` (no boot trigger) and lets `svc-meowdoku` start and stop it. The
+  Apache supervisor starts and stops it with the stack because `instances.json` lists it under `hosted_tasks`.
+- State, all in the `agents-gemma` profile: `%USERPROFILE%\hermes\gemma` (the Hermes home; `cycle.log`, `cycle_state.json`),
+  `%USERPROFILE%\GemmaAgent` (`runner.log`, `llama-server.out.log`, `llama-server.err.log`) and the sign-in copy
+  `%USERPROFILE%\speaktome-credentials\gemma.secret` made by Set-AgentBox.
+- `-GrantRead` gives `agents-gemma` read and execute on exactly: the gemma model directory, `srv\tools\llama-cpp\b12416`
+  and `srv\tools\hermes-agent\0.19.0`. The Hermes venv's base Python is `srv\python`, which the Set-AgentBox service-Python
+  grant already covers. The MCP server runs on that same Python, not on `speaktome\.venv` (that venv is based on the
+  operator's own Python install, which the account cannot run).
+
+The owner's one-time elevated steps, once the user account is ready:
+
+1. `Set-AgentBox.ps1 -Apply -CreateAgentAccount -AgentAccount agents-gemma -AgentLogins gemma` (already done).
+2. `Start-Gemma.ps1 -GrantRead`
+3. `Start-Gemma.ps1 -Register`
+
+Then `Start-Gemma.ps1 -Run` starts it by hand, or the next stack start does. Stop the test cycle and the test model server
+first: the port check refuses a second model server, and the cycle lock only guards one Hermes home.
