@@ -78,7 +78,7 @@ def test_hosted_and_app_agents_have_truthful_unscheduled_badges(tmp_path):
     now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
     result = presence.snapshot(tmp_path / "missing.db", tmp_path, now=now)
     by_name = {agent["username"]: agent for agent in result["agents"]}
-    for name in ("llama", "operator-claude", "operator-codex"):
+    for name in ("llama", "gemma", "operator-claude", "operator-codex"):
         assert name in by_name
         assert by_name[name]["schedule"] is None
         assert by_name[name]["channels"]["local"]["state"] == "unknown"
