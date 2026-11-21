@@ -446,7 +446,7 @@ def serve(args, tie=None, listening=_port_listening, healthy=_healthy, popen=sub
         prepared = parser.parse_args(["prepare", *base, "--provider", "custom", "--model", args.alias,
                                       "--base-url", f"http://127.0.0.1:{args.port}/v1",
                                       "--speaktome-hermes", str(args.speaktome_hermes), "--secrets-dir", str(args.secrets_dir),
-                                      "--speaktome-base", args.speaktome_base,
+                                      "--speaktome-base", args.speaktome_base, "--tools-include", args.tools_include,
                                       *(["--mcp-python", str(args.mcp_python)] if args.mcp_python else [])])
         code = prepare(prepared)
         if code != 0:
@@ -510,6 +510,7 @@ def build_parser():
     v.add_argument("--secrets-dir", type=Path, default=DEFAULT_SECRETS)
     v.add_argument("--speaktome-base", default=DEFAULT_BASE)
     v.add_argument("--mcp-python", type=Path)
+    v.add_argument("--tools-include", default=DEFAULT_TOOLS, help="SpeakToMe MCP tools offered (comma list)")
     v.add_argument("--cycles", type=int, default=0, help="0 = forever")
     return parser
 

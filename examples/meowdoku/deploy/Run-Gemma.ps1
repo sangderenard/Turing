@@ -19,9 +19,15 @@ $needed = @($secret, $python, $agent, (Join-Path $toolRoot 'llama-server.exe'), 
 foreach ($file in $needed) { if (-not (Test-Path -LiteralPath $file)) { throw "Missing gemma prerequisite: $file" } }
 New-Item -ItemType Directory -Force -Path $state, $hermesRoot | Out-Null
 $log = Join-Path $state 'runner.log'
+# gemma's tools (owner, 2026-11-20: it moves things along in the repo, comments, coordinates, and calls an operator in
+# the agents room when it has nothing new to explore): the 12 walking/messaging verbs, the rooms, comment threads, the
+# reviews waiting for attention and one diff, and experience reports. Bulk listings (reviews_list, reviews_threads,
+# research_cases) are left out: one answer is larger than a 64K context.
+$tools = 'whoami,where,look,enter,go,leave,examine,man,say,pending,acknowledge,contacts,' +
+         'chat_rooms,chat_room,chat_post,comments_thread,comments_post,reviews_attention,reviews_diff,make'
 & $python $agent serve --account gemma --hermes-root $hermesRoot `
     --llama-server (Join-Path $toolRoot 'llama-server.exe') --model-file $modelFile `
     --alias 'gemma-4-26B-A4B-it-Q4_K_M' --port 11436 --device CUDA0 --context 65536 `
     --state-dir $state --speaktome-hermes $speaktomeHermes --secrets-dir $credentials `
-    --mcp-python $python *>> $log
+    --mcp-python $python --tools-include $tools *>> $log
 exit $LASTEXITCODE
