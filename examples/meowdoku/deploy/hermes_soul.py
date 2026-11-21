@@ -95,6 +95,18 @@ def write_atomic(path, content):
         raise
 
 
+def _readable(path):
+    """True only when the accounts database can be read. An isolated agent account (agents-gemma) is not allowed to see
+    srv\\state at all, so even asking whether the file exists raises PermissionError (2026-11-20, gemma's first start):
+    that means "not readable", which sends SOUL.md to the REST path, never a crash."""
+    if not path:
+        return False
+    try:
+        return Path(path).is_file() and os.access(path, os.R_OK)
+    except OSError:
+        return False
+
+
 def main(argv=None, rest=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--accounts-db", type=Path)
@@ -107,8 +119,7 @@ def main(argv=None, rest=None):
     parser.add_argument("--instance-id")
     parser.add_argument("--job")
     args = parser.parse_args(argv)
-    use_rest = args.rest or rest is not None or not (args.accounts_db and Path(args.accounts_db).is_file()
-                                                    and os.access(args.accounts_db, os.R_OK))
+    use_rest = args.rest or rest is not None or not _readable(args.accounts_db)
     try:
         if use_rest:
             if rest is None:

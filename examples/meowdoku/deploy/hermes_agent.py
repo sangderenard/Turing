@@ -157,9 +157,13 @@ def prepare(args):
     link_directory(home / "plugins" / "speaktome", package)
     # An account that cannot read accounts.db builds SOUL.md from its own orientation over REST (hermes_soul decides).
     sys.path.insert(0, str(root))
-    code = hermes_soul.main(["--accounts-db", str(args.accounts_db), "--account", args.account, "--hermes-home", str(home),
-                             "--secret-file", str(secret), "--speaktome-base", args.speaktome_base]
-                            + (["--rest"] if args.soul_from_rest else []))
+    try:  # SOUL.md never stops a launch: any failure is a warning and Hermes uses its default identity
+        code = hermes_soul.main(["--accounts-db", str(args.accounts_db), "--account", args.account, "--hermes-home",
+                                 str(home), "--secret-file", str(secret), "--speaktome-base", args.speaktome_base]
+                                + (["--rest"] if args.soul_from_rest else []))
+    except Exception as error:  # noqa: BLE001 - reported, not raised
+        print(f"warning: SOUL.md generation raised {type(error).__name__}: {error}", file=sys.stderr)
+        code = 1
     if code == 2:
         print(f"warning: {args.account} has no character profile; continuing without SOUL.md", file=sys.stderr)
     elif code != 0:

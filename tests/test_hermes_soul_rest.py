@@ -43,3 +43,13 @@ def test_empty_answer_writes_nothing_and_rest_failure_prints_no_secret(tmp_path,
 def test_rest_without_secret_or_base_is_refused(tmp_path, capsys):
     assert S.main(["--account", "gemma", "--hermes-home", str(tmp_path), "--rest"]) == 1
     assert "--secret-file" in capsys.readouterr().err
+
+
+def test_an_accounts_db_the_account_may_not_see_is_unreadable_not_a_crash(tmp_path, monkeypatch):
+    """2026-11-20: agents-gemma cannot see srv\state, so Path.is_file() on accounts.db raised PermissionError and
+    stopped gemma's launch before the REST path could run."""
+    def denied(self):
+        raise PermissionError(5, "Access is denied", str(self))
+    monkeypatch.setattr(Path, "is_file", denied)
+    assert S._readable(tmp_path / "accounts.db") is False
+    assert S._readable(None) is False
