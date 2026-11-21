@@ -1535,6 +1535,7 @@ __all__ = [
     "lower_elementwise_kernel_calls",
     "inline_region_calls", "lower_tensor_lane_kernel_calls", "emit_tensor_lane_module",
     "WGSLLaneFeed", "WGSLLaneOutput", "WGSLTensorLaneProgram", "MAX_LANE_COMPONENTS",
+    "TENSOR_LANE_ABI_SCHEMA", "emit_tensor_lane_abi",
 ]
 
 
@@ -2372,6 +2373,108 @@ def emit_tensor_lane_module(
         artifact, function, lowered_outputs, feeds, published, int(count),
     )
 
+
+
+#: Schema id of the document written beside a tensor-lane WGSL file.
+TENSOR_LANE_ABI_SCHEMA = "turing.wgsl-tensor-lane-abi.v1"
+
+
+def emit_tensor_lane_abi(
+    program: WGSLTensorLaneProgram,
+    *,
+    function: str,
+    formal_names: Mapping[str, int],
+    output_names: Sequence[str],
+    outputs: Sequence[SSAValue],
+    shader: str | None = None,
+) -> dict:
+    """The ABI document (``turing.wgsl-tensor-lane-abi.v1``) of a complete
+    tensor-lane program, derived from ``program`` alone: nothing is spelled by
+    hand.
+
+    ``function`` is the source function's name; ``formal_names`` maps its
+    formal names to formal value ids (``module.functions[entry].metadata
+    ["parameter_names"]``); ``outputs`` are the source output values handed to
+    ``emit_tensor_lane_module`` and ``output_names`` their names, in order;
+    ``shader`` is the published file name of the WGSL.
+
+    Layout (every float is ``scalar``; ``count`` is baked into the shader, it
+    is not a runtime value): a lane-varying feed slot ``s`` of the packed
+    ``feeds`` binding holds ``count`` floats at element ``s * count``; the
+    value of lane ``i`` is element ``s * count + i`` and its component is the
+    row-major flat index into the formal's trailing axes (``shape[1:]``).  A
+    uniform slot reads element 0 of its slot only (the component is the
+    row-major flat index into the whole ``shape``).  When the program has few
+    enough feeds the shader instead binds one buffer per slot
+    (``feed_layout`` ``separate``: slot ``s`` is binding ``s``, element ``i``
+    / element 0).  Output slot ``s`` is ``count`` floats at element
+    ``s * count`` of the ``outputs`` binding."""
+
+    if not program.complete:
+        raise WGSLEmissionError(
+            "a tensor-lane ABI describes a complete program; shortfalls: "
+            + "; ".join(item.format() for item in program.shortfalls)
+        )
+    layout = program.module.io_layout
+    if layout is None or len(layout.outputs) != 1:
+        raise WGSLEmissionError("tensor-lane program has no packed output binding")
+    feed_bindings = tuple(layout.feeds)
+    packed = len(feed_bindings) == 1 and feed_bindings[0].name == "feeds"
+    if not packed and len(feed_bindings) != len(program.feeds):
+        raise WGSLEmissionError("tensor-lane feed bindings do not match the feed slots")
+    if len(program.function.args) != len(program.feeds):
+        raise WGSLEmissionError("tensor-lane feed slots do not match the lane formals")
+    by_id = {int(identity): str(name) for name, identity in formal_names.items()}
+    if len(outputs) != len(output_names):
+        raise WGSLEmissionError("one output name per output value")
+    out_by_id = {int(value.id): str(name) for value, name in zip(outputs, output_names)}
+    count = int(program.count)
+    feed_slots = []
+    for slot, feed in enumerate(program.feeds):
+        if int(feed.formal) not in by_id:
+            raise WGSLEmissionError(f"formal %{feed.formal} has no source name")
+        binding = feed_bindings[0] if packed else feed_bindings[slot]
+        feed_slots.append({
+            "slot": slot, "name": by_id[int(feed.formal)], "formal": int(feed.formal),
+            "component": int(feed.component), "shape": [int(e) for e in feed.shape],
+            "uniform": bool(feed.uniform), "dtype": binding.dtype,
+            "binding": int(binding.index),
+            "offset_elements": slot * count if packed else 0,
+            "length_elements": 1 if feed.uniform else count,
+        })
+    output_slots = []
+    for slot, item in enumerate(program.published):
+        if int(item.output) not in out_by_id:
+            raise WGSLEmissionError(f"output %{item.output} has no source name")
+        output_slots.append({
+            "slot": slot, "name": out_by_id[int(item.output)], "output": int(item.output),
+            "component": int(item.component), "shape": [int(e) for e in item.shape],
+            "dtype": layout.outputs[0].dtype,
+            "offset_elements": slot * count, "length_elements": count,
+        })
+    source = program.source
+    return {
+        "schema": TENSOR_LANE_ABI_SCHEMA,
+        "function": str(function),
+        "shader": shader or f"{program.module.name}.wgsl",
+        "shader_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "entry": "main",
+        "workgroup_size": [int(e) for e in program.module.launch_plan.workgroup_size],
+        "count": count,
+        "count_is_runtime": False,
+        "scalar": layout.outputs[0].dtype,
+        "bindings": {
+            "group": 0,
+            "feed_layout": "packed" if packed else "separate",
+            "feeds": {"binding": int(feed_bindings[0].index), "access": "read"} if packed else
+                     [{"binding": int(b.index), "access": "read"} for b in feed_bindings],
+            "outputs": {"binding": int(layout.outputs[0].index), "access": "read_write"},
+        },
+        "feed_elements": count * len(program.feeds) if packed else None,
+        "output_elements": count * len(program.published),
+        "feed_slots": feed_slots,
+        "output_slots": output_slots,
+    }
 
 
 # ---------------------------------------------------------------------------
