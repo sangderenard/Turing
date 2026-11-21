@@ -121,18 +121,47 @@ def test_generations_rise_and_revocation_excludes(regions):
         sb.accept(regions["reader"], second["dir"], regions["tmp"] / "held")
 
 
+def _arrivals(records, spool):
+    """The wire order: the sealed chunks, then the signed manifest (000000.rec), each one spooled arrival."""
+    order = sorted(r for r in records if r.name != "000000.rec") + [r for r in records if r.name == "000000.rec"]
+    spool.mkdir(exist_ok=True)
+    for index, record in enumerate(order):
+        shutil.copyfile(record, spool / f"{index + 1:08d}.arrival")
+    return sorted(spool.glob("*.arrival"))
+
+
 def test_assemble_rebuilds_a_generation_from_arrivals(regions):
     """The link carries one record per tensor; arrivals are spooled in order and assembled back into a generation."""
     packed = _pack(regions)
+    arrivals = _arrivals(sorted(Path(packed["dir"]).glob("*.rec")), regions["tmp"] / "spool")
+    generation, rest = sb.assemble(arrivals[:-1], regions["tmp"] / "incoming")     # the manifest has not arrived
+    assert generation is None and len(rest) == len(arrivals) - 1
+    extra = regions["tmp"] / "spool" / "99999999.arrival"
+    extra.write_bytes(b"the next generation's first chunk")
+    generation, rest = sb.assemble(arrivals + [extra], regions["tmp"] / "incoming")
+    assert generation is not None and rest == [extra]
+    assert sb.accept(regions["reader"], generation, regions["tmp"] / "held")["accepted"]
+
+
+def test_many_chunks_stream_and_emit(regions, monkeypatch):
+    """A small chunk size makes many sealed chunks: the last one alone says it is last, emit hands each record over as
+    it is written and leaves none behind, and the reader still assembles, accepts and regrows the state."""
+    monkeypatch.setattr(sb, "CHUNK_BYTES", 4096)
+    (regions["writer"] / "content" / "noise.bin").write_bytes(__import__("os").urandom(50_000))
+    handed = []
     spool = regions["tmp"] / "spool"
     spool.mkdir()
-    records = sorted(Path(packed["dir"]).glob("*.rec"))
-    for index, record in enumerate(records):
-        shutil.copyfile(record, spool / f"{index + 1:08d}.arrival")
-    # Not all arrived yet: nothing is assembled.
-    generation, rest = sb.assemble(sorted(spool.glob("*.arrival"))[:-1], regions["tmp"] / "incoming")
-    assert generation is None and len(rest) == len(records) - 1
-    (spool / "99999999.arrival").write_bytes(b"next generation's header would start here")
+
+    def emit(path):
+        handed.append(path.name)
+        shutil.copyfile(path, spool / f"{len(handed):08d}.arrival")
+
+    packed = sb.pack(regions["writer"], regions["db"], regions["tmp"] / "work", regions["tmp"] / "out", emit=emit)
+    assert packed["chunks"] > 10 and handed[-1] == "000000.rec" and len(handed) == packed["chunks"] + 1
+    assert list(Path(packed["dir"]).iterdir()) == []                                 # nothing left on disk
     generation, rest = sb.assemble(sorted(spool.glob("*.arrival")), regions["tmp"] / "incoming")
-    assert generation is not None and [p.name for p in rest] == ["99999999.arrival"]
-    assert sb.accept(regions["reader"], generation, regions["tmp"] / "held")["accepted"]
+    assert rest == []
+    held = sb.accept(regions["reader"], generation, regions["tmp"] / "held")
+    target = regions["tmp"] / "regrown"
+    sb.take_over(regions["reader"], held["held"], target, writer_stopped=True)
+    assert (target / "content" / "noise.bin").read_bytes() == (regions["writer"] / "content" / "noise.bin").read_bytes()

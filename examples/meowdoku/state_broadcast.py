@@ -5,11 +5,15 @@ room, so the database needs to be broadcast written everywhere ... regularly"; "
 writer many reader model"; "of course nothing handled in the clear". Hidden data -- the state root, its secrets, what
 git does not carry -- moves only through canvas-owned back channels; code and tool versions come from git.
 
-A GENERATION is one consistent snapshot of the writer's state root (state_backup.snapshot: SQLite online backup plus
-integrity_check, secrets included, the region's own keys excluded), packed as a stream of RECORDS:
+A GENERATION is one consistent snapshot of the writer's state root (databases through SQLite's online backup and
+integrity_check, every other file read in place, secrets included, the region's own keys excluded), streamed as one gzip
+tar and sealed as it grows into RECORDS:
 
-    record 0   header: magic, then the manifest JSON, then the writer's Ed25519 signature over the manifest bytes
-    record 1.. chunks: the tar of the snapshot, gzip, sealed with ChaCha20-Poly1305 in chunks of CHUNK_BYTES
+    000001.rec ..  chunks: ChaCha20-Poly1305 over CHUNK_BYTES of the archive each
+    000000.rec     the manifest: magic, the manifest JSON, the writer's Ed25519 signature over the manifest bytes
+
+On the wire the chunks go first and the manifest last (it names every chunk's hash, so it exists only at the end);
+``assemble`` rebuilds the directory from arrivals in that order.
 
 The manifest names the generation number (rising, per writer), the writer region, when, the tool commits that wrote
 it, the chunk count and the sha256 of every sealed chunk, and one wrapped content key per recipient: X25519 between a
@@ -35,6 +39,7 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -219,10 +224,56 @@ def _tool_commits(repos) -> dict:
     return commits
 
 
-def pack(state_dir, accounts_db, work_dir, out_dir, repos=None, exclude=()) -> dict:
-    """Pack the next generation of ``state_dir`` into ``out_dir/<writer>-<generation>/`` as record files
-    (000000.rec = header, then one file per sealed chunk). ``work_dir`` holds the short-lived plaintext snapshot and
-    must be outside the state root; the plaintext is removed before this returns. Memory stays at one chunk."""
+class _SealingSink:
+    """A write-only stream that seals what it is given into CHUNK_BYTES records as it arrives. One full chunk is held
+    back until the next byte comes, so the last chunk is known when it is sealed (its associated data says so)."""
+
+    def __init__(self, aead, prefix, generation, writer, emit):
+        self.aead, self.prefix, self.generation, self.writer, self.emit = aead, prefix, generation, writer, emit
+        self.buffer = bytearray()
+        self.held = None
+        self.index = 0
+        self.hashes = []
+
+    def _seal(self, piece, last):
+        sealed = self.aead.encrypt(_nonce(self.prefix, self.index), bytes(piece),
+                                   _chunk_aad(self.generation, self.writer, self.index, last))
+        self.hashes.append(hashlib.sha256(sealed).hexdigest())
+        self.emit(self.index + 1, sealed)
+        self.index += 1
+
+    def write(self, data):
+        self.buffer += data
+        while len(self.buffer) > CHUNK_BYTES:              # strictly more: the chunk after this one exists
+            if self.held is not None:
+                self._seal(self.held, last=False)
+            self.held = bytes(self.buffer[:CHUNK_BYTES])
+            del self.buffer[:CHUNK_BYTES]
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def finish(self):
+        """Seal what is left: the held full chunk (if any) and the partial tail; the very last one says it is last."""
+        tail = bytes(self.buffer)
+        if self.held is None:
+            self._seal(tail, last=True)
+        elif tail:
+            self._seal(self.held, last=False)
+            self._seal(tail, last=True)
+        else:
+            self._seal(self.held, last=True)
+
+def pack(state_dir, accounts_db, work_dir, out_dir, repos=None, exclude=(), emit=None) -> dict:
+    """Pack the next generation of ``state_dir`` and write it to ``out_dir/<writer>-<generation>/`` as record files:
+    one per sealed chunk (000001.rec ...) and the signed manifest (000000.rec), written last because it names every
+    chunk's hash. On the wire the chunks go first and the manifest closes the generation.
+
+    It streams: each database goes through SQLite's online backup into ``work_dir`` (outside the state root) one at a
+    time, every other file is read in place, all into one gzip tar that is sealed in CHUNK_BYTES records as it grows.
+    With ``emit(path)`` each record is handed over as soon as it is written and then removed, so disk holds one
+    database copy and one record at a time (the 5.6 GB home state on a disk with 21 GB free, 2026-11-21)."""
     import state_backup
 
     region = Region(state_dir)
@@ -238,29 +289,62 @@ def pack(state_dir, accounts_db, work_dir, out_dir, repos=None, exclude=()) -> d
         raise BroadcastError(f"{final} already exists")
     shutil.rmtree(work_out, ignore_errors=True)
     work_out.mkdir(parents=True)
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    state_backup._check_out(Path(state_dir).resolve(), work.resolve())
+
+    def write_record(number, data):
+        path = work_out / f"{number:06d}.rec"
+        path.write_bytes(data)
+        if emit is not None:
+            emit(path)
+            path.unlink()
 
     key, prefix = os.urandom(32), os.urandom(4)
-    aead = ChaCha20Poly1305(key)
-    hashes_out, files = [], []
-    Path(work_dir).mkdir(parents=True, exist_ok=True)
+    sink = _SealingSink(ChaCha20Poly1305(key), prefix, generation, region.name, write_record)
+    paths = state_backup.StatePaths(Path(state_dir))
+    files, skipped, t0 = [], [], time.time()
     try:
-        with tempfile.TemporaryDirectory(dir=work_dir) as scratch,                 tempfile.TemporaryDirectory(dir=region.dir) as private:          # the archive sits in the restricted folder
-            snap = state_backup.snapshot(state_dir, Path(scratch) / "snapshots", keep=1, include_secrets=True,
-                                         exclude=tuple(exclude) + (REGION_DIR.as_posix(),))
-            files = [{"rel": f["rel"], "kind": f["kind"], "size": f["size"]} for f in snap["files"]]
-            archive = Path(private) / "generation.tar.gz"
-            with gzip.GzipFile(archive, mode="wb", compresslevel=3, mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:
-                tar.add(snap["snapshot"], arcname="snapshot")
-            shutil.rmtree(snap["snapshot"], ignore_errors=True)
-            size = archive.stat().st_size
-            count = max(1, -(-size // CHUNK_BYTES))
-            with open(archive, "rb") as source:
-                for index in range(count):
-                    sealed = aead.encrypt(_nonce(prefix, index), source.read(CHUNK_BYTES),
-                                          _chunk_aad(generation, region.name, index, index == count - 1))
-                    (work_out / f"{index + 1:06d}.rec").write_bytes(sealed)
-                    hashes_out.append(hashlib.sha256(sealed).hexdigest())
-            archive.unlink()
+        with tempfile.TemporaryDirectory(dir=work) as scratch:
+            with gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=3, mtime=0) as gz, \
+                    tarfile.open(fileobj=gz, mode="w|") as tar:
+                for kind, src, rel in state_backup._plan(paths, False, True, tuple(exclude) + (REGION_DIR.as_posix(),)):
+                    try:
+                        if kind == "sqlite":
+                            copy = Path(scratch) / "db.copy"
+                            state_backup._backup_db(src, copy)
+                            facts = state_backup._sqlite_facts(copy)
+                            if facts["integrity"] != "ok":
+                                raise BroadcastError(f"integrity_check failed on the copy of {rel}: {facts['integrity']}")
+                            entry = {"rel": rel, "kind": kind, "size": copy.stat().st_size, "sha256": state_backup.sha256(copy),
+                                     "integrity": facts["integrity"], "rows": facts["rows"]}
+                            tar.add(copy, arcname=f"snapshot/{rel}")
+                            copy.unlink()
+                        else:
+                            entry = {"rel": rel, "kind": kind, "size": src.stat().st_size, "sha256": state_backup.sha256(src)}
+                            info = tar.gettarinfo(src, arcname=f"snapshot/{rel}")
+                            if info.size != entry["size"]:
+                                raise OSError("changed while read")
+                            with open(src, "rb") as handle:
+                                tar.addfile(info, handle)
+                    except FileNotFoundError:
+                        skipped.append({"rel": rel, "why": "vanished"})
+                        continue
+                    except OSError as error:
+                        skipped.append({"rel": rel, "why": f"{type(error).__name__}: {error}"})
+                        continue
+                    files.append(entry)
+                snapshot_manifest = {"tool_version": state_backup.TOOL_VERSION, "source_root": str(state_dir),
+                                     "created_utc": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                                     "include_logs": False, "include_secrets": True, "secrets_restrict": "broadcast",
+                                     "excluded": [REGION_DIR.as_posix(), *map(str, exclude)], "text_only": False,
+                                     "binary_left_out": {"files": 0, "bytes": 0}, "files": files, "skipped": skipped,
+                                     "duration_s": round(time.time() - t0, 3)}
+                body = json.dumps(snapshot_manifest, indent=1).encode("utf-8")
+                info = tarfile.TarInfo("snapshot/manifest.json")
+                info.size, info.mtime = len(body), int(time.time())
+                tar.addfile(info, io.BytesIO(body))
+        sink.finish()
         wrapped = []
         for target in targets:
             ephemeral = X25519PrivateKey.generate()
@@ -272,18 +356,18 @@ def pack(state_dir, accounts_db, work_dir, out_dir, repos=None, exclude=()) -> d
                             "key": _b64(ChaCha20Poly1305(_kek(shared, generation, target["region"])).encrypt(nonce, key, None))})
         manifest = {"format": FORMAT, "generation": generation, "writer": region.name,
                     "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "tools": _tool_commits(repos), "files": files, "chunk_bytes": CHUNK_BYTES,
-                    "nonce_prefix": _b64(prefix), "chunks": len(hashes_out), "chunk_sha256": hashes_out,
-                    "recipients": wrapped}
+                    "tools": _tool_commits(repos), "files": [{"rel": f["rel"], "kind": f["kind"], "size": f["size"]} for f in files],
+                    "skipped": skipped, "chunk_bytes": CHUNK_BYTES, "nonce_prefix": _b64(prefix),
+                    "chunks": len(sink.hashes), "chunk_sha256": sink.hashes, "recipients": wrapped}
         body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        (work_out / "000000.rec").write_bytes(MAGIC + struct.pack(">I", len(body)) + body + region.sign.sign(body))
+        write_record(0, MAGIC + struct.pack(">I", len(body)) + body + region.sign.sign(body))
         os.replace(work_out, final)
     except BaseException:
         shutil.rmtree(work_out, ignore_errors=True)
         raise
     gen_path.write_text(str(generation))
-    return {"writer": region.name, "generation": generation, "chunks": len(hashes_out),
-            "recipients": [t["region"] for t in targets], "dir": str(final)}
+    return {"writer": region.name, "generation": generation, "chunks": len(sink.hashes), "files": len(files),
+            "skipped": len(skipped), "recipients": [t["region"] for t in targets], "dir": str(final)}
 
 
 # ---- reading ----------------------------------------------------------------------------------------------------------
@@ -303,25 +387,34 @@ def read_header(header: bytes) -> tuple[dict, bytes, bytes]:
 
 
 def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
-    """Rebuild one generation's record directory from transport arrivals in arrival order (the link carries one record
-    per tensor, header first). Takes the header and the chunk count it names; returns (the generation directory, or None
-    while its records have not all arrived, and the arrivals not yet used). Nothing is verified here; accept does that."""
+    """Rebuild one generation's record directory from transport arrivals in arrival order. On the wire a generation is
+    its sealed chunks, then the signed manifest that names how many there were (it carries every chunk's hash, so it is
+    written last). The first arrival that is a manifest naming exactly the arrivals before it closes the generation.
+    Returns (the generation directory, or None while it is not complete, and the arrivals after it). Nothing is
+    verified here; accept does that."""
     arrivals = [Path(a) for a in arrivals]
-    if not arrivals:
-        return None, []
-    manifest, _body, _signature = read_header(arrivals[0].read_bytes())
-    count = int(manifest["chunks"])
-    if len(arrivals) < 1 + count:
-        return None, arrivals
-    target = Path(incoming_dir) / f"{manifest['writer']}-{int(manifest['generation']):08d}"
-    work = Path(incoming_dir) / f".partial-{target.name}"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    for index, arrival in enumerate(arrivals[:1 + count]):
-        shutil.copyfile(arrival, work / f"{index:06d}.rec")
-    shutil.rmtree(target, ignore_errors=True)
-    os.replace(work, target)
-    return target, arrivals[1 + count:]
+    for position, arrival in enumerate(arrivals):
+        with open(arrival, "rb") as handle:
+            if handle.read(len(MAGIC)) != MAGIC:
+                continue
+        try:
+            manifest, _body, _signature = read_header(arrival.read_bytes())
+        except (BroadcastError, ValueError, KeyError):
+            continue
+        if int(manifest["chunks"]) != position:
+            raise BroadcastError(f"generation {manifest.get('generation')} names {manifest['chunks']} chunk(s), "
+                                 f"{position} arrived before it")
+        target = Path(incoming_dir) / f"{manifest['writer']}-{int(manifest['generation']):08d}"
+        work = Path(incoming_dir) / f".partial-{target.name}"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        shutil.copyfile(arrival, work / "000000.rec")
+        for index, chunk in enumerate(arrivals[:position]):
+            shutil.copyfile(chunk, work / f"{index + 1:06d}.rec")
+        shutil.rmtree(target, ignore_errors=True)
+        os.replace(work, target)
+        return target, arrivals[position + 1:]
+    return None, arrivals
 
 
 def _records(generation_dir) -> list[Path]:
