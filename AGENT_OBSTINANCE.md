@@ -1,5 +1,9 @@
 # Agent Obstinance
 
+## 2026-11-21 - reading the Turing obstinance ledger after a supervisor edit
+
+I began the supervisor standby-takeover edit before reading this ledger, although `AGENTS.md` requires reading it first. I then read the ledger and the current hazard receipt, audited the edit against the existing Apache-owned lifecycle, and ran the focused supervisor tests. This reversed the required order and added an audit pass. The change remained in a review checkout; no live service was changed.
+
 ## 2026-11-19 - running focused tests concurrently with the hazards read
 
 I launched the hosted-agent focused tests in the same parallel tool batch as the required hazards-log read. The tests therefore began before I had read the current hazard receipt. The first run also used system Python and failed collection because `speaktome_mcp` was not on its path. I read the latest valid hazard receipt and the baseline opening, then reran the focused tests with the service Python and SpeakToMe path; 13 passed. The ordering mistake cost a redundant run and did not change service state.

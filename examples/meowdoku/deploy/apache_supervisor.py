@@ -12,7 +12,7 @@ starts it at startup, restarts it if it exits, and closes its stdin at shutdown.
 NOT GATED: unlike deploy/*.ps1 (operator gate, authz.py script-auth; see LAUNCH_2026-11-10.md "Who may run the scripts"), this process is
 launched by httpd under Apache's identity, not by a user, so it carries no -User/-PasswordFile check.
 Only one supervisor manages instances (an OS lock on ``<state>/supervisor.lock``); a second one (httpd on Windows can open the pipe
-from more than one process) stays a log sink.  A port that already has a listener is not launched over (state ``external``).
+from more than one process) stays a log sink until it can acquire the lock and take over.  A port that already has a listener is not launched over (state ``external``).
 [DEV] An instance may run another tree's code: ``"code_root"`` (its working directory) and ``"speaktome_root"`` (its SPEAKTOME_REPO),
 so the dev server can follow what landed while stable stays on its own checkout.
 [LOAN] With a ``"loans"`` block in instances.json, every ready branch loan (branch_servers.py) is one more instance,
@@ -703,6 +703,8 @@ class Supervisor:
                 fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
         except OSError:
+            self._lock_file.close()
+            self._lock_file = None
             return False
 
     def tail_stdin(self):
@@ -754,11 +756,12 @@ class Supervisor:
                         "speaktome_root": str(inst.speaktome_root) if inst.speaktome_root is not None else None})
         return out
 
-    def run(self, manage=True):
+    def run(self, manage=True, reader_started=False):
         role = "manager" if manage else "access-log reader"
         self.log(f"process pid {os.getpid()} role {role}")
-        reader = threading.Thread(target=self.tail_stdin, daemon=True)
-        reader.start()
+        if not reader_started:
+            reader = threading.Thread(target=self.tail_stdin, daemon=True)
+            reader.start()
         for sig in ("SIGTERM", "SIGBREAK", "SIGINT"):
             if hasattr(signal, sig):
                 signal.signal(getattr(signal, sig), lambda *_: self.stop.set())
@@ -802,7 +805,14 @@ class Supervisor:
             self.shutdown()
         else:
             self.log("another supervisor owns the instances; this process only logs")
-            self.stop.wait()
+            while not self.stop.wait(5.0):
+                if self.acquire_lock():
+                    if self.stop.is_set():
+                        self._lock_file.close()
+                        self._lock_file = None
+                        break
+                    self.log("manager lock released; this access-log reader is taking over the instances")
+                    return self.run(manage=True, reader_started=True)
         return 0
 
     def reconcile_loans(self):
