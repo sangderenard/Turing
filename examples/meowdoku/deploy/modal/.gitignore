@@ -1,0 +1,5 @@
+# Run outputs of the subordinate test, never committed: the short-lived link tickets, the home canvas run folder,
+# and the packaged Linux Nodus build the Modal image copies in (built from nodus build-linux, not source).
+tickets.json
+home-run/
+*.tar.gz
