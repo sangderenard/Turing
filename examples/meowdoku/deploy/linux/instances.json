@@ -1,5 +1,5 @@
 {
- "_comment": "The Linux host's instances (Oracle A1, Ubuntu). Same schema as deploy/instances.json; read by apache_supervisor.py started from deploy/apache/oracle-stack.conf. Loopback HTTP only: Apache holds TLS at the front (oracle-front.conf). Instances are added here as each is proven on Linux.",
+ "_comment": "The Linux host's instances (Oracle A1, Ubuntu). Same schema as deploy/instances.json; read by apache_supervisor.py started from deploy/apache/oracle-stack.conf. Loopback HTTP only: Apache holds TLS at the front (oracle-front.conf). Instances are added here as each is proven on Linux. meowdoku-a runs --no-wasm: the fountains' wasm fallback compile (zig clang -O2 on fountain_small.ll) peaked at ~22 GB and the OOM killer fired twice on the 24 GB Oracle A1 host (2026-11-21); the GPU products are built, the wasm fallback is not.",
  "supervisor_python": "/srv/powershell/srv/service-venv/bin/python",
  "state_dir": "/srv/powershell/srv/state",
  "hosted_tasks": [],
@@ -13,7 +13,8 @@
    "account": "svc-meowdoku-a",
    "args": [
     "--condition-dir",
-    "/srv/powershell/srv/state/condition"
+    "/srv/powershell/srv/state/condition",
+    "--no-wasm"
    ],
    "leases": [],
    "python": "/srv/powershell/srv/service-venv/bin/python",
