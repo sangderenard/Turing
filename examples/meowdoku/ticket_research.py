@@ -79,8 +79,9 @@ def exact(body, fields):
         raise ResearchError("unexpected research fields")
 
 class Service:
-    def __init__(self, accounts):
+    def __init__(self, accounts, oauth_mcp=None):
         self.accounts = accounts
+        self.oauth_mcp = oauth_mcp
         with accounts.lock:
             rows = accounts._conn.execute("PRAGMA database_list").fetchall()
         filename = next((row[2] for row in rows if row[1] == "main"), None)
@@ -93,6 +94,8 @@ class Service:
         if not isinstance(token, str) or not token or len(token) > 4096:
             raise ResearchError("sign in to use research", 401)
         account = self.accounts.user_for_token(token)
+        if account is None and self.oauth_mcp is not None:
+            account = self.oauth_mcp.user_for_token(token)
         if account is None:
             raise ResearchError("sign in to use research", 401)
         db = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=10)
@@ -108,7 +111,11 @@ class Service:
                 db.execute(statement)
             current = db.execute("SELECT user_id FROM sessions WHERE token=? AND expires_at>=?",
                                  (token, time.time())).fetchone()
-            if current is None or current["user_id"] != account["id"]:
+            if (current is None or current["user_id"] != account["id"]) and not (
+                self.oauth_mcp is not None and
+                (oauth_account := self.oauth_mcp.user_for_token(token)) is not None and
+                oauth_account["id"] == account["id"]
+            ):
                 raise ResearchError("sign in to use research", 401)
             admin = db.execute("SELECT 1 FROM account_roles WHERE user_id=? AND role='admin'",
                                (account["id"],)).fetchone() is not None

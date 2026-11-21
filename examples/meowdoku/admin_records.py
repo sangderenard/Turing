@@ -15,15 +15,19 @@ def read(path: Path, key_path: Path, *, limit: int = 100) -> dict:
         raise ValueError("limit must be 1 through 500")
     path = Path(path)
     if not path.exists():
-        return {"requests": 0, "bytes": 0, "by_status": {}, "by_method": {}, "ip_history": []}
+        return {"requests": 0, "bytes": 0, "by_status": {}, "by_method": {}, "ip_history": [], "unreadable": 0}
     cipher = RecordCipher(key_path, existing_streams=(path,))
     cipher.migrate(path)
     statuses, methods = Counter(), Counter()
     history = deque(maxlen=limit)
-    requests = size = 0
+    requests = size = unreadable = 0
     with path.open("rb") as saved:
         for line in saved:
-            plain = cipher.open(line).decode("utf-8", "replace")
+            try:        # ticket f62934c8 hazard 3: one torn or spliced record (or a line still being written) is
+                plain = cipher.open(line).decode("utf-8", "replace")     # counted, not allowed to fail the whole view
+            except ValueError:
+                unreadable += 1
+                continue
             match = ACCESS.fullmatch(plain)
             if match is None:
                 continue
@@ -34,4 +38,4 @@ def read(path: Path, key_path: Path, *, limit: int = 100) -> dict:
             methods[item["method"]] += 1
             history.append(item)
     return {"requests": requests, "bytes": size, "by_status": dict(statuses), "by_method": dict(methods),
-            "ip_history": list(history)}
+            "ip_history": list(history), "unreadable": unreadable}

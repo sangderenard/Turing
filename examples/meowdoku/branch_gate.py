@@ -5,6 +5,7 @@ whoever holds the Git credential (an operator, or a worker started by one), neve
 
     python branch_gate.py --policy deploy/branch_policy.json --db <accounts.db> status
     ... submit <repository> <branch> --as <username> [--timeout-hours N] [--keep]
+    ... sync-loan <repository> <branch> --for <borrower> [--apply]
     ... land  [--apply]        fast-forward each accepted change onto its default branch, then remove or keep it
     ... clean [--apply]        remove branches that have been fully merged for the grace period
     ... check-push <repository>    the pre-push hook: refuse a push to a default branch that no review accepts
@@ -778,6 +779,64 @@ def _user(db, username):
     return row
 
 
+def sync_loan(policy, db, repository, branch, borrower, *, apply=False) -> dict:
+    """A Git-credential operator merges the default into a borrower's registered open worktree.
+
+    The caller must have the borrower's request. This command never switches the core checkout or lands a review.
+    On a content conflict, it leaves the merge in the borrower's worktree for their explicit resolution and resubmission.
+    """
+    declared = policy["repositories"].get(repository)
+    if declared is None:
+        raise GateError("the policy does not name that repository")
+    if branch == declared["default"]:
+        raise GateError("a loan cannot be the repository default branch")
+    account = _user(db, borrower)
+    held = branch_review.owner(db, repository, branch)
+    if held is None or held["user_id"] != account[0]:
+        raise GateError("that branch is not registered to the named borrower")
+    row = db.execute("SELECT user_id, path FROM checkouts WHERE repository = ? AND branch = ?",
+                     (repository, branch)).fetchone()
+    if row is None or row[0] != account[0]:
+        raise GateError("the borrower has no open checkout of that branch")
+    folder = Path(row[1]).resolve()
+    if not folder.is_dir() or Path(git(folder, "rev-parse", "--show-toplevel")).resolve() != folder:
+        raise GateError("the registered loan worktree is unavailable")
+    if git(folder, "symbolic-ref", "-q", "--short", "HEAD") != branch:
+        raise GateError("the loan worktree is not on its registered branch")
+    if git(folder, "status", "--porcelain", "--untracked-files=all"):
+        raise GateError("the loan has uncommitted work; commit it before sync")
+    if git(folder, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False):
+        raise GateError("the loan already has a merge in progress")
+    remote = policy["remote"]
+    default = declared["default"]
+    if apply:
+        git(declared["path"], "fetch", "--quiet", remote, default)
+    upstream = f"refs/remotes/{remote}/{default}"
+    target = git(declared["path"], "rev-parse", "--verify", f"{upstream}^{{commit}}")
+    before = git(folder, "rev-parse", "HEAD")
+    if not apply:
+        return {"state": "ready", "repository": repository, "branch": branch,
+                "borrower": borrower, "head": before, "default_head": target,
+                "note": "dry run uses the locally known default; --apply fetches it first"}
+    if before == target or subprocess.run(["git", "-C", str(folder), "merge-base", "--is-ancestor",
+                                          target, before], capture_output=True).returncode == 0:
+        return {"state": "current", "repository": repository, "branch": branch,
+                "borrower": borrower, "head": before, "default_head": target}
+    git(folder, "merge", "--no-edit", upstream, check=False)
+    if git(folder, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False):
+        conflicts = git(folder, "diff", "--name-only", "--diff-filter=U").splitlines()
+        return {"state": "conflict", "repository": repository, "branch": branch,
+                "borrower": borrower, "head": before, "default_head": target,
+                "conflicts": conflicts,
+                "next": "borrower resolves conflicts in this loan, commits the merge, and resubmits review"}
+    after = git(folder, "rev-parse", "HEAD")
+    if after == before:
+        raise GateError("Git did not advance the loan; inspect its merge result")
+    return {"state": "synced", "repository": repository, "branch": branch,
+            "borrower": borrower, "head": after, "default_head": target,
+            "next": "borrower resubmits review at this head"}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--policy", required=True)
@@ -787,6 +846,11 @@ def main(argv=None) -> int:
     sub.add_parser("status")
     for name in ("land", "clean", "worktrees"):
         sub.add_parser(name).add_argument("--apply", action="store_true")
+    sync = sub.add_parser("sync-loan", help="merge the current default into an owner's open loan checkout")
+    sync.add_argument("repository")
+    sync.add_argument("branch")
+    sync.add_argument("--for", dest="borrower", required=True, help="the registered loan owner who requested this")
+    sync.add_argument("--apply", action="store_true", help="perform the merge; otherwise only inspect")
     submit = sub.add_parser("submit")
     submit.add_argument("repository")
     submit.add_argument("branch")
@@ -842,6 +906,10 @@ def main(argv=None) -> int:
                 if refused:
                     print(branch_review.advice(policy, name), file=sys.stderr)
                 return 0 if mock or not refused else 1
+            if args.command == "sync-loan":
+                print(json.dumps(sync_loan(policy, db, args.repository, args.branch, args.borrower,
+                                           apply=args.apply)))
+                return 0
             if args.command == "submit":
                 declared = policy["repositories"].get(args.repository)
                 if declared is None:

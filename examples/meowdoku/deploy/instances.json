@@ -6,6 +6,7 @@
   ],
   "restart_account": "svc-pale-horse",
   "restart_account_display_name": "Pale Horse",
+  "hosted_tasks": ["SpeakToMe hosted llama", "SpeakToMe gemma"],
   "instances": [
     {
       "name": "meowdoku-a",
@@ -358,6 +359,25 @@
         "C:/dev/Powershell/srv/state/sql/accounts.db",
         "--config",
         "C:/dev/Powershell/turing/examples/meowdoku/deploy/relay.json"
+      ]
+    },
+    {
+      "name": "link-broker",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-link-broker",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/link_broker.py",
+        "--state-dir",
+        "C:/dev/Powershell/srv/state",
+        "--router",
+        "127.0.0.1:47699",
+        "--port",
+        "47702"
       ]
     }
   ],

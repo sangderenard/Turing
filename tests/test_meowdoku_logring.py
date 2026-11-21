@@ -89,6 +89,121 @@ def test_persistence_survives_restart(tmp_path):
     assert b.seq == 10 and b.add("after") == 11 and len(b.fetch(0)["entries"]) == 11
 
 
+def test_bad_persisted_lines_are_skipped_not_fatal(tmp_path):
+    """Ticket f62934c8: one cut-off or corrupt line must not stop the server from starting."""
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    for i in range(5):
+        a.add(f"n{i}")
+    good = p.read_bytes()
+    cut = a.cipher.seal(b'{"seq": 6, "ts": 1.0, "src": "server", "text": "n5"}')[:30]   # an append cut off by a kill
+    p.write_bytes(good + b"enc:v1:not-a-token\n" + cut)
+    found = p.read_bytes()
+    b = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    texts = [e["text"] for e in b.fetch(0)["entries"]]
+    assert texts[:5] == [f"n{i}" for i in range(5)]
+    assert texts[5].startswith("[logring] skipped 2 unreadable line(s)") and b.seq == 6
+    evidence = list(tmp_path.glob("ring.jsonl.bad-*"))
+    assert len(evidence) == 1 and evidence[0].read_bytes() == found          # the file as found is kept
+    assert not list(tmp_path.glob("ring.jsonl.rewrite-*"))                    # no temporary left behind
+    c = L.Ring(cap_bytes=5000, path=p, key_path=key)                          # the rewritten ring reloads clean
+    assert [e["text"] for e in c.fetch(0)["entries"]] == texts
+    assert len(list(tmp_path.glob("ring.jsonl.bad-*"))) == 1
+
+
+def test_failed_evidence_copy_leaves_the_file_as_found(tmp_path, monkeypatch):
+    """Ticket f62934c8, review eab6c75f (codex): no rewrite may drop the unreadable lines before an evidence copy of them exists,
+    and an append after a cut-off tail must not fuse with it into one unreadable line."""
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    for i in range(5):
+        a.add(f"n{i}")
+    cut = a.cipher.seal(b'{"seq": 6, "ts": 1.0, "src": "server", "text": "n5"}')[:30]   # no newline: an append cut off by a kill
+    p.write_bytes(p.read_bytes() + b"enc:v1:not-a-token\n" + cut)
+    found = p.read_bytes()
+
+    def failing_copy(src, dst, *args, **kwargs):
+        dst.write(b"partial")                                                 # a copy that fails after writing into its file
+        raise OSError("disk full")
+    monkeypatch.setattr(L.shutil, "copyfileobj", failing_copy)
+    b = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    texts = [e["text"] for e in b.fetch(0)["entries"]]
+    assert texts[:5] == [f"n{i}" for i in range(5)]                           # startup still works from the readable lines
+    assert texts[5].startswith("[logring] skipped 2 unreadable line(s)") and "could not be written" in texts[5]
+    assert p.read_bytes().startswith(found)                                   # the original bytes are untouched
+    assert not list(tmp_path.glob("ring.jsonl.bad-*"))                        # no partial evidence left behind
+    b.add("after")
+    c = L.Ring(cap_bytes=5000, path=p, key_path=key)                          # restart while the copy still fails
+    texts = [e["text"] for e in c.fetch(0)["entries"]]
+    assert texts[:7] == [f"n{i}" for i in range(5)] + [texts[5], "after"]    # the records appended after the cut tail survive
+    assert texts[7].startswith("[logring] skipped 2 unreadable line(s)")      # still only the original bad lines
+    assert p.read_bytes().startswith(found)
+
+    c._written = 2 * c.cap + 1                                                # an oversize rewrite while the copy fails: appended
+    c.add("still failing")
+    assert p.read_bytes().startswith(found) and not list(tmp_path.glob("ring.jsonl.bad-*"))
+    monkeypatch.undo()                                                        # the copy works again: evidence first, then the rewrite
+    before = p.read_bytes()
+    c.add("copy works")
+    evidence = list(tmp_path.glob("ring.jsonl.bad-*"))
+    assert len(evidence) == 1 and evidence[0].read_bytes() == before and before.startswith(found)
+    assert not p.read_bytes().startswith(found)                               # rewritten from the ring
+    d = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    assert [e["text"] for e in d.fetch(0)["entries"]] == [e["text"] for e in c.fetch(0)["entries"]]
+    assert len(list(tmp_path.glob("ring.jsonl.bad-*"))) == 1                 # the rewritten ring reloads clean
+
+
+def test_same_second_failed_copy_keeps_the_earlier_snapshot(tmp_path, monkeypatch):
+    """Ticket f62934c8, review 0ea3e90b (codex): two captures in the same second must not share a destination; a failed later copy
+    must neither truncate nor remove the earlier snapshot, and must leave the damaged ring as found (no rewrite)."""
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    monkeypatch.setattr(L.time, "time", lambda: 1795000000.0)                # every capture below falls in the same second
+    a = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    for i in range(5):
+        a.add(f"n{i}")
+    p.write_bytes(p.read_bytes() + b"enc:v1:not-a-token\n")
+    found = p.read_bytes()
+    L.Ring(cap_bytes=5000, path=p, key_path=key)                              # the first capture succeeds
+    first = tmp_path / "ring.jsonl.bad-1795000000"
+    assert first.read_bytes() == found
+
+    p.write_bytes(p.read_bytes() + b"enc:v1:not-a-token-either\n")            # damaged again, same second
+    found2 = p.read_bytes()
+    real_copy = L.shutil.copyfileobj
+
+    def failing_copy(src, dst, *args, **kwargs):
+        dst.write(b"partial")
+        raise OSError("disk full")
+    monkeypatch.setattr(L.shutil, "copyfileobj", failing_copy)
+    c = L.Ring(cap_bytes=5000, path=p, key_path=key)
+    assert "could not be written" in c.fetch(0)["entries"][-1]["text"]
+    assert first.read_bytes() == found                                        # the earlier snapshot is intact
+    assert list(tmp_path.glob("ring.jsonl.bad-*")) == [first]                 # the failed attempt left nothing behind
+    assert p.read_bytes().startswith(found2)                                  # the damaged ring is left as found
+
+    monkeypatch.setattr(L.shutil, "copyfileobj", real_copy)                   # the copy works again, still the same second
+    before = p.read_bytes()
+    L.Ring(cap_bytes=5000, path=p, key_path=key)
+    second = tmp_path / "ring.jsonl.bad-1795000000-1"
+    assert first.read_bytes() == found and second.read_bytes() == before and before.startswith(found2)
+    assert sorted(tmp_path.glob("ring.jsonl.bad-*")) == sorted([first, second])
+
+
+def test_oversize_rewrite_is_atomic(tmp_path):
+    p = tmp_path / "ring.jsonl"
+    key = tmp_path / "secrets" / "records.key"
+    a = L.Ring(cap_bytes=600, path=p, key_path=key)
+    for i in range(200):                                                      # forces several rewrites (written > 2 * cap)
+        a.add(f"line {i:03d} " + "x" * 20)
+    assert not list(tmp_path.glob("ring.jsonl.rewrite-*"))
+    b = L.Ring(cap_bytes=600, path=p, key_path=key)
+    assert b.seq == 200 and b.fetch(0)["entries"][-1]["text"].startswith("line 199")
+    assert not list(tmp_path.glob("ring.jsonl.bad-*"))
+
+
 def test_tee_keeps_stdout_and_files_lines(monkeypatch):
     real = io.StringIO()
     monkeypatch.setattr(sys, "stdout", real)

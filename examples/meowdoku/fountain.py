@@ -224,7 +224,9 @@ IOTA = ("pid",)                        # columns the generated shader derives fr
 #: ``ke``..``n_drop`` are the law's DIAGNOSTICS: reduced by a fixed-order tree, so element 0 holds the total over all ids
 #: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
 #: walls, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
-DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop")
+#: ``n_out_x``, ``n_out_y`` and ``n_sdf_gone`` say WHY ids are ``n_out``: past a side wall, under the floor, on the wrong
+#: side of the drawn SDF.  An id may meet more than one test, so they need not add up to ``n_out`` (case a0e9535f).
+DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop", "n_out_x", "n_out_y", "n_sdf_gone")
 OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "rs_next", "cr", "cg", "cb", "rad") + DIAGNOSTICS
 BODY_OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "rs_next", "bth_next", "bom_next", "cr", "cg", "cb",
                 "rad") + DIAGNOSTICS + BODY_DIAGNOSTICS
@@ -1116,6 +1118,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         v2 = AbstractTensor.where(placed > 0.5, vxn * vxn + vyn * vyn, vxn * 0.0)
         ke = 0.5 * mass * v2 + AbstractTensor.where(placed > 0.5, 0.5 * inertia * wn * wn, vxn * 0.0)
         c_drop = dropped
+        c_out_x = placed * as_float(xn.abs() > half + radius)
+        c_out_y = placed * as_float(yn < -radius)
+        c_sdf = placed * sdf_gone
         # ---- fixed-order reduction (Hillis-Steele): after the shifts 1, 2, 4 .. element 0 holds the total,
         # always as the same tree of additions, so native, wasm and WebGPU add in one order
         for shift in scan_shifts:
@@ -1129,6 +1134,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             c_out = c_out + c_out.index_select(0, partner) * gate
             c_live = c_live + c_live.index_select(0, partner) * gate
             c_drop = c_drop + c_drop.index_select(0, partner) * gate
+            c_out_x = c_out_x + c_out_x.index_select(0, partner) * gate
+            c_out_y = c_out_y + c_out_y.index_select(0, partner) * gate
+            c_sdf = c_sdf + c_sdf.index_select(0, partner) * gate
             v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
         if body:
             # ---- the BODY's step, in engine_toy's order (DrivetrainSolver): the applied torques first (the grains' reaction, from the
@@ -1142,7 +1150,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             om2 = om1 - _sgn(om1) * mag * (1.0 / inertia_b)
             th1 = a["bth"] + om2 * DT
             th2 = th1 - TAU * (th1 * (1.0 / TAU) + 0.5).floor()
-            return (xn, yn, vxn, vyn, wn, age_next, rsn, th2, om2, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop,
+            return (xn, yn, vxn, vyn, wn, age_next, rsn, th2, om2, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop, c_out_x, c_out_y, c_sdf,
                     th2, om2, tau_c)
         # <mobroad>
         if _MOBROAD["on"]:
@@ -1156,9 +1164,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
                 m_dead = m_dead + m_dead.index_select(0, partner) * gate
                 m_goal = m_goal + m_goal.index_select(0, partner) * gate
                 m_crush = m_crush + m_crush.index_select(0, partner) * gate
-            return (xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop, m_dead, m_goal, m_crush)
+            return (xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop, c_out_x, c_out_y, c_sdf, m_dead, m_goal, m_crush)
         # </mobroad>
-        return xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
+        return xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop, c_out_x, c_out_y, c_sdf
 
     return fountain_step
 

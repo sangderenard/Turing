@@ -62,8 +62,9 @@ def text(value, name, maximum, *, empty=False):
 
 
 class Service:
-    def __init__(self, accounts):
+    def __init__(self, accounts, oauth_mcp=None):
         self.accounts = accounts
+        self.oauth_mcp = oauth_mcp
         # Follow the open incumbent connection, not a client path or mutable label.
         with accounts.lock:
             rows = accounts._conn.execute('PRAGMA database_list').fetchall()
@@ -77,6 +78,8 @@ class Service:
         if not isinstance(token, str) or not token or len(token) > 4096:
             raise IssueError('sign in to use issue tickets', 401)
         account = self.accounts.user_for_token(token)
+        if account is None and self.oauth_mcp is not None:
+            account = self.oauth_mcp.user_for_token(token)
         if account is None:
             raise IssueError('sign in to use issue tickets', 401)
         db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=10)
@@ -92,7 +95,11 @@ class Service:
             for statement in DDL:
                 db.execute(statement)
             current = db.execute('SELECT user_id FROM sessions WHERE token=? AND expires_at>=?', (token,time.time())).fetchone()
-            if current is None or current['user_id'] != account['id']:
+            if (current is None or current['user_id'] != account['id']) and not (
+                self.oauth_mcp is not None and
+                (oauth_account := self.oauth_mcp.user_for_token(token)) is not None and
+                oauth_account['id'] == account['id']
+            ):
                 raise IssueError('sign in to use issue tickets', 401)
             admin = False
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_roles'").fetchone():
@@ -162,7 +169,8 @@ class Service:
                     raise IssueError('submission key already used for different content',409)
                 return {'id':old['id'],'created':False}
             now=time.time()
-            if db.execute('SELECT COUNT(*) FROM issue_tickets WHERE owner_id=? AND created_at>?',(actor,now-600)).fetchone()[0] >= 10:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM issue_tickets WHERE owner_id=? AND created_at>?',(actor,now-600)).fetchone()[0] >= 10:
                 raise IssueError('too many tickets; wait before submitting another',429)
             ticket_id=uuid.uuid4().hex
             db.execute('INSERT INTO issue_tickets VALUES(?,?,?,?,?,?,?,\'open\',1,?,?,?,?)',
@@ -171,7 +179,7 @@ class Service:
             return {'id':ticket_id,'created':True}
 
     def list(self, token, *, scope='mine', status='all', offset=0):
-        if scope not in ('mine','assigned','all') or status not in (*STATUSES,'all') or type(offset) is not int or not 0 <= offset <= 1_000_000:
+        if scope not in ('mine','assigned','all') or status not in (*STATUSES,'all','active') or type(offset) is not int or not 0 <= offset <= 1_000_000:
             raise IssueError('invalid list filter')
         with self.transaction(token) as (db,actor,admin):
             operator = self.is_operator(db,actor)
@@ -187,8 +195,8 @@ class Service:
             params = (actor,) if scope != 'all' else ()
             rows=db.execute(
                 'SELECT id,owner_id,title,status,version,created_at,updated_at FROM issue_tickets '
-                'WHERE '+visibility+' AND (?=\'all\' OR status=?) ORDER BY updated_at DESC,id DESC LIMIT 51 OFFSET ?',
-                (*params,status,status,offset)).fetchall()
+                'WHERE '+visibility+' AND (?=\'all\' OR (?=\'active\' AND status IN (\'open\',\'investigating\')) OR status=?) ORDER BY updated_at DESC,id DESC LIMIT 51 OFFSET ?',
+                (*params,status,status,status,offset)).fetchall()
             tickets=[dict(r) for r in rows[:50]]
             for ticket in tickets:
                 ticket['assignees']=self.assignees(db,ticket['id'])
@@ -220,7 +228,8 @@ class Service:
             if version != row['version']:
                 raise IssueError('ticket changed; refresh before updating',409)
             now=time.time()
-            if db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
                 raise IssueError('too many updates; wait before trying again',429)
             db.execute('UPDATE issue_tickets SET status=?,version=version+1,updated_at=? WHERE id=?',(status,now,ticket_id))
             db.execute('INSERT INTO issue_ticket_events(ticket_id,actor_id,created_at,status,note,version) VALUES(?,?,?,?,?,?)',(ticket_id,actor,now,status,note,version+1))
@@ -262,7 +271,8 @@ class Service:
             if old==set(ids):
                 return {'id':ticket_id,'version':version,'assignees':self.assignees(db,ticket_id)}
             now=time.time()
-            if db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and db.execute('SELECT COUNT(*) FROM issue_ticket_events WHERE actor_id=? AND created_at>?',(actor,now-60)).fetchone()[0]>=30:
                 raise IssueError('too many updates; wait before trying again',429)
             db.execute('DELETE FROM issue_ticket_assignees WHERE ticket_id=?',(ticket_id,))
             db.executemany('INSERT INTO issue_ticket_assignees VALUES(?,?,?,?)',

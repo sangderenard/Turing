@@ -57,7 +57,8 @@ def check_quota(db_path, now=None):
         recent = db.execute("SELECT COUNT(*) FROM llm_registrations WHERE registered_at > ?", (now - 86400,)).fetchone()[0]
     finally:
         db.close()
-    if recent >= MAX_PER_DAY:
+    from meowdoku import rate_limits
+    if rate_limits.enabled() and recent >= MAX_PER_DAY:
         raise LlmRegistrationError("LLM registration is full for today; try again tomorrow", 429)
 
 

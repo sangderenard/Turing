@@ -85,7 +85,7 @@ def check_base_url(provider: str, base_url: str | None) -> str:
 
 
 # ---------------------------------------------------------------- the provider over HTTPS
-def http_caller(base: str, headers: dict, opener=None, timeout: float = 120):
+def http_caller(base: str, headers: dict, opener=None, timeout: float = 120, on_request=None):
     """A function (method, path, body) -> answer; the key travels only in ``headers``."""
     opener = opener or urllib.request.build_opener()
 
@@ -105,16 +105,19 @@ def http_caller(base: str, headers: dict, opener=None, timeout: float = 120):
             raise AgentError(f"the provider refused ({error.code}): {detail or error.reason}") from None
         except urllib.error.URLError as error:
             raise AgentError(f"cannot reach the provider: {error.reason}") from None
+        finally:
+            if on_request:
+                on_request("api_out")
 
     return call
 
 
-def caller_for(provider: str, base: str, key: str, opener=None):
+def caller_for(provider: str, base: str, key: str, opener=None, on_request=None):
     if provider == "gemini":
-        return gemini_agent.gemini_caller(key, opener)
+        return gemini_agent.gemini_caller(key, opener, on_request=on_request)
     if provider == "anthropic":
-        return http_caller(base, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, opener)
-    return http_caller(base, {"Authorization": "Bearer " + key}, opener)
+        return http_caller(base, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, opener, on_request=on_request)
+    return http_caller(base, {"Authorization": "Bearer " + key}, opener, on_request=on_request)
 
 
 def _schema(tool: dict) -> dict:
@@ -324,8 +327,11 @@ def main(argv=None) -> int:
     try:
         base = check_base_url(args.provider, args.base_url)
         key_file = args.key_file or os.path.join(os.path.expanduser("~"), f"{args.name}.key")
-        call = caller_for(args.provider, base, read_key(key_file))
+        activity_rest = [None]
+        observe = lambda channel: gemini_agent.report_activity(activity_rest[0], channel)
+        call = caller_for(args.provider, base, read_key(key_file), on_request=observe)
         if args.check:
+            activity_rest[0] = gemini_agent.optional_activity_rest()
             print(f"key accepted by {args.provider} at {base}: {check(call, args.provider)} model(s) listed")
             return 0
         if not args.model:
@@ -343,7 +349,8 @@ def main(argv=None) -> int:
         except ImportError:
             raise AgentError("speaktome_mcp is not importable: put the speaktome checkout on PYTHONPATH", 2) from None
         try:
-            world = SpeakToMe(ApiServer(Rest.from_env()))
+            activity_rest[0] = Rest.from_env()
+            world = SpeakToMe(ApiServer(activity_rest[0]), on_call=observe)
         except RestError as error:
             raise AgentError(f"speaktome: {error.message}", 2) from None
         reply, calls = run(world, call, args.provider, args.model, prompt, room=args.room, tail=args.tail,

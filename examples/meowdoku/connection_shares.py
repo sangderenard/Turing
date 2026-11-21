@@ -113,7 +113,8 @@ def shared_call(db, *, owner_id, provider, caller_id, caller, name, arguments, c
         recent = db.execute("SELECT count(*) FROM connection_share_calls WHERE owner_id = ? AND provider = ? "
                             "AND caller_id = ? AND at > ?", (int(owner_id), provider, int(caller_id), now - 3600.0)
                             ).fetchone()[0]
-        if recent >= CALLS_PER_HOUR:
+        from meowdoku import rate_limits
+        if rate_limits.enabled() and recent >= CALLS_PER_HOUR:
             raise ShareError(f"at most {CALLS_PER_HOUR} calls an hour on a shared connection", 429)
         slot = db.execute("INSERT INTO connection_share_calls (at, owner_id, provider, caller_id, caller, tool, ok) "
                           "VALUES (?,?,?,?,?,?,0)", (now, int(owner_id), provider, int(caller_id), str(caller), name)

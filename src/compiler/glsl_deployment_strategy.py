@@ -8058,7 +8058,8 @@ def _build_shell_hierarchy_plan(
                     "atanh", "sign", "add", "sub", "mul", "truediv", "div",
                     "floordiv", "mod", "pow", "less", "less_equal",
                     "greater", "greater_equal", "equal", "not_equal",
-                    "maximum", "minimum", "where", "float", "double",
+                    "maximum", "minimum", "clamp", "clamp_min", "clamp_max",
+                    "where", "float", "double",
                     "long", "int", "to", "to_dtype", "astype", "cbrt",
                     "zeros_like", "empty_like", "ones_like", "full_like",
                 }:
@@ -27276,6 +27277,10 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "eq", "ne", "lt", "le", "gt", "ge",
     "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
+    # ``clamp`` is these two in sequence: the tensor and its present bounds
+    # (``kw:min`` / ``kw:max``, below) are its operands, joined and promoted
+    # exactly as ``maximum(x, lo)`` then ``minimum(.., hi)`` would be.
+    "clamp",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
     # The process graph spells Python's bit operators ``bitand``/``bitor``/
@@ -30032,6 +30037,22 @@ def _tensor_descriptor_rule(
                     # A method call's argument (``x.maximum(y)``) is an
                     # operand under role ``arg:0``, as a builtin's are.
                     or str(role).casefold().startswith("arg:")
+                    # ``x.clamp(min=lo, max=hi)`` names its bounds by keyword;
+                    # a bound spelled ``None`` is absent, not an operand.
+                    or (
+                        operation == "clamp"
+                        and str(role).casefold() in {"kw:min", "kw:max"}
+                        and not (
+                            str(graph.G.nodes[int(parent)].get("type"))
+                            in {"Constant", "Const", "const"}
+                            and graph.G.nodes[int(parent)].get("constant")
+                            is None
+                            and (
+                                graph.G.nodes[int(parent)].get("attributes")
+                                or {}
+                            ).get("value") is None
+                        )
+                    )
                 )
                 and int(parent) in graph.G
             )

@@ -45,10 +45,10 @@ MEMORY_HEADER = ("# Llama memory\n"
 # The setting when the site cannot give Llama its orientation. Owner, 2026-11-17: a helpful assistant, not an intern being
 # coached ("i need all the agents to become helpful not a daycare").
 FALLBACK_SETTING = ("You are Llama, a helpful assistant in SpeakToMe's rooms. Answer the latest question from another "
-                    "person plainly and briefly. If someone reports a problem with the site, thank them and suggest they "
+                    "person clearly. If someone reports a problem with the site, thank them and suggest they "
                     "file a ticket with the Report issue button. Say so when you do not know.")
 RUNNER_RULES = ("You can only speak through your runner: never claim to have used a tool or seen anything beyond these chat "
-                "logs and your memory. Reply to the latest other person's message, in under 500 characters.")
+                "logs and your memory. Reply to the latest other person's message.")
 SYSTEM_SENDERS = {"svc-nodus-messenger", "nodus"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cursors (place TEXT PRIMARY KEY, message_id INTEGER NOT NULL);
@@ -96,10 +96,10 @@ def context(messages, username, limit=24):
                      and not m.get("removed"))
 
 
-def profile_messages(work, count_tokens, input_budget=4096 - 256 - 128):
+def profile_messages(work, count_tokens, input_budget=4096 - 1024 - 128):
     """Keep the full contract and job; fit only saved memory to one slot.
 
-    The runner reserves 256 tokens for the answer and 128 for the chat
+    The runner reserves 1024 tokens for the answer and 128 for the chat
     template. Its shared KV pool is sized for 4096 tokens per active slot.
     Saved memory stays complete on disk and is excerpted only for this call.
     """
@@ -295,7 +295,7 @@ class LocalModel:
         setting = guide.setting() if guide is not None else FALLBACK_SETTING + "\n\n" + RUNNER_RULES
         place = f"direct conversation with {peer}" if peer else f"room {room}"
         return self._complete(self.chat_messages(setting, guide.memory if guide is not None else "", place, messages),
-                              160, 120)[:500]
+                              1024, 120)
 
     def answer_profile(self, work):
         answer = self._complete(profile_messages(work, self.count_tokens), 256, 180)
@@ -360,6 +360,17 @@ def controls(rest, username, now=None):
     return value
 
 
+def apply_controls(model, guide, control):
+    """Keep the model process in the operator-selected state, including while idle."""
+    guide.goal = control["goal"]
+    if not control["enabled"]:
+        model.stop()
+        guide.flush()
+        return False
+    model.start()
+    return True
+
+
 def mode(rest, username, scope, place, now=None):
     """The effective last-word setting, asked at most every MODE_SECONDS per place (a 1 s cycle must not ask each pass)."""
     now = time.monotonic() if now is None else now
@@ -380,6 +391,11 @@ def room_list(rest, username):
 
 def room_history(rest, room, tail=100):
     return rest.call(f"/api/chat/rooms/{key(room)}?tail={tail}")["messages"]
+
+
+def reply_parts(answer, limit=4000):
+    """Send a complete answer through the message API's per-message body limit."""
+    return [answer[i:i + limit] for i in range(0, len(answer), limit)]
 
 
 def visit_room(rest, model, db, username, room, guide=None):
@@ -406,7 +422,8 @@ def visit_room(rest, model, db, username, room, guide=None):
         prior = [m for m in history if m["id"] <= message["id"]]
         answer = model.answer(room, prior, guide=guide)
         if answer:
-            rest.call(f"/api/chat/rooms/{key(room)}", {"body": answer})
+            for part in reply_parts(answer):
+                rest.call(f"/api/chat/rooms/{key(room)}", {"body": part})
             if guide is not None:
                 guide.remember(f"room {room}", message.get("username"), message.get("body"), answer)
         advance(db, place, message["id"])
@@ -443,8 +460,9 @@ def handle_direct(rest, model, db, username, guide=None):
                 match = next((row for row in contacts_now if row["username"] == peer), None)
                 if match is None:
                     raise RuntimeError("conversation ended before reply")
-                rest.call("/api/messages/send", {"conversation_handle": match["conversation_handle"], "body": answer,
-                                                 "idempotency_key": f"llama-reply-{message_id:020d}"})
+                for part_no, part in enumerate(reply_parts(answer)):
+                    rest.call("/api/messages/send", {"conversation_handle": match["conversation_handle"], "body": part,
+                                                     "idempotency_key": f"llama-reply-{message_id:020d}-{part_no}"})
                 if prior is None and guide is not None:
                     guide.remember(f"direct with {peer}", peer, message.get("body"), answer)
         highest = max(highest, message_id)
@@ -456,6 +474,13 @@ def run(args):
     username = os.environ.get("SPEAKTOME_USER")
     if not username:
         raise RuntimeError("SPEAKTOME_USER is required")
+    if os.name == "nt":
+        # The scheduled task can end this runner abruptly. Reuse the stack's kill-on-close
+        # Windows job so its llama.cpp child cannot outlive the task at stack shutdown.
+        from meowdoku.deploy.apache_supervisor import tie_children_to_this_process
+        bound = tie_children_to_this_process()
+        if "are tied" not in bound:
+            raise RuntimeError(bound)
     rest = Rest.from_env()
     db_path = Path(args.state_dir) / "hosted-llm.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,17 +489,18 @@ def run(args):
     guide = Guide(rest)
     model = LocalModel(Path(args.llama_server), Path(args.model), args.port, Path(args.state_dir) / "logs", args.batch_slots)
     try:
-        model.start()
         room = ""
         until = 0
         rooms, rooms_due, profiles_due = [], 0.0, 0.0
         while True:
             try:
                 tick = time.monotonic()
-                control = controls(rest, username, tick)
-                guide.goal = control["goal"]
-                if not control["enabled"]:
-                    guide.flush()
+                try:
+                    control = controls(rest, username, tick)
+                except (RestError, OSError, ValueError, KeyError):
+                    model.stop()  # the site went away: do not keep llama.cpp running outside the stack
+                    raise
+                if not apply_controls(model, guide, control):
                     time.sleep(POLL_SECONDS)
                     continue
                 if tick >= profiles_due:

@@ -2,7 +2,7 @@
 // textContent only; the server decides every permission and checks every grant, this page only decides what to offer.
 //   GET  /api/account/admin/people                 accounts with their authority (account_admin.py)
 //   GET  /api/account/admin/tools?username=NAME    that account's capabilities and tools
-//   POST /api/account/authority/grant              {username, group: dev|operator|nodus|message, enabled}
+//   POST /api/account/authority/grant              {username, group: dev|operator|nodus|message|execution, enabled}
 //   POST /api/account/admin/grant | revoke         {username}
 //   POST /api/account/admin/purge                  {username, password}: an ordinary account and its private rows; posts stay
 const byId = id => document.getElementById(id);
@@ -83,6 +83,12 @@ async function open(username) {
   }
   else if (a.service) panel.append(el("p", "A service account is not on the people ladder; its role decides.", "muted"));
   else {
+    if (person.server_agent) {
+      const enabled = (a.groups || []).includes("execution");
+      const button = el("button", `${enabled ? "Remove" : "Grant"} exec and Python`); button.type = "button";
+      button.onclick = () => grant(person, "execution", !enabled);
+      panel.append(button, el("p", "Separate account permission for commands and Python run as this agent's Windows account. Llama is excluded.", "muted"));
+    }
     const buttons = el("div", null, "actions");
     const direct = new Set(a.direct || []);
     for (const group of ["dev", "operator", "nodus", "admin"]) {

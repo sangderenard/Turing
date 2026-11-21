@@ -23,6 +23,19 @@ def test_legacy_access_migrates_and_metrics_are_read_from_ciphertext(tmp_path):
     assert RecordCipher(key).open(path.read_bytes().splitlines()[0]).startswith(b"192.0.2.1")
 
 
+def test_unreadable_record_is_counted_not_fatal(tmp_path):
+    """Ticket f62934c8 hazard 3: a torn or spliced line must not fail the whole admin records view."""
+    key = tmp_path / "secrets" / "records.key"
+    access = tmp_path / "logs" / "apache-access.log"
+    access.parent.mkdir()
+    cipher = RecordCipher(key)
+    good = cipher.seal(b'192.0.2.7 - - [16/Nov/2026:10:00:00 -0600] "GET / HTTP/1.1" 200 5')
+    access.write_bytes(good + good[:40] + b"\n" + b"enc:v1:not-a-token\n" + good)
+    result = admin_records.read(access, key)
+    assert result["requests"] == 2 and result["unreadable"] == 2
+    assert [item["ip"] for item in result["ip_history"]] == ["192.0.2.7", "192.0.2.7"]
+
+
 def test_missing_key_never_replaces_encrypted_history(tmp_path):
     key = tmp_path / "secrets" / "records.key"
     access = tmp_path / "logs" / "apache-access.log"

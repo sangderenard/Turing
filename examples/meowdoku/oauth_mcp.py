@@ -136,7 +136,8 @@ class OAuthMCP:
             now = time.time()
             with self.lock:
                 hits = [t for t in self.register_hits.get(peer, []) if now - t < 3600]
-                if len(hits) >= 10:
+                from meowdoku import rate_limits
+                if rate_limits.enabled() and len(hits) >= 10:
                     return _json(handler, 429, {"error": "rate_limited"})
                 hits.append(now)
                 self.register_hits[peer] = hits

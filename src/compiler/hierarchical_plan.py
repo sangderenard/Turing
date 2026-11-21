@@ -1178,6 +1178,80 @@ def plan_region_to_ssa_instrs(
             fork_operand_read(item, 2, result, "upper", upper)
             continue
 
+        # A tensor ``clamp`` / ``clamp_min`` / ``clamp_max`` is the same two
+        # binary folds the scalar clamp above is, in the same order the
+        # repository's own C backend applies them (``clamp_`` is ``maximum``
+        # with the lower bound, then ``minimum`` with the upper;
+        # ``clamp_min_`` / ``clamp_max_`` are one of the two).  Spelled as
+        # ``Max`` / ``Min`` they reach the tensor lowering as the catalogued
+        # binary kernels (``binary_double`` / ``binary_scalar_double``) that
+        # ``maximum`` / ``minimum`` already use; there is no clamp kernel.
+        # A bound is named by its argument role (``kw:min`` / ``kw:max`` or
+        # the positional ``arg:0`` / ``arg:1``); an absent bound has no input.
+        clamp_bounds = None
+        if semantic_opcode.casefold() in {"clamp", "clamp_min", "clamp_max"}:
+            roles = tuple(role.casefold() for role in semantic_roles)
+            tensor_position = next(
+                (index for index, role in enumerate(roles)
+                 if role in {"operand", "value", "self", "receiver", "base"}),
+                0,
+            )
+            lower_position = upper_position = None
+            kind = semantic_opcode.casefold()
+            for index, role in enumerate(roles):
+                if index == tensor_position:
+                    continue
+                if role == "kw:min" or (
+                    kind == "clamp_min" and role in {"arg:0", "kw:min_val"}
+                ) or (kind == "clamp" and role == "arg:0"):
+                    lower_position = index
+                elif role == "kw:max" or (
+                    kind == "clamp_max" and role in {"arg:0", "kw:max_val"}
+                ) or (kind == "clamp" and role == "arg:1"):
+                    upper_position = index
+            if (lower_position is not None or upper_position is not None)                     and len(semantic_inputs) == 1 + (
+                        (lower_position is not None) + (upper_position is not None)
+                    ):
+                clamp_bounds = (tensor_position, lower_position, upper_position)
+        if clamp_bounds is not None:
+            tensor_position, lower_position, upper_position = clamp_bounds
+            clamp_attributes = {
+                key: attribute for key, attribute in attributes.items()
+                if key not in {
+                    "callee", "lowered_from", "tensor", "tensor_candidate",
+                    "tensor_operation", "min", "max", "min_val", "max_val",
+                }
+            }
+            operand = value(semantic_inputs[tensor_position])
+            steps = [
+                (fold, position, role_name)
+                for fold, position, role_name in (
+                    ("Max", lower_position, "lower"),
+                    ("Min", upper_position, "upper"),
+                )
+                if position is not None
+            ]
+            accumulator = operand
+            for step, (fold, position, role_name) in enumerate(steps):
+                bound = value(semantic_inputs[position])
+                fold_result = (
+                    result if step == len(steps) - 1 else fresh_like(result)
+                )
+                instructions.append(Instr(
+                    fold, [accumulator, bound], fold_result,
+                    arg_roles=["operand", role_name],
+                    attributes={
+                        **clamp_attributes, "source_operator": semantic_opcode,
+                    },
+                ))
+                if step == 0:
+                    fork_operand_read(
+                        item, tensor_position, fold_result, "operand", accumulator,
+                    )
+                fork_operand_read(item, position, fold_result, role_name, bound)
+                accumulator = fold_result
+            continue
+
         operands = [value(value_id) for value_id in semantic_inputs]
         if len(semantic_inputs) == 2 and (
             opcode.casefold() in {"lt", "le", "gt", "ge", "eq", "ne"}

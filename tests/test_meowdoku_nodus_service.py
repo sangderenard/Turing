@@ -38,7 +38,11 @@ GRAPH = {"revision": 7,
          "ports": [], "contract_ports": [{"prefix": "cp", "capacity": 4, "listen_port": 5555, "loan_ticks": 2, "edge": 0}]}
 TOOLS = {"tools": [{"name": "gen", "plugin_id": "p1", "source": "s", "description": "makes"}]}
 ACTIVITY = {"tick": 42, "edges": [{"index": 0, "fill": 2, "seq": 9}], "contract_ports": [], "compile_hosts": []}
-REPLIES = {"DIGEST": DIGEST, "GRAPH": GRAPH, "TOOLS": TOOLS, "ACTIVITY": ACTIVITY}
+META = {"tick": 42, "groups": [{"id": 3, "channel_group": 9, "vertices": 1, "records": 4, "feed_refused": 0, "slots": 8,
+                                "members": [{"tick": 41, "edge_idx": 0, "rope_id": (1 << 60) + 1, "write_seq": (1 << 55) + 3,
+                                             "occupancy": 2, "flags": 3, "canvas_edge_idx": 0}]}],
+        "links": [{"id": "lnk", "state": "linked", "control_sent": 5, "listen_port": 7001}]}
+REPLIES = {"DIGEST": DIGEST, "GRAPH": GRAPH, "TOOLS": TOOLS, "ACTIVITY": ACTIVITY, "META": META}
 
 
 class FakeConsole:
@@ -189,6 +193,22 @@ def test_passthrough_and_cache(server, fake, caplog):
     assert _call(server.port, "/api/nodus/digest?instance=demo", headers=h)[0] == 200 and fake.connections == n + 1
 
 
+def test_meta_route(server, fake):
+    _register(server, fake.port)
+    assert _call(server.port, "/api/nodus/meta", headers=OUTSIDE)[0] == 403
+    assert _call(server.port, "/api/nodus/meta?instance=demo", headers={**_cookie(server, "member1", "member"), **OUTSIDE})[0] == 403
+    h = _cookie(server, "dev1", "operator")
+    st, _, m = _call(server.port, "/api/nodus/meta?instance=demo", headers=h)
+    assert st == 200 and m["instance"] == "demo" and m["tick"] == 42
+    member = m["groups"][0]["members"][0]
+    assert member["rope_id"] == str((1 << 60) + 1) and member["write_seq"] == str((1 << 55) + 3)   # beyond 2^53: strings
+    assert member["occupancy"] == 2 and member["flags"] == 3                                        # small values stay numbers
+    assert m["links"][0]["state"] == "linked" and m["links"][0]["control_sent"] == 5
+    _call(server.port, "/api/nodus/meta?instance=demo", headers=h)
+    assert fake.verbs.count("META") == 1 and fake.connections == 1                                  # cached 1 s per instance
+    assert TOKEN not in json.dumps(m)
+
+
 def test_unknown_instance_and_token_never_in_responses(server, fake):
     _register(server, fake.port)
     h = _cookie(server, "dev1", "operator")
@@ -203,7 +223,7 @@ def test_v1_host_is_501(server):
     try:
         _register(server, old.port)
         h = _cookie(server, "dev1", "operator")
-        for path in ("digest", "graph", "tools", "activity", "abstract"):
+        for path in ("digest", "graph", "tools", "activity", "meta", "abstract"):
             status, _, body = _call(server.port, "/api/nodus/%s?instance=demo" % path, headers=h)
             assert status == 501 and "not supported by this host" in body["error"], path
     finally:

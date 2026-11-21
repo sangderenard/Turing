@@ -23,7 +23,7 @@ USERS_DDL = """
                 created_at REAL NOT NULL
             );
 """
-ALL = set(authz.CAPS) - {"compile_unstable", "nodus_edit"}
+ALL = set(authz.CAPS) - {"compile_unstable", "nodus_edit", "agent_execute"}
 
 
 @pytest.fixture
@@ -222,6 +222,31 @@ def test_intern_is_off_the_human_ladder_and_takes_no_group(db):
     principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
     assert principal.role == "intern" and principal.groups == frozenset({"intern"})
     assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
+
+
+def test_execution_is_a_separate_server_agent_group_and_llama_is_excluded(db):
+    from meowdoku import agent_execution
+    with authz._connect(db) as conn:
+        conn.execute("INSERT INTO users(username,password_hash,display_name,created_at) VALUES('claude','x','claude',0)")
+        conn.execute("INSERT INTO users(username,password_hash,display_name,created_at) VALUES('llama','x','llama',0)")
+        conn.commit()
+    claude = authz.principal_from({"id": 3, "username": "claude"}, "lan", "edit", db)
+    llama = authz.principal_from({"id": 4, "username": "llama"}, "lan", "edit", db)
+    assert "execution" in claude.groups and "agent_execute" in authz.capabilities(claude, authz.DEFAULT_POLICY)
+    assert "execution" not in llama.groups and "agent_execute" not in authz.capabilities(llama, authz.DEFAULT_POLICY)
+    assert agent_execution.allowed(db, "claude") and not agent_execution.allowed(db, "llama")
+    direct = subprocess.run([sys.executable, str(AUTHZ), "show", "--db", str(db), "claude"],
+                            capture_output=True, text=True)
+    assert direct.returncode == 0, direct.stderr
+    authz.grant_admin(db, "alice", "operator:test")
+    with authz._connect(db) as conn:
+        with pytest.raises(PermissionError):
+            authz._permission_groups.set_grant(conn, 1, 4, "execution", True)
+        removed = authz._permission_groups.set_grant(conn, 1, 3, "execution", False)
+        conn.commit()
+    assert "execution" not in removed["groups"]
+    assert "agent_execute" not in authz.capabilities(authz.principal_from({"id": 3, "username": "claude"}, "lan", "edit", db), authz.DEFAULT_POLICY)
+    assert not agent_execution.allowed(db, "claude")
 
 
 def test_only_an_admin_can_grant_message_to_one_intern(db):

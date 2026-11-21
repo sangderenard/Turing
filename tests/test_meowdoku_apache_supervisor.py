@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import sqlite3
 import subprocess
@@ -14,6 +15,218 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 SUP = ROOT / "examples" / "meowdoku" / "deploy" / "apache_supervisor.py"
 
 from meowdoku import lowering_library as lib  # noqa: E402
+
+
+def test_hosted_task_follows_supervisor_start_and_stop(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("hosted_task_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / "instances.json"
+    config.write_text(json.dumps({"hosted_tasks": ["SpeakToMe hosted llama"], "instances": []}))
+    assert module.instances_hosted_tasks(config) == ["SpeakToMe hosted llama"]
+    supervisor = module.Supervisor(tmp_path / "accounts.db", config, tmp_path / "state")
+    supervisor.hosted_tasks = module.instances_hosted_tasks(config)
+    calls = []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(module.subprocess, "run", command)
+    supervisor.task_action("start")
+    supervisor.task_action("stop")
+    if os.name == "nt":
+        assert calls == [["schtasks.exe", "/Run", "/TN", "SpeakToMe hosted llama"],
+                         ["schtasks.exe", "/End", "/TN", "SpeakToMe hosted llama"]]
+    else:
+        assert calls == []
+
+
+def test_hosted_task_timeout_is_logged_and_the_next_task_still_runs(tmp_path, monkeypatch):
+    """2026-11-19 22:28: a schtasks timeout escaped task_action and ended the supervisor with every instance."""
+    import pytest
+    if os.name != "nt":
+        pytest.skip("hosted tasks are Windows scheduled tasks")
+    spec = importlib.util.spec_from_file_location("hosted_task_timeout_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / "instances.json"
+    config.write_text(json.dumps({"hosted_tasks": ["first task", "second task"], "instances": []}))
+    supervisor = module.Supervisor(tmp_path / "accounts.db", config, tmp_path / "state")
+    supervisor.hosted_tasks = module.instances_hosted_tasks(config)
+    calls, logged = [], []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[-1] == "first task":
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(module.subprocess, "run", command)
+    monkeypatch.setattr(supervisor, "log", logged.append)
+    supervisor.task_action("start", quiet=True)
+    assert [argv[-1] for argv in calls] == ["first task", "second task"]
+    assert any("'first task'" in line and "start" in line and "TimeoutExpired" in line for line in logged)
+
+
+def _tail_supervisor(tmp_path, monkeypatch, cipher_class, lines):
+    import io
+    spec = importlib.util.spec_from_file_location("tail_survive_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / "instances.json"
+    config.write_text(json.dumps({"instances": []}))
+    supervisor = module.Supervisor(tmp_path / "accounts.db", config, tmp_path / "state")
+    monkeypatch.setattr(module, "RecordCipher", cipher_class)
+    stdin = io.BytesIO(b"".join(lines))
+    monkeypatch.setattr(module.sys, "stdin", type("Stdin", (), {"buffer": stdin})())
+    return supervisor, stdin
+
+
+def test_tail_stdin_setup_failure_is_logged_and_stdin_is_drained(tmp_path, monkeypatch):
+    """Ticket f62934c8 hazard 2: a RecordCipher failure must not leave Apache's pipe unread."""
+    class Broken:
+        def __init__(self, *args, **kwargs):
+            raise OSError("records key unreadable")
+
+    lines = [f"GET /x{i} 200\n".encode() for i in range(5)]
+    supervisor, stdin = _tail_supervisor(tmp_path, monkeypatch, Broken, lines)
+    supervisor.tail_stdin()                       # returns at EOF instead of raising
+    assert stdin.tell() == len(b"".join(lines))   # every line was read, so httpd could not block
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "ACCESS LOG FAILED" in text and "records key unreadable" in text
+    assert "5 line(s) drained unrecorded after the failure, up to EOF" in text
+    assert "not the total loss" in text
+
+
+def test_tail_stdin_seal_failure_mid_stream_keeps_draining(tmp_path, monkeypatch):
+    class SealFails:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def migrate(self, path):
+            pass
+
+        def seal(self, data):
+            self.calls += 1
+            if self.calls > 1:
+                raise OSError("disk full")
+            return data
+
+    lines = [f"GET /distinct-{i} 200\n".encode() for i in range(6)]
+    supervisor, stdin = _tail_supervisor(tmp_path, monkeypatch, SealFails, lines)
+    supervisor.tail_stdin()
+    assert stdin.tell() == len(b"".join(lines))
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "ACCESS LOG FAILED" in text and "disk full" in text
+    assert "drained unrecorded after the failure, up to EOF" in text
+
+
+class _BrokenCipher:
+    def __init__(self, *args, **kwargs):
+        raise OSError("records key unreadable")
+
+
+def test_tail_stdin_drains_even_when_stderr_is_broken(tmp_path, monkeypatch):
+    """Review a5e4ae0f (codex): Supervisor.log printed to stderr unguarded, so a broken stderr raised in the failure
+    handler before the drain began, and Apache's pipe went unread again."""
+    class BrokenStderr:
+        def write(self, *args):
+            raise OSError("stderr closed")
+
+        def flush(self):
+            raise OSError("stderr closed")
+
+    lines = [f"GET /s{i} 200\n".encode() for i in range(4)]
+    supervisor, stdin = _tail_supervisor(tmp_path, monkeypatch, _BrokenCipher, lines)
+    monkeypatch.setattr(sys, "stderr", BrokenStderr())
+    supervisor.tail_stdin()
+    assert stdin.tell() == len(b"".join(lines))
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "ACCESS LOG FAILED" in text and "4 line(s) drained unrecorded after the failure, up to EOF" in text
+
+
+def test_tail_stdin_drain_read_error_reports_partial_count_without_eof(tmp_path, monkeypatch):
+    """Review a5e4ae0f (codex): a read error during the drain must not be reported as EOF."""
+    supervisor, _ = _tail_supervisor(tmp_path, monkeypatch, _BrokenCipher, [])
+
+    class OneLineThenFails:
+        def __init__(self):
+            self.reads = 0
+
+        def readline(self):
+            self.reads += 1
+            if self.reads == 1:
+                return b"GET /only 200\n"
+            raise OSError("pipe broken")
+
+    stdin = OneLineThenFails()
+    monkeypatch.setattr(sys, "stdin", type("Stdin", (), {"buffer": stdin})())
+    supervisor.tail_stdin()                       # returns instead of raising
+    assert supervisor.stop.is_set()
+    text = (supervisor.log_dir / "apache-supervisor.log").read_text(encoding="utf-8")
+    assert "stdin drain failed too" in text and "pipe broken" in text
+    assert "1 line(s) drained unrecorded after the failure before the read error, EOF not reached" in text
+    assert "up to EOF" not in text
+
+
+_APPENDER = r'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("appender_supervisor", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+tag, count = sys.argv[3], int(sys.argv[4])
+with open(sys.argv[2], "ab") as out, module.AccessAppendLock(sys.argv[2] + ".lock", print) as lock:
+    for i in range(count):
+        lock.append(out, b"".join((f"{tag}{i:05d}:" + tag * 4000 + "\n").encode() for _ in range(3)))
+'''
+
+
+def test_access_append_lock_keeps_two_processes_records_whole(tmp_path):
+    """Ticket f62934c8 hazard 3: the manager and the log-sink supervisor both append to apache-access.log."""
+    target = tmp_path / "apache-access.log"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT), str(ROOT / "examples")])}
+    procs = [subprocess.Popen([sys.executable, "-c", _APPENDER, str(SUP), str(target), tag, "200"], env=env)
+             for tag in ("A", "B")]
+    assert [p.wait(timeout=120) for p in procs] == [0, 0]
+    lines = target.read_bytes().split(b"\n")
+    assert lines[-1] == b""
+    lines = lines[:-1]
+    assert len(lines) == 2 * 200 * 3
+    for line in lines:
+        tag = line[:1].decode()
+        assert line == f"{line[:6].decode()}:".encode() + tag.encode() * 4000
+    for k in range(0, len(lines), 3):  # each append's three records stay together (review f70723f0, codex)
+        assert len({line[:6] for line in lines[k:k + 3]}) == 1, lines[k][:6]
+    for tag in ("A", "B"):         # and each writer's appends keep their order
+        seen = [line[:6] for line in lines if line[:1] == tag.encode()]
+        assert seen == [f"{tag}{i:05d}".encode() for i in range(200) for _ in range(3)]
+
+
+def test_access_append_lock_never_blocks_the_drain(tmp_path, monkeypatch):
+    """A lock another handle holds past WAIT_S: the append is still written, and the unlocked write is logged."""
+    spec = importlib.util.spec_from_file_location("append_timeout_supervisor", SUP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    lock_path, target, said = tmp_path / "access.log.lock", tmp_path / "access.log", []
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    with module.AccessAppendLock(lock_path, said.append) as holder:
+        assert holder._lock()
+        with open(target, "ab") as out, module.AccessAppendLock(lock_path, said.append, clock=lambda: now[0],
+                                                                 sleep=sleep) as waiter:
+            waiter.append(out, b"record\n")
+            assert waiter.unlocked == 1
+        holder._unlock()
+    assert target.read_bytes() == b"record\n"
+    assert now[0] >= module.AccessAppendLock.WAIT_S
+    assert any("WITHOUT the lock" in text for text in said)
 
 
 def _spec(child_code, **extra):
@@ -76,7 +289,7 @@ def test_shipped_instances_dry_run_lists_all():
     out = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     names = [i["name"] for i in json.loads(out.stdout)["instances"]]
-    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "nodus-ui-mirror", "nodus-training", "nodus-training-ui-mirror", "task-worker", "udp-router", "udp-router-radio", "relay"]
+    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "nodus-ui-mirror", "nodus-training", "nodus-training-ui-mirror", "task-worker", "udp-router", "udp-router-radio", "relay", "link-broker"]
 
 
 def test_lifecycle_account_lease_stdin_eof(tmp_path):

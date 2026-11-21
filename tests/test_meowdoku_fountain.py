@@ -1333,6 +1333,24 @@ def test_an_sdf_grain_thrown_at_the_wall_stays_inside():
         state = {k: out[k + "_next"] for k in F.STATE}
         worst = min(worst, float(F.chamber_distance(u, state["x"], state["y"])[0].min()))
     assert float(out["n_out"][0]) == 0 and float(out["n_nan"][0]) == 0 and worst > -0.05
+    assert float(out["n_out_x"][0]) == 0 and float(out["n_out_y"][0]) == 0 and float(out["n_sdf_gone"][0]) == 0
+
+
+def test_the_out_reasons_cover_n_out():
+    """Case a0e9535f: ``n_out_x`` / ``n_out_y`` / ``n_sdf_gone`` say why ids are ``n_out``.  Each reason counts only
+    outside ids, and every outside id has at least one reason (an id may have two)."""
+    n, active = 4, 4096
+    cols = F.initial_columns(n, mix=0.0, shape="sdf_circle", active=active)
+    law = F.make_law(n, active)
+    cols["age"][:] = 1.0e3
+    cols["x"][:], cols["y"][:] = [5.0, 0.0, -5.0, 0.0], [0.5, -3.0, -3.0, 0.5]        # past a side wall, under the floor, both, inside
+    cols["vx"][:], cols["vy"][:] = 0.0, 0.0
+    ts = [AbstractTensor.get_tensor(np.asarray(cols[k], dtype=np.float64)) for k in F.ARGUMENTS]
+    out = dict(zip(F.OUTPUTS, (np.broadcast_to(np.asarray(v.numpy()), (n,)).copy() for v in law(*ts))))
+    n_out, ox, oy, og = (float(out[k][0]) for k in ("n_out", "n_out_x", "n_out_y", "n_sdf_gone"))
+    assert n_out > 0
+    assert ox <= n_out and oy <= n_out and og <= n_out
+    assert ox + oy + og >= n_out
 
 
 # ------------------------------------------------- the 3-D law's tunables in the 2-D law (eager lane: no compile needed)

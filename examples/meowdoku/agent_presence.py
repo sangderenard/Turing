@@ -201,7 +201,8 @@ def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | Non
                     "local": {"state": "active" if runs else "unobserved" if records_available else "unknown", "since": min((r["started"] for r in runs), default=None)}}
         agents.append({"username": name, "account": account, "runs": runs, "schedule": _schedule(days, name, minute, now), "channels": channels})
     for name in UNSCHEDULED_AGENTS:
-        agents.append({"username": name, "account": None, "runs": [], "schedule": None,
+        agents.append({"username": name, "account": name if name.startswith("operator-") else None,
+                       "runs": [], "schedule": None,
                        "channels": {**_observed(name, now), "local": {"state": "unknown"}}})
     return {"as_of": now, "agents": agents, "locations": checkout_locations(accounts_db, now),
             "note": "Repository locations require a file access observed in the last 30 seconds. Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound lights come only from instrumented agent call sites; unknown means this server has no such observation."}

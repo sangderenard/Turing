@@ -3,7 +3,7 @@
 // HAND-AUTHORED. createElement/textContent only. The server enforces every capability; this only decides what to show.
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
-const OPEN = new Set(["waiting", "objected", "accepted", "revoked"]);
+const OPEN = new Set(["waiting", "objected", "accepted", "revoked", "held"]);
 const DIFF_LINES = 6000;
 let who = null, caps = new Set(), reviews = [], selected = null, detailGeneration = 0;
 let landing = { queue: [], updater: false, apply: true, schedule: null, clockOffset: 0 };
@@ -166,7 +166,7 @@ async function load({quiet = false} = {}) {
 function renderAwaiting() {
   const list = byId("awaiting-list");
   list.replaceChildren();
-  const awaiting = reviews.filter(r => r.standing === "waiting" || r.standing === "objected")
+  const awaiting = reviews.filter(r => r.standing === "waiting" || r.standing === "objected" || r.standing === "held")
     .sort((a, b) => b.created_at - a.created_at);
   byId("awaiting-note").textContent = !awaiting.length ? "No change is waiting for approval." :
     `${awaiting.length} change${awaiting.length === 1 ? "" : "s"} waiting for a decision. ` +
@@ -349,18 +349,27 @@ function controls(review, detail) {
   if (settled) return;
   const box = el("section", null, "decide");
   const feedback = el("p", null, "muted"); feedback.setAttribute("role", "status");
-  const noteLabel = el("label", "Note (kept with the decision)"), note = document.createElement("textarea");
+  const noteLabel = el("label", "Note or hold reason"), note = document.createElement("textarea");
   note.id = "review-note"; noteLabel.htmlFor = note.id; note.rows = 3; note.maxLength = 2000;
   const buttons = el("div", null, "actions");
-  if (who.role === "admin") {
+  if (who.role === "admin" && review.standing === "held") {
+    box.append(el("h3", "Held for review"), el("p", "Release gives this review a fresh 30-minute window. Decide it separately after release.", "muted"));
+    const release = el("button", "Release hold"); release.type = "button";
+    release.onclick = () => { if (confirm(`Release the hold on ${review.repository} ${review.branch}?`))
+      post("/api/reviews/release", { id: review.id, note: note.value }, feedback); };
+    buttons.append(release);
+  } else if (who.role === "admin") {
     box.append(el("h3", "Decide"), el("p", `Approving lands ${review.branch} at ${review.head.slice(0, 12)} on ${review.base} when the admin tool next runs. A newer commit on the branch is a different change and needs its own review.`, "muted"));
     const approve = el("button", "Approve this commit", "approve"); approve.type = "button";
     const reject = el("button", "Reject", "reject"); reject.type = "button";
+    const hold = el("button", "Hold for review"); hold.type = "button";
     approve.onclick = () => { if (confirm(`Approve ${review.repository} ${review.branch} at ${review.head.slice(0, 12)}?`))
       post("/api/reviews/decide", { id: review.id, head: review.head, decision: "approved", note: note.value }, feedback); };
     reject.onclick = () => { if (confirm(`Reject ${review.repository} ${review.branch}?`))
       post("/api/reviews/decide", { id: review.id, head: review.head, decision: "rejected", note: note.value }, feedback); };
-    buttons.append(approve, reject);
+    hold.onclick = () => { if (!note.value.trim()) { feedback.textContent = "Enter a reason for the hold."; return; }
+      post("/api/reviews/hold", { id: review.id, reason: note.value }, feedback); };
+    buttons.append(approve, reject, hold);
   } else box.append(el("h3", "Remark"));
   const mine = String(review.owner_name).toLowerCase() === String(who.username).toLowerCase();
   if (review.standing === "revoked" && !review.hidden && (mine || who.role === "admin")) {
@@ -370,9 +379,11 @@ function controls(review, detail) {
     buttons.append(read);
   }
   if (mine) {
-    const withdraw = el("button", "Withdraw my change"); withdraw.type = "button";
-    withdraw.onclick = () => { if (confirm("Withdraw this change?")) post("/api/reviews/withdraw", { id: review.id }, feedback); };
-    buttons.append(withdraw);
+    if (review.standing !== "held") {
+      const withdraw = el("button", "Withdraw my change"); withdraw.type = "button";
+      withdraw.onclick = () => { if (confirm("Withdraw this change?")) post("/api/reviews/withdraw", { id: review.id }, feedback); };
+      buttons.append(withdraw);
+    }
   } else {
     for (const verdict of ["agree", "object"]) {
       const b = el("button", verdict === "agree" ? "Agree" : "Object"); b.type = "button";
@@ -395,11 +406,12 @@ async function show(id) {
   const facts = document.createElement("dl");
   for (const [term, value] of [
     ["Lands on", review.base], ["Review ID", review.id], ["Commit", review.head], ["Author", review.owner_name], ["Submitted", when(review.created_at)],
-    ["Accepted after", `${when(review.accept_after)} (${until(review.accept_after)})`],
+    ["Accepted after", review.standing === "held" ? "Paused for further review" : `${when(review.accept_after)} (${until(review.accept_after)})`],
     ["Branch after landing", review.delete_branch ? "deleted" : "kept"],
     ...(review.reviewer_name ? [["Decided by", `${review.reviewer_name}, ${when(review.reviewed_at)}`]] : []),
     ...(review.note ? [["Note", review.note]] : []),
     ...(review.revoked_at ? [["Approval revoked", `by ${review.revoked_by}, ${when(review.revoked_at)}: ${review.revoke_reason}`]] : []),
+    ...(review.held_at ? [["Held for review", `by ${review.held_by}, ${when(review.held_at)}: ${review.held_reason}`]] : []),
     ...(review.landed_at ? [["Landed", `${when(review.landed_at)} ${review.landed_detail || ""}`]] : []),
   ]) { facts.append(el("dt", term)); const dd = el("dd"); dd.append(el(term === "Commit" || term === "Review ID" ? "code" : "span", value)); facts.append(dd); }
   detail.replaceChildren(heading, facts);
@@ -407,6 +419,11 @@ async function show(id) {
   if (review.remarks.length) {
     detail.append(el("h3", "Reviewer remarks"));
     for (const r of review.remarks) detail.append(el("p", `${r.username}: ${r.verdict}${r.note ? " — " + r.note : ""} (${when(r.at)})`));
+  }
+  if (review.hold_events?.length) {
+    detail.append(el("h3", "Hold history"));
+    for (const event of review.hold_events)
+      detail.append(el("p", `${event.actor} ${event.action} ${when(event.at)}${event.reason ? ": " + event.reason : ""}`));
   }
   controls(review, detail);
   const thread = el("section", null, "decide");

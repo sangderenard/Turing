@@ -29,10 +29,11 @@ SpeakToMe catalog exposes them as MCP tools only to those roles.
 /api/scratch` are account-owned text files. Every permanent account, including
 an intern, may use them through REST and MCP. They are separate from encrypted
 user-file attachments and cannot be shared through messages. Temporary preview
-accounts use an HttpOnly, Secure, SameSite=Lax cookie, bound to their preview
-account ID, with a 2 KiB JSON budget. The MCP internal client keeps that
-cookie only for its preview session. Keeping a preview account does not copy
-cookie scratch into durable storage; the user can save it afterward.
+accounts use the same account-owned scratch store. Keeping a preview retains
+its user ID, so its scratch files remain with the new member account. An older
+preview scratch cookie is imported on the next `/api/scratch` request and then
+cleared. The registration page completes that import before Keep and stops
+Keep if it fails. Cookie file data is imported, not the account credential.
 Workspace and durable scratch text are stored in the accounts database and
 are not encrypted at rest by this change. Do not place secrets there; the
 existing encrypted user-file feature remains the place for client-encrypted

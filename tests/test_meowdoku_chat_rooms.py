@@ -15,11 +15,45 @@ from meowdoku import chat_rooms  # noqa: E402
 @pytest.fixture
 def db(tmp_path):
     conn = sqlite3.connect(tmp_path / "accounts.db", isolation_level=None)
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL)")
+    conn.executemany("INSERT INTO users VALUES (?, ?)", [(1, "admin"), (2, "opal"), (3, "dev"),
+                                                         (6, "intern"), (7, "service"), (8, "operator-gpt"), (9, "member")])
     conn.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL)")
     conn.executemany("INSERT INTO account_roles VALUES (?, ?)", [(1, "admin"), (2, "operator"), (3, "dev"), (6, "intern"),
                                                                   (7, "service")])
     yield conn
     conn.close()
+
+
+def test_one_send_key_survives_retry_and_removal(db, monkeypatch):
+    from meowdoku import permission_groups
+    monkeypatch.setattr(permission_groups, "authority", lambda _db, _id: {"highest": "member"})
+    fields = {"user_id": 2, "username": "opal", "body": "hello @someone",
+              "key": "send-key-12345678"}
+    first, duplicate = chat_rooms.post_once(db, "tickets", **fields)
+    assert not duplicate
+    again, duplicate = chat_rooms.post_once(db, "tickets", **fields)
+    assert duplicate and again["id"] == first["id"]
+    assert db.execute("SELECT count(*) FROM chat_messages").fetchone()[0] == 1
+    with pytest.raises(chat_rooms.ChatError) as error:
+        chat_rooms.post_once(db, "tickets", **{**fields, "body": "changed"})
+    assert error.value.status == 409
+    chat_rooms.remove(db, first["id"], admin="admin")
+    removed, duplicate = chat_rooms.post_once(db, "tickets", **fields)
+    assert duplicate and removed["removed"] and removed["id"] == first["id"]
+    next_message, duplicate = chat_rooms.post_once(db, "tickets", **{**fields, "key": "send-key-87654321"})
+    assert not duplicate and next_message["id"] != first["id"]
+    assert db.execute("SELECT count(*) FROM chat_messages").fetchone()[0] == 2
+
+
+def test_one_send_key_is_scoped_to_room_and_account(db, monkeypatch):
+    from meowdoku import permission_groups
+    monkeypatch.setattr(permission_groups, "authority", lambda _db, _id: {"highest": "member"})
+    key = "send-key-12345678"
+    first, _ = chat_rooms.post_once(db, "agents", user_id=2, username="opal", body="hello", key=key)
+    other_room, _ = chat_rooms.post_once(db, "tickets", user_id=2, username="opal", body="hello", key=key)
+    other_writer, _ = chat_rooms.post_once(db, "agents", user_id=1, username="admin", body="hello", key=key)
+    assert len({first["id"], other_room["id"], other_writer["id"]}) == 3
 
 
 def test_the_reviewers_room_is_for_operators_and_admins_only(db):
@@ -302,8 +336,7 @@ def test_overlapping_forwarded_calls_never_pass_the_hourly_limit(tmp_path):
 # ---------------------------------------------------------------- the round table
 @pytest.fixture
 def seated(db):
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL)")
-    db.executemany("INSERT INTO users VALUES (?, ?)", [(1, "admin"), (2, "opal"), (3, "devi"), (6, "intern"), (7, "svc"),
+    db.executemany("INSERT OR REPLACE INTO users VALUES (?, ?)", [(1, "admin"), (2, "opal"), (3, "devi"), (6, "intern"), (7, "svc"),
                                                        (10, "claude"), (11, "gemini")])
     db.executemany("INSERT INTO account_roles VALUES (?, ?)", [(10, "operator"), (11, "member")])
     return db

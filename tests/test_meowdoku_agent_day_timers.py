@@ -130,3 +130,44 @@ def test_a_resumable_character_is_rung_into_a_kept_session_that_never_blocks_a_w
     assert "Add-AgentRecord $AgentDays 'session' $declared.account $process.Id" in start, "the record names the session"
     block = text[text.index("$Agents = [ordered]@{"):text.index("$Preamble = @'")]
     assert block.count("session = $true") == 2, "the CLIs agent_session.py has an adapter for: claude and codex"
+
+
+def test_ticks_never_stack_behind_the_execution_queue():
+    """2026-11-20: the claim ran before any lock and with no limit; ~190 ticks piled up behind it while icacls held the
+    tree, and Task Scheduler's time limit stops the headless conhost, not the pwsh under it."""
+    text = _launcher()
+    tick = text[text.index("# ---------------------------------------------------------------- one tick for one agent"):]
+    gate, claim, decide = tick.index('"$Agent.queue.lock"'), tick.index("Invoke-AgentExecution $Agent"), tick.index('"$Agent.lock"')
+    assert gate < claim < decide
+    assert "catch { exit 0 }" in tick[gate:claim]
+    body = text[text.index("function Invoke-AgentExecution"):text.index("# ---------------------------------------------------------------- the tasks")]
+    assert "& $Python $queue" not in body
+    assert body.count("Invoke-BoundedPython @($queue") == 2
+
+
+def _bounded_python_function():
+    text = _launcher()
+    start = text.index("function Invoke-BoundedPython")
+    return text[start:text.index("\nfunction Invoke-AgentExecution", start)]
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell 7")
+def test_a_hung_python_call_is_killed_at_its_limit_and_input_passes_as_utf8(tmp_path):
+    script = tmp_path / "bounded.ps1"
+    script.write_text(
+        f"$Python = '{sys.executable}'\n"
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"   # as the launcher sets it
+        + _bounded_python_function() + "\n"
+        "$started = Get-Date\n"
+        "$hung = Invoke-BoundedPython @('-c', 'import time; time.sleep(60)') 2\n"
+        "'hung ' + $hung.TimedOut + ' ' + $hung.ExitCode + ' ' + [int]((Get-Date) - $started).TotalSeconds\n"
+        "$echo = Invoke-BoundedPython @('-c', 'import sys; sys.stdout.write(sys.stdin.read().upper())') 20 'weight × 12 − done'\n"
+        "'echo ' + $echo.ExitCode + ' ' + $echo.Output\n", encoding="utf-8")
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    done = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, env=env, timeout=120)
+    out = done.stdout.decode("utf-8", "replace")
+    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+    hung = next(line for line in out.splitlines() if line.startswith("hung "))
+    _, timed_out, code, seconds = hung.split()
+    assert timed_out == "True" and code == "-1" and int(seconds) < 15
+    assert "echo 0 WEIGHT × 12 − DONE" in out

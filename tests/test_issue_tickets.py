@@ -48,6 +48,18 @@ class IssueTests(unittest.TestCase):
         self.assertEqual(self.service.list('fixture-token-3',scope='all')['tickets'][0]['id'],ticket)
         self.assertEqual(self.service.get('fixture-token-3',ticket)['ticket']['id'],ticket)
 
+    def test_active_and_finished_filters_preserve_scope(self):
+        active = self.create()
+        investigating = self.service.create('fixture-token-1', payload('differentkey00001'))['id']
+        finished = self.service.create('fixture-token-1', payload('differentkey00002'))['id']
+        self.service.update('fixture-token-1', investigating, {'status':'investigating','note':'Working','version':1})
+        self.service.update('fixture-token-1', finished, {'status':'resolved','note':'Done','version':1})
+        self.assertEqual({r['id'] for r in self.service.list('fixture-token-1', status='active')['tickets']}, {active, investigating})
+        self.assertEqual([r['id'] for r in self.service.list('fixture-token-1', status='resolved')['tickets']], [finished])
+        self.assertEqual({r['id'] for r in self.service.list('fixture-token-1')['tickets']}, {active, investigating, finished})
+        self.assertEqual(self.service.list('fixture-token-2', status='active')['tickets'], [])
+        self.assertEqual({r['id'] for r in self.service.list('fixture-token-3', scope='all', status='active')['tickets']}, {active, investigating})
+
     def test_idempotency_and_changed_content_conflict(self):
         ticket=self.create()
         self.assertEqual(self.service.create('fixture-token-1',payload()),{'id':ticket,'created':False})

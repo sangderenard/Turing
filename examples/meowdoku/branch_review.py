@@ -51,6 +51,7 @@ VERDICTS = ("agree", "object")
 MAX_NOTE = 2000
 MAX_TIMEOUT_S = 30 * 86400.0
 REVOKED_SHOWN_S = 7 * 86400.0      # a revoked change leaves the default listing this long after its revoke
+RELEASE_WINDOW_S = 1800.0           # a released hold gets a fresh half-hour review window
 HEAD = re.compile(r"[0-9a-f]{40}\Z")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 DDL = (
@@ -60,7 +61,7 @@ DDL = (
     "status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','approved','rejected','withdrawn')), "
     "reviewed_at REAL, reviewer_id INTEGER, reviewer_name TEXT, note TEXT NOT NULL DEFAULT '', "
     "landed_at REAL, landed_detail TEXT, land_tried_at REAL, land_result TEXT, revoked_at REAL, revoked_by TEXT, "
-    "revoke_reason TEXT, UNIQUE(repository, branch, head))",
+    "revoke_reason TEXT, held_at REAL, held_by TEXT, held_reason TEXT, UNIQUE(repository, branch, head))",
     "CREATE TABLE IF NOT EXISTS branch_review_remarks (review_id TEXT NOT NULL, user_id INTEGER NOT NULL, username TEXT, "
     "verdict TEXT NOT NULL CHECK(verdict IN ('agree','object')), note TEXT NOT NULL DEFAULT '', at REAL NOT NULL, "
     "PRIMARY KEY(review_id, user_id))",
@@ -81,10 +82,13 @@ DDL = (
     "declared_at REAL NOT NULL)",
     # A revoked change its author or an admin has marked read: hidden from the default listing, never deleted (mark_read()).
     "CREATE TABLE IF NOT EXISTS branch_review_read (review_id TEXT PRIMARY KEY, read_by TEXT NOT NULL, read_at REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS branch_review_hold_events (review_id TEXT NOT NULL, at REAL NOT NULL, "
+    "actor TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('hold','release')), reason TEXT NOT NULL)",
 )
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
             "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail",
-            "land_tried_at", "land_result", "revoked_at", "revoked_by", "revoke_reason")
+            "land_tried_at", "land_result", "revoked_at", "revoked_by", "revoke_reason",
+            "held_at", "held_by", "held_reason")
 
 
 class ReviewError(Exception):
@@ -100,7 +104,8 @@ def ensure(db) -> None:
         db.execute("ALTER TABLE branch_removed ADD COLUMN removed_by TEXT")      # notices made before the cleanup account
     columns = {row[1] for row in db.execute("PRAGMA table_info(branch_reviews)")}
     for column, kind in (("land_tried_at", "REAL"), ("land_result", "TEXT"),      # the landing queue: reviews made before it
-                         ("revoked_at", "REAL"), ("revoked_by", "TEXT"), ("revoke_reason", "TEXT")):   # and before revoking
+                         ("revoked_at", "REAL"), ("revoked_by", "TEXT"), ("revoke_reason", "TEXT"),
+                         ("held_at", "REAL"), ("held_by", "TEXT"), ("held_reason", "TEXT")):   # and before revoking
         if column not in columns:
             db.execute(f"ALTER TABLE branch_reviews ADD COLUMN {column} {kind}")
 
@@ -175,6 +180,9 @@ def is_admin(db, user_id) -> bool:
 def _record(db, row) -> dict:
     record = dict(zip(_COLUMNS, row))
     record["delete_branch"] = bool(record["delete_branch"])
+    record["hold_events"] = [{"at": r[0], "actor": r[1], "action": r[2], "reason": r[3]} for r in db.execute(
+        "SELECT at, actor, action, reason FROM branch_review_hold_events WHERE review_id = ? ORDER BY at",
+        (record["id"],))]
     record["remarks"] = [{"username": r[0], "verdict": r[1], "note": r[2], "at": r[3]} for r in db.execute(
         "SELECT username, verdict, note, at FROM branch_review_remarks WHERE review_id = ? ORDER BY at", (record["id"],))]
     return record
@@ -259,6 +267,8 @@ def standing(record: dict, now: float) -> str:
         return "landed"
     if record["status"] != "open":
         return record["status"]
+    if record.get("held_at") is not None:
+        return "held"                            # an admin pause: no timeout acceptance or landing
     if record.get("revoked_at") is not None:
         return "revoked"                         # an approval taken back: never accepted by silence, never landed
     if any(remark["verdict"] == "object" for remark in record["remarks"]):
@@ -290,6 +300,9 @@ def submit(db, *, user_id, username, repository, branch, base, head, timeout_s, 
         if old is not None:                      # the same change again: the same row, whoever asks
             db.execute("COMMIT")
             return get(db, old[0], now)
+        if db.execute("SELECT 1 FROM branch_reviews WHERE repository = ? AND branch = ? "
+                      "AND held_at IS NOT NULL AND landed_at IS NULL", (repository, branch)).fetchone():
+            raise ReviewError("an admin has held this branch for further review", 409)
         review_id = uuid.uuid4().hex
         db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = ? WHERE repository = ? AND branch = ? "
                    "AND status = 'open' AND landed_at IS NULL", (now, f"superseded by {review_id}", repository, branch))
@@ -333,11 +346,65 @@ def decide(db, review_id, *, user_id, username, head, decision, note="", now=Non
         raise ReviewError("an admin decides a review", 403)
     now = time.time() if now is None else now
     done = db.execute("UPDATE branch_reviews SET status = ?, reviewed_at = ?, reviewer_id = ?, reviewer_name = ?, note = ? "
-                      "WHERE id = ? AND status = 'open' AND landed_at IS NULL AND head = ?",
+                      "WHERE id = ? AND status = 'open' AND landed_at IS NULL AND held_at IS NULL AND head = ?",
                       (decision, now, user_id, username, note, str(review_id), head))
     if done.rowcount != 1:
         get(db, review_id, now)                  # 404 when there is no such review
         raise ReviewError("the review is already settled, or it is about a different commit", 409)
+    return get(db, review_id, now)
+
+
+def hold(db, review_id, *, user_id, username, reason, now=None) -> dict:
+    """An admin pauses an open review before it lands, including one already accepted by silence."""
+    _account(user_id)
+    reason = _note(reason)
+    if not reason:
+        raise ReviewError("a hold needs a reason")
+    ensure(db)
+    if not is_admin(db, user_id):
+        raise ReviewError("an admin holds a review", 403)
+    now = time.time() if now is None else now
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        done = db.execute("UPDATE branch_reviews SET held_at = ?, held_by = ?, held_reason = ? "
+                          "WHERE id = ? AND status = 'open' AND landed_at IS NULL AND held_at IS NULL "
+                          "AND revoked_at IS NULL",
+                          (now, str(username), reason, str(review_id)))
+        if done.rowcount != 1:
+            get(db, review_id, now)
+            raise ReviewError("only an unlanded open review may be held", 409)
+        db.execute("INSERT INTO branch_review_hold_events VALUES (?,?,?,?,?)",
+                   (str(review_id), now, str(username), "hold", reason))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return get(db, review_id, now)
+
+
+def release(db, review_id, *, user_id, username, note="", now=None) -> dict:
+    """An admin resumes a held review with a fresh window, never an elapsed timeout."""
+    _account(user_id)
+    note = _note(note)
+    ensure(db)
+    if not is_admin(db, user_id):
+        raise ReviewError("an admin releases a held review", 403)
+    now = time.time() if now is None else now
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        done = db.execute("UPDATE branch_reviews SET held_at = NULL, held_by = NULL, held_reason = NULL, "
+                          "accept_after = ? "
+                          "WHERE id = ? AND status = 'open' AND landed_at IS NULL AND held_at IS NOT NULL",
+                          (now + RELEASE_WINDOW_S, str(review_id)))
+        if done.rowcount != 1:
+            get(db, review_id, now)
+            raise ReviewError("only a held, unlanded review may be released", 409)
+        db.execute("INSERT INTO branch_review_hold_events VALUES (?,?,?,?,?)",
+                   (str(review_id), now, str(username), "release", note))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
     return get(db, review_id, now)
 
 
@@ -347,7 +414,7 @@ def withdraw(db, review_id, *, user_id, now=None) -> dict:
     _account(user_id)
     now = time.time() if now is None else now
     done = db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = 'withdrawn by its author' "
-                      "WHERE id = ? AND owner_id = ? AND status IN ('open', 'approved') AND landed_at IS NULL",
+                      "WHERE id = ? AND owner_id = ? AND status IN ('open', 'approved') AND landed_at IS NULL AND held_at IS NULL",
                       (now, str(review_id), user_id))
     if done.rowcount != 1:
         get(db, review_id, now)
@@ -746,6 +813,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         POST /api/reviews                 {repository, branch, head, timeout_hours?, keep?}   submit
         POST /api/reviews/remark          {id, verdict, note?}                                a peer
         POST /api/reviews/decide          {id, head, decision, note?}                         an admin
+        POST /api/reviews/hold            {id, reason}                                        an admin pauses
+        POST /api/reviews/release         {id, note?}                                         an admin resumes
         POST /api/reviews/withdraw        {id}                                                the author
         POST /api/reviews/checkout        {repository, branch}      register a branch to yourself; answers the steps
         GET  /api/reviews/identity        the Git author identity this account declared
@@ -838,6 +907,10 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             made = remark(db, body.get("id"), **who, verdict=body.get("verdict"), note=body.get("note", ""))
         elif path == "/api/reviews/decide":
             made = decide(db, body.get("id"), **who, head=body.get("head"), decision=body.get("decision"), note=body.get("note", ""))
+        elif path == "/api/reviews/hold":
+            made = hold(db, body.get("id"), **who, reason=body.get("reason"))
+        elif path == "/api/reviews/release":
+            made = release(db, body.get("id"), **who, note=body.get("note", ""))
         elif path == "/api/reviews/withdraw":
             made = withdraw(db, body.get("id"), user_id=principal.user_id)
         elif path == "/api/reviews/read":

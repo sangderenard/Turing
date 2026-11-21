@@ -17,3 +17,14 @@ row exec.zstd.unpack
   argument -c
   directory C:/dev/Powershell/srv/state/content/users/account/2/exec
   most 2
+
+# The Nodus compiler service (nodus tools/build_service/nodus_build.py; owner, 2026-11-19: "we use it as an exec call to
+# get linux products"). A span is a build request (NBR1 | header JSON {"triple"} | the source tar); the span back is the
+# built Nodus as a tar.gz, cached by source digest and triple in this row's folder. x64-windows builds with MSVC here;
+# x64-linux builds in the service account's own WSL2 distro, nodus-build. One build at a time.
+row exec.build.nodus
+  name Nodus build
+  program C:/dev/Powershell/srv/python/python.exe
+  argument C:/dev/Powershell/nodus/tools/build_service/nodus_build.py
+  directory C:/dev/Powershell/srv/state/content/users/account/2/build
+  most 1

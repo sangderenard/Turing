@@ -107,6 +107,7 @@ from meowdoku import agent_workspace as agent_workspace_mod  # noqa: E402
 from meowdoku import agent_decisions as agent_decisions_mod  # noqa: E402  [DECISIONS]
 from meowdoku import agent_guidance as agent_guidance_mod  # noqa: E402  [GUIDANCE]
 from meowdoku import agent_runs as agent_runs_mod  # noqa: E402
+from meowdoku import agent_execution as agent_execution_mod  # noqa: E402
 from meowdoku import agent_training_arena as agent_training_arena_mod  # noqa: E402
 from meowdoku import alpaca_credentials as alpaca_credentials_mod  # noqa: E402  [PAPER CREDENTIALS] secret-state only
 from meowdoku import market_data as market_data_mod       # noqa: E402  [MARKETS] read-only Alpaca paper data
@@ -591,26 +592,36 @@ def make_handler(sessions: Sessions):
 
         def _account(self) -> dict | None:
             """The logged-in account for this request (accounts.py), or None.
-            Cookie authentication is unchanged. Messenger REST also accepts the same
-            session token as Bearer, over verified HTTPS transport only. No token is minted here."""
+            Inspect cookie and explicit token independently; the token decides identity
+            when supplied. Messenger REST also accepts the session token as Bearer,
+            over verified HTTPS transport only. No token is minted here."""
             from http.cookies import SimpleCookie
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            cookie_token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+            cookie_user = sessions.accounts.user_for_token(cookie_token)
+            self._cookie_account = cookie_user
+            self._token_account = None
             authorization = self.headers.get_all("Authorization", [])
             if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
                 self.client_address[0] in ("127.0.0.1", "::1") and not getattr(self, "_via_proxy", False) and
                 len(authorization) == 1 and authorization[0].startswith("Bearer ")):
                 user = sessions.oauth_mcp.user_for_token(authorization[0][7:])
+                self._token_account = user
                 if user is not None:
                     self._oauth_internal = True
-                    agent_presence_mod.note_inbound(user["username"], mcp=True)
+                    if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
+                        agent_presence_mod.note_inbound(user["username"], mcp=True)
                     return user
                 return None
             if (sessions.oauth_mcp is not None and self.path.partition("?")[0].startswith("/api/") and
                 self.client_address[0] in ("127.0.0.1", "::1") and not getattr(self, "_via_proxy", False) and
                 len(authorization) == 1 and authorization[0].startswith("Preview ")):
                 user = sessions.accounts.user_for_token(authorization[0][8:])
+                self._token_account = user if user is not None and user.get("temporary") else None
                 if user is not None and user.get("temporary"):
                     self._mcp_preview_internal = True
-                    agent_presence_mod.note_inbound(user["username"], mcp=True)
+                    if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
+                        agent_presence_mod.note_inbound(user["username"], mcp=True)
                     return user
                 return None
             if self.path.partition("?")[0].startswith("/api/messages/"):
@@ -623,15 +634,18 @@ def make_handler(sessions: Sessions):
                     if len(parts) != 2 or parts[0].lower() != "bearer":
                         return None
                     user = sessions.accounts.user_for_token(parts[1])
+                    self._token_account = user
                     if user is not None:
-                        agent_presence_mod.note_inbound(user["username"], mcp=False)
+                        if self.path.partition("?")[0] != "/api/worldmap/presence/outbound":
+                            agent_presence_mod.note_inbound(user["username"], mcp=False)
                     return user
-            jar = SimpleCookie(self.headers.get("Cookie", ""))
-            token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
-            user = sessions.accounts.user_for_token(token)
+            if authorization:
+                return None  # an explicit invalid or unsupported token never falls back to an ambient cookie
+            user = cookie_user
             if user is not None:                                  # [LOG] an `activity` line when this account was quiet IDLE_SECONDS
                 logring_mod.note_activity(user["id"], user["username"], getattr(self, "_client_ip", None))
-                if self.path.partition("?")[0].startswith("/api/"):
+                if (self.path.partition("?")[0].startswith("/api/") and
+                    self.path.partition("?")[0] != "/api/worldmap/presence/outbound"):
                     agent_presence_mod.note_inbound(user["username"], mcp=False)
             return user
 
@@ -1342,10 +1356,12 @@ def make_handler(sessions: Sessions):
                 return
             try:
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
-                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                token = (self.headers["Authorization"][7:] if self._oauth_internal else
+                         self.headers["Authorization"][8:] if self._mcp_preview_internal else
+                         jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
                 if self._account() is None:
                     raise issue_tickets_mod.IssueError("sign in to use issue tickets", 401)
-                service = issue_tickets_mod.Service(sessions.accounts)
+                service = issue_tickets_mod.Service(sessions.accounts, sessions.oauth_mcp)
                 if method == "GET":
                     query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
                     if path == "/api/issues":
@@ -1407,8 +1423,10 @@ def make_handler(sessions: Sessions):
                 return
             try:
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
-                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
-                service = ticket_research_mod.Service(sessions.accounts)
+                token = (self.headers["Authorization"][7:] if self._oauth_internal else
+                         self.headers["Authorization"][8:] if self._mcp_preview_internal else
+                         jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
+                service = ticket_research_mod.Service(sessions.accounts, sessions.oauth_mcp)
                 parts = path.removeprefix("/api/research/").split("/")
                 if not parts or parts[0] != "cases":
                     raise ticket_research_mod.ResearchError("not found", 404)
@@ -1715,46 +1733,32 @@ def make_handler(sessions: Sessions):
             query = parse_qs(self.path.partition("?")[2])
             db = None
             try:
+                db = agent_workspace_mod.connect(sessions.accounts_db)
                 if temporary:
                     files = agent_workspace_mod.temp_files(self.headers.get("Cookie"), owner_id)
-                    if method == "GET" and path == "/api/scratch":
-                        return self._json({"files": [{"name": name, "bytes": len(value.encode())} for name, value in sorted(files.items())],
-                                           "quota": {"total_bytes": agent_workspace_mod.MAX_TEMP_BYTES, "storage": "cookie"}})
-                    if method == "GET" and path == "/api/scratch/file":
-                        name = agent_workspace_mod._name((query.get("name") or [None])[0])
-                        if name not in files:
-                            raise agent_workspace_mod.WorkspaceError("scratch file not found", 404)
-                        return self._json({"name": name, "body": files[name]})
-                    if method == "POST" and path == "/api/scratch":
-                        body = self._body_json(limit=4096)
-                        if body is None:
-                            return
-                        name = agent_workspace_mod._name(body.get("name"))
-                        if body.get("action") == "write":
-                            files[name] = agent_workspace_mod._text(body.get("body"), "scratch file", agent_workspace_mod.MAX_TEMP_BYTES)
-                        elif body.get("action") == "delete":
-                            if name not in files:
-                                raise agent_workspace_mod.WorkspaceError("scratch file not found", 404)
-                            del files[name]
-                        else:
-                            raise agent_workspace_mod.WorkspaceError("action must be write or delete")
-                        self._set_cookie.append(agent_workspace_mod.temp_cookie(owner_id, files))
-                        return self._json({"name": name, "stored": body["action"] == "write", "storage": "cookie"})
-                else:
-                    db = agent_workspace_mod.connect(sessions.accounts_db)
-                    if method == "GET" and path == "/api/scratch":
-                        return self._json(agent_workspace_mod.scratch_list(db, owner_id))
-                    if method == "GET" and path == "/api/scratch/file":
-                        return self._json(agent_workspace_mod.scratch_read(db, owner_id, (query.get("name") or [None])[0]))
-                    if method == "POST" and path == "/api/scratch":
-                        body = self._body_json(limit=agent_workspace_mod.MAX_SCRATCH_FILE_BYTES + 8192)
-                        if body is None:
-                            return
-                        if body.get("action") == "write":
-                            return self._json(agent_workspace_mod.scratch_write(db, owner_id, body.get("name"), body.get("body")))
-                        if body.get("action") == "delete":
-                            return self._json(agent_workspace_mod.scratch_delete(db, owner_id, body.get("name")))
-                        raise agent_workspace_mod.WorkspaceError("action must be write or delete")
+                    if files:
+                        for name, value in files.items():
+                            try:
+                                agent_workspace_mod.scratch_read(db, owner_id, name)
+                            except agent_workspace_mod.WorkspaceError as error:
+                                if error.status != 404:
+                                    raise
+                                agent_workspace_mod.scratch_write(db, owner_id, name, value)
+                        self._set_cookie.append(agent_workspace_mod.TEMP_COOKIE +
+                                                "=; Path=/api/scratch; Max-Age=0; HttpOnly; SameSite=Lax; Secure")
+                if method == "GET" and path == "/api/scratch":
+                    return self._json(agent_workspace_mod.scratch_list(db, owner_id))
+                if method == "GET" and path == "/api/scratch/file":
+                    return self._json(agent_workspace_mod.scratch_read(db, owner_id, (query.get("name") or [None])[0]))
+                if method == "POST" and path == "/api/scratch":
+                    body = self._body_json(limit=agent_workspace_mod.MAX_SCRATCH_FILE_BYTES + 8192)
+                    if body is None:
+                        return
+                    if body.get("action") == "write":
+                        return self._json(agent_workspace_mod.scratch_write(db, owner_id, body.get("name"), body.get("body")))
+                    if body.get("action") == "delete":
+                        return self._json(agent_workspace_mod.scratch_delete(db, owner_id, body.get("name")))
+                    raise agent_workspace_mod.WorkspaceError("action must be write or delete")
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             except agent_workspace_mod.WorkspaceError as error:
                 return self._json({"error": str(error)}, error.status)
@@ -1843,6 +1847,36 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": str(error)}, error.status)
             except (OSError, sqlite3.Error):
                 return self._json({"error": "agent run queue unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                if db is not None:
+                    db.close()
+
+        def _agent_execution_route(self, path: str, method: str) -> None:
+            if not self._is_secure():
+                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+            if not self._require("agent_execute"):
+                return
+            principal = self._principal()
+            if method == "POST" and self.headers.get("X-Meowdoku-Workspace") != "1":
+                return self._json({"error": "workspace write header required"}, HTTPStatus.FORBIDDEN)
+            db = None
+            try:
+                db = agent_execution_mod.connect(sessions.accounts_db)
+                if method == "GET" and path.startswith("/api/agent-execution/"):
+                    return self._json(agent_execution_mod.read(db, principal.user_id, path.rsplit("/", 1)[1]))
+                if method == "POST" and path in ("/api/agent-execution/exec", "/api/agent-execution/python"):
+                    body = self._body_json(limit=agent_execution_mod.MAX_SOURCE_BYTES + 1024)
+                    if body is None:
+                        return
+                    if not isinstance(body, dict) or set(body) != {"source"}:
+                        raise agent_execution_mod.ExecutionError("expected source")
+                    return self._json(agent_execution_mod.submit(db, principal.user_id, principal.username,
+                                                                  path.rsplit("/", 1)[1], body["source"]))
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except agent_execution_mod.ExecutionError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (OSError, sqlite3.Error):
+                return self._json({"error": "agent execution queue unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
                 if db is not None:
                     db.close()
@@ -2606,9 +2640,11 @@ def make_handler(sessions: Sessions):
                 return
             if self._is_viewer():
                 return self._refuse_viewer()
-            prefix = path[len("/api/link/ticket/"):]
+            udp = path.startswith("/api/link/rendezvous/")
+            prefix = path[len("/api/link/rendezvous/" if udp else "/api/link/ticket/"):]
             if not prefix or "/" in prefix or len(prefix) > 120:
-                return self._json({"error": "expected /api/link/ticket/<prefix>"}, HTTPStatus.BAD_REQUEST)
+                return self._json({"error": "expected /api/link/ticket/<prefix> or /api/link/rendezvous/<prefix>"},
+                                  HTTPStatus.BAD_REQUEST)
             body = self._body_json(2048)
             if body is None:
                 return
@@ -2621,6 +2657,15 @@ def make_handler(sessions: Sessions):
                 key = link_tickets.load_key(sessions.state.secrets_dir)
             except link_tickets.LinkKeyMissing:
                 return self._json({"error": "this instance holds no link key"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            if udp:
+                # [LINK] The UDP broker (link_broker.py, case a02ca4a5): a rendezvous key for this side, and where to say hello.
+                # The broker is reached at the name this request used, on the broker's UDP port.
+                from meowdoku import link_broker
+                answer = link_broker.rendezvous(key, prefix, str(body.get("direction")))
+                host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]") or "127.0.0.1"
+                answer["broker"] = {"host": host, "port": link_broker.PORT}
+                answer["account"] = int(grant["service_user_id"])
+                return self._json(answer)
             return self._json(link_tickets.issue(key, prefix, int(grant["service_user_id"])))
 
         def _relay_route(self, path: str, method: str) -> None:
@@ -2793,9 +2838,25 @@ def make_handler(sessions: Sessions):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        def _worldmap_outbound_post(self) -> None:
+            # A signed-in agent reports only the channel. Identity and time come from the server.
+            if not self._require("dev_ui"):
+                return
+            if self.headers.get("Sec-Fetch-Site") == "cross-site" or self.headers.get("X-Meowdoku-Activity") != "1":
+                return self._json({"error": "activity header or same-origin request required"}, HTTPStatus.FORBIDDEN)
+            body = self._body_json(256)
+            if body is None:
+                return
+            if set(body) != {"channel"} or body["channel"] not in agent_presence_mod.OUTBOUND_CHANNELS:
+                return self._json({"error": "invalid outbound channel"}, HTTPStatus.BAD_REQUEST)
+            username = self._principal().username
+            agent_presence_mod.known_agents(sessions.accounts_db)
+            if not agent_presence_mod.note_outbound(username, body["channel"]):
+                return self._json({"error": "agent account required"}, HTTPStatus.FORBIDDEN)
+            return self._json({"ok": True})
         # ---- end [WORLDMAP]
 
-        # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
+        # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,meta,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
         # web/nodus.html).  Read access needs dev_ui or the admin-granted nodus group; UI actions need nodus_edit.
         def _nodus_db(self):
             import sqlite3
@@ -2811,7 +2872,7 @@ def make_handler(sessions: Sessions):
             if any(len(values) != 1 for values in parsed_query.values()):
                 return self._json({"error": "repeated query parameter"}, HTTPStatus.BAD_REQUEST)
             query = {k: v[0] for k, v in parsed_query.items()}
-            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract", "map", "picture", "frame"):
+            if name not in ("instances", "digest", "graph", "tools", "activity", "meta", "abstract", "map", "picture", "frame"):
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             try:
                 db = self._nodus_db()
@@ -3777,6 +3838,8 @@ def make_handler(sessions: Sessions):
                 return self._memory_route(path, "GET")
             if path == "/api/agent-runs" or path.startswith("/api/agent-runs/"):
                 return self._agent_runs_route(path, "GET")
+            if path.startswith("/api/agent-execution/"):
+                return self._agent_execution_route(path, "GET")
             if path == "/api/agent-training-arena" or path.startswith("/api/agent-training-arena/"):
                 return self._agent_training_arena_route(path, "GET")
             if path in ("/api/file-keys/me", "/api/file-keys/peer"):
@@ -4378,6 +4441,8 @@ def make_handler(sessions: Sessions):
                 return self._relay_route(path0, "POST")
             if path0.startswith("/api/link/ticket/"):             # [LINK] Nodus link tickets from a peer grant
                 return self._link_ticket_route(path0)
+            if path0.startswith("/api/link/rendezvous/"):         # [LINK] UDP broker rendezvous from a peer grant
+                return self._link_ticket_route(path0)
             if path0 == "/api/fortune" or path0.startswith("/api/fortune/"):   # [FORTUNE]
                 return self._fortune_route(path0, "POST")
             if path0 in ("/api/condition", "/api/condition/notice"):   # [CONDITION] [NOTICE]
@@ -4457,12 +4522,16 @@ def make_handler(sessions: Sessions):
                          "/api/agent-workspace/decisions/at", "/api/agent-workspace/guidance",
                          "/api/agent-workspace/session"):
                 return self._agent_workspace_route(path0, "POST")
+            if path0 == "/api/worldmap/presence/outbound":
+                return self._worldmap_outbound_post()
             if path0 == "/api/scratch":
                 return self._scratch_route(path0, "POST")
             if path0 == "/api/memory":
                 return self._memory_route(path0, "POST")
             if path0 == "/api/agent-runs" or path0 in ("/api/agent-runs/claim", "/api/agent-runs/complete"):
                 return self._agent_runs_route(path0, "POST")
+            if path0 in ("/api/agent-execution/exec", "/api/agent-execution/python"):
+                return self._agent_execution_route(path0, "POST")
             if path0 in ("/api/agent-training-arena", "/api/agent-training-arena/claim", "/api/agent-training-arena/heartbeat", "/api/agent-training-arena/complete"):
                 return self._agent_training_arena_route(path0, "POST")
             if path0 == "/api/file-keys/me":
@@ -5004,7 +5073,8 @@ def make_handler(sessions: Sessions):
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}") if length else {}
                     if path == "/api/share":
-                        if not self._share_rate_ok():
+                        from meowdoku import rate_limits
+                        if rate_limits.enabled() and not self._share_rate_ok():
                             raise share_mod.ShareError("too many shares from this address", 429)
                         return self._json({"id": sessions.shares.put(body.get("view"))})
                     self._table()                                # the owner's cookie session names the owner
