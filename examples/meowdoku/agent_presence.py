@@ -142,7 +142,7 @@ def _schedule(days: Path, name: str, minute: int, now: float) -> dict:
 
 
 def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
-    """Last audited file access, not an assertion about where the agent is now."""
+    """Recent audited file access; older files cannot locate an agent now."""
     try:
         with sqlite3.connect(f"file:{Path(accounts_db).as_posix()}?mode=ro", uri=True, timeout=1) as db:
             rows = db.execute("SELECT username, repository, path, at FROM checkout_calls "
@@ -154,6 +154,8 @@ def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
         if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
             continue
         if username in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
+            continue
+        if not isinstance(at, (int, float)) or not 0 <= now - at <= RECENT_SECONDS:
             continue
         seen.add(username)
         out.append({"username": username, "repository": repository, "path": path.replace("\\", "/"), "at": at,
@@ -182,4 +184,4 @@ def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | Non
                        "channels": {**_observed(name, now), "api_out": {"state": "unknown"},
                                     "mcp_out": {"state": "unknown"}, "local": {"state": "unknown"}}})
     return {"as_of": now, "agents": agents, "locations": checkout_locations(accounts_db, now),
-            "note": "Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound channels have no shared observation source."}
+            "note": "Repository locations require a file access observed in the last 30 seconds. Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound channels have no shared observation source."}

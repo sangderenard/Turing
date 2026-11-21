@@ -52,21 +52,22 @@ def test_non_object_records_do_not_hide_a_valid_run(tmp_path, monkeypatch):
     assert [run["kind"] for run in codex["runs"]] == ["run"]
 
 
-def test_checkout_location_is_last_observed_and_outbound_unknown(tmp_path):
+def test_checkout_location_requires_recent_observation_and_outbound_unknown(tmp_path):
+    now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
     db = tmp_path / "accounts.db"
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE checkout_calls (id INTEGER PRIMARY KEY, at REAL, username TEXT, repository TEXT, path TEXT, operation TEXT, ok INTEGER)")
         conn.executemany("INSERT INTO checkout_calls(at,username,repository,path,operation,ok) VALUES (?,?,?,?,?,?)", [
-            (10, "codex", "turing", "examples/meowdoku/server.py", "read", 1),
-            (20, "codex", "turing", "examples/meowdoku/worldmap.py", "write", 1),
+            (now - 60, "codex", "turing", "examples/meowdoku/server.py", "read", 1),
+            (now - 10, "codex", "turing", "examples/meowdoku/worldmap.py", "write", 1),
             (30, "claude", "turing", "../secret", "read", 1),
             (40, "gemini", "turing", "src/compiler/fortran_c_shell.py", "read", 0),
         ])
-    now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
     (tmp_path / "running").mkdir()
     result = presence.snapshot(db, tmp_path, now=now)
-    assert result["locations"] == [{"username": "codex", "repository": "turing", "path": "examples/meowdoku/worldmap.py", "at": 20,
-                                     "age_seconds": now - 20}]
+    assert result["locations"] == [{"username": "codex", "repository": "turing", "path": "examples/meowdoku/worldmap.py", "at": now - 10,
+                                     "age_seconds": 10}]
+    assert presence.checkout_locations(db, now + presence.RECENT_SECONDS + 1) == []
     codex = next(agent for agent in result["agents"] if agent["username"] == "codex")
     assert codex["channels"]["mcp_out"]["state"] == "unknown"
     assert codex["channels"]["local"]["state"] == "unobserved"
