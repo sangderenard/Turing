@@ -191,3 +191,38 @@ def test_assemble_places_chunks_by_hash_in_any_order(regions, monkeypatch):
     generation, rest = sb.assemble(sorted(spool.glob("*.arrival")), regions["tmp"] / "incoming")
     assert generation is not None and rest == []
     assert sb.accept(regions["reader"], generation, regions["tmp"] / "held")["accepted"]
+
+
+def test_assemble_never_follows_an_unverified_writer_out_of_incoming(regions):
+    """assemble runs before any signature is checked, so a header naming a writer like ../outside, an absolute path or a
+    non-integer generation is not a manifest: nothing outside the incoming directory is removed or written."""
+    import json as _json
+    import struct as _struct
+    packed = _pack(regions)
+    records = sorted(Path(packed["dir"]).glob("*.rec"))
+    manifest, _body, _signature = sb.read_header(records[0].read_bytes())
+    incoming = regions["tmp"] / "incoming"
+    outside = regions["tmp"] / "outside-00000001"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("must survive")
+    for writer, generation in (("../outside", 1), (str(outside), 1), ("ok", "1"), ("a/b", 1), ("..", 1)):
+        forged = dict(manifest, writer=writer, generation=generation)
+        body = _json.dumps(forged).encode("utf-8")
+        spool = regions["tmp"] / f"spool-{abs(hash((writer, str(generation))))}"
+        spool.mkdir()
+        header = spool / "00000001.arrival"
+        header.write_bytes(sb.MAGIC + _struct.pack(">I", len(body)) + body + bytes(64))
+        arrivals = [header]
+        for index, record in enumerate(records[1:]):
+            arrivals.append(spool / f"{index + 2:08d}.arrival")
+            shutil.copyfile(record, arrivals[-1])
+        generation_dir, rest = sb.assemble(arrivals, incoming)
+        assert generation_dir is None and len(rest) == len(arrivals), (writer, generation)
+    assert (outside / "keep.txt").read_text() == "must survive"
+    assert not incoming.exists() or not any(incoming.iterdir())
+
+
+def test_region_names_are_plain_components(tmp_path):
+    for bad in ("../x", "a/b", "", ".hidden", "x" * 65):
+        with pytest.raises(sb.BroadcastError):
+            sb.keygen(tmp_path / bad.replace("/", "_").replace(".", "_") / "s", bad)

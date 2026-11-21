@@ -42,6 +42,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import struct
@@ -136,8 +137,19 @@ class Region:
                 "box_pub": _b64(self.box.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw))}
 
 
+# A region's name is one plain path component: it names the generation directories a reader builds (assemble), from a
+# header that is not yet verified, so it can never climb out of or reach outside the directory it is placed in.
+REGION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def region_name_ok(name) -> bool:
+    return isinstance(name, str) and REGION_NAME.fullmatch(name) is not None
+
+
 def keygen(state_dir, region: str) -> dict:
     """Make this region's keys. Refuses to replace existing ones (a new key is a new enrollment, decided by a person)."""
+    if not region_name_ok(region):
+        raise BroadcastError(f"region name {region!r} must match {REGION_NAME.pattern}")
     d = Path(state_dir) / REGION_DIR
     if (d / "self.json").exists():
         raise BroadcastError(f"{d} already holds a region identity; keys are never replaced in place")
@@ -411,8 +423,11 @@ def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
     chunks and the signed manifest that names every chunk's hash; a link may deliver them out of order (a refused send
     waits on the stack and goes later, even after the manifest), so each chunk is placed by its hash, never by its
     position. Returns (the generation directory, or None while some chunk has not arrived, and the arrivals it did not
-    use). Nothing is verified here; accept checks the signature and unseals."""
+    use). Nothing is verified here; accept checks the signature and unseals. So nothing from the header touches the
+    filesystem until it is shown safe: the writer must be a plain region name and the generation an integer, and the
+    directory they name must resolve inside ``incoming_dir``; a header that fails is not a manifest and is left unused."""
     arrivals = [Path(a) for a in arrivals]
+    incoming = Path(incoming_dir).resolve()
     for arrival in arrivals:
         with open(arrival, "rb") as handle:
             if handle.read(len(MAGIC)) != MAGIC:
@@ -420,6 +435,13 @@ def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
         try:
             manifest, _body, _signature = read_header(arrival.read_bytes())
         except (BroadcastError, ValueError, KeyError):
+            continue
+        writer, generation = manifest.get("writer"), manifest.get("generation")
+        if not region_name_ok(writer) or not isinstance(generation, int) or isinstance(generation, bool)                 or not 0 <= generation < 10 ** 8 or not isinstance(manifest.get("chunk_sha256"), list):
+            continue                                       # not a manifest this reader can place
+        target = incoming / f"{writer}-{generation:08d}"
+        work = incoming / f".partial-{target.name}"
+        if target.resolve().parent != incoming or work.resolve().parent != incoming:
             continue
         wanted = {digest: index for index, digest in enumerate(manifest["chunk_sha256"])}
         found = {}
@@ -431,10 +453,9 @@ def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
                 found[wanted[digest]] = other
         if len(found) < len(wanted):
             return None, arrivals                         # some chunk is still on its way
-        target = Path(incoming_dir) / f"{manifest['writer']}-{int(manifest['generation']):08d}"
-        work = Path(incoming_dir) / f".partial-{target.name}"
+        incoming.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(work, ignore_errors=True)
-        work.mkdir(parents=True)
+        work.mkdir()
         shutil.copyfile(arrival, work / "000000.rec")
         for index, chunk in found.items():
             shutil.copyfile(chunk, work / f"{index + 1:06d}.rec")
