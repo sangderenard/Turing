@@ -173,3 +173,21 @@ def test_many_chunks_stream_and_emit(regions, monkeypatch):
     target = regions["tmp"] / "regrown"
     sb.take_over(regions["reader"], held["held"], target, writer_stopped=True)
     assert (target / "content" / "noise.bin").read_bytes() == (regions["writer"] / "content" / "noise.bin").read_bytes()
+
+
+def test_assemble_places_chunks_by_hash_in_any_order(regions, monkeypatch):
+    """A link may deliver a generation out of order (a refused send is retried later, even after the manifest); every
+    chunk is placed by its hash, so a shuffled arrival order still assembles and accepts."""
+    import random
+    monkeypatch.setattr(sb, "CHUNK_BYTES", 4096)
+    (regions["writer"] / "content" / "noise.bin").write_bytes(__import__("os").urandom(40_000))
+    packed = _pack(regions)
+    records = sorted(Path(packed["dir"]).glob("*.rec"))
+    random.Random(7).shuffle(records)
+    spool = regions["tmp"] / "spool"
+    spool.mkdir()
+    for index, record in enumerate(records):
+        shutil.copyfile(record, spool / f"{index + 1:08d}.arrival")
+    generation, rest = sb.assemble(sorted(spool.glob("*.arrival")), regions["tmp"] / "incoming")
+    assert generation is not None and rest == []
+    assert sb.accept(regions["reader"], generation, regions["tmp"] / "held")["accepted"]

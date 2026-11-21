@@ -398,14 +398,22 @@ def read_header(header: bytes) -> tuple[dict, bytes, bytes]:
     return manifest, body, signature
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
-    """Rebuild one generation's record directory from transport arrivals in arrival order. On the wire a generation is
-    its sealed chunks, then the signed manifest that names how many there were (it carries every chunk's hash, so it is
-    written last). The first arrival that is a manifest naming exactly the arrivals before it closes the generation.
-    Returns (the generation directory, or None while it is not complete, and the arrivals after it). Nothing is
-    verified here; accept does that."""
+    """Rebuild one generation's record directory from transport arrivals, in any order. A generation is its sealed
+    chunks and the signed manifest that names every chunk's hash; a link may deliver them out of order (a refused send
+    waits on the stack and goes later, even after the manifest), so each chunk is placed by its hash, never by its
+    position. Returns (the generation directory, or None while some chunk has not arrived, and the arrivals it did not
+    use). Nothing is verified here; accept checks the signature and unseals."""
     arrivals = [Path(a) for a in arrivals]
-    for position, arrival in enumerate(arrivals):
+    for arrival in arrivals:
         with open(arrival, "rb") as handle:
             if handle.read(len(MAGIC)) != MAGIC:
                 continue
@@ -413,19 +421,27 @@ def assemble(arrivals, incoming_dir) -> tuple[Path | None, list[Path]]:
             manifest, _body, _signature = read_header(arrival.read_bytes())
         except (BroadcastError, ValueError, KeyError):
             continue
-        if int(manifest["chunks"]) != position:
-            raise BroadcastError(f"generation {manifest.get('generation')} names {manifest['chunks']} chunk(s), "
-                                 f"{position} arrived before it")
+        wanted = {digest: index for index, digest in enumerate(manifest["chunk_sha256"])}
+        found = {}
+        for other in arrivals:
+            if other == arrival or len(found) == len(wanted):
+                continue
+            digest = _sha256_file(other)
+            if digest in wanted and wanted[digest] not in found:
+                found[wanted[digest]] = other
+        if len(found) < len(wanted):
+            return None, arrivals                         # some chunk is still on its way
         target = Path(incoming_dir) / f"{manifest['writer']}-{int(manifest['generation']):08d}"
         work = Path(incoming_dir) / f".partial-{target.name}"
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True)
         shutil.copyfile(arrival, work / "000000.rec")
-        for index, chunk in enumerate(arrivals[:position]):
+        for index, chunk in found.items():
             shutil.copyfile(chunk, work / f"{index + 1:06d}.rec")
         shutil.rmtree(target, ignore_errors=True)
         os.replace(work, target)
-        return target, arrivals[position + 1:]
+        used = {arrival, *found.values()}
+        return target, [a for a in arrivals if a not in used]
     return None, arrivals
 
 
