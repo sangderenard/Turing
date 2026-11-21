@@ -113,11 +113,14 @@ The read grant is confined to the model and the pinned llama.cpp files; Llama ha
 gemma is a SpeakToMe agent account run by the Hermes launcher (`hermes_agent.py`: prepare, run, cycle), not by
 `hosted_llm_runner.py`. It runs exactly the way Llama does, as its own isolated Windows account `agents-gemma`:
 
-- `Run-Gemma.ps1` runs inside that account. It starts `llama-server` (pinned llama.cpp b12416, model
-  `srv\state\models\gemma-4-26b-a4b\google_gemma-4-26B-A4B-it-Q4_K_M.gguf`, loopback port 11436, CUDA0, 65536 context,
-  one slot, mmap left on), waits for `/health`, runs `hermes_agent.py prepare` for gemma, then runs
-  `hermes_agent.py cycle` (the sleep cycle) in the foreground. When the cycle ends or the task is stopped it stops the
-  `llama-server` it started, with its whole process tree. It refuses to start if port 11436 is already listening.
+- `Run-Gemma.ps1` runs inside that account, checks prerequisites and calls `hermes_agent.py serve` (the runner is a subcommand
+  of the Hermes launcher, not a sibling of `hosted_llm_runner.py`, because it reuses that file's `prepare`, `cycle`,
+  `kill_tree` and parser as they are). `serve` first ties its children to a kill-on-close Windows job
+  (`apache_supervisor.tie_children_to_this_process`, the mechanism the Llama runner uses), so `llama-server` and every Hermes
+  turn end with it however it ends. Then it starts `llama-server` (pinned llama.cpp b12416, model
+  `srv\state\models\gemma-4-26b-a4b\google_gemma-4-26B-A4B-it-Q4_K_M.gguf`, loopback port 11436, CUDA0, 65536 context, one
+  slot, mmap left on), waits for `/health`, runs `prepare` for gemma and runs the sleep cycle in-process. It refuses to start
+  if port 11436 is already listening, and kills `llama-server` in a `finally` as well.
 - `Start-Gemma.ps1` is the twin of `Start-HostedLlm.ps1` (`-GrantRead`, `-Register`, `-Status`, `-Run`). `-Register` makes the
   on-demand task `SpeakToMe gemma` under `agents-gemma` (no boot trigger) and lets `svc-meowdoku` start and stop it. The
   Apache supervisor starts and stops it with the stack because `instances.json` lists it under `hosted_tasks`.
@@ -137,3 +140,11 @@ The owner's one-time elevated steps, once the user account is ready:
 
 Then `Start-Gemma.ps1 -Run` starts it by hand, or the next stack start does. Stop the test cycle and the test model server
 first: the port check refuses a second model server, and the cycle lock only guards one Hermes home.
+
+gemma's SOUL.md: the account cannot read `accounts.db`, so `prepare` (through `hermes_soul.py`) builds SOUL.md from the
+account's own orientation, `GET /api/agent-workspace/orientation?full=1`, through the `speaktome_mcp.rest` client signed in with
+its profile sign-in file (`--rest`, automatic when `accounts.db` is unreadable). Same header and MCP line as the accounts.db path.
+
+Left as they are, noted here: (a) `admin_script_control.SCRIPTS` (the admin web console's script allowlist) does not list
+`Run-Gemma.ps1` or `Start-Gemma.ps1`; (b) `stm.ps1` hard-codes the 'SpeakToMe hosted llama' task, so `stm restart` does not
+register or stop 'SpeakToMe gemma' (the supervisor still starts and stops it through `hosted_tasks`).
