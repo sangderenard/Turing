@@ -891,6 +891,8 @@ class Supervisor:
         return out
 
     def run(self, manage=True):
+        role = "manager" if manage else "access-log reader"
+        self.log(f"process pid {os.getpid()} role {role}")
         reader = threading.Thread(target=self.tail_stdin, daemon=True)
         reader.start()
         for sig in ("SIGTERM", "SIGBREAK", "SIGINT"):
