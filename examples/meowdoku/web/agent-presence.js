@@ -22,6 +22,7 @@ export function renderAgentPresence(target, data, { locations = false, onLocatio
   for (const agent of data.agents) {
     const row = node("div", null, "agent-presence"), head = node("div", null, "agent-head");
     head.append(node("strong", agent.username));
+    head.append(node("span", `Account: ${agent.account || "unknown"}`, "agent-run"));
     const runs = agent.runs || [];
     head.append(node("span", runs.length ? runs.map(run => run.kind === "seat" ? `at ${run.room} table` : `${run.kind} run`).join(" + ") : "no validated run observed", "agent-run"));
     row.append(head);

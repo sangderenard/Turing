@@ -83,6 +83,10 @@ def test_hosted_and_app_agents_have_truthful_unscheduled_badges(tmp_path):
         assert by_name[name]["schedule"] is None
         assert by_name[name]["channels"]["local"]["state"] == "unknown"
         assert by_name[name]["channels"]["api_out"]["state"] == "unknown"
+    assert by_name["operator-codex"]["account"] == "operator-codex"
+    assert by_name["operator-claude"]["account"] == "operator-claude"
+    assert by_name["llama"]["account"] is None
+    assert by_name["gemma"]["account"] is None
 
 
 def test_outbound_requires_known_agent_and_real_channel():
