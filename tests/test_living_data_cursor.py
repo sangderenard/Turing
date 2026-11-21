@@ -86,6 +86,29 @@ def test_http_ownership_admission_and_conflict(server):
     assert _call(server.port, url + '/close', 'POST', h, {'expected_revision': 0})[0] == 409
 
 
+def test_current_session_is_owner_only_and_close_checks_revision(server):
+    owner = _cookie(server, 'recover-owner', 'operator')
+    other = _cookie(server, 'recover-other', 'operator')
+    assert _call(server.port, BASE + '/current', headers=owner)[0] == 404
+    payload = {'map': model(), 'at': 'r', 'request_id': 'recover-create'}
+    status, _, created = _call(server.port, BASE, 'POST', owner, payload)
+    assert status == 201
+    sid = created['session_id']
+    status, _, current = _call(server.port, BASE + '/current', headers=owner)
+    assert status == 200 and current == {'session_id': sid, 'revision': 0}
+    assert _call(server.port, BASE + '/current', headers=other)[0] == 404
+    assert _call(server.port, BASE, 'POST', owner, {**payload, 'request_id': 'second'})[0] == 409
+    movement = {'to': 'b', 'relationship': 'contained-by', 'direction': 'incoming',
+                'expected_revision': 0, 'request_id': 'recover-move'}
+    assert _call(server.port, BASE + '/' + sid + '/move', 'POST', owner, movement)[0] == 200
+    assert _call(server.port, BASE + '/' + sid + '/close', 'POST', owner,
+                 {'expected_revision': current['revision']})[0] == 409
+    assert _call(server.port, BASE + '/current', headers=owner)[2]['revision'] == 1
+    assert _call(server.port, BASE + '/' + sid + '/close', 'POST', owner,
+                 {'expected_revision': 1})[0] == 200
+    assert _call(server.port, BASE + '/current', headers=owner)[0] == 404
+
+
 def test_store_immutable_input_retries_expiry_and_capacity(monkeypatch):
     from meowdoku import living_data_cursor as mod
     now = [0.0]; store = CursorStore(clock=lambda: now[0])

@@ -151,6 +151,15 @@ class CursorStore:
                 del item['receipts'][next(iter(item['receipts']))]
             return result
 
+    def current(self, owner):
+        """Identify this account's active cursor for an explicit recovery close."""
+        with self.lock:
+            self._prune()
+            for item in self.sessions.values():
+                if item['owner'] == owner:
+                    return {'session_id': item['id'], 'revision': item['revision']}
+            raise CursorError('graph session not found', 404)
+
     def close(self, owner, identity, body):
         _fields(body, {'expected_revision'})
         revision = _integer(body.get('expected_revision'), 0, 2**53 - 1, 'expected_revision')
