@@ -155,7 +155,11 @@ def prepare(args):
     hermes_soul.write_atomic(home / ".env", render_env(args.account, secret, args.speaktome_base, root))
     (home / "plugins").mkdir(parents=True, exist_ok=True)
     link_directory(home / "plugins" / "speaktome", package)
-    code = hermes_soul.main(["--accounts-db", str(args.accounts_db), "--account", args.account, "--hermes-home", str(home)])
+    # An account that cannot read accounts.db builds SOUL.md from its own orientation over REST (hermes_soul decides).
+    sys.path.insert(0, str(root))
+    code = hermes_soul.main(["--accounts-db", str(args.accounts_db), "--account", args.account, "--hermes-home", str(home),
+                             "--secret-file", str(secret), "--speaktome-base", args.speaktome_base]
+                            + (["--rest"] if args.soul_from_rest else []))
     if code == 2:
         print(f"warning: {args.account} has no character profile; continuing without SOUL.md", file=sys.stderr)
     elif code != 0:
@@ -389,6 +393,71 @@ def cycle(args, pending_check=None, session_probe=None, sleep=time.sleep, clock=
         release_lock(lock)
 
 
+# ---- serve: the isolated account's runner (model server + prepare + cycle, children tied to a kill-on-close job) ----
+def _port_listening(port):
+    import socket
+    with contextlib.closing(socket.socket()) as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _healthy(port):
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as answer:
+            return answer.status == 200
+    except OSError:
+        return False
+
+
+def serve(args, tie=None, listening=_port_listening, healthy=_healthy, popen=subprocess.Popen, sleep=time.sleep,
+          clock=time.monotonic):
+    """Tie every child to a kill-on-close job (as the hosted Llama runner does), start llama-server, wait for /health, run
+    prepare, then the sleep cycle in-process. llama-server and every Hermes turn are children of this process, so none
+    outlives it however it ends. Hooks are injectable for tests."""
+    if tie is None:
+        from apache_supervisor import tie_children_to_this_process as tie
+    bound = tie()
+    if os.name == "nt" and "are tied" not in bound:
+        raise SystemExit(bound)
+    if listening(args.port):
+        raise SystemExit(f"port {args.port} is already listening; not starting a second model server")
+    for needed in (args.llama_server, args.model_file):
+        if not Path(needed).is_file():
+            raise SystemExit(f"missing prerequisite: {needed}")
+    state = Path(args.state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    # mmap stays on (the default): never --load-mode none, it filled the page file on 2026-11-20.
+    command = [str(args.llama_server), "--model", str(args.model_file), "--alias", args.alias, "--host", "127.0.0.1",
+               "--port", str(args.port), "--device", args.device, "--fit", "on", "-c", str(args.context), "-np", "1", "--jinja"]
+    out = open(state / "llama-server.out.log", "ab")
+    err = open(state / "llama-server.err.log", "ab")
+    server = popen(command, stdout=out, stderr=err, stdin=subprocess.DEVNULL, **spawn_kwargs())
+    try:
+        deadline = clock() + args.health_seconds
+        while not healthy(args.port):
+            if server.poll() is not None:
+                raise SystemExit(f"llama-server exited early with code {server.returncode}; see {state}")
+            if clock() > deadline:
+                raise SystemExit(f"llama-server did not answer /health within {args.health_seconds:.0f} s; see {state}")
+            sleep(3)
+        parser = build_parser()
+        base = ["--account", args.account, "--hermes-root", str(args.hermes_root)]
+        prepared = parser.parse_args(["prepare", *base, "--provider", "custom", "--model", args.alias,
+                                      "--base-url", f"http://127.0.0.1:{args.port}/v1",
+                                      "--speaktome-hermes", str(args.speaktome_hermes), "--secrets-dir", str(args.secrets_dir),
+                                      "--speaktome-base", args.speaktome_base, "--tools-include", args.tools_include,
+                                      *(["--mcp-python", str(args.mcp_python)] if args.mcp_python else [])])
+        code = prepare(prepared)
+        if code != 0:
+            return code
+        return cycle(parser.parse_args(["cycle", *base, "--cycles", str(args.cycles)]))
+    finally:
+        kill_tree(server)
+        for handle in (out, err):
+            handle.close()
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -407,6 +476,8 @@ def build_parser():
     p.add_argument("--accounts-db", type=Path, default=DEFAULT_ACCOUNTS_DB)
     p.add_argument("--mcp-python", type=Path, help="python for the SpeakToMe MCP server (default: live speaktome .venv)")
     p.add_argument("--mcp-api", type=Path, help="speaktome_mcp/api.py (default: live speaktome tree)")
+    p.add_argument("--soul-from-rest", action="store_true",
+                   help="build SOUL.md from the account's own orientation over REST (automatic when accounts.db is unreadable)")
     r = sub.choices["run"]
     r.add_argument("--prompt", required=True)
     r.add_argument("--timeout-seconds", type=float, default=900)
@@ -424,11 +495,30 @@ def build_parser():
     c.add_argument("--program-dir", type=Path, default=DEFAULT_PROGRAM)
     c.add_argument("--hermes-exe", type=Path, help="override the hermes executable (tests)")
     c.add_argument("--speaktome", type=Path, default=DEFAULT_SPEAKTOME, help="speaktome tree holding speaktome_mcp")
+    v = sub.add_parser("serve", help="run the isolated account's model server and sleep cycle")
+    v.add_argument("--account", required=True)
+    v.add_argument("--hermes-root", type=Path, default=DEFAULT_HERMES_ROOT)
+    v.add_argument("--llama-server", type=Path, required=True)
+    v.add_argument("--model-file", type=Path, required=True)
+    v.add_argument("--alias", required=True)
+    v.add_argument("--port", type=int, default=11436)
+    v.add_argument("--device", default="CUDA0")
+    v.add_argument("--context", type=int, default=65536)
+    v.add_argument("--health-seconds", type=float, default=600)
+    v.add_argument("--state-dir", type=Path, required=True, help="where the llama-server logs go")
+    v.add_argument("--speaktome-hermes", type=Path, default=DEFAULT_SPEAKTOME / "speaktome_hermes")
+    v.add_argument("--secrets-dir", type=Path, default=DEFAULT_SECRETS)
+    v.add_argument("--speaktome-base", default=DEFAULT_BASE)
+    v.add_argument("--mcp-python", type=Path)
+    v.add_argument("--tools-include", default=DEFAULT_TOOLS, help="SpeakToMe MCP tools offered (comma list)")
+    v.add_argument("--cycles", type=int, default=0, help="0 = forever")
     return parser
 
 
 def main(argv=None, **hooks):
     args = build_parser().parse_args(argv)
+    if args.command == "serve":
+        return serve(args, **hooks)
     if args.command == "cycle":
         return cycle(args, **hooks)
     return prepare(args) if args.command == "prepare" else run(args)

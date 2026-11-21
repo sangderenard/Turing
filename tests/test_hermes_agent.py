@@ -221,3 +221,58 @@ def test_cycle_ends_rest_early_when_pending_reports_message(tmp_path):
                   pending_check=lambda: next(seen), sleep=lambda s: None, clock=iter(range(0, 1000, 1)).__next__) == 0
     assert len(_calls(log)) == 4  # the second wake started at once, after one poll slice
     assert "woke early" in (tmp_path / "h" / "fake" / "cycle.log").read_text(encoding="utf-8")
+
+
+# ---- serve: children tied to a job, port check, order, llama-server always killed ----
+class _FakeServer:
+    returncode = None
+
+    def poll(self):
+        return None
+
+
+def _serve_args(tmp_path, *extra):
+    model = tmp_path / "m.gguf"
+    exe = tmp_path / "llama-server.exe"
+    model.write_bytes(b"x")
+    exe.write_bytes(b"x")
+    return A.build_parser().parse_args(["serve", "--account", "fake", "--hermes-root", str(tmp_path / "h"), "--llama-server", str(exe),
+                                        "--model-file", str(model), "--alias", "m-1", "--state-dir", str(tmp_path / "s"), *extra])
+
+
+def test_serve_ties_children_starts_server_prepares_cycles_and_kills_server(tmp_path, monkeypatch):
+    events, popen_calls = [], []
+    monkeypatch.setattr(A, "prepare", lambda a: events.append(("prepare", a.base_url, a.model)) or 0)
+    monkeypatch.setattr(A, "cycle", lambda a: events.append(("cycle", a.account)) or 0)
+    monkeypatch.setattr(A, "kill_tree", lambda p: events.append("kill"))
+
+    def popen(command, **kw):
+        popen_calls.append(command)
+        events.append("popen")
+        return _FakeServer()
+
+    code = A.serve(_serve_args(tmp_path), tie=lambda: events.append("tie") or "children are tied", listening=lambda port: False,
+                   healthy=lambda port: True, popen=popen)
+    assert code == 0
+    assert events == ["tie", "popen", ("prepare", "http://127.0.0.1:11436/v1", "m-1"), ("cycle", "fake"), "kill"]
+    assert "--load-mode" not in popen_calls[0] and popen_calls[0][popen_calls[0].index("--port") + 1] == "11436"
+
+
+def test_serve_refuses_a_listening_port_and_kills_server_when_cycle_raises(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit, match="already listening"):
+        A.serve(_serve_args(tmp_path), tie=lambda: "children are tied", listening=lambda port: True,
+                popen=lambda *a, **k: pytest.fail("must not start"))
+    killed = []
+    monkeypatch.setattr(A, "prepare", lambda a: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(A, "kill_tree", lambda p: killed.append(p))
+    with pytest.raises(RuntimeError):
+        A.serve(_serve_args(tmp_path), tie=lambda: "children are tied", listening=lambda port: False, healthy=lambda port: True,
+                popen=lambda *a, **k: _FakeServer())
+    assert len(killed) == 1
+
+
+def test_serve_stops_when_the_job_cannot_be_made(tmp_path):
+    if os.name != "nt":
+        pytest.skip("kill-on-close job is Windows")
+    with pytest.raises(SystemExit, match="NOT tied"):
+        A.serve(_serve_args(tmp_path), tie=lambda: "children are NOT tied to the supervisor", listening=lambda p: False)
