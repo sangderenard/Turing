@@ -83,6 +83,22 @@ def test_hosted_and_app_agents_have_truthful_unscheduled_badges(tmp_path):
         assert by_name[name]["channels"]["api_out"]["state"] == "unknown"
 
 
+def test_inaccessible_scheduler_directory_keeps_presence_available(tmp_path, monkeypatch):
+    running = tmp_path / "running"
+    original_is_dir = Path.is_dir
+
+    def is_dir(path):
+        if path == running:
+            raise PermissionError("scheduler directory is not readable")
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    result = presence.snapshot(tmp_path / "missing.db", tmp_path, now=100)
+    codex = next(agent for agent in result["agents"] if agent["username"] == "codex")
+    assert codex["runs"] == []
+    assert codex["channels"]["local"]["state"] == "unknown"
+
+
 def test_inbound_is_recent_only(monkeypatch):
     with presence._lock:
         presence._recent.clear()
