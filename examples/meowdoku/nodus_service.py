@@ -1,7 +1,7 @@
 """Web view and authorized actions for a running Nodus canvas host.
 
 The host (nodus/tools/run_canvas.py, run by deploy/apache_supervisor.py as an instance of kind "nodus") keeps a READ-ONLY console on
-loopback: ``HELLO nodus-console/1 <token>`` -> ``OK console <name> read-only``; then the verbs DIGEST, GRAPH, TOOLS and ACTIVITY, each answered
+loopback: ``HELLO nodus-console/1 <token>`` -> ``OK console <name> read-only``; then the verbs DIGEST, GRAPH, TOOLS, ACTIVITY and META, each answered
 ``JSON <verb> <n>`` + n bytes of UTF-8 JSON.  A host that predates a verb answers ``REFUSED read-only``: that is NotSupported (HTTP 501).
 
 Where the console is found: the supervisor's own records.  ``service_instances`` (accounts.db) gives state and ``console_port``; the per-run
@@ -33,7 +33,7 @@ HOST = "127.0.0.1"
 TIMEOUT = 3.0
 MAX_REPLY = 32 * 1024 * 1024
 NOTE_MAX = 500
-VERBS = ("DIGEST", "GRAPH", "TOOLS", "ACTIVITY")
+VERBS = ("DIGEST", "GRAPH", "TOOLS", "ACTIVITY", "META")
 
 
 class NodusError(Exception):
@@ -315,6 +315,27 @@ def activity(db, paths, name=None, *, cache=CACHE, timeout=TIMEOUT) -> dict:
     where = locate(db, paths, name)
     inst, payload = cache.get(("activity", where["name"]), 1.0, lambda: _fetch(db, paths, where["name"], "ACTIVITY", timeout))
     return _result(inst, payload)
+
+
+_JS_SAFE = (1 << 53) - 1
+
+
+def _wide_ids_as_strings(value):
+    """JSON numbers above 2^53 lose digits in a browser: those integers (uint64 ropes and sequences) travel as decimal strings, as does every rope_id."""
+    if isinstance(value, dict):
+        return {k: str(v) if k == "rope_id" and isinstance(v, int) else _wide_ids_as_strings(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_wide_ids_as_strings(v) for v in value]
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > _JS_SAFE:
+        return str(value)
+    return value
+
+
+def meta(db, paths, name=None, *, cache=CACHE, timeout=TIMEOUT) -> dict:
+    """META: every meta group with its members' latest records by name, and every registered link's report. Changes every tick, so 1 s per instance like activity."""
+    where = locate(db, paths, name)
+    inst, payload = cache.get(("meta", where["name"]), 1.0, lambda: _fetch(db, paths, where["name"], "META", timeout))
+    return _result(inst, _wide_ids_as_strings(payload))
 
 
 def ui_action(db, paths, name, body: dict, *, cache=CACHE, timeout=TIMEOUT) -> dict:

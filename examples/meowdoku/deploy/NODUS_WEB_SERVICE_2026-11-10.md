@@ -19,6 +19,7 @@ else. An instance is "console available" when it is `running`, has a `console_po
 | `GET /api/nodus/graph?instance=` | GRAPH JSON + `"instance"` |
 | `GET /api/nodus/tools?instance=` | TOOLS JSON + `"instance"` (`complete:false` / `missing` passed through) |
 | `GET /api/nodus/activity?instance=` | ACTIVITY JSON + `"instance"` |
+| `GET /api/nodus/meta?instance=` | META JSON + `"instance"`: `{tick, groups:[{id, channel_group, members:[record by field name]}], links:[{id, state, counters}]}`; integers above 2^53 and every `rope_id` are decimal strings |
 | `GET /api/nodus/abstract?instance=` | `{"instance","revision","nodes":[...]}`: the generic identity graph |
 | `POST /api/nodus/share` `{instance,to,note}` | needs `dev_ui` AND `message`; one note message to a mutual contact |
 
@@ -26,7 +27,7 @@ else. An instance is "console available" when it is `running`, has a `console_po
 501 the host predates the verb ("not supported by this host"), 503 console not available or unreachable, 502 malformed console reply.
 Each request opens, uses and closes one console connection (3 s timeout; a graph/tools request after an expired digest uses two).
 
-Cache (per process): digest and activity 1 s per instance; graph and tools 5 s keyed by (instance, revision from the digest).
+Cache (per process): digest, activity and meta 1 s per instance; graph and tools 5 s keyed by (instance, revision from the digest).
 
 ## Share
 Sends exactly one message through `messaging.send` (mutual contacts only, its limits and refusals apply): type `note`, subject

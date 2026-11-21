@@ -2856,7 +2856,7 @@ def make_handler(sessions: Sessions):
             return self._json({"ok": True})
         # ---- end [WORLDMAP]
 
-        # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
+        # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,meta,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
         # web/nodus.html).  Read access needs dev_ui or the admin-granted nodus group; UI actions need nodus_edit.
         def _nodus_db(self):
             import sqlite3
@@ -2872,7 +2872,7 @@ def make_handler(sessions: Sessions):
             if any(len(values) != 1 for values in parsed_query.values()):
                 return self._json({"error": "repeated query parameter"}, HTTPStatus.BAD_REQUEST)
             query = {k: v[0] for k, v in parsed_query.items()}
-            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract", "map", "picture", "frame"):
+            if name not in ("instances", "digest", "graph", "tools", "activity", "meta", "abstract", "map", "picture", "frame"):
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             try:
                 db = self._nodus_db()
