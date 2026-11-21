@@ -1,12 +1,16 @@
 // The site console: a text adventure over the site's own walking verbs, for dev_ui accounts.  HAND-AUTHORED.
 // Places come from maps the server already has; walking is the Living Data cursor (/api/living-data/sessions: one per account,
-// dev_ui).  Two maps:
+// dev_ui).  Three maps:
 //   pictures   your photo jobs (GET /api/marble_photo/jobs), one place each; "develop" re-develops the one you stand on from its
 //              saved linear exposure through POST /api/marble_photo/retouch, "show" puts the picture on screen.
 //   repo       a stored repository world map (GET /api/worldmap/index, /api/worldmap/map; files are rooms, folders hold them,
 //              imports are passages).  A whole repository can exceed the cursor's 4096 places, so the console hands the cursor the
 //              neighbourhood of where you stand (the folder, its parent chain and subfolders, and the files a file links with) and
 //              re-centres it after every step.  "examine" reads a file through the core's Git (/api/git/file, core_git).
+//   orient     agent orientation: every markdown file of the core's repositories in one causal order (GET /api/orientation/map,
+//              orientation.py: markdown links depth-first from each AGENTS.md, history for the rest), a page at a time.  Filters
+//              and the reading position are the account's own, kept by the server (POST /api/orientation); the panel above
+//              the log and the filter / next / prev / first / last verbs change them.  Needs core_git.
 // The server enforces every capability; this page only stops a non-dev account early.  textContent only, no innerHTML.
 const byId = id => document.getElementById(id);
 const out = byId("out");
@@ -25,7 +29,7 @@ const DEVELOP = {   // the retouch endpoint's own settings and ranges (marble_ph
 
 let who = null, caps = new Set();
 let cursor = null;          // the last cursor receipt
-let place = null;           // {map: "pictures"|"repo", ...}
+let place = null;           // {map: "pictures"|"repo"|"orientation", ...}
 let developed = {};         // settings kept per picture between develop commands
 
 function print(text, cls = "say") {
@@ -239,10 +243,73 @@ async function examineFile() {
   if (lines.length > 80) print(`… ${lines.length - 80} more lines.`, "note");
 }
 
+// ---- agent orientation -----------------------------------------------------------------------------------------------------------
+const ORIENT_KEYS = ["repository", "prefix", "kind", "keyword"];
+function showOrientation(state) {   // the panel's own controls follow the server's record
+  if (!state) return;
+  for (const [id, values] of [["orient-repository", state.repositories], ["orient-kind", state.kinds]]) {
+    const select = byId(id);
+    if (select.options.length <= 1) for (const value of values || []) select.append(new Option(value, value));
+  }
+  for (const key of ORIENT_KEYS) byId("orient-" + key).value = (state.filters || {})[key] || "";
+  const doc = state.document;
+  byId("orient-status").textContent = state.position
+    ? `${state.position} of ${state.matching} matching (${state.total} in all) · ${doc.repository}/${doc.path} · ${doc.kind}`
+    : `${state.matching} of ${state.total} documents match; no position yet.`;
+}
+async function enterOrientation(offset) {
+  const found = await call("/api/orientation/map" + (offset === undefined ? "" : "?offset=" + offset));
+  const names = new Map([[found.map.identity, found.map.name]]);
+  for (const region of found.map.regions) names.set(region.identity, region.name);
+  place = { map: "orientation", names, offset: found.offset, next_offset: found.next_offset, previous_offset: found.previous_offset,
+            objects: new Map(found.map.world.objects.map(o => [o.identity, o])) };
+  await stand(found.map, found.at);
+  print(found.say + (found.truncated.length ? ` Git output was cut short for ${found.truncated.join(", ")}.` : ""), "note");
+  showOrientation(await call("/api/orientation"));
+  describe();
+}
+async function orientStep(step) {
+  if (!place || place.map !== "orientation") await enterOrientation();
+  const before = (cursor.at || {}).identity;
+  const state = await call("/api/orientation", { step });
+  showOrientation(state);
+  const exit = cursor.exits.find(e => e.to === state.at);
+  if (state.at === before) print(`You are already at the ${step === "previous" || step === "first" ? "start" : "end"} of the order.`, "note");
+  else if (exit && place.objects.has(state.at)) {
+    cursor = await call(`/api/living-data/sessions/${cursor.session_id}/move`,
+      { to: exit.to, relationship: exit.relationship, direction: exit.direction, expected_revision: cursor.revision, request_id: rid() });
+    describe();
+  } else await enterOrientation();   // another page, or no edge between the two
+}
+async function orientFilter(words) {
+  const body = words[0] === "clear" ? { clear: true } : { filters: {} };
+  if (!body.clear) {
+    for (const word of words) {
+      const [key, ...rest] = word.split("=");
+      if (!ORIENT_KEYS.includes(key)) throw new Error(`filters are ${ORIENT_KEYS.join(", ")}: filter key=value …, or filter clear`);
+      body.filters[key] = rest.join("=");
+    }
+  }
+  showOrientation(await call("/api/orientation", body));
+  await enterOrientation();
+}
+async function examineDocument() {
+  const doc = place.objects.get(cursor.at.identity);
+  if (!doc) { print(`${label(cursor.at.identity)} is not a document; go to one (next, or an exit).`, "note"); return; }
+  const result = await call("/api/git/file", { repository: doc.repository, ref: doc.ref, path: doc.path });
+  const lines = result.output.split("\n");
+  print(`${doc.position}. ${doc.repository}/${doc.path} (${doc.kind}, ${doc.ref.slice(0, 12)})`, "note");
+  print(lines.slice(0, 200).join("\n"), "say");
+  if (lines.length > 200) print(`… ${lines.length - 200} more lines.`, "note");
+}
+
 // ---- verbs -----------------------------------------------------------------------------------------------------------------------
 const HELP = [
   "pictures [digest-prefix]   stand among your photo jobs, or on one",
   "repo [name] [path]         stand on a file or folder of a repository's world map (default: this page in Turing)",
+  "orient [page-offset]       agent orientation: every markdown file in causal order, at your saved position",
+  "filter key=value … | clear  orientation filters: repository, prefix, kind, keyword (kept on your account)",
+  "next / prev / first / last  step through the orientation order (examine reads the document)",
   "where / look               where you stand and its exits",
   "go <n | name>              take an exit",
   "examine                    read the file, or show the picture, you stand on",
@@ -260,6 +327,10 @@ async function run(text) {
       case "help": HELP.forEach(h => print(h, "note")); break;
       case "pictures": await enterPictures(words[0]); break;
       case "repo": await enterRepo(words); break;
+      case "orient": await enterOrientation(words[0] === undefined ? undefined : Number(words[0])); break;
+      case "filter": await orientFilter(words); break;
+      case "next": case "prev": case "previous": case "first": case "last":
+        await orientStep(verb.toLowerCase() === "prev" ? "previous" : verb.toLowerCase()); break;
       case "where": case "look":
         if (!cursor) throw new Error("you are nowhere yet: pictures, or repo");
         cursor = await call(`/api/living-data/sessions/${cursor.session_id}`); describe(); break;
@@ -269,12 +340,16 @@ async function run(text) {
         if (!exit) throw new Error("no such exit; look lists them");
         cursor = await call(`/api/living-data/sessions/${cursor.session_id}/move`,
           { to: exit.to, relationship: exit.relationship, direction: exit.direction, expected_revision: cursor.revision, request_id: rid() });
-        if (place.map === "repo") await standInRepo(place.world, exit.to); else describe();
+        if (place.map === "repo") await standInRepo(place.world, exit.to);
+        else if (place.map === "orientation" && place.objects.has(exit.to)) { showOrientation(await call("/api/orientation", { at: exit.to })); describe(); }
+        else describe();
         break;
       }
       case "examine":
         if (!cursor) throw new Error("you are nowhere yet: pictures, or repo");
-        if (place.map === "repo") await examineFile(); else await showPicture(digestHere());
+        if (place.map === "repo") await examineFile();
+        else if (place.map === "orientation") await examineDocument();
+        else await showPicture(digestHere());
         break;
       case "show": await showPicture(digestHere()); break;
       case "develop": await develop(words); break;
@@ -294,6 +369,16 @@ async function main() {
   if (!who.signed_in) { print("Sign in first (/login.html).", "err"); return; }
   if (!caps.has("dev_ui")) { print("The console is for developer accounts (dev_ui).", "err"); return; }
   byId("form").hidden = false;
+  if (caps.has("core_git")) {   // the orientation panel: its controls only type the console's own verbs
+    byId("orient").hidden = false;
+    const typed = text => run(text).then(() => byId("line").focus());
+    byId("orient-apply").addEventListener("click", () => typed("filter " + ORIENT_KEYS.map(k => [k, byId("orient-" + k).value.trim()])
+      .filter(([, v]) => v).map(([k, v]) => `${k}=${v.replace(/\s+/g, "")}`).join(" ")));
+    byId("orient-clear").addEventListener("click", () => typed("filter clear"));
+    for (const step of ["first", "prev", "next", "last"]) byId("orient-" + step).addEventListener("click", () => typed(step));
+    byId("orient-examine").addEventListener("click", () => typed("examine"));
+    byId("orient").addEventListener("toggle", () => { if (byId("orient").open && (!place || place.map !== "orientation")) typed("orient"); });
+  }
   print(`Signed in as ${who.username}. Type help.`, "note");
   const history = [];
   let back = 0;

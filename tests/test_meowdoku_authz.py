@@ -23,7 +23,7 @@ USERS_DDL = """
                 created_at REAL NOT NULL
             );
 """
-ALL = set(authz.CAPS) - {"compile_unstable"}
+ALL = set(authz.CAPS) - {"compile_unstable", "nodus_edit", "agent_execute"}
 
 
 @pytest.fixture
@@ -49,7 +49,7 @@ def test_guest_dns():
 
 
 def test_member_dns():
-    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "photo_read", "studio_write", "photo_submit", "share_live", "compile_submit", "message"}
+    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "photo_read", "studio_write", "photo_submit", "share_live", "compile_submit", "message", "agent_scratch"}
 
 
 def test_admin_dns_no_lifecycle():
@@ -62,7 +62,16 @@ def test_admin_lan_everything():
 
 def test_member_lan_edit_has_no_admin_caps():
     caps = authz.capabilities(P("member", "lan", "edit"), authz.DEFAULT_POLICY)
-    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git"}
+    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git", "paper_train", "operator_workspace",
+                    "private_read"}
+
+
+def test_higher_permission_group_inherits_lower_capabilities():
+    dev = authz.capabilities(P("dev"), authz.DEFAULT_POLICY)
+    operator = authz.capabilities(P("operator"), authz.DEFAULT_POLICY)
+    admin = authz.capabilities(P("admin"), authz.DEFAULT_POLICY)
+    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) <= dev <= operator <= admin
+    assert "dev_ui" in operator
 
 
 def test_policy_override_after_mtime_bump(tmp_path):
@@ -102,6 +111,83 @@ def test_principal_from(db):
     assert (pr.role, pr.username) == ("admin", "alice")
 
 
+def test_permission_group_rank_and_cumulative_membership(db):
+    assert authz.role_of(db, 2) == "member"
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        dev = groups.set_grant(conn, 1, 2, "dev", True)
+        assert dev["highest"] == "dev"
+        assert dev["groups"] == ["member", "dev"]
+        operator = groups.set_grant(conn, 1, 2, "operator", True)
+        assert operator["highest"] == "operator"
+        assert operator["groups"] == ["member", "dev", "operator"]
+        assert conn.execute("SELECT COUNT(*) FROM account_permission_audit WHERE actor_id=1 AND user_id=2").fetchone()[0] == 2
+    assert authz.role_of(db, 2) == "operator"
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "operator", False)
+    assert authz.role_of(db, 2) == "dev"
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "dev", False)
+    assert authz.role_of(db, 2) == "member"
+
+
+def test_permission_groups_require_admin_and_ignore_flat_sharing_groups(db):
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        conn.execute("CREATE TABLE account_content_groups (id TEXT, owner_id INTEGER, name TEXT)")
+        conn.execute("INSERT INTO account_content_groups VALUES ('place', 2, 'admin')")
+        assert groups.authority(conn, 2)["highest"] == "member"
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 1, "dev", True)
+        with pytest.raises(ValueError):
+            groups.set_grant(conn, 2, 1, "admin", True)
+
+
+def test_service_is_separate_from_human_rank(db):
+    authz.grant_role(db, "bob", "service", "supervisor")
+    with authz._connect(db) as conn:
+        effective = authz._permission_groups.authority(conn, 2)
+    assert effective["service"] is True
+    assert effective["highest"] == "member"
+    assert authz.role_of(db, 2) == "service"
+
+
+def test_paper_credential_boundary_uses_rank_and_service_status(db):
+    groups = authz._permission_groups
+    with authz._connect(db) as conn:
+        assert groups.paper_credential_owner(conn, 2, None) == 2
+        with pytest.raises(PermissionError):
+            groups.paper_credential_owner(conn, None, 1)
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "dev", True)
+        assert groups.paper_credential_owner(conn, 2, 1) == 2
+        assert groups.paper_credential_owner(conn, 1, 1) == 1
+    authz.grant_role(db, "bob", "service", "supervisor")
+    with authz._connect(db) as conn:
+        assert groups.paper_credential_owner(conn, 2, 1) == 1
+        with pytest.raises(RuntimeError):
+            groups.paper_credential_owner(conn, 2, None)
+
+
+def test_nodus_grant_is_admin_controlled_and_independent_of_rank(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    with authz._connect(db) as conn:
+        groups = authz._permission_groups
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 2, "nodus", True)
+        granted = groups.set_grant(conn, 1, 2, "nodus", True)
+        assert granted["highest"] == "member"
+        assert granted["groups"] == ["member", "nodus"]
+    member = authz.principal_from({"id": 2, "username": "bob"}, "dns", "shader", db)
+    assert "nodus_edit" in authz.capabilities(member, authz.DEFAULT_POLICY)
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "nodus", False)
+    member = authz.principal_from({"id": 2, "username": "bob"}, "dns", "shader", db)
+    assert "nodus_edit" not in authz.capabilities(member, authz.DEFAULT_POLICY)
+
+
 def test_require_raises_403_with_cap():
     with pytest.raises(authz.AuthzError) as e:
         authz.require(P("guest"), "studio_write")
@@ -113,3 +199,87 @@ def test_cli_caps_sorted():
     out = subprocess.run([sys.executable, str(AUTHZ), "caps", "--role", "admin", "--tier", "dns"],
                          capture_output=True, text=True, check=True).stdout.split()
     assert out == sorted(ALL - {"lifecycle_admin"})
+
+
+def test_intern_is_a_kiosk_whatever_the_tier():
+    for origin, tier in (("dns", "shader"), ("dns", "play"), ("ip", "dev"), ("lan", "edit")):
+        principal = P("intern", origin, tier)
+        assert authz.kiosk(principal)
+        assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
+    assert not any(authz.kiosk(P(role)) for role in ("guest", "member", "dev", "operator", "service", "admin"))
+
+
+def test_intern_is_off_the_human_ladder_and_takes_no_group(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    authz.grant_role(db, "bob", "intern", "alice")
+    groups = authz._permission_groups
+    with authz._connect(db) as conn:
+        assert groups.authority(conn, 2) == {"highest": "intern", "direct": ["intern"], "groups": ["intern"], "service": False, "modifiers": {}}
+        for group in ("dev", "operator", "nodus"):
+            with pytest.raises(PermissionError):
+                groups.set_grant(conn, 1, 2, group, True)
+    assert authz.role_of(db, 2) == "intern"
+    principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
+    assert principal.role == "intern" and principal.groups == frozenset({"intern"})
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
+
+
+def test_execution_is_a_separate_server_agent_group_and_llama_is_excluded(db):
+    from meowdoku import agent_execution
+    with authz._connect(db) as conn:
+        conn.execute("INSERT INTO users(username,password_hash,display_name,created_at) VALUES('claude','x','claude',0)")
+        conn.execute("INSERT INTO users(username,password_hash,display_name,created_at) VALUES('llama','x','llama',0)")
+        conn.commit()
+    claude = authz.principal_from({"id": 3, "username": "claude"}, "lan", "edit", db)
+    llama = authz.principal_from({"id": 4, "username": "llama"}, "lan", "edit", db)
+    assert "execution" in claude.groups and "agent_execute" in authz.capabilities(claude, authz.DEFAULT_POLICY)
+    assert "execution" not in llama.groups and "agent_execute" not in authz.capabilities(llama, authz.DEFAULT_POLICY)
+    assert agent_execution.allowed(db, "claude") and not agent_execution.allowed(db, "llama")
+    direct = subprocess.run([sys.executable, str(AUTHZ), "show", "--db", str(db), "claude"],
+                            capture_output=True, text=True)
+    assert direct.returncode == 0, direct.stderr
+    authz.grant_admin(db, "alice", "operator:test")
+    with authz._connect(db) as conn:
+        with pytest.raises(PermissionError):
+            authz._permission_groups.set_grant(conn, 1, 4, "execution", True)
+        removed = authz._permission_groups.set_grant(conn, 1, 3, "execution", False)
+        conn.commit()
+    assert "execution" not in removed["groups"]
+    assert "agent_execute" not in authz.capabilities(authz.principal_from({"id": 3, "username": "claude"}, "lan", "edit", db), authz.DEFAULT_POLICY)
+    assert not agent_execution.allowed(db, "claude")
+
+
+def test_only_an_admin_can_grant_message_to_one_intern(db):
+    authz.grant_admin(db, "alice", "operator:abcd")
+    authz.grant_role(db, "bob", "intern", "alice")
+    groups = authz._permission_groups
+    with authz._connect(db) as conn:
+        with pytest.raises(PermissionError):
+            groups.set_grant(conn, 2, 2, "message", True)
+        with pytest.raises(ValueError):
+            groups.set_grant(conn, 1, 2, "account_manage", True)
+        granted = groups.set_grant(conn, 1, 2, "message", True)
+        assert granted["modifiers"] == {"message": True}
+        assert conn.execute("SELECT count(*) FROM account_capability_modifier_audit").fetchone()[0] == 1
+    principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "message", "agent_scratch"}
+    with authz._connect(db) as conn:
+        groups.set_grant(conn, 1, 2, "message", False)
+        assert conn.execute("SELECT count(*) FROM account_capability_modifier_audit").fetchone()[0] == 2
+    principal = authz.principal_from({"id": 2, "username": "bob"}, "lan", "edit", db)
+    assert authz.capabilities(principal, authz.DEFAULT_POLICY) == {"view_site", "photo_read", "agent_scratch"}
+
+
+def test_an_older_account_roles_table_is_rebuilt_to_admit_intern(tmp_path):
+    path = tmp_path / "accounts.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(USERS_DDL)
+    conn.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL "
+                 "CHECK(role IN ('admin','member','service','operator')), granted_by TEXT NOT NULL, created_at REAL NOT NULL)")
+    conn.execute("INSERT INTO users (username, password_hash, display_name, created_at) VALUES ('alice','x','alice',0)")
+    conn.execute("INSERT INTO users (username, password_hash, display_name, created_at) VALUES ('bob','x','bob',0)")
+    conn.execute("INSERT INTO account_roles VALUES (1, 'operator', 'operator:abcd', 0)")
+    conn.commit()
+    conn.close()
+    authz.grant_role(path, "bob", "intern", "operator:abcd")
+    assert (authz.role_of(path, 1), authz.role_of(path, 2)) == ("operator", "intern")

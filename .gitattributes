@@ -11,3 +11,6 @@ tools/gate/*.txt text eol=lf
 # into CRLF, changed every content hash, and failed tests/test_dream_cpp_pipeline.py
 # with "Illegal character '\r'".  Dream sources are LF on disk.
 *.dream text eol=lf
+
+# Keep the pinned browser HLS module byte-for-byte identical to its npm package.
+examples/meowdoku/web/radio-hls.min.js text eol=lf

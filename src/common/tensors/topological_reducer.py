@@ -12901,8 +12901,8 @@ def _normalize_lexical_values(
                         ),
                     )
                 if refined_annotation == "str":
-                    # A declared string field is a runtime string-token value,
-                    # even though its physical column is int64.  Publish the
+                    # A declared string field retains its semantic class;
+                    # its physical glyph carrier is a separate fact. Publish the
                     # semantic class from the field declaration at the read
                     # itself so method results and formatting follow the same
                     # exact receiver edge instead of rediscovering the type
@@ -12927,6 +12927,15 @@ def _normalize_lexical_values(
                     "int": "int64", "bool": "bool", "float": "float64",
                 }.get(refined_annotation)
                 if (
+                    field_storage.get("storage") == "span"
+                    and int(field_storage.get("rank", 0)) > 0
+                ):
+                    graph.G.nodes[attribute_id]["tensor"] = {
+                        "shape": (), "dtype": str(field_storage["dtype"]),
+                        "rank": int(field_storage["rank"]),
+                        "metadata_state": "dynamic",
+                    }
+                elif (
                     field_storage.get("dtype") is not None
                     and field_storage.get("record") is None
                     and field_storage.get("aggregate_kind") is None
@@ -18730,6 +18739,19 @@ def _normalize_lexical_values(
 
             body_terminal = terminal_branch(body_statement.body)
             else_terminal = terminal_branch(body_statement.orelse)
+            # Program: ``if True: c = ...`` then ``total += c`` (scratch
+            # iftrue/c1; exception ingestion's guards that are true by
+            # construction are spelled this way).  Wrong record: the merge
+            # joined the body's ``c`` with the empty else arm, which no
+            # execution takes, so ``c`` after the If had no producer ("region
+            # value ... Add has no settled dtype", also before 2716cd06).  Rule:
+            # the arm a literal-constant test never takes does not reach the
+            # statement after the If -- it is terminal, as a raising arm is.
+            if isinstance(body_statement.test, ast.Constant):
+                if bool(body_statement.test.value):
+                    else_terminal = True
+                else:
+                    body_terminal = True
 
             # A guard clause -- `if cond: body else: raise` or its mirror --
             # has only one arm that can ever reach the statement after the
@@ -23604,11 +23626,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             else annotation.attr if isinstance(annotation, ast.Attribute)
             else ""
         )
+        if name == "str":
+            # Authored strings are glyph spans. Vocabulary-token carriers
+            # have their own scalar declaration and are not inferred here.
+            return {"dtype": "int64", "aggregate_kind": "str",
+                    "storage": "span", "rank": 1}
         dtype = {
             "bool": "bool", "int": "int64", "float": "float64",
-            # Source strings are repository string-table tokens at this
-            # boundary, not Python objects.
-            "str": "int64",
         }.get(str(name))
         if dtype is not None:
             return {"dtype": dtype}

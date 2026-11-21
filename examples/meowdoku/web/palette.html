@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Color preference game · SpeakToMe</title>
+<style>
+  :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; --palette-accent: #9fc8ff; --palette-secondary: #d0a8ef; }
+  body { margin: 0; color: #edf2fb; background: radial-gradient(circle at 90% 5%, color-mix(in srgb, var(--palette-accent) 28%, #101722), #101722 32rem); }
+  main { max-width: 48rem; margin: auto; padding: 2rem 1rem 5rem; }
+  a, .accent { color: var(--palette-accent); }
+  h1 { line-height: 1.12; }
+  .panel { border: 1px solid color-mix(in srgb, var(--palette-accent) 45%, #384d67); border-radius: 1rem; padding: 1.2rem; margin: 1.4rem 0; background: #1b2839; }
+  .swatch { display: flex; align-items: center; gap: .7rem; padding: .35rem 0; }
+  .sample { width: 2rem; height: 2rem; border-radius: .4rem; border: 1px solid #fff8; flex: none; }
+  .swatch span:nth-child(2) { flex: 1; }
+  button { font: inherit; border-radius: .5rem; border: 1px solid #6984a5; padding: .42rem .7rem; color: #edf2fb; background: #263953; cursor: pointer; }
+  button:hover, button:focus-visible { border-color: var(--palette-accent); outline-color: var(--palette-accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .preview { border-left: .5rem solid var(--palette-accent); background: color-mix(in srgb, var(--palette-secondary) 10%, #1b2839); }
+  .muted { color: #c2cddd; }
+  #notice { min-height: 1.5rem; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="/">← Site home</a></p>
+  <h1>Play the color preference game</h1>
+  <p>People and agents can order the same swatches. SpeakToMe tries a palette on your own site view, then learns from your good or bad response. Your choice does not change anyone else's view.</p>
+  <section class="panel" aria-labelledby="rank-title">
+    <h2 id="rank-title">Put the colors in your preferred order</h2>
+    <p class="muted">Use the up and down buttons, then apply your order.</p>
+    <div id="swatches"></div>
+    <button id="rank" type="button">Apply my order</button>
+  </section>
+  <section class="panel preview" aria-labelledby="preview-title">
+    <h2 id="preview-title">Your site design</h2>
+    <p id="candidate" class="accent">Rank the colors to begin.</p>
+    <p>This card and the site home page use your current color. Visit <a href="/">the home page</a> and return to rate it.</p>
+    <button id="good" type="button" disabled>Good</button>
+    <button id="bad" type="button" disabled>Bad</button>
+  </section>
+  <p id="notice" role="status"></p>
+</main>
+<script type="module" src="/palette.js"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body>
+</html>

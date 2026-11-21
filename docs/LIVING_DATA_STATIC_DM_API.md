@@ -3,7 +3,7 @@
 Implemented locally, not deployed. This slice exposes the registered Living
 Data map as analytic data and requests images from its existing Pluck Phong
 renderer. It does not start a game engine or simulation. The current commands
-are `inspect` and `render-phong`, not arbitrary DM edits or tensor writes.
+are `inspect`, `render-phong` and `export-scene`, not arbitrary DM edits or tensor writes.
 
 ## Authentication and ownership
 
@@ -142,3 +142,104 @@ Python/JavaScript syntax checks and independent service security review passed.
 Real browser REST receipt and returned PNGs are in
 build/dot-storybook-static-phong-20261110. Full repository tests and deployment were
 not performed.
+
+## Opt-in Studio autofocus on a DM Phong photo (2026-11-13)
+
+`POST /api/living-data/dm/worlds/{world_id}/commands` accepts:
+
+```json
+{"request_id":"photo-focus-1","operation":"render-phong",
+ "position":[25.62085954642648,1.08,0.5],"facing":[0,0,1],
+ "width":320,"height":240,
+ "optics":{"autofocus":true,"f_stop":2,"sensor_height_m":0.024,"focus_distance_m":3}}
+```
+
+Positions above are a test viewpoint, not a universal map location. Use the registered
+map's actual coordinates. The existing owner-scoped host poll/complete protocol is
+unchanged. The host returns resolved `actual_camera.optics`; the server refuses a
+missing receipt, changed aperture/sensor, invalid range, or absent autofocus evidence.
+Omitting `optics` preserves the old unmodified Phong render path.
+
+The adapter uses the exact uploaded native triangle stream and palette material
+rows, StudioRangefinder's existing compiled triangle intersection law, Studio's
+nine Gaussian-weighted rays, its maximum sampled one-pixel depth coverage candidates,
+and its contrast score on completed native Phong images. It applies the existing
+Studio DOF shader after the original native map renderer. It does not rebuild a
+renderer or replace the map with proxy boxes. The optical pass starts after native
+shadow prepasses. Fixed native vertical FOV is 2*atan(.70), with 0.04..128m clipping.
+The present search evaluates coverage candidates, not the Studio UI's two subsequent
+refinement rounds. It fails explicitly on no hits/no contrast, changed scene, GPU
+errors, or a 30-second rendering budget rather than returning a fake focused photo.
+
+Required hosted modules are `living_data_focus.js` and its existing Studio imports.
+The original compiled rangefinder assets must be served under `client-ray-plain/`.
+Static products must be regenerated to acquire the two reversible draw hooks.
+No live deployment or product publication is performed by this change.
+
+Limits: screen-space thin-lens DOF uses opaque depth. It is not thick-lens optics,
+refracted internal focus, Studio scene composition, or a ray-trace photograph.
+The separate `/api/show/pictures` settings/ray-job path is not wired to map geometry
+by this patch. A browser host still serves this static DM route; this is not a
+browserless renderer or an unverified new MCP verb.
+
+Verification: 13 focused Python tests passed. A temporary loopback instance of the
+actual account-authenticated service completed two real DM photos in Chrome from
+LanternCottage and ClockworkTower, with original Pluck Phong selected, six measured
+rays each, sampled coverage 1, and resolved focus 0.590163934m from requested 3m.
+Contrasts were 282.9266 and 298.8209; PNG hashes differed. The test also verified
+native authored story metadata, no physics workers, and latched source-mutation
+refusal. These dark, block-shaped native-map views are diagnostic images, not a
+Studio beauty scene. The existing headless Chrome launch failed in Crashpad before
+rendering; the supported connected-browser run above supplied actual evidence.
+
+Reproduction: stage with `tools.stage_storybook_static_map.stage_storybook`, then
+`tests.living_data_static_rest_browser_check.run(stage, autofocus=True,
+compute_assets=verified_existing_studio_compute_directory, external_browser=True)`.
+Open only the printed loopback test URL within 180 seconds. Fixture state is temporary;
+no production account, service, or render queue is touched. Preserve the sibling
+spectral-analyzer checkout layout: missing native Pluck source is correctly refused,
+not silently replaced by a fallback shader.
+
+
+## Exact general-scene admission (2026-11-13)
+
+After registering the actual host snapshot, the owner can call
+`await livingDataStaticHost.admitScene({world_id, host_token})`. This posts the
+existing `meshSnapshot()` to the same-origin authenticated host route with
+`action: "scene"`. It never submits an exposure or executes uploaded code.
+The existing account session and private host token are both required.
+
+The service validates the registered world/source/renderer identity, complete
+object registry, contiguous triangle ownership, semantic-part ranges, palette
+and material table layouts. The complete original interleaved vertex stream,
+normals, colors, all material tables, ownership and geometry metadata are
+retained unchanged, bound to `scene_sha256`. Admission is immutable for the
+attachment: changing the scene requires closing and registering again.
+Maximum scene JSON is 3 MiB within the existing 4 MiB host request limit; larger
+scenes fail explicitly, never truncate. Close/expiry discards it. This is still
+a host declaration, not independent server attestation or persistent storage.
+
+Retrieve it using the existing commands endpoint:
+
+```json
+{"request_id":"scene-1","operation":"export-scene"}
+```
+
+The completed result includes `snapshot`, `scene_sha256`, `ray_available:false`
+and explicit `ray_unavailable_reasons`. Export before admission returns 409.
+No fake marble, shell material replacement, guessed physical emitters, or
+placeholder image is used. The native shader's palette-nearest material
+selection remains represented by the raw colors and tables, not recoded as
+claimed original material IDs. The existing Phong path remains available.
+
+Ray photographs still require a real physical light-source contract (native
+celestial shader lighting is not one), certified volume/boundary ownership,
+and a general-world admission to PhotoJobs rather than its saved-subject-only
+contract. Merely transporting this snapshot does not satisfy those requirements.
+
+Local production-code verification admitted the existing realized Storybook
+scene (33 objects, 7,164 vertices, 1,299,206 JSON bytes) through StaticWorlds and
+retrieved exactly equal source data. Scene digest:
+`da56eed18f9f391993b567556bf791a3c467f501e8629ee47cadab2b30ab57e7`.
+Python/JavaScript syntax and diff checks passed. No live HTTP deployment,
+ray exposure, service restart or publication was performed for this change.

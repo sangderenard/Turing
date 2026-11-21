@@ -379,6 +379,29 @@ def local_append_publication(
         if child == int(effect.effect_node_id):
             continue
         data = graph.G.nodes.get(child, {})
+        # Program: ``coordinates = []; for extent in shape:
+        # coordinates.append(...)`` then ``tuple(coordinates)`` (the composite
+        # ``AbstractTensor.nonzero``; scratch nzc/c06).  Wrong record: a
+        # whole-list consumer counted as an escape, so the static loop was
+        # retained and the tuple of its tensors had no record.  Rule: a
+        # consumer that takes the list whole as ``arg:0`` -- declared
+        # ``builtins.tuple`` / ``builtins.list``, or the tensor op ``stack`` /
+        # ``cat`` / ``concat`` / ``concatenate`` -- reads every member in
+        # order, so after the unroll the list is the display of the iteration
+        # values.  It is carried as a read with literal ``None``.
+        consumer_roles = {
+            int(parent): str(role)
+            for parent, role in data.get("parents") or ()
+        }
+        consumer_attributes = data.get("attributes") or {}
+        if consumer_roles.get(list_id) == "arg:0" and (
+            consumer_attributes.get("extraction_identity")
+            in {"builtins.tuple", "builtins.list"}
+            or str(data.get("op") or "").casefold()
+            in {"stack", "cat", "concat", "concatenate"}
+        ):
+            reads.append((child, None))
+            continue
         if str(data.get("type") or "") != "Indexed":
             return None
         roles = {
@@ -2609,11 +2632,77 @@ def evaporate_unrolled_loops(
             # Member k of the display is iteration k's value: each literal
             # read of it is redirected to that value through the incumbent
             # operand writer, then the read and the display are retired.
+            whole = any(literal is None for _read_id, literal in reads)
             for read_id, literal in reads:
+                if literal is None:
+                    continue
                 _replace_parent_value(
                     graph, int(read_id), (int(values[literal]),),
                 )
                 retired_local_lists.add(int(read_id))
+            if whole:
+                # A whole-list consumer (``tuple(L)``, ``stack(L)``) reads the
+                # display itself: the list keeps its identity and its members
+                # are the iteration values, written through the incumbent
+                # operand writer, so the consumer reads an authored display.
+                from ..common.tensors.topological_reducer import _set_operands
+
+                _set_operands(
+                    graph, int(list_id),
+                    [(int(value), "elts") for value in values],
+                    cause=_LOOP_PARENT_REPLACEMENT,
+                )
+                list_attributes = graph.G.nodes[int(list_id)].setdefault(
+                    "attributes", {},
+                )
+                list_attributes["aggregate_leaf_value_ids"] = tuple(
+                    int(value) for value in values
+                )
+                # ``tuple(L)`` / ``list(L)`` materializes the same members in
+                # the same order: its member ledger is the display's.
+                for read_id, literal in reads:
+                    if literal is not None or int(read_id) not in graph.G:
+                        continue
+                    consumer = graph.G.nodes[int(read_id)].setdefault(
+                        "attributes", {},
+                    )
+                    if (
+                        consumer.get("extraction_identity")
+                        in {"builtins.tuple", "builtins.list"}
+                        and consumer.get("producer_kind")
+                        == "aggregate_materialization"
+                    ):
+                        # The materialization IS the display of the same
+                        # members, as an aggregate formal is made one
+                        # (glsl ``_publish_aggregate_formal_members``):
+                        # type Tuple, member ledger, operands through the
+                        # incumbent writer.
+                        kind = (
+                            "tuple"
+                            if consumer.get("extraction_identity")
+                            == "builtins.tuple" else "list"
+                        )
+                        consumer.update({
+                            "producer_kind": "aggregate",
+                            "aggregate_kind": kind,
+                            "aggregate_leaf_value_ids": tuple(
+                                int(value) for value in values
+                            ),
+                            "sequence_key_columns": (),
+                            "sequence_column_count": 1,
+                            "sequence_writable": kind == "list",
+                        })
+                        consumer.pop("materialized_source_value_ids", None)
+                        node = graph.G.nodes[int(read_id)]
+                        node["type"] = "Tuple" if kind == "tuple" else "List"
+                        node["op"] = None
+                        node["tensor"] = {}
+                        _set_operands(
+                            graph, int(read_id),
+                            [(int(value), "elts") for value in values],
+                            cause=_LOOP_PARENT_REPLACEMENT,
+                        )
+                continue
             retired_local_lists.add(int(list_id))
         if local_appends:
             # The pre-fold mutation snapshot still names the evaporated

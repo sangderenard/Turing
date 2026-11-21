@@ -131,7 +131,7 @@ $("import-reveal").addEventListener("click", () => {
 
 try {
   const who = await json("/api/whoami");
-  if (!who.signed_in) { $("identity").innerHTML = 'Please <a href="/login.html">sign in</a> to manage keys.'; }
+  if (!who.signed_in) { $("identity").innerHTML = 'Please <a href="/login.html?next=' + encodeURIComponent(location.pathname + location.search + location.hash) + '">sign in</a> to manage keys.'; }
   else {
     $("identity").textContent = "Signed in as " + who.username + ".";
     $("paper-box").hidden = false; $("general-box").hidden = false;

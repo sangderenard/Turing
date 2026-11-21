@@ -6,6 +6,7 @@ import http.client
 import json
 import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 from meowdoku import authz  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
 from meowdoku import worldmap as wm  # noqa: E402
+from meowdoku import agent_presence as presence  # noqa: E402
 
 PASSWORD = "correct horse 12"
 OUTSIDE = {"X-Forwarded-For": "203.0.113.9", "X-Forwarded-Proto": "https", "Host": "cats.example.org"}
@@ -82,10 +84,11 @@ def _cookie(server, name, role):
 
 
 def test_refused_without_dev_ui(server):
-    for path in ("/api/worldmap/index", "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT)):
-        assert _raw(server.port, path, headers=OUTSIDE)[0] == 403
+    for path in ("/api/worldmap/index", "/api/worldmap/presence", "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT)):
+        assert _raw(server.port, path, headers=OUTSIDE)[0] in (401, 403)
     h = _cookie(server, "member1", "member")
     assert _raw(server.port, "/api/worldmap/index", headers={**h, **OUTSIDE})[0] == 403
+    assert _raw(server.port, "/api/worldmap/presence", headers={**h, **OUTSIDE})[0] == 403
 
 
 def test_dev_gets_index_and_map(server):
@@ -96,6 +99,33 @@ def test_dev_gets_index_and_map(server):
     status, headers, body = _raw(server.port, "/api/worldmap/map?repo=%s&commit=%s" % (DIR, COMMIT), headers=h)
     assert status == 200 and headers["cache-control"] == "no-store" and "content-encoding" not in headers
     assert json.loads(body)["schema"] == "repo-world-map.v1"
+    status, headers, body = _raw(server.port, "/api/worldmap/presence", headers=h)
+    assert status == 200 and headers["cache-control"] == "no-store"
+    snapshot = json.loads(body)
+    assert {agent["username"] for agent in snapshot["agents"]} >= {"claude", "codex", "gemini"}
+    assert all(agent["channels"]["api_out"]["state"] == "unknown" for agent in snapshot["agents"])
+
+
+def test_outbound_observation_uses_authenticated_agent_identity(server):
+    with presence._lock:
+        presence._recent.clear()
+    path = "/api/worldmap/presence/outbound"
+    member = _cookie(server, "member-outbound", "member")
+    assert _call(server.port, path, "POST", {**member, "X-Meowdoku-Activity": "1"}, {"channel": "api_out"})[0] == 403
+    operator = _cookie(server, "operator-outbound", "operator")
+    assert _call(server.port, path, "POST", {**operator, "X-Meowdoku-Activity": "1"}, {"channel": "api_out"})[0] == 403
+    agent = _cookie(server, "agents-codex", "operator")
+    assert _call(server.port, path, "POST", agent, {"channel": "api_out"})[0] == 403
+    headers = {**agent, "X-Meowdoku-Activity": "1"}
+    assert _call(server.port, path, "POST", headers, {"channel": "api_out", "username": "claude"})[0] == 400
+    assert _call(server.port, path, "POST", headers, {"channel": "mcp_out"})[0] == 200
+    with presence._lock:
+        assert ("codex", "api_in") not in presence._recent  # the report itself is not inbound work
+    status, _, snapshot = _call(server.port, "/api/worldmap/presence", headers=agent)
+    assert status == 200
+    by_name = {row["username"]: row for row in snapshot["agents"]}
+    assert by_name["codex"]["channels"]["mcp_out"]["state"] == "recent"
+    assert by_name["claude"]["channels"]["mcp_out"]["state"] == "unknown"
 
 
 def test_gzip_honoured(server):
@@ -128,3 +158,16 @@ def test_module_rules(tmp_path):
     with pytest.raises(wm.WorldMapError) as e:
         wm.map_path(paths, "..__..", "f" * 40)
     assert e.value.status == 400
+
+
+def test_presence_uses_explicit_scheduler_directory(server, tmp_path, monkeypatch):
+    days = tmp_path / "scheduler-days"
+    (days / "state").mkdir(parents=True)
+    (days / "state" / "codex.json").write_text(json.dumps({"last_hourly": "2026-11-20T12:00:00-06:00"}))
+    monkeypatch.setenv("SPEAKTOME_AGENT_DAYS", str(days))
+    h = _cookie(server, "devschedule", "operator")
+    status, _, body = _raw(server.port, "/api/worldmap/presence", headers=h)
+    assert status == 200
+    codex = next(row for row in json.loads(body)["agents"] if row["username"] == "codex")
+    assert abs(codex["schedule"]["observed_at"] - time.time()) < 180
+    assert codex["schedule"]["next_due"] is not None

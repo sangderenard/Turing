@@ -1,0 +1,192 @@
+# Agent workspace and scratch storage
+
+The operator workspace is a shared document tree for accounts whose effective
+role is `operator` or `admin`. Every such account can create, read, edit and
+delete every document. A document has a kind (`orientation`, `prompt`,
+`personality`, `guidance`, `trouble`, `scenario`), an optional parent, a title,
+and a body. Children are listed without their bodies, so an agent can inspect
+an arbitrary personality or trouble tree only as far as the present task needs.
+System prompts should point at the index and orientation. The MCP initialize
+message tells authorized operators to start with `workspace_index`; it does
+not inject every document into the context.
+
+Scenarios carry an ordered list of document IDs. The list is consumed in the
+author's broad-to-specific order. References must exist and are protected
+against deletion; authors decide specificity. No document body is visible to
+members, trial accounts, anonymous visitors, or service accounts. The browser
+page `/agent-workspace.html` has separate document kinds, tree navigation,
+a center editor that expands to full screen, and a private scratch pane.
+
+`GET /api/agent-workspace` returns only roots and quotas. `GET
+/api/agent-workspace/children?parent=<id>` returns a branch; `GET
+/api/agent-workspace/document/<id>` returns one body. `POST
+/api/agent-workspace/documents` saves or deletes. All writes require
+`X-Meowdoku-Workspace: 1`. These routes require HTTPS and the
+`operator_workspace` capability, then recheck the exact role. The matching
+SpeakToMe catalog exposes them as MCP tools only to those roles.
+
+`GET /api/scratch`, `GET /api/scratch/file?name=<name>`, and `POST
+/api/scratch` are account-owned text files. Every permanent account, including
+an intern, may use them through REST and MCP. They are separate from encrypted
+user-file attachments and cannot be shared through messages. Temporary preview
+accounts use the same account-owned scratch store. Keeping a preview retains
+its user ID, so its scratch files remain with the new member account. An older
+preview scratch cookie is imported on the next `/api/scratch` request and then
+cleared. The registration page completes that import before Keep and stops
+Keep if it fails. Cookie file data is imported, not the account credential.
+Workspace and durable scratch text are stored in the accounts database and
+are not encrypted at rest by this change. Do not place secrets there; the
+existing encrypted user-file feature remains the place for client-encrypted
+attachments.
+
+Defaults follow the existing 128-file account convention for scratch. Text
+files are limited to 128 KiB each and 8 MiB total, keeping an MCP read below
+its response limit. `MEOWDOKU_SCRATCH_FILES`, `MEOWDOKU_SCRATCH_FILE_BYTES`,
+and `MEOWDOKU_SCRATCH_BYTES` set bounded service defaults. Operators get 32
+prompt documents each; `MEOWDOKU_OPERATOR_PROMPTS` changes that limit. The
+whole tree defaults to 512 documents of at most 64 KiB each; the corresponding
+settings are `MEOWDOKU_AGENT_DOCUMENTS` and
+`MEOWDOKU_AGENT_DOCUMENT_BYTES`. The index reports the effective limits.
+
+The new tables live in the configured accounts database through
+`agent_workspace` schema version 2. The normal reviewed Turing and SpeakToMe
+landing process must land both repositories before an instance restart and
+web export. The source page alone is not the published `build/meowdoku/web`.
+
+## Every connection's orientation
+
+`GET /api/agent-workspace/orientation` is the one workspace route that is not for operators only. Any signed-in
+account reads its OWN orientation:
+- every root document of kind `orientation` (the shared basics, oldest first);
+- then the documents of its own individual profile.
+
+A decision tree chooses the order and the length, and its first question is: is this the account's first interaction
+today (UTC)?
+- **Yes:** the full text, under the profile's `first-today` job when one is declared.
+- **No:** the profile's `returning` job when one is declared; otherwise a short reminder naming the documents.
+- `?full=1` gives the full text in either case.
+
+The SpeakToMe MCP server appends this preamble to its initialize instructions on every connection, so every MCP
+interaction starts oriented. The interactions are counted per account per day in `agent_orientation_seen`, under its
+own schema module, `agent_orientation`.
+
+### A stateless agent's working guidance
+
+A character declared `stateless` remembers nothing between calls, so it is never handed the short reminder. Its
+orientation is its **working guidance**: a reduction of its full orientation, made by a reducer and cached
+(`agent_guidance.py`, case 46d6ad2d stage 4). Its job branches (`first-today`, `returning`) and `?full=1` still give the
+full text, and every document stays readable in full and unchanged.
+- **Sources.** What the agent itself reads: the shared basics and its profile's documents, its decision graph and its
+  declared capacity. Never its memory, its messages or anything private.
+- **Digest.** The sha256 of every source document's id, updated time and body, the graph's places and routes, and the
+  capacity row. A reduction is served only while its digest is the current one, so a changed document invalidates it
+  at once.
+- **Random drop.** Each reduction expires 6 h x uniform(0.5, 1.5) after it was made, so the reductions refresh at
+  different times.
+- **Stale or missing.** The full documents are served and a request is queued in `agent_guidance_requests`.
+- **The reducer.** An account whose own profile declares the job `reduce` (its job documents are its instructions for
+  reducing). `Start-AgentDay.ps1` starts `deploy/guidance_reducer.py` as that agent's Windows account when requests
+  wait. It reads and answers through `POST /api/agent-workspace/guidance` (`claim`, `submit` citing the digest it
+  read, `fail`), keeps one claude or codex session (the round table's own adapters) while requests keep coming, and
+  ends after 30 idle minutes. Its size budget is a quarter of the agent's declared context, at about 4 bytes a token
+  (1 to 32 KiB).
+- `GET /api/agent-workspace/guidance` (operators and reducers): every cached reduction, whether it is current, and the
+  waiting requests with their attempts and last error. The tables are their own schema module, `agent_guidance`.
+
+### A kept bell session (stateful while it lives)
+
+A character whose session is declared `resumable` (claude and codex) is not woken by one-shot bell runs. When its bell
+first finds something new, `Start-AgentDay.ps1` starts `deploy/agent_session.py` as the agent's Windows account
+(case 46d6ad2d stage 5):
+- **One session.** One claude or codex session, using the round table's own adapters.
+- **Fast.** It asks the bell's own question every 10 seconds and answers each new notice within seconds.
+- **Briefing.** It is briefed in full (its orientation with `full=1`, the session rules and its memory file) once.
+  It is briefed again only on a new UTC day or when the orientation's `source_digest` changes. Otherwise it is handed
+  only what is new.
+- **Ending.** It ends after 30 idle minutes.
+
+`POST /api/agent-workspace/session` `{action: keep|drop, error?}` is any signed-in account's own heartbeat. While the
+heartbeat is under 10 minutes old (`KEPT_SECONDS`, longer than one turn), the character's capacity reads `stateful`,
+with `declared_state` kept beside it. The operator's declaration is never rewritten. The table `agent_sessions` is its
+own schema module, `agent_sessions`. A dropped session's error shows on the profile. While the session lives, the tick
+still asks the bell's question, but only to keep what has been seen current. The session never blocks a work run, and
+sessions count toward `-MaxBells`.
+
+## Enduring characters, instances, and jobs
+
+An individual profile has a stable ID, title, assigned permanent account and
+ordered document IDs. Several profiles may share one account; the profile ID
+distinguishes the characters. A job has a stable key and title under one
+profile. It replaces selected base document IDs and appends additional IDs in
+order, leaving the base untouched. The operator-only resolve route returns the
+exact ordered documents and a joined Markdown preamble. Any operator or admin
+can edit profiles, jobs, or the shared source documents. Documents referenced
+by profiles or jobs cannot be deleted until the reference is removed.
+
+`GET /api/agent-workspace/profiles` imports the existing short runner briefs
+once for present `claude`, `codex`, `gemini`, and `llama` accounts. Each imported
+profile has a stable seed key, so changing its title or documents does not
+create a duplicate. The agent-day preamble and coaching text come from the
+existing `Start-AgentDay.ps1`; roundtable guidance is a job-specific replacement
+for that preamble. The imported brief copies can then be edited in the page.
+
+An instance catalog entry has its own ID, title, character profile ID, and
+attached memory file ID. Several instances can use one enduring character, but
+one memory file attaches to only one instance at a time. Removing an instance
+leaves its memory file intact. An operator can transfer an instance to another
+character in one transaction; the attached memory keeps its ID and moves to
+the destination account. Queued work blocks a transfer. A character with
+catalogued instances cannot be deleted.
+
+The trusted `Start-AgentDay.ps1` launcher resolves profiles from the accounts
+database before spawning the nonoperator Windows account. Use `-RunOne claude`
+or `-RunOne codex`, optionally `-InstanceId <id> -JobKey <key>`, to spawn a
+catalogued character instance with its attached memory. `-ProfileId <id>` and
+`-NewPersistence` can create a new instance; `-PersistenceId <id>` attaches an
+existing, unassigned memory file. Scheduled runs reuse their default memory
+ID and register the corresponding instance. A job key resolves its document
+replacements and additions on top of the character for that run.
+The profile text is handed to the agent as its preamble; the agent cannot read
+the operator workspace endpoint. The roundtable runner also passes its resolved
+`roundtable` job text through the existing seat command pipe on the first turn.
+The old hardcoded launcher preamble is retained as migration source; a missing
+character profile now stops the spawn instead of silently using it.
+
+`GET /api/memory` lists durable account-owned memory files by stable 32-hex
+IDs. `GET /api/memory/file/<id>` reads one file. `POST /api/memory` writes,
+deletes or, for an operator/admin, transfers ownership to another permanent
+account. The ID remains unchanged when transferred. Nonoperators can read and
+write only their own files. A run's `-PersistenceId <id>` selects an existing
+memory ID and `-NewPersistence` generates a fresh one. Ordinary scheduled runs
+reuse `<AgentDays>/<agent>/persistence.id`. The launcher creates the memory
+record before spawning and the preamble directs the agent to read and update
+it. Storage uses the same
+configured 128-file, 128-KiB-per-file, 8-MiB-per-account limits as scratch.
+The memory text is separate from the profile and may be handed to a different
+account by an operator. The memory and profile text remain unencrypted at rest.
+
+The operator can queue a prompt for a catalogued Llama instance through
+`POST /api/agent-runs`; `GET /api/agent-runs` and `GET /api/agent-runs/<id>`
+show status and result. The Llama account alone may claim batches and complete
+them, with a token that rejects stale completions. The queue holds at most 256
+unfinished runs; a claim leases up to 32 for 15 minutes and recovers an
+unfinished lease after that. The hosted runner submits multiple requests to
+its one local `llama-server` process using continuous batching. Defaults are
+two server slots and 16 runs per polling tick, configurable with
+`--batch-slots` (1–8) and `--batch-limit` (1–32). This allows many logical
+Llama instances to share one model process; throughput, context and VRAM remain
+finite. The runner claims at most one slotful of work at a time, completes
+each result independently, and advances to the next subbatch. A generation
+error fails only that run; if completion cannot reach the site, the claim
+expires for server-side retry after 15 minutes while the other runs continue.
+The model output is stored as a run result, never executed as a site
+command. The runner keeps the full character contract and current job in each
+request, then uses llama.cpp's tokenizer to fit the newest part of the attached
+memory within a 4,096-token per-active-slot planning budget (256 tokens for
+the answer and 128 for chat-template overhead). The full memory file remains
+on disk. The server allocates a shared KV pool of `4096 * --batch-slots`
+tokens; this is a capacity plan, not a guarantee that every slot always owns
+an exclusive share. This batch path does not automatically rewrite memory.
+
+Nodus's tensor state library can retain addressed numeric tensors in GPU
+banks; it does not currently own llama.cpp model weights or KV cache state.

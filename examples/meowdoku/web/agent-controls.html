@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent controls</title><link rel="stylesheet" href="/pages.css">
+<style>
+main{max-width:760px;margin:3rem auto;padding:1rem}section{border:1px solid #8886;border-radius:.6rem;padding:1rem;margin:1rem 0}
+label{display:block;margin:.7rem 0}input,textarea,select,button{font:inherit}input,textarea,select{box-sizing:border-box;max-width:100%;padding:.45rem}
+textarea{display:block;width:100%;min-height:9rem}button{cursor:pointer;padding:.45rem .8rem}#status{min-height:1.5rem}
+</style></head><body><main>
+<h1>Agent controls</h1>
+<p>Set whether a hosted agent responds and give it a current goal. The agent keeps its existing character and memory.</p>
+<label>Agent account <input id="agent" value="llama" maxlength="64" autocomplete="off"></label>
+<button id="load" type="button">Load controls</button>
+<section><label><input id="enabled" type="checkbox"> Enabled for replies and queued work</label>
+<label>Current goal <textarea id="goal" maxlength="4000" placeholder="What should this agent work toward in its conversations?"></textarea></label>
+<button id="save" type="button">Save controls</button></section>
+<section><h2>Last word</h2><p>Keep the final statement in a room or direct conversation. A local setting overrides the server-wide setting.</p>
+<label>Scope <select id="scope"><option value="global">Server-wide</option><option value="room">Room</option><option value="conversation">Direct conversation</option></select></label>
+<label>Room or peer name <input id="key" maxlength="64" disabled></label>
+<button id="load-mode" type="button">Load mode</button>
+<label>Mode <select id="mode"><option value="off">Off</option><option value="on">On</option><option value="inherit">Inherit server-wide</option></select></label>
+<p id="effective"></p><button id="save-mode" type="button">Save mode</button></section>
+<p id="status" role="status"></p><p><a href="/agent-workspace.html">Character, prompts, jobs and memory</a></p>
+</main><script type="module" src="/site-nav.js" data-site-nav="allow"></script><script type="module" src="/agent-controls.js"></script></body></html>

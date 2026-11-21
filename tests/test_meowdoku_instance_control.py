@@ -138,3 +138,42 @@ def test_the_supervisor_restarts_shuts_down_and_starts_on_request_even_a_process
             proc.kill()
         proc.stdout.close()
         proc.stderr.close()
+
+
+def test_an_instance_off_at_start_waits_for_a_start_by_name_and_the_whole_stack_leaves_it_stopped(tmp_path):
+    polite = "import time\nprint('up', flush=True)\ntime.sleep(600)"
+    specs = [{"name": name, "kind": "command", "port": None, "route": "", "bind": "127.0.0.1", "account": f"svc-{name}",
+              "args": [sys.executable, "-c", polite], "leases": [], **extra}
+             for name, extra in (("standin", {}), ("deaf", {"autostart": False}))]
+    db, state, inst = tmp_path / "accounts.db", tmp_path / "state", tmp_path / "instances.json"
+    inst.write_text(json.dumps(specs), encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, str(SUP), "--db", str(db), "--instances", str(inst), "--state-dir", str(state)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def instance(name):
+        return next((r for r in _rows(db, "SELECT * FROM service_instances") if r["name"] == name), None)
+
+    def handled(request_id):
+        return next((r for r in _rows(db, "SELECT * FROM instance_requests") if r["id"] == request_id and r["state"] != "pending"), None)
+    try:
+        _wait(lambda: (instance("standin") or {}).get("state") == "running")
+        assert instance("deaf")["state"] == "stopped" and instance("deaf")["pid"] is None, "off at start"
+        asked = _ask(db, instance="*", action="restart")
+        everything = _wait(lambda: handled(asked), timeout=60)
+        assert "deaf: left stopped (autostart: false)" in everything["detail"] and "standin:" in everything["detail"]
+        assert instance("deaf")["state"] == "stopped"
+        asked = _ask(db, instance="deaf", action="start")
+        started = _wait(lambda: handled(asked))
+        assert "started pid" in started["detail"]
+        first = _wait(lambda: instance("deaf") if (instance("deaf") or {}).get("state") == "running" else None)
+        asked = _ask(db, instance="*", action="restart")
+        again = _wait(lambda: handled(asked), timeout=60)
+        assert "deaf: started pid" in again["detail"], "running when the whole stack restarts: it comes back"
+        _wait(lambda: (instance("deaf") or {}).get("state") == "running" and instance("deaf")["pid"] != first["pid"])
+        proc.stdin.close()
+        assert proc.wait(timeout=60) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        proc.stderr.close()

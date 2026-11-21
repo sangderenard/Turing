@@ -1,8 +1,11 @@
 // [LOG] The pure parts of the log page (log.js): which lines/characters are in view, which glyph draws a character, the filters.
 // No DOM, no GL: tests/meowdoku_log_view_check.mjs runs this under node.
 
-export const SOURCES = ["client-error", "fountain-diag", "server"];
-export const TAGS = { "client-error": "ERR", "fountain-diag": "DIA", "server": "SRV", "console-log": "LOG", "console-warn": "WRN", "console-error": "CER", "uncaught": "UNC" };
+export const SOURCES = ["client-error", "fountain-diag", "login", "activity", "server"];   // logring.py SOURCES
+export const TAGS = { "client-error": "ERR", "fountain-diag": "DIA", "login": "LGN", "activity": "ACT", "server": "SRV",
+                      "console-log": "LOG", "console-warn": "WRN", "console-error": "CER", "uncaught": "UNC" };
+/** The time-window choices of the server pane, in seconds (0: everything held). */
+export const WINDOWS = [["all", 0], ["15 min", 900], ["1 h", 3600], ["6 h", 21600], ["24 h", 86400]];
 export const LOCAL_SOURCES = ["console-log", "console-warn", "console-error", "uncaught"];
 
 /** The window of items in view along one axis: items [first, last) intersect [scroll, scroll + view); `overscan` extra items each side. */
@@ -43,9 +46,10 @@ export function formatTime(ts) {
 /** The text of one log line as shown: time, a three-letter source tag, the text (the tag is also its colour's key). */
 export function lineText(e) { return `${formatTime(e.ts)} ${TAGS[e.src] || "???"} ${String(e.text).replace(/\s+/g, " ")}`; }
 
-/** Filter by source set and a case-insensitive search (every whitespace-separated term must appear). */
-export function matches(e, sources, terms) {
+/** Filter by source set, an optional oldest timestamp `after` (seconds; 0 keeps all) and a case-insensitive search (every whitespace-separated term must appear). */
+export function matches(e, sources, terms, after = 0) {
   if (!sources.has(e.src)) return false;
+  if (after && e.ts < after) return false;
   if (!terms.length) return true;
   const t = String(e.text).toLowerCase();
   return terms.every((w) => t.includes(w));

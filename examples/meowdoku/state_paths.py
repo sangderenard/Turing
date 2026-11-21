@@ -33,6 +33,7 @@ class StatePaths:
             self.job_library_db = r / "marble_photos" / "job-library.sqlite"
             self.log_ring = r / "log_ring.jsonl"
             self.operator_credentials_dir = r / "operator_credentials"
+            self.console_dir = r / "console"
         else:
             self.sql_dir, self.content_dir, self.products_dir = r / "sql", r / "content", r / "products"
             self.canvas_dir, self.logs_dir = r / "canvas", r / "logs"
@@ -40,6 +41,9 @@ class StatePaths:
             self.job_library_db = r / "sql" / "job-library.sqlite"
             self.log_ring = r / "logs" / "log_ring.jsonl"
             self.operator_credentials_dir = r / "secrets" / "operator_credentials"
+            # Per-run console tokens live under run/, which the service account owns: it writes one at every launch, and it
+            # must not need write access to operator_credentials/ (the operators' and the service's own passwords).
+            self.console_dir = r / "run" / "console"
 
     # ---- constructors
     @classmethod
@@ -63,6 +67,11 @@ class StatePaths:
     @property
     def access_json(self) -> Path:
         return self.sql_dir / "access.json"
+
+    @property
+    def private_record_db(self) -> Path:
+        """[PRIVATE] token -> raw IP/email/user-agent; read back only by private_read (private_record.py)."""
+        return self.sql_dir / "private_record.db"
 
     # ---- jobs (source_divider: one directory per divide-and-lower job; legacy build/meowdoku/jobs)
     @property
@@ -102,6 +111,16 @@ class StatePaths:
     @property
     def tls_dir(self) -> Path:
         return self.secrets_dir / "tls"
+
+    @property
+    def private_hash_key(self) -> Path:
+        """[PRIVATE] this state's HMAC key for private-value tokens; made once, never replaced."""
+        return self.secrets_dir / "private_hash.key"
+
+    @property
+    def records_key(self) -> Path:
+        """The Fernet key for retained records (secure_records.py): the ring, apache-access.log, private_record values."""
+        return self.secrets_dir / "records.key"
 
     def admin_token(self, port=None) -> Path:
         """admin_token.txt for the default port (or None), admin_token_<port>.txt for any other (lifecycle's per-port rule)."""

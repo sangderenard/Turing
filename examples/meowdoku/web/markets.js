@@ -57,6 +57,188 @@ function renderer(canvas) {
 }
 
 const fmt = (number) => Number(number).toLocaleString(undefined, { maximumFractionDigits: 2 });
+let adminTraining = false, trainingInstance = null, trainingPending = null;
+let trainingBusy = false, trainingReading = false, trainingAction = null, clearingRun = null;
+let qualificationPayload = null;
+
+function drawQualification(payload) {
+  qualificationPayload = payload;
+  const root = $("qualification-runs"); root.replaceChildren();
+  for (const run of payload.runs || []) {
+    const card = document.createElement("article"); card.className = "qualification-run";
+    const title = document.createElement("h3"); title.textContent = `${run.market} · ${run.status}`;
+    const meta = document.createElement("div"); meta.className = "metrics";
+    const last = (run.progress || []).at(-1);
+    const fields = [`${run.model} · ${run.worker}`, `phase ${run.phase}`,
+                    run.planned_epochs ? `${run.completed_epochs}/${run.planned_epochs} epochs`
+                                       : `${run.completed_epochs} epochs · continuous`];
+    if (last?.loss != null) fields.push(`loss ${Number(last.loss).toFixed(5)}`);
+    if (last?.validation_mean != null) fields.push(`validation mean ${(Number(last.validation_mean) * 100).toFixed(2)}% of order cap`);
+    if (run.live) {
+      const observed = run.live.observed_at ? ` · last AAPL bar ${new Date(run.live.observed_at).toLocaleString()}` : "";
+      fields.push(`market feed ${run.live.source}${observed}`);
+      fields.push(`${run.live.matured_frames} live frames with known outcomes`);
+      fields.push(run.live.live_batch
+        ? `${run.live.historical_batch} historical + ${run.live.live_batch} live labeled frames per batch`
+        : "historical training while live outcomes mature");
+    }
+    if (run.result?.holdout_mean_return_on_order_cap != null)
+      fields.push(`holdout mean ${(Number(run.result.holdout_mean_return_on_order_cap) * 100).toFixed(2)}% of order cap`);
+    for (const value of fields) { const item = document.createElement("span"); item.textContent = value; meta.append(item); }
+    const bar = document.createElement("progress");
+    if (run.planned_epochs) {
+      bar.max = run.planned_epochs;
+      bar.value = Math.min(bar.max, run.completed_epochs);
+    } else {
+      bar.removeAttribute("value");
+    }
+    const checks = document.createElement("ol"); checks.className = "checks";
+    for (const check of (run.progress || []).filter((item) => item.validation_mean != null).slice(-8)) {
+      const line = document.createElement("li");
+      const position = [check.seed != null ? `seed ${check.seed}` : null,
+                        check.epoch != null ? `epoch ${check.epoch}` : null].filter(Boolean).join(", ");
+      line.textContent = `${position ? position + ": " : ""}validation ${(Number(check.validation_mean) * 100).toFixed(2)}% · ${check.validation_passed ? "gate met" : "gate unmet"}`;
+      checks.append(line);
+    }
+    card.append(title, meta, bar, checks);
+    if (adminTraining) {
+      const controls = document.createElement("div"); controls.className = "row qualification-actions";
+      const managed = trainingInstance?.name === run.worker;
+      const active = managed && ["running", "starting", "backoff"].includes(trainingInstance.state);
+      const stopped = managed && ["stopped", "failed"].includes(trainingInstance.state) && trainingInstance.enabled !== false;
+      for (const [label, action, enabled] of [["Start worker", "start", stopped], ["Stop worker", "shutdown", active]]) {
+        const button = document.createElement("button");
+        button.type = "button"; button.textContent = label;
+        button.disabled = !enabled || !!trainingPending || trainingBusy || trainingReading;
+        button.addEventListener("click", () => requestTrainingControl(false, action, run.worker));
+        controls.append(button);
+      }
+      const clear = document.createElement("button"); clear.type = "button"; clear.textContent = "Clear run";
+      clear.disabled = clearingRun !== null || run.status === "running";
+      clear.addEventListener("click", () => clearQualification(run.id));
+      controls.append(clear);
+      const note = document.createElement("small"); note.className = "muted";
+      note.textContent = managed ? "Start and Stop control the shared worker; Clear removes this run from the watch list."
+                                 : "This worker is not managed here; Clear removes this run from the watch list.";
+      controls.append(note); card.append(controls);
+    }
+    root.append(card);
+  }
+  $("qualification-state").textContent = root.childElementCount
+    ? `${root.childElementCount} recent run(s). Updated ${new Date(payload.asof * 1000).toLocaleTimeString()}.`
+    : "No qualification run has started on this shared arena.";
+}
+
+async function updateQualification() {
+  drawQualification(await api("/api/paper/qualification/live"));
+}
+async function clearQualification(id) {
+  if (!adminTraining || clearingRun !== null) return;
+  clearingRun = id;
+  if (qualificationPayload) drawQualification(qualificationPayload);
+  let clearError = null;
+  try {
+    const response = await fetch("/api/paper/qualification/clear", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Clear refused (${response.status})`);
+    await updateQualification();
+  } catch (error) {
+    clearError = `${error.message}. Refresh before retrying; the request may have reached the server.`;
+  } finally {
+    clearingRun = null;
+    if (qualificationPayload) drawQualification(qualificationPayload);
+    if (clearError) $("qualification-state").textContent = clearError;
+  }
+}
+setInterval(() => { if (!document.hidden) updateQualification().catch((error) => { $("qualification-state").textContent = error.message; }); }, 2000);
+updateQualification().catch((error) => { $("qualification-state").textContent = error.message; });
+
+// Use the existing audited supervisor request queue, never a second trainer runner.
+// This page exposes the shortcut to admins only; the control API rechecks authority.
+const TRAINING_INSTANCE = "nodus-training";
+async function refreshTrainingControl() {
+  if (trainingReading || trainingBusy) return;
+  trainingReading = true;
+  $("training-toggle").disabled = true;
+  $("training-cancel").disabled = true;
+  trainingAction = null; trainingPending = null;
+  try {
+    const who = await api("/api/whoami");
+    const allowed = who.role === "admin" && (who.capabilities || []).includes("account_manage");
+    adminTraining = allowed;
+    $("training-controls").hidden = !allowed;
+    if (!allowed) { trainingInstance = null; if (qualificationPayload) drawQualification(qualificationPayload); return; }
+    const data = await api("/api/control/instances");
+    const instance = (data.instances || []).find((item) => item.name === TRAINING_INSTANCE);
+    trainingInstance = instance || null;
+    const requests = (data.requests || []).filter((item) => item.instance === TRAINING_INSTANCE || item.instance === "*");
+    trainingPending = requests.find((item) => item.state === "pending") || null;
+    if (qualificationPayload) drawQualification(qualificationPayload);
+    $("training-cancel").hidden = !trainingPending || trainingPending.instance !== TRAINING_INSTANCE;
+    $("training-cancel").disabled = !trainingPending || trainingPending.instance !== TRAINING_INSTANCE;
+    if (!instance) {
+      $("training-toggle").textContent = "Trainer unavailable";
+      $("training-control-state").textContent = "The supervisor has no registered nodus-training instance.";
+      return;
+    }
+    const active = ["running", "starting", "backoff"].includes(instance.state);
+    const stopped = ["stopped", "failed"].includes(instance.state);
+    trainingAction = active ? "shutdown" : stopped && instance.enabled !== false ? "start" : null;
+    $("training-toggle").textContent = active ? "Stop training" : stopped ? "Start training" : "Training " + instance.state;
+    $("training-toggle").disabled = !trainingAction || !!trainingPending;
+    const last = requests[0];
+    $("training-control-state").textContent = `Supervisor: ${instance.state}. ` + (trainingPending
+      ? `Request ${trainingPending.id}: ${trainingPending.action} pending. ${trainingPending.detail || "Waiting for the supervisor; this is not yet completed."}`
+      : last ? `Last request ${last.id}: ${last.state}. ${last.detail || ""}` : "No recent control request.");
+  } catch (error) {
+    adminTraining = false; trainingInstance = null;
+    $("training-controls").hidden = true;
+    if (qualificationPayload) drawQualification(qualificationPayload);
+    $("training-control-state").textContent = `Could not verify training state: ${error.message}. Refresh before acting.`;
+    $("training-toggle").textContent = "Training status unavailable";
+  } finally { trainingReading = false; if (qualificationPayload) drawQualification(qualificationPayload); }
+}
+async function requestTrainingControl(cancel = false, requestedAction = null, worker = TRAINING_INSTANCE) {
+  if (trainingBusy || trainingReading || !adminTraining || worker !== TRAINING_INSTANCE ||
+      (cancel ? !trainingPending || trainingPending.instance !== TRAINING_INSTANCE : !(requestedAction || trainingAction))) return;
+  const action = requestedAction || trainingAction, pending = trainingPending;
+  if (!cancel && (trainingPending || !trainingInstance ||
+      (action === "start" && !["stopped", "failed"].includes(trainingInstance.state)) ||
+      (action === "shutdown" && !["running", "starting", "backoff"].includes(trainingInstance.state)))) return;
+  trainingBusy = true;
+  if (qualificationPayload) drawQualification(qualificationPayload);
+  $("training-toggle").disabled = true; $("training-cancel").disabled = true;
+  $("training-refresh").disabled = true;
+  try {
+    const response = await fetch("/api/control/instances" + (cancel ? "/cancel" : ""), {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cancel ? { id: pending.id } : {
+        instance: TRAINING_INSTANCE, action, after_jobs: action !== "shutdown",
+        reason: "Paper market watch admin training control",
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Control refused (${response.status})`);
+    $("training-control-state").textContent = `Request ${result.request.id}: ${result.request.state}. Waiting for supervisor state.`;
+  } catch (error) {
+    // A lost response is not proof the request failed. Never resend automatically.
+    $("training-control-state").textContent = `${error.message}. Check supervisor status before retrying; the request may have reached it.`;
+  } finally {
+    trainingBusy = false; trainingAction = null; trainingPending = null;
+    $("training-refresh").disabled = false;
+    await refreshTrainingControl();
+  }
+}
+$("training-toggle").addEventListener("click", () => requestTrainingControl());
+$("training-cancel").addEventListener("click", () => requestTrainingControl(true));
+$("training-refresh").addEventListener("click", refreshTrainingControl);
+setInterval(() => { if (!document.hidden) refreshTrainingControl(); }, 3000);
+refreshTrainingControl();
+
 const historyView = renderer($("history"));
 const bookView = renderer($("book"));
 let lastHistory = null, lastBook = null;
@@ -195,3 +377,106 @@ setInterval(() => { if (!document.hidden) now().catch((error) => { $("status").t
 setInterval(() => { if (!document.hidden) history().catch((error) => { $("status").textContent = error.message; }); }, 300000);
 update();
 credentialState().catch((error) => { $("key-state").textContent = error.message; });
+
+const dmTemplates = {
+  "look:account": () => ({}), "look:bots": () => ({}), "look:presence": () => ({}),
+  "look:strategies": () => ({}),
+  "look:orders": () => ({}), "look:mock_orders": () => ({}),
+  "look:mock_ledger": () => ({ strategy_id: "" }),
+  "look:scoreboard": () => ({}), "look:map": () => ({}), "look:picture": () => ({}),
+  "look:qualification": () => ({}),
+  "look:proposals": () => ({ stock: "AAPL", offset: 0, limit: 100 }),
+  "examine:node": () => ({ radius: 1 }),
+  "make:strategy": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Strategy", risk: "cautious", policy: "momentum", outcomes: ["fixed_horizon", "closed_trade", "fill_quality"] }),
+  "make:bot": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), name: "Market bot", kind: "python", source: { ref: "divider:YOUR_JOB_ID" } }),
+  "make:order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
+  "make:mock_order": () => ({ request_id: crypto.randomUUID().replaceAll("-", ""), strategy_id: "", symbol: "BTC/USD", side: "buy", amount: "5" }),
+  "use:reconcile": () => ({ id: "" }),
+  "use:nodus_ui": () => ({ instance: "nodus-messenger", action: { op: "viewport", expected_revision: 0, width: 800, height: 600 } }),
+};
+$("dm-command").addEventListener("change", async () => {
+  const command = $("dm-command").value;
+  const template = dmTemplates[command]();
+  if (command === "use:nodus_ui") {
+    try {
+      const response = await fetch(`/api/nodus/digest?instance=${encodeURIComponent(template.instance)}`, { credentials: "same-origin", cache: "no-store" });
+      if (response.ok) template.action.expected_revision = (await response.json()).revision;
+    } catch (_) { /* The action response reports unavailable hosts. */ }
+  }
+  if ($("dm-command").value === command) $("dm-input").value = JSON.stringify(template, null, 2);
+});
+$("dm-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("dm-form").querySelector("button");
+  button.disabled = true;
+  try {
+    const input = JSON.parse($("dm-input").value);
+    if (input === null || Array.isArray(input) || typeof input !== "object") throw new Error("Input must be a JSON object.");
+    const [verb, target] = $("dm-command").value.split(":");
+    const response = await fetch("/api/paper/dm", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ verb, target, input }),
+    });
+    const result = await response.json();
+    $("dm-output").textContent = JSON.stringify(result, null, 2);
+    if (!response.ok) $("dm-output").textContent = `Command failed (${response.status})\n` + $("dm-output").textContent;
+    const picture = $("dm-picture");
+    picture.hidden = !(response.ok && verb === "look" && target === "picture" && result.view);
+    if (!picture.hidden) {
+      const view = new URL(result.view, location.href);
+      view.searchParams.set("picture", "1");
+      picture.src = view.href;
+      $("dm-output").textContent = "Living Data map picture";
+    } else picture.removeAttribute("src");
+  } catch (error) { $("dm-picture").hidden = true; $("dm-picture").removeAttribute("src"); $("dm-output").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+let latestPresence = null;
+let presenceCards = [];
+function drawPresence() {
+  const root = $("bot-presence"); root.replaceChildren();
+  presenceCards = [];
+  const bots = latestPresence?.bots || [];
+  for (const bot of bots) {
+    const age = Math.max(0, Date.now() / 1000 - bot.last_seen);
+    if (age >= (latestPresence?.fade_seconds || 300)) continue;
+    const card = document.createElement("div"); card.className = "bot-unit";
+    card.style.opacity = String(Math.max(.12, 1 - age / (latestPresence.fade_seconds || 300)));
+    const avatar = document.createElement("span"); avatar.className = "bot-avatar";
+    const head = document.createElement("span"); head.className = "bot-head";
+    const body = document.createElement("span"); body.className = "bot-body";
+    avatar.append(head, body);
+    const copy = document.createElement("span"); copy.className = "bot-copy";
+    const name = document.createElement("strong"); name.textContent = bot.name;
+    const kind = document.createElement("small"); kind.textContent = bot.kind.replaceAll("_", " ");
+    const source = document.createElement("small");
+    const channel = bot.activity?.channel === "mcp_reported" ? "MCP (reported)" : bot.activity?.channel || "REST";
+    source.textContent = `${channel} · ${bot.activity?.interaction || "active"}`;
+    copy.append(name, kind, source); card.append(avatar, copy); root.append(card);
+    presenceCards.push({ card, seen: bot.last_seen });
+  }
+  $("bot-presence-state").textContent = root.childElementCount ? `${root.childElementCount} bots active in the last five minutes.` : "No registered bots active in the last five minutes.";
+}
+function fadePresence() {
+  const seconds = latestPresence?.fade_seconds || 300;
+  for (const item of presenceCards) {
+    const age = Math.max(0, Date.now() / 1000 - item.seen);
+    item.card.style.opacity = age >= seconds ? "0" : String(Math.max(.12, 1 - age / seconds));
+  }
+}
+async function updatePresence() {
+  let offset = 0, combined = [], latest = null;
+  for (let page = 0; page < 20; page++) {
+    latest = await api(`/api/paper/presence?offset=${offset}`);
+    combined.push(...(latest.bots || []));
+    if (latest.next_offset === null || latest.next_offset === undefined) break;
+    offset = latest.next_offset;
+  }
+  latestPresence = { ...latest, bots: combined };
+  drawPresence();
+}
+setInterval(fadePresence, 1000);
+setInterval(() => { if (!document.hidden) updatePresence().catch((error) => { $("bot-presence-state").textContent = error.message; }); }, 15000);
+updatePresence().catch((error) => { $("bot-presence-state").textContent = error.message; });

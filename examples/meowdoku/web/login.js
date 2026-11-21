@@ -6,12 +6,28 @@
 
   function say(text, cls) { status.textContent = text || ""; status.className = cls || "mut"; }
 
+  // ?next= is the page the visitor signed in from (site-nav.js).  Only a same-site path is accepted:
+  // one leading "/", not "//" or "/\" (another host), no control characters (browsers drop tabs and
+  // newlines, which would turn "/\t/host" into "//host"), and never the sign-in page itself.
+  function nextPage() {
+    var next = new URLSearchParams(location.search).get("next") || "";
+    if (!/^\/(?![\/\\])/.test(next) || /[\x00-\x1f\x7f]/.test(next)) return "";
+    if (/^\/login\.html(?:[?#]|$)/.test(next)) return "";
+    return next;
+  }
+
   function show(info) {
     var account = info && info.account;
     form.hidden = !!account;
     who.hidden = !account;
     if (account) { $("name").textContent = account.username; $("role").textContent = info.role || "member"; }
-    if (account) serverPanel(); else $("server").hidden = true;
+    var next = nextPage();
+    $("back-item").hidden = !(account && next);
+    if (next) $("back").setAttribute("href", next);
+    $("preview-note").hidden = !(account && account.temporary);
+    if (account && account.temporary) $("preview-date").textContent = new Date(account.expires_at * 1000).toLocaleString();
+    $("signout").textContent = account && account.temporary ? "End preview (restore later with recovery code)" : "Sign out";
+    if (account && !account.temporary) serverPanel(); else $("server").hidden = true;
   }
 
   // Stable server / Development server: two shared instances of the whole service (not the dev page vs shader page, not a per-user server).
@@ -63,7 +79,11 @@
     submit.disabled = true; say("signing in...");
     post("/api/account/login", { username: $("username").value, password: $("password").value }).then(function (res) {
       $("password").value = "";
-      if (res.status === 200) { say(""); return refresh(); }
+      if (res.status === 200) {
+        var next = nextPage();
+        if (next) { say("signed in; returning..."); location.assign(next); return; }
+        say(""); return refresh();
+      }
       if (res.status === 429) {
         var secs = Number(res.retry || (res.body && res.body.retry_after) || 0);
         var mins = Math.ceil(secs / 60);

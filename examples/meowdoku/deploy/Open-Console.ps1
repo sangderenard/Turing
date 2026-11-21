@@ -36,7 +36,9 @@ $row = @($json | ConvertFrom-Json) | Where-Object { $_.name -eq $Instance } | Se
 if (-not $row) { throw "REFUSED no such instance: $Instance" }
 if ($row.state -ne 'running') { throw "REFUSED instance $Instance is not running (state $($row.state))." }
 if (-not $row.console_port) { throw "REFUSED instance $Instance has no console port." }
-$Token = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$Instance.console.secret" } else { Join-Path $State "operator_credentials\$Instance.console.secret" }
+# The token is written by the supervisor (the service account) under run\console; Administrators may read it, so under the
+# service account this script needs an elevated shell.
+$Token = if ($StateDir) { Join-Path $StateDir "run\console\$Instance.console.secret" } else { Join-Path $State "console\$Instance.console.secret" }
 if (-not (Test-Path -LiteralPath $Token)) { throw "REFUSED console token file missing: $Token" }
 if (Test-Path -LiteralPath $PidFile) {
     $old = (Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)

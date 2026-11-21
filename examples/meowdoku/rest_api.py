@@ -65,3 +65,6 @@ goal = _load("speaktome_goal") if (REPOSITORY / "speaktome_goal" / "__init__.py"
 from speaktome_api import groups
 if groups.API_VERSION != 1:
     raise ImportError("This Turing host requires SpeakToMe group contract version 1")
+
+if not hasattr(routes, "compute_route"):
+    raise ImportError("Update SpeakToMe REST contract: compute_route is required by this host")

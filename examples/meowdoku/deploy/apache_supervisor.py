@@ -12,7 +12,11 @@ starts it at startup, restarts it if it exits, and closes its stdin at shutdown.
 NOT GATED: unlike deploy/*.ps1 (operator gate, authz.py script-auth; see LAUNCH_2026-11-10.md "Who may run the scripts"), this process is
 launched by httpd under Apache's identity, not by a user, so it carries no -User/-PasswordFile check.
 Only one supervisor manages instances (an OS lock on ``<state>/supervisor.lock``); a second one (httpd on Windows can open the pipe
-from more than one process) stays a log sink.  A port that already has a listener is not launched over (state ``external``).
+from more than one process) stays a log sink until it can acquire the lock and take over.  A port that already has a listener is not launched over (state ``external``).
+[DEV] An instance may run another tree's code: ``"code_root"`` (its working directory) and ``"speaktome_root"`` (its SPEAKTOME_REPO),
+so the dev server can follow what landed while stable stays on its own checkout.
+[LOAN] With a ``"loans"`` block in instances.json, every ready branch loan (branch_servers.py) is one more instance,
+``loan-<port>``: started when its loan becomes ready, stopped when the loan ends or goes idle (checked every 10 s).
 
   python apache_supervisor.py --status                 # service_instances as JSON
   python apache_supervisor.py --once --dry-run         # print what would be done, change nothing
@@ -46,6 +50,7 @@ from meowdoku import lifecycle as lifecycle_mod      # noqa: E402
 from meowdoku import lowering_library as lib         # noqa: E402
 from meowdoku import service_jobs                     # noqa: E402  (the server-wide job table a restart waits for)
 from meowdoku.state_paths import StatePaths          # noqa: E402
+from meowdoku.secure_records import RecordCipher       # noqa: E402
 
 STATE = StatePaths.legacy(ROOT).root                # the old layout: no --state-dir, no "state_dir" in instances.json
 LEASE_SECONDS = 86400
@@ -54,6 +59,8 @@ STOP_WAIT = 20.0
 MAX_RESTARTS, RESTART_WINDOW = 5, 600.0
 START_TIMEOUT = {"meowdoku": 300.0, "nodus": 60.0}
 EXIT_RESTART = lifecycle_mod.EXIT_RESTART
+LOAN_CHECK_S = 10.0                                 # [LOAN] how often the branch loans are compared with the running loan instances
+HOSTED_CHECK_S = 30.0                               # on-demand tasks are kept running only while this supervisor owns the stack
 
 DDL = """
 CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT,
@@ -137,6 +144,15 @@ def instances_restart_account(path):
     return data["restart_account"], str(data.get("restart_account_display_name") or data["restart_account"])
 
 
+def instances_hosted_tasks(path):
+    """Windows tasks running isolated hosted agents, owned by this stack's lifecycle."""
+    data = _read_instances(path)
+    tasks = data.get("hosted_tasks", []) if isinstance(data, dict) else []
+    if not isinstance(tasks, list) or any(not isinstance(name, str) or not name for name in tasks):
+        raise ValueError("hosted_tasks must be a list of task names")
+    return tasks
+
+
 def instances_state_dir(path):
     """The top-level ``state_dir`` of the object form of instances.json (a path, absolute or relative to the repo root), or None."""
     data = _read_instances(path)
@@ -152,9 +168,68 @@ def listening(port, host="127.0.0.1") -> bool:
         return False
 
 
+_JOB = None      # [JOB] the kill-on-close job this supervisor put itself in; held for the life of the process
+
+
+def tie_children_to_this_process() -> str:
+    """Put this process in a Windows job object that ends every process in it when its last handle closes.
+
+    The supervisor holds the only handle, so when the supervisor ends, however it ends, every instance it started
+    ends with it. Children join the job when they are created, so none can start outside it. Without this, a service
+    stop ended the supervisor without its shutdown and left the instances running on their ports (2026-11-13: the next
+    supervisor found 8766, 47611-47617 and 47699 taken and could start nothing). Returns a sentence for the log."""
+    global _JOB
+    if os.name != "nt":
+        return "children follow the supervisor by process group only (not Windows)"
+    if _JOB is not None:
+        return "children are already tied to this supervisor"
+    import ctypes
+    from ctypes import wintypes
+
+    class BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class IO(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                                         "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class EXTENDED(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IO), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return f"children are NOT tied to the supervisor: CreateJobObject failed ({ctypes.get_last_error()})"
+    info = EXTENDED()
+    info.BasicLimitInformation.LimitFlags = 0x2000                # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):   # JobObjectExtendedLimitInformation
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        return f"children are NOT tied to the supervisor: SetInformationJobObject failed ({error})"
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        return f"children are NOT tied to the supervisor: AssignProcessToJobObject failed ({error})"
+    _JOB = job
+    return "children are tied to this supervisor: a kill-on-close job ends them when it ends"
+
+
 def console_secret_path(state_dir, name) -> Path:
-    """Per-run read-only-console token file: <operator_credentials>/<instance>.console.secret (the operators.py secrets dir)."""
-    return StatePaths.coerce(state_dir).operator_credentials_dir / f"{name}.console.secret"
+    """Per-run read-only-console token file: <run>/console/<instance>.console.secret. Not under secrets/operator_credentials:
+    the supervisor runs as the service account, which writes this file at every launch and must not hold write access to
+    the operators' credentials (2026-11-13: that write was refused and the Nodus host did not start)."""
+    return StatePaths.coerce(state_dir).console_dir / f"{name}.console.secret"
 
 
 def _abs(path):
@@ -178,8 +253,17 @@ class Instance:
         self.console_port = None  # the port the host reported on its first JSON line
         self.contract_prefix = None   # first entry of that line's contract_ports: its prefix and listen_port
         self.contract_port = None
+        # [DEV] per-instance "code_root" (a turing tree, absolute or relative to this repo root): the child's working directory, so
+        # its relative argv (examples/meowdoku/server.py, task_worker.py ...) runs THAT tree's code; "speaktome_root" becomes the
+        # child's SPEAKTOME_REPO.  Neither set = this supervisor's own tree, exactly as before.  Relative paths in "args" resolve
+        # against the code root too, so a dev tree's instance gives its TLS pair and other untracked files as absolute paths.
+        self.code_root = _abs(spec["code_root"]) if spec.get("code_root") else ROOT
+        self.speaktome_root = _abs(spec["speaktome_root"]) if spec.get("speaktome_root") else None
         # [ROUTE] per-instance "state_dir" (a path, absolute or relative to the repo root): that child's --state-dir and nothing else
         self.paths = StatePaths(_abs(spec["state_dir"])) if spec.get("state_dir") else sup.paths
+        # [ROUTE] A dev or loan child owns its state-root DB unless accounts_db explicitly selects another one.
+        # The former fallback to sup.db_path gave meowdoku-dev and loans the live users and sessions.
+        self.accounts_db = _abs(spec["accounts_db"]) if spec.get("accounts_db") else self.paths.accounts_db
         self.federation_args = []     # [FEDERATE] --federation-port/--federation-canvas, set by begin() from spec["federation_from"]
 
     def console_requested(self) -> bool:
@@ -190,14 +274,15 @@ class Instance:
         return console_secret_path(self.sup.paths, self.name)
 
     def write_console_token(self):
-        """A fresh token for this run (overwritten on every launch), in the restricted secrets dir."""
+        """A fresh token for this run (overwritten on every launch), in the restricted console dir: the account the stack runs
+        as has full control, Administrators may read (an elevated Open-Console.ps1)."""
         path = self.console_token_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if not self.sup.secrets_restricted:
             self.sup.secrets_restricted = True
             sys.path[:0] = [p for p in (str(HERE),) if p not in sys.path]
             import operators as operators_mod            # noqa: E402  (the same icacls restriction operators.py applies)
-            self.sup.log(operators_mod._restrict(path.parent))
+            self.sup.log(operators_mod._restrict(path.parent, readers=("*S-1-5-32-544",)))
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(secrets.token_urlsafe(32))
@@ -219,8 +304,8 @@ class Instance:
                     *self.spec.get("args", [])]
             if not self.paths.is_legacy:                # an explicit state root is handed to the child; the old layout is its own default
                 argv += ["--state-dir", str(self.paths.root)]
-            if self.paths is not self.sup.paths:        # [ROUTE] a per-instance root shares the supervisor's accounts.db (users, roles, sessions, preferences)
-                argv += ["--accounts-db", str(self.sup.db_path)]
+            if self.paths is not self.sup.paths or self.spec.get("accounts_db"):
+                argv += ["--accounts-db", str(self.accounts_db)]
             if self.route:
                 argv += ["--route", self.route]
             argv += self.sup.route_args()               # [ROUTE] --routes / --stable-route / --dev-route from the enabled instances
@@ -244,9 +329,19 @@ class Instance:
             env["NODUS_HEADLESS_TEST_DLL"] = n["dll"]
         if n.get("path_prepend"):
             env["PATH"] = os.pathsep.join([str(Path(p)) for p in n["path_prepend"]] + [env.get("PATH", "")])
+        if self.speaktome_root is not None:             # [DEV] the SpeakToMe tree this child imports (rest_api.py reads it)
+            env["SPEAKTOME_REPO"] = str(self.speaktome_root)
         # Optional "env" of the instance: variables its child is started with (e.g. the Nodus exec rows' declarations).
         for key, value in (self.spec.get("env") or {}).items():
             env[str(key)] = str(value)
+        # Optional "env_files": a variable whose value is the content of a file, read at each launch and given to this
+        # child only (the landing task's GitHub token). The value is never logged; an unreadable file leaves it unset.
+        for key, path in (self.spec.get("env_files") or {}).items():
+            try:
+                env[str(key)] = Path(path).read_text(encoding="utf-8").strip()
+            except OSError as error:
+                env.pop(str(key), None)
+                self.sup.log(f"{self.name}: env_files {key}: {path} is unreadable ({type(error).__name__}); not set")
         return env
 
     def check(self):
@@ -255,9 +350,17 @@ class Instance:
             return "disabled (enabled: false)"
         if self.kind not in ("meowdoku", "nodus", "command"):
             return f"unknown kind {self.kind!r}"
+        if self.kind == "meowdoku" and self.spec.get("site") in ("dev", "loan") and self.accounts_db.resolve() == self.sup.db_path.resolve():
+            return "Development and loan accounts_db must differ from the live supervisor database"
+        if not self.code_root.is_dir():                   # [DEV] a missing tree is reported, never replaced by this one
+            return f"code_root not found: {self.code_root}"
+        if self.kind == "meowdoku" and not (self.code_root / "examples" / "meowdoku" / "server.py").is_file():
+            return f"code_root has no examples/meowdoku/server.py: {self.code_root}"
+        if self.speaktome_root is not None and not (self.speaktome_root / "speaktome_api" / "__init__.py").is_file():
+            return f"speaktome_root has no speaktome_api package: {self.speaktome_root}"
         if self.kind == "nodus":
             n = self.spec.get("nodus") or {}
-            if not n.get("canvas") or not _abs(n["canvas"]).exists():
+            if not n.get("canvas") or (not n.get("create_canvas", False) and not _abs(n["canvas"]).exists()):
                 return f"canvas not found: {n.get('canvas')}"
             if not Path(n.get("tool", "")).exists():
                 return f"run_canvas tool not found: {n.get('tool')}"
@@ -311,7 +414,7 @@ class Instance:
         out = open(self.logfile, "ab")
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
-            self.proc = subprocess.Popen(self.command(), cwd=str(ROOT), env=self.env(), stdin=subprocess.DEVNULL, stdout=out,
+            self.proc = subprocess.Popen(self.command(), cwd=str(self.code_root), env=self.env(), stdin=subprocess.DEVNULL, stdout=out,
                                          stderr=subprocess.STDOUT, creationflags=flags)
         finally:
             out.close()
@@ -369,6 +472,11 @@ class Instance:
         self.uid = ensure_service_user(self.spec["account"], self.sup.db_path)
         with connect(self.sup.db_path) as db:
             db.execute("INSERT OR REPLACE INTO account_instances VALUES (?, ?)", (self.uid, self.name))
+        if self.spec.get("autostart", True) is False:   # [CONTROL] off at start: managed, launched only by a start request
+            self.state = "stopped"
+            self.sup.log(f"{self.name}: autostart false: not started with the stack; a start request starts it")
+            self.record(started=None)
+            return
         if self.kind == "meowdoku" and listening(self.port):
             self.state = "external"
             self.sup.log(f"{self.name}: port {self.port} already has a listener; not launching over it (state external)")
@@ -425,6 +533,15 @@ class Instance:
                 flags += ["--userlist-port", str(port)]
             else:
                 self.sup.log(f"{self.name}: userlist_prefix {userlist!r}: the host declares no such contract port; searched directly")
+        events = getattr(self.sup, "system_events", None) or {}     # [REVIEWS] this instance may ask the updater for a task
+        if self.spec.get("system_events") is True:                   # (the landing queue's "land now"): instances.json system_events
+            port = getattr(source, "contract_ports", {}).get(events.get("prefix")) if events.get("from") == source_name else None
+            if port:
+                self.sup.log(f"{self.name}: asks tasks of {source_name!r} contract port {port} ({events['prefix']})")
+                flags += ["--task-port", str(port), "--task-jobs-dir", str(events["jobs_dir"])]
+            else:
+                self.sup.log(f"{self.name}: system_events: {source_name!r} declares no {events.get('prefix')!r} port for it; "
+                             "the landing queue cannot land now")
         return flags
 
     def poll(self):
@@ -559,6 +676,79 @@ class Instance:
             self.record(stopped=time.time())
 
 
+class AccessAppendLock:
+    """[APPEND] ticket f62934c8, hazard 3: both supervisors (the manager and the log sink, docstring above) append to
+    apache-access.log.  On Windows an O_APPEND write is "seek to the end, then write" and is not atomic across
+    processes, so two appenders can overwrite or splice each other's records.  Each append (one stdin line's sealed
+    records, written and flushed) is therefore made under an OS lock on ``<logs>/apache-access.log.lock``, the same
+    one-byte msvcrt/fcntl lock acquire_lock uses.  The lock is held only for that write.  A lock that cannot be opened
+    or taken within WAIT_S never stops the append (the drain must not block httpd); it is written unlocked and logged."""
+    WAIT_S = 2.0
+    RETRY_S = 0.005
+
+    def __init__(self, path, log, clock=time.monotonic, sleep=time.sleep):
+        self.log, self.clock, self.sleep = log, clock, sleep
+        self.unlocked = 0
+        try:
+            self.file = open(path, "a+b")
+        except OSError as error:
+            self.file = None
+            log(f"access log lock {path} could not be opened ({error!r}); appends are written unlocked")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.file is not None:
+            self.file.close()
+        return False
+
+    def _lock(self) -> bool:
+        if self.file is None:
+            return False
+        deadline = self.clock() + self.WAIT_S
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.file.seek(0)
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if self.clock() >= deadline:
+                    return False
+                self.sleep(self.RETRY_S)
+
+    def _unlock(self):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.file.seek(0)
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.file, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+    def append(self, out, data: bytes):
+        """Write and flush ``data`` to ``out`` (opened "ab") while holding the lock."""
+        locked = self._lock()
+        try:
+            out.write(data)
+            out.flush()
+        finally:
+            if locked:
+                self._unlock()
+        if not locked:
+            self.unlocked += 1
+            if self.unlocked == 1 or self.unlocked % 1000 == 0:
+                self.log(f"access log: {self.unlocked} append(s) written WITHOUT the lock (not taken within {self.WAIT_S}s)")
+
+
 class Supervisor:
     def __init__(self, db_path, instances_path, state_dir):
         """state_dir: a StatePaths, or a plain directory (the old meaning: the legacy layout rooted there)."""
@@ -572,10 +762,30 @@ class Supervisor:
         self.restart_display = "the restart account"
         self.secrets_restricted = False
         self._lock_file = None
+        self.hosted_tasks = []
+
+    def task_action(self, action, *, quiet=False):
+        """Use the registered agent account task; never launch its model under Apache's identity."""
+        if os.name != "nt":
+            return
+        flag = "/Run" if action == "start" else "/End"
+        for name in self.hosted_tasks:
+            try:
+                result = subprocess.run(["schtasks.exe", flag, "/TN", name], capture_output=True, text=True, timeout=35)
+            except (subprocess.TimeoutExpired, OSError) as error:  # a slow Task Scheduler must never end the supervisor
+                self.log(f"hosted task {name!r} {action} did not answer: {error!r}")
+                continue
+            if result.returncode:
+                self.log(f"hosted task {name!r} {action} failed: {(result.stderr or result.stdout).strip()}")
+            elif not quiet:
+                self.log(f"hosted task {name!r} {action} requested")
 
     def log(self, text):
         line = time.strftime("%Y-%m-%d %H:%M:%S ") + f"[apache_supervisor] {text}"
-        print(line, file=sys.stderr, flush=True)
+        try:                       # a closed or broken stderr must not stop the file record (or tail_stdin's drain)
+            print(line, file=sys.stderr, flush=True)
+        except (OSError, ValueError, AttributeError):
+            pass
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             with open(self.log_dir / "apache-supervisor.log", "a", encoding="utf-8") as f:
@@ -596,16 +806,62 @@ class Supervisor:
                 fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
         except OSError:
+            self._lock_file.close()
+            self._lock_file = None
             return False
 
     def tail_stdin(self):
-        """Apache's access-log lines -> apache-access.log.  Returns on EOF (= httpd is shutting down)."""
+        """Apache's access-log lines -> apache-access.log.  Returns on EOF (= httpd is shutting down).
+
+        [SURVIVE] ticket f62934c8, hazard 2: this reader is the only consumer of the piped CustomLog.  Before this, an
+        exception in RecordCipher/migrate/seal/write ended the daemon thread silently; nobody read the pipe any more,
+        so httpd blocked writing access lines once its pipe buffer filled, and the supervisor never saw EOF.  Now a
+        failure is logged loudly (apache-supervisor.log and stderr) and stdin is drained to EOF, unrecorded, so httpd
+        keeps serving; the loss is counted in the log.  EOF still sets ``stop`` as before."""
+        try:
+            self._tail_stdin_sealed()
+        except Exception as error:
+            import traceback
+
+            def say(text):         # nothing in the failure path may raise before or during the drain
+                try:
+                    self.log(text)
+                except Exception:
+                    pass
+
+            say(f"ACCESS LOG FAILED: {error!r}; Apache's access lines are now DROPPED (not recorded) until the "
+                f"supervisor restarts. stdin is still drained so httpd does not block.\n{traceback.format_exc()}")
+            loss_note = "the line in flight and any buffered reducer entries may also be lost; this is not the total loss"
+            drained = 0
+            try:
+                for _ in iter(sys.stdin.buffer.readline, b""):
+                    drained += 1
+            except Exception as drain_error:
+                say(f"stdin drain failed too: {drain_error!r}; {drained} line(s) drained unrecorded after the failure "
+                    f"before the read error, EOF not reached ({loss_note})")
+            else:
+                say(f"access log: {drained} line(s) drained unrecorded after the failure, up to EOF ({loss_note})")
+        finally:
+            self.stop.set()
+
+    def _tail_stdin_sealed(self):
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.log_dir / "apache-access.log", "ab") as out:
+        path = self.log_dir / "apache-access.log"
+        cipher = RecordCipher(self.paths.records_key, existing_streams=(path, self.paths.log_ring))
+        cipher.migrate(path)
+        # [REDUCE] repeated n-line cycles (a polling client) are counted, not written again; an optional keep/drop filter,
+        # <logs>/log_filter.json, is read whenever it changes (log_reduce.py). Reduced before sealing.
+        from meowdoku import log_reduce
+        reducer = log_reduce.Reducer(line_filter=log_reduce.LineFilter(self.log_dir / "log_filter.json"))
+        # [APPEND] hazard 3: each line's records are one locked append, so the other supervisor cannot splice into them.
+        with open(path, "ab") as out, AccessAppendLock(self.log_dir / "apache-access.log.lock", self.log) as appender:
             for line in iter(sys.stdin.buffer.readline, b""):
-                out.write(line)
-                out.flush()
-        self.stop.set()
+                sealed = b"".join(cipher.seal(text.encode("utf-8")) for text in reducer.feed(line.decode("utf-8", "replace")))
+                if sealed:
+                    appender.append(out, sealed)
+            sealed = b"".join(cipher.seal(text.encode("utf-8")) for text in reducer.flush())
+            if sealed:
+                appender.append(out, sealed)
 
     def route_args(self):
         """[ROUTE] ``--routes a,b --stable-route a --dev-route b`` for every meowdoku child: built from the ENABLED meowdoku instances
@@ -631,17 +887,24 @@ class Supervisor:
                         "route": inst.route, "console_port": (spec.get("nodus") or {}).get("console_port", spec.get("console_port")),
                         "leases": spec.get("leases", []), "federation_from": spec.get("federation_from"),
                         "command": inst.command() if not reason else None, "skipped": reason,
-                        "state_dir": str(inst.paths.root) if spec.get("state_dir") else None})
+                        "state_dir": str(inst.paths.root) if spec.get("state_dir") else None,
+                        "code_root": str(inst.code_root) if spec.get("code_root") else None,
+                        "speaktome_root": str(inst.speaktome_root) if inst.speaktome_root is not None else None})
         return out
 
-    def run(self, manage=True):
-        reader = threading.Thread(target=self.tail_stdin, daemon=True)
-        reader.start()
+    def run(self, manage=True, reader_started=False):
+        role = "manager" if manage else "access-log reader"
+        self.log(f"process pid {os.getpid()} role {role}")
+        if not reader_started:
+            reader = threading.Thread(target=self.tail_stdin, daemon=True)
+            reader.start()
         for sig in ("SIGTERM", "SIGBREAK", "SIGINT"):
             if hasattr(signal, sig):
                 signal.signal(getattr(signal, sig), lambda *_: self.stop.set())
         if manage:
+            self.log(tie_children_to_this_process())       # [JOB] before the first instance starts
             specs = load_instances(self.instances_path)
+            self.hosted_tasks = instances_hosted_tasks(self.instances_path)
             self.system_events = instances_system_events(self.instances_path)
             account, display = instances_restart_account(self.instances_path)
             if account:
@@ -659,7 +922,18 @@ class Supervisor:
                 except Exception as error:
                     inst.state = "failed"
                     self.log(f"{inst.name}: start failed: {error!r}")
+            self.task_action("start")
+            loans_due, hosted_due = 0.0, time.monotonic() + HOSTED_CHECK_S
             while not self.stop.wait(1.0):
+                if time.monotonic() >= hosted_due:
+                    hosted_due = time.monotonic() + HOSTED_CHECK_S
+                    self.task_action("start", quiet=True)
+                if time.monotonic() >= loans_due:           # [LOAN] before the requests, so a loan's restart finds its instance
+                    loans_due = time.monotonic() + LOAN_CHECK_S
+                    try:
+                        self.reconcile_loans()
+                    except Exception as error:
+                        self.log(f"loan reconcile error: {error!r}")
                 try:
                     self.handle_requests()
                 except Exception as error:
@@ -672,8 +946,50 @@ class Supervisor:
             self.shutdown()
         else:
             self.log("another supervisor owns the instances; this process only logs")
-            self.stop.wait()
+            while not self.stop.wait(5.0):
+                if self.acquire_lock():
+                    if self.stop.is_set():
+                        self._lock_file.close()
+                        self._lock_file = None
+                        break
+                    self.log("manager lock released; this access-log reader is taking over the instances")
+                    return self.run(manage=True, reader_started=True)
         return 0
+
+    def reconcile_loans(self):
+        """[LOAN] Start the ready loans that have no instance yet; stop and drop the loan instances whose loan ended or went
+        idle. Only instances this method made (site "loan") are ever stopped here."""
+        from meowdoku import branch_servers
+        cfg = branch_servers.config(self.instances_path)
+        if cfg is None:
+            return
+        db = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+        try:
+            from meowdoku import central_checkout
+            central_checkout.ensure(db)
+            wanted = {spec["name"]: spec for spec in branch_servers.specs(db, cfg)}
+        finally:
+            db.close()
+        current = {inst.name: inst for inst in self.instances if inst.spec.get("site") == "loan"}
+        for name, inst in current.items():
+            if name not in wanted:
+                try:
+                    said = inst.force_stop()
+                except Exception as error:
+                    said = f"stop failed: {error!r}"
+                self.instances.remove(inst)
+                self.log(f"{name}: its loan ended or went idle: {said}")
+        for name, spec in wanted.items():
+            if name in current:
+                continue
+            inst = Instance(spec, self)
+            self.instances.append(inst)
+            try:
+                inst.begin()
+                self.log(f"{name}: lent for {spec['loan']['repository']} {spec['loan']['branch']} on port {spec['port']}")
+            except Exception as error:
+                inst.state = "failed"
+                self.log(f"{name}: start failed: {error!r}")
 
     def handle_requests(self):
         """[CONTROL] Perform the pending rows of ``instance_requests``. ``*`` means every instance: sources of a
@@ -712,13 +1028,18 @@ class Supervisor:
                 state, detail = "refused", "no such instance under this supervisor"
             else:
                 done = []
+                # [CONTROL] the whole stack ("*") brings back only what runs with it: an instance off at start
+                # ("autostart": false) that is not running now stays stopped; asked for by name, it starts.
+                left = set() if item["instance"] != instance_control.ALL else {
+                    i.name for i in targets if i.spec.get("autostart", True) is False and not (i.proc and i.proc.poll() is None)}
                 try:
                     if item["action"] in ("restart", "shutdown"):
                         for inst in reversed(targets):
                             done.append(f"{inst.name}: {inst.force_stop()}")
                     if item["action"] in ("restart", "start"):
                         for inst in targets:
-                            done.append(f"{inst.name}: {inst.force_start()}")
+                            done.append(f"{inst.name}: " + ("left stopped (autostart: false)" if inst.name in left
+                                                            else inst.force_start()))
                     if authorized is not None:
                         done.insert(0, f"authorized by {self.restart_display}: no running jobs")
                     state, detail = "done", "; ".join(done)
@@ -766,6 +1087,7 @@ class Supervisor:
             instance_control.mark_announced(db, item["id"], 2 if cancelled else 1)
 
     def shutdown(self):
+        self.task_action("stop")
         self.log("stopping instances")
         for inst in self.instances:
             if inst.state in ("starting", "running", "backoff"):

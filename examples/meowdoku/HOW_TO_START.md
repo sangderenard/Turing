@@ -1,5 +1,36 @@
 # How to start Meowdoku on Windows
 
+The public MCP deployment declares `SPEAKTOME_PUBLIC_ORIGIN=https://stichka.duckdns.org:8766` for the stable
+instance in `deploy/instances.json`. Apache routes `/mcp`, `/mcp/guest`,
+`/oauth/*`, and the OAuth discovery documents to that same instance so a
+development-route browser cookie cannot split an authorization flow. After
+this configuration lands, use the job-aware full stack restart procedure;
+an instance-only restart retains the supervisor's old environment. Verify
+the public HTTPS discovery document and MCP initialize before telling a
+client to connect. The public hostname's certificate must validate with the
+client's normal trust store.
+
+The external guest MCP URL is `https://stichka.duckdns.org:8766/mcp/guest`.
+The router forwards external 8766 to Apache on this machine's port 443;
+Apache forwards to the stable TLS listener on local port 8766. Retained
+Apache access records and the server log ring are
+encrypted with `StatePaths.records_key`; keep that key with the state backup.
+`/api/account/admin/records` and `/api/log` require an admin account and HTTPS.
+
+Before the coordinated restart, provision the records key as the operator in
+`C:/dev/Powershell/turing` and grant the Apache service account read access:
+
+```powershell
+& C:/dev/Powershell/srv/python/python.exe -c "import sys; sys.path.insert(0, 'examples'); from meowdoku.secure_records import RecordCipher; RecordCipher('C:/dev/Powershell/srv/state/secrets/records.key')"
+icacls C:/dev/Powershell/srv/state/secrets/records.key /grant 'svc-meowdoku:(R)'
+```
+
+Keep that key with every state backup. The first startup converts the existing
+plain `log_ring.jsonl` and `apache-access.log` to authenticated ciphertext.
+The old supervisor must have exited before conversion; it still writes plain
+access lines. Historical backups and other diagnostic logs require a separate
+retention review because this migration does not rewrite them.
+
 Run from `C:\dev\Powershell\turing`. These are the verified deployment settings
 as of 2026-11-10. Before a later restart, inspect `build/meowdoku/launch.json`
 for the current executable, argv, cwd, and environment. Preserve that record's

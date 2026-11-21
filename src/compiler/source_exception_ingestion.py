@@ -96,13 +96,65 @@ class FailureArms:
     def active(self, context):
         return self.intrinsic("exception_active", (self.load(context.error),))
 
-    def guard(self, context, statements):
+    def guard(self, context, statements, *, inactive_by_construction=None):
+        """``if not exception_active(error): statements``.
+
+        Program: YoungMan ``_build_triangle_map`` -- ``try: <if/else binding
+        centroid> except Exception: ...; exit()`` inside ``for bitmask``, then
+        ``centroid.all()``.  Wrong record: two guards tested a record that is
+        inactive by construction -- the fresh ``exception_none()`` assigned on
+        the line before the protected body, and an unprotected (function-
+        level) error record, which every earlier try's barrier leaves inactive
+        or raises.  Their never-taken arm reached the code after the try
+        without the body, so names the body bound had no value there
+        (dominance finding, or no dtype in a loop).  Rule: such a guard is
+        spelled ``if True:`` and records why (``inactive_by_construction``);
+        the reducer treats the never-taken arm as terminal.
+        """
+        if inactive_by_construction is not None and not (
+                context.protected and self.return_flag is not None):
+            guard = ast.If(test=ast.Constant(True), body=statements or [ast.Pass()], orelse=[])
+            guard._turing_exception_guard = (context.error, context.protected, self.return_flag)
+            guard._turing_exception_guard_inactive = inactive_by_construction
+            return guard
         predicate = ast.UnaryOp(op=ast.Not(), operand=self.active(context))
         if context.protected and self.return_flag is not None:
             predicate = ast.BoolOp(op=ast.And(), values=[predicate, ast.UnaryOp(op=ast.Not(), operand=self.load(self.return_flag))])
         guard = ast.If(test=predicate, body=statements or [ast.Pass()], orelse=[])
         guard._turing_exception_guard = (context.error, context.protected, self.return_flag)
         return guard
+
+    def system_exit(self, node):
+        """``exit(...)`` / ``quit(...)`` / ``sys.exit(...)`` as the Raise it performs, else None.
+
+        The builtins (installed by ``site``) and ``sys.exit`` raise
+        ``SystemExit(*args)`` and never return.  Resolved as Python resolves the
+        name: not bound in the module or function (``shadowed``), the builtin
+        present, or ``sys`` imported as the ``sys`` module.
+        """
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)) or node.value.keywords:
+            return None
+        call, func = node.value, node.value.func
+        builtin = (isinstance(func, ast.Name) and func.id in {"exit", "quit"}
+                   and func.id not in self.shadowed and func.id not in self.external_shadowed
+                   and getattr(builtins, func.id, None) is not None)
+        module = (isinstance(func, ast.Attribute) and func.attr == "exit"
+                  and isinstance(func.value, ast.Name)
+                  and self.exception_imports.get(func.value.id) == "sys"
+                  and func.value.id not in self.external_shadowed)
+        if not (builtin or module) or len(call.args) > 1:
+            return None
+        if "SystemExit" in self.shadowed or "SystemExit" in self.external_shadowed:
+            return None
+        raised = ast.Raise(exc=ast.Call(func=ast.Name(id="SystemExit", ctx=ast.Load()),
+                                        args=[_copy_source(arg) for arg in call.args], keywords=[]),
+                           cause=None)
+        ast.copy_location(raised, node)
+        for descendant in ast.walk(raised):
+            if not hasattr(descendant, "lineno"):
+                ast.copy_location(descendant, node)
+        raised._turing_system_exit_call = node
+        return raised
 
     def exception_identity(self, node, occupied):
         del occupied
@@ -220,6 +272,7 @@ class FailureArms:
         )
 
     def statement(self, node, context):
+        node = self.system_exit(node) or node
         if isinstance(node, ast.Raise):
             return [self.assign(context.error, self.raised_record(
                 node, context, retain_message_operand=True,
@@ -303,7 +356,7 @@ class FailureArms:
         self.checks += 1
         body = [
             self.assign(error, self.intrinsic("exception_none")),
-            self.guard(context, protected_body),
+            self.guard(context, protected_body, inactive_by_construction="fresh_exception_none"),
             self.guard(context, [self.assign(error, self.intrinsic("exception_take"))]),
         ]
         body_bound = set(self.bound)
@@ -357,13 +410,17 @@ class FailureArms:
                 body += [ast.If(test=self.load(self.return_flag), body=[self.assign(error, self.intrinsic("exception_none"))],
                     orelse=[self.assign(self.return_flag, self.load(saved_return))])]
         body.append(ast.If(test=self.active(context), body=[self.assign(parent.error, self.load(error))], orelse=[]))
-        wrapper = self.guard(parent, body)
+        # An unprotected parent is the function-level record: every earlier
+        # try's barrier raised it or left it inactive.
+        wrapper = self.guard(parent, body, inactive_by_construction=(
+            None if parent.protected else "unprotected_function_record"))
         wrapper._turing_exception_normal_bindings = normal_bindings
         return [wrapper]
 
     def outside(self, statements, context):
         result = []
         for statement in statements:
+            statement = self.system_exit(statement) or statement
             if isinstance(statement, ast.Try):
                 lowered = self.try_statement(statement, context)
                 barrier = ast.If(test=self.active(context), body=[ast.Expr(value=self.intrinsic("exception_raise", (self.load(context.error),)))], orelse=[])
@@ -383,7 +440,8 @@ class FailureArms:
                 # Raise.  Keep its source cell through the later A-normal
                 # hoist, which moves the call into an Assign.
                 from ..transmogrifier.graph.graph_express2 import post_source_span
-                terminal._turing_authored_raise_cell = post_source_span(None, statement)
+                terminal._turing_authored_raise_cell = post_source_span(
+                    None, getattr(statement, "_turing_system_exit_call", statement))
                 result.append(ast.copy_location(ast.Expr(value=terminal), statement))
             elif isinstance(statement, (ast.If, ast.For, ast.While, ast.With)):
                 incoming_bound = set(self.bound)

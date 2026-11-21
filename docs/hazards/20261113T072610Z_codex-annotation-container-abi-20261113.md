@@ -1,0 +1,7 @@
+# Default receipts follow exact source-span revisions
+
+Observed in real compile_nodes: output_node_keys=None had correct argument and Constant(None) source causes, but two revisions of the same FunctionDef span. Republishing the unchanged default with CONCORD merged both function-span causes into one receipt. The exact-three-span validator correctly refused four.
+
+Repair is at post_source_parameter_defaults, not the validator. An unchanged fact with identical current causes remains idempotent. Newer revisions of the same exact three authored source rows produce a new receipt citing those three current spans and the prior receipt as history. Different source occurrences or backward revisions refuse; a different default value retains CONCORD disagreement refusal. No source identity is inferred from a parameter spelling alone.
+
+Verification: default, intrinsic-signature and guarded-callable suites: 19 passed. Immediate HEAD comparison with the same tests: 17 passed, 2 failed, exactly the body-revision and unrelated-occurrence regressions. Changed default values still refuse, existing missing-cause negative remains, and old receipt facts remain readable. Mapping audit: 28 rows across 2 functions, zero findings, zero unsourced, latch CLOSED. With the actual AbstractNN Module dependency integrated, real compile_nodes now reaches one concordance finding instead of two: an unaccounted membership operand. No LLVM completion claimed; no push, merge or deployment.

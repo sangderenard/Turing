@@ -373,6 +373,15 @@ LINUX_AMD64_NATIVE_LINKER = NativeTargetContext(
     accepts_loadable_images=False, name="linux-amd64",
     llvm_triple="x86_64-linux-gnu", toolchain_target="x86_64-linux-gnu",
 )
+# Program: the dt-system compile on the Oracle A1 host (Ubuntu 24.04 aarch64,
+# 2026-11-21).  Wrong record: no arm64 Linux target was registered, so the
+# unnamed build fell to the Windows linker and the three law pieces were
+# built as x86_64 PE DLLs that ``dlopen`` refused ("invalid ELF header").
+LINUX_ARM64_NATIVE_LINKER = NativeTargetContext(
+    "arm64", "linux", "aapcs64", frozenset({"elf-object"}),
+    accepts_loadable_images=False, name="linux-arm64",
+    llvm_triple="aarch64-linux-gnu", toolchain_target="aarch64-linux-gnu",
+)
 ANDROID_ARM64_NATIVE_LINKER = NativeTargetContext(
     "arm64", "android", "aapcs64", frozenset({"elf-object"}),
     accepts_loadable_images=False, name="android-arm64-v8a",
@@ -402,6 +411,7 @@ _BUILD_TARGETS = MappingProxyType({
         IOS_ARM64_NATIVE_LINKER,
         ANDROID_ARM64_NATIVE_LINKER,
         LINUX_AMD64_NATIVE_LINKER,
+        LINUX_ARM64_NATIVE_LINKER,
         WASM32_FREESTANDING_LINKER,
     )
 })
@@ -424,6 +434,8 @@ def host_build_target() -> NativeTargetContext:
     machine = platform.machine().casefold()
     if sys.platform.startswith("linux") and machine in {"x86_64", "amd64"}:
         return LINUX_AMD64_NATIVE_LINKER
+    if sys.platform.startswith("linux") and machine in {"aarch64", "arm64"}:
+        return LINUX_ARM64_NATIVE_LINKER
     return WINDOWS_AMD64_NATIVE_LINKER
 
 
@@ -482,6 +494,7 @@ __all__ = [
     "NativeRetentionMode", "NativeTargetContext", "RetainedNativeModule",
     "ANDROID_ARM64_NATIVE_LINKER", "IOS_ARM64_NATIVE_LINKER",
     "LINUX_AMD64_NATIVE_LINKER",
+    "LINUX_ARM64_NATIVE_LINKER",
     "PORTABLE_AMD64_MACHINE_SSA_VM", "WINDOWS_AMD64_NATIVE_LINKER",
     "WINDOWS_AMD64_NATIVE_LOADER", "X86_64_PORTABLE_EXECUTOR",
     "build_target_from_metadata", "build_targets", "host_build_target",

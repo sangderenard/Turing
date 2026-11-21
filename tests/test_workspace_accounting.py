@@ -66,6 +66,14 @@ class WorkspaceAccountingTests(unittest.TestCase):
         self.assertEqual(self.store.list_owned(2), [])
         self.assertEqual(self.store.get(1, key)['state'], 'active')
 
+    def test_published_bundle_prevents_workspace_release(self):
+        key = self.active()
+        with db_connect(self.db) as db:
+            db.execute('CREATE TABLE authored_pages(workspace_id TEXT)')
+            db.execute('INSERT INTO authored_pages VALUES(?)', (key,))
+        with self.assertRaisesRegex(w.Refused, 'published pages prevent workspace release'):
+            self.store.begin_release(1, key)
+
     def test_ticket_owner_and_admin_queue(self):
         key, ticket = self.ticket()
         with self.assertRaises(w.NotFound): self.store.get_ticket(2, ticket)

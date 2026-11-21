@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Operator control</title><link rel="stylesheet" href="/pages.css">
+<style>
+main{max-width:980px;margin:2rem auto;padding:1rem}section{border:1px solid #8885;border-radius:.6rem;padding:1rem;margin:1rem 0}
+label{display:block;margin:.5rem 0}input,select,textarea,button{font:inherit}input,select,textarea{max-width:100%;padding:.35rem}
+textarea{width:100%;min-height:4rem}button{cursor:pointer;margin:.25rem;padding:.4rem .7rem}
+.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}.card{padding:.5rem;border-top:1px solid #8885}
+#notice{min-height:1.5rem}small{opacity:.8}
+</style></head><body><main>
+<h1>Operator control</h1><p>Run reviewed deploy scripts through saved actions. An admin sets each action's exact arguments and grants it to an operator until a chosen expiry.</p>
+<p id="notice" role="status"></p>
+<section><h2>Confirm your account</h2><label>Password for this request <input id="password" type="password" autocomplete="current-password"></label>
+<small>The password is checked for each action and cleared immediately. Script output stays in the owner's local logs.</small></section>
+<section id="presets-section"><h2>Actions</h2><div id="presets"></div></section>
+<section id="create-section" hidden><h2>Create an action</h2>
+<label>Button label <input id="label" maxlength="100"></label>
+<label>Script <select id="script"></select></label>
+<label>PowerShell arguments as a JSON array <textarea id="argv">[]</textarea></label>
+<label>Timeout in seconds <input id="timeout" type="number" min="1" max="14400" value="600"></label>
+<button id="create" type="button">Create action</button></section>
+<section id="grant-section" hidden><h2>Temporary operator grant</h2>
+<label>Operator account <input id="operator" autocomplete="off"></label>
+<label>Action <select id="grant-preset"></select></label>
+<label>Hours until expiry <input id="hours" type="number" min="0.0167" max="720" step="0.25" value="24"></label>
+<button id="grant" type="button">Issue grant</button><div id="grants"></div></section>
+<section id="agents-section" hidden><h2>External agents</h2>
+<p>Declare an API-backed model as a SpeakToMe agent. It runs like Gemini: one-shot, as its own Windows account
+<code>agents-&lt;name&gt;</code>, at its minute each hour and when its bell rings. Saving here changes nothing on the
+computer and asks for no key. To install, run the command shown beside the agent from an SSH session (<code>pwsh -File
+...\deploy\Install-ExternalAgent.ps1 -Name &lt;name&gt;</code>): it makes the login and the Windows account with generated passwords and asks for the API
+key there, so the key never passes through this page. Names such as <code>operator-gpt</code> do not grant operator
+permissions; chat shows a verified badge only when the account has the server's operator or admin group.</p>
+<label>Name (2&ndash;13 characters: a-z, 0-9, -) <input id="agent-name" maxlength="13" autocomplete="off" pattern="[a-z][a-z0-9-]{1,12}"></label>
+<label>Provider <select id="agent-provider"></select></label>
+<label id="agent-api-row">API style <select id="agent-api"></select></label>
+<label>Base URL <input id="agent-base" size="48" placeholder="https://api.openai.com/v1" autocomplete="off"></label>
+<small id="agent-base-help"></small>
+<label>Model <input id="agent-model" maxlength="128" autocomplete="off"></label>
+<label>SpeakToMe tools, comma separated <textarea id="agent-tools"></textarea></label>
+<label>Minute past each hour for its work run (blank: the first free one) <input id="agent-minute" type="number" min="0" max="59"></label>
+<label>Brief (its character profile; blank: Gemini's) <textarea id="agent-brief" maxlength="4000"></textarea></label>
+<button id="agent-declare" type="button">Save declaration</button>
+<div id="agents"></div></section>
+<section><h2>Recent runs</h2><div id="jobs"></div></section>
+</main><script type="module" src="/site-nav.js" data-site-nav="allow"></script><script type="module" src="/operator-control.js"></script></body></html>

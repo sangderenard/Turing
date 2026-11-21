@@ -283,3 +283,17 @@ def test_a_real_countdown_is_broadcast_through_nodus_interrupted_and_then_one_ru
             proc.kill()
         proc.stdout.close()
         proc.stderr.close()
+
+
+def test_a_broadcast_to_named_accounts_reaches_exactly_them_with_its_review_subject(tmp_path):
+    path = tmp_path / "accounts.db"
+    ids = make_accounts(path)
+    request = {"text": "bo revoked the approval of work feature", "usernames": ["cy", "an", "nobody"], "msg_type": "question",
+               "subject": {"kind": "review", "ref": "r1"}}
+    said = scheduled_tasks.broadcast(path, "svc-nodus", request, messaging=messaging)
+    assert said.startswith("told 1 named account(s), 2 skipped"), said
+    got = messages_to(path, ids["cy"])
+    assert len(got) == 1 and got[0]["subject_kind"] == "review" and got[0]["subject_ref"] == "r1" and got[0]["msg_type"] == "question"
+    assert messages_to(path, ids["ann"]) == [], "a name is never a partial match: 'an' is not ann"
+    with pytest.raises(ValueError):
+        scheduled_tasks.broadcast(path, "svc-nodus", {"text": "x", "usernames": []}, messaging=messaging)

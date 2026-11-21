@@ -154,7 +154,8 @@ def _check_limits(db, owner_key: str, now: float) -> None:
     if active >= MAX_QUEUED_PER_ACCOUNT:
         raise DividerError(f"at most {MAX_QUEUED_PER_ACCOUNT} queued jobs per account", 429)
     recent = db.execute("SELECT COUNT(*) FROM divider_jobs WHERE owner_key=? AND created > ?", (owner_key, now - 86400)).fetchone()[0]
-    if recent >= MAX_PER_DAY:
+    from meowdoku import rate_limits
+    if rate_limits.enabled() and recent >= MAX_PER_DAY:
         raise DividerError(f"at most {MAX_PER_DAY} jobs per day", 429)
 
 

@@ -73,7 +73,7 @@ def test_limits(monkeypatch):
 def test_http_query_and_admission(server):
     path = '/api/living-data/query'; payload = {'map': model(), 'at': 'r'}
     assert _call(server.port, path, 'POST', OUTSIDE, payload)[0] == 403
-    assert _call(server.port, path, 'POST', {}, payload)[0] == 401
+    assert _call(server.port, path, 'POST', {}, payload)[0] == 403          # a guest never holds dev_ui (owner, 2026-11-13)
     member = _cookie(server, 'querymember', 'member')
     assert _call(server.port, path, 'POST', {**member, **OUTSIDE}, payload)[0] == 403
     operator = _cookie(server, 'queryoperator', 'operator')

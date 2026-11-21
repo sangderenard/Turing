@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>We are under mild attack</title>
+<!-- [CONDITION] The yellow card (deploy/Set-SiteCondition.ps1 -Yellow). Apache answers every new request with this page
+     and 503 while it is posted. It is self-contained: nothing else on the site is reachable while it is up. -->
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #ffd60a; color: #000;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    font: 18px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 34rem; padding: 2rem 1.25rem; }
+  .cat { font-size: 4.5rem; line-height: 1; display: inline-block; animation: breathe 3.2s ease-in-out infinite; }
+  h1 { font-size: clamp(1.9rem, 6vw, 3rem); line-height: 1.1; margin: 1rem 0 0.75rem; letter-spacing: -0.02em; }
+  p { margin: 0.6rem 0; }
+  .small { font-size: 0.95rem; opacity: 0.75; margin-top: 1.5rem; }
+  @keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08) rotate(-3deg); } }
+  @media (prefers-reduced-motion: reduce) { .cat { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="cat" aria-hidden="true">🐈</div>
+  <h1>We are under mild attack</h1>
+  <p>Something out there keeps poking us, so we have curled up like a sleepy cat with a little fever and stopped letting new visitors in for a while.</p>
+  <p>Nothing is broken. The site is resting, and so is everything you keep here.</p>
+  <p class="small">We will uncurl soon. Please try again in a few minutes.</p>
+  <div id="controls" style="max-width:22rem;margin:2rem auto 0;"></div>
+</main>
+<script type="module">
+  // [CONDITION] For an operator or an admin only: the server answers this module to no one else and checks the role on
+  // every switch (site_condition.py). Anyone else gets nothing from it.
+  import("/api/condition/controls.js")
+    .then(m => m.mount(document.getElementById("controls"), { onCard: state => { if (!state.card) location.reload(); } }))
+    .catch(() => {});
+</script>
+</body>
+</html>

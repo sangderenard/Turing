@@ -1,0 +1,354 @@
+// Rooms: the chat server's rooms (chat_rooms.py) as site objects. HAND-AUTHORED. createElement/textContent only; the server
+// decides every permission, this page only decides what to offer.
+import { CHANNELS, renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
+const byId = id => document.getElementById(id);
+const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
+let who = null, rooms = [], presenceByName = new Map(), selected = new URLSearchParams(location.search).get("room");   // ?room=NAME opens that room (a menu link)
+
+async function request(path, body) {
+  const response = await fetch(path, { credentials: "same-origin", cache: "no-store",
+    ...(body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
+  let result = {};
+  try { result = await response.json(); } catch (error) { /* no body */ }
+  if (!response.ok) {
+    if (response.status === 401) { byId("signin").hidden = false; byId("content").hidden = true; }
+    throw new Error(result.error || `HTTP ${response.status}`);
+  }
+  return result;
+}
+const status = message => { byId("message").textContent = message; };
+async function loadAgentPresence() {
+  if (byId("agents").hidden) return;
+  try { const data = await request("/api/worldmap/presence");
+    presenceByName = new Map(data.agents.map(agent => [agent.username, agent]));
+    renderAgentPresence(byId("agent-presence"), data); }
+  catch (error) { byId("agent-presence").textContent = `Agent status unavailable: ${error.message}`; }
+}
+const when = seconds => seconds == null ? "—" : new Date(seconds * 1000).toLocaleString();
+const field = (label, input) => { const box = el("div"), l = el("label", label); input.id ||= `f-${Math.random().toString(36).slice(2)}`; l.htmlFor = input.id; box.append(l, input); return box; };
+const input = (value = "", type = "text") => { const i = document.createElement("input"); i.type = type; i.value = value; return i; };
+const choice = (options, value) => { const s = document.createElement("select"); for (const o of options) { const opt = el("option", o); opt.value = o; s.append(opt); } s.value = value; return s; };
+
+async function load() {
+  try {
+    ({ rooms } = await request("/api/chat/rooms"));
+    const list = byId("rooms");
+    list.replaceChildren();
+    for (const room of rooms) {
+      const row = el("button", room.title, "row"); row.type = "button";
+      if (!room.system) row.append(el("span", room.stage === "dev" ? "dev" : "released", "badge " + room.stage));
+      row.append(el("small", room.system ? `system room · ${room.room}` : `${room.room} · by ${room.owner}`));
+      row.setAttribute("aria-current", String(room.room === selected));
+      row.onclick = () => open(room.room);
+      list.append(row);
+    }
+    if (!rooms.length) list.append(el("p", "No room is open to you yet.", "muted"));
+    status(`${rooms.length} room${rooms.length === 1 ? "" : "s"} open to you.`);
+    if (selected) await open(selected, { quiet: true });
+  } catch (error) { status(error.message); }
+}
+
+async function open(name, { quiet = false } = {}) {
+  selected = name;
+  const panel = byId("room");
+  const typing = (panel.contains(document.activeElement) && ["TEXTAREA", "INPUT"].includes(document.activeElement.tagName)) ||
+    !!panel.querySelector(".picker:not([hidden]), .quickbar:not([hidden])");        // an open picker is not refreshed away
+  await emojiAtlas();
+  if (quiet && typing) return;
+  try {
+    const tail = encodeURIComponent(byId("tail").value);
+    const [{ settings }, { messages }, set, { table }] = await Promise.all([request(`/api/chat/rooms/${name}/settings`),
+      request(`/api/chat/rooms/${name}?tail=${tail}`), request(`/api/chat/rooms/${name}/tools`),
+      request(`/api/chat/rooms/${name}/table`)]);
+    panel.replaceChildren(el("h2", settings.title), el("p", settings.about || "", "muted"), roundTable(name, settings, table));
+    // the chat
+    const list = el("ul", null, "msgs");
+    for (const m of messages) {
+      const li = el("li");
+      li.append(el("span", m.username, "who"));
+      if (m.verified_role === "operator" || m.verified_role === "admin") {
+        const verified = el("span", `✓ Verified ${m.verified_role}`, "badge verified-role");
+        verified.setAttribute("aria-label", `Verified ${m.verified_role} permission`);
+        li.append(verified);
+      }
+      const presence = presenceByName.get(m.username);
+      if (presence) {
+        const summary = CHANNELS.map(([key, label]) => `${label}: ${presence.channels[key]?.state || "unknown"}`).join("; ");
+        const badge = el("span", CHANNELS.map(([key]) => ["active", "recent"].includes(presence.channels[key]?.state) ? "■" : "□").join(""), "agent-mini");
+        badge.title = `${m.username} · ${summary}`; badge.setAttribute("role", "img"); badge.setAttribute("aria-label", badge.title);
+        li.append(badge);
+      }
+      if (m.round) li.append(el("span", `round ${m.round}`, "badge round"));          // written at the round table
+      li.append(document.createTextNode(m.removed ? "(removed by an admin)" : m.body), el("span", when(m.at), "at"));
+      if (m.sticker && !m.removed) {                                                   // a picture the site made, through the room
+        const picture = document.createElement("img");
+        picture.src = `/api/chat/rooms/${encodeURIComponent(name)}/sticker/${m.id}`; picture.alt = `A sticker from ${m.username}`;
+        picture.className = "sticker"; picture.loading = "lazy";
+        li.append(picture);
+      }
+      if (!m.removed) li.append(reactions(name, m));
+      list.append(li);
+    }
+    if (!messages.length) list.append(el("li", "No message yet.", "muted"));
+    const compose = el("div", null, "compose"), text = document.createElement("textarea"), send = el("button", "Send");
+    text.rows = 2; text.maxLength = 4000; text.setAttribute("aria-label", `Message to ${settings.title} (Enter sends, Shift+Enter starts a new line)`);
+    send.type = "button";
+    // One post per press: while a post is in flight the composer is busy (Send disabled, text read-only), so a slow or
+    // paused server cannot turn impatient presses or repeated Enter into two or three copies of the same message.
+    const busy = on => { send.disabled = text.readOnly = on; send.textContent = on ? "Sending…" : "Send"; compose.setAttribute("aria-busy", String(on)); };
+    let pendingSend = null;
+    text.addEventListener("input", () => { pendingSend = null; });
+    send.onclick = async () => { if (send.disabled || !text.value.trim()) return;
+      if (!pendingSend || pendingSend.body !== text.value)
+        pendingSend = { body: text.value, idempotency_key: crypto.randomUUID() };
+      busy(true);
+      try {
+        await request(`/api/chat/rooms/${name}`, pendingSend);
+        pendingSend = null; text.value = ""; busy(false); await open(name);
+      } catch (error) {
+        busy(false); status(`Delivery unconfirmed: ${error.message}. Retry sends this message once.`);
+      } };
+    text.addEventListener("keydown", event => {                                        // Enter sends; Shift+Enter is a new line
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); send.click(); }
+    });
+    const sticker = el("button", "Sticker"), picker = stickerPicker(name, text);
+    sticker.type = "button"; sticker.setAttribute("aria-expanded", "false");
+    sticker.onclick = () => { picker.hidden = !picker.hidden; sticker.setAttribute("aria-expanded", String(!picker.hidden)); if (!picker.hidden) picker.load(); };
+    compose.append(text, send, sticker);
+    panel.append(list, compose, picker);
+    if (!settings.system) panel.append(roomSet(name, set), ...(isOwner(settings) ? [ownerSettings(name, settings)] : []), forwarding(name, set));
+  } catch (error) { panel.replaceChildren(el("p", `The room could not be read: ${error.message}`, "muted")); }
+}
+
+const isOwner = settings => who && (settings.owner_name === who.username || who.role === "admin");
+
+// The site's emoji (web_export.emoji_kinds, published as emoji_atlas.json and its picture emoji_atlas.png): the quick bar.
+// The page holds no list of its own; the server accepts exactly these kinds as reactions.
+let atlas = null;
+async function emojiAtlas() {
+  if (!atlas) {
+    try { atlas = await (await fetch("/emoji_atlas.json", { cache: "no-store" })).json(); } catch (error) { atlas = null; }
+    if (!atlas || !Array.isArray(atlas.kinds)) atlas = { kinds: [], cols: 1, rows: 1 };
+  }
+  return atlas;
+}
+
+function emojiCell(kind, px) {
+  const at = atlas.kinds.findIndex(k => k.name === kind), cell = el("span", null, "emoji");
+  if (at < 0) { cell.textContent = kind; return cell; }
+  Object.assign(cell.style, { width: `${px}px`, height: `${px}px`, backgroundImage: "url(/emoji_atlas.png)",
+    backgroundSize: `${atlas.cols * px}px ${atlas.rows * px}px`,
+    backgroundPosition: `-${(at % atlas.cols) * px}px -${Math.floor(at / atlas.cols) * px}px` });
+  return cell;
+}
+
+// A message's reactions (each kind, how many, who; pressed when one is yours) and the quick bar to add one.
+function reactions(name, m) {
+  const box = el("div", null, "reacts"), mine = kind => (m.reactions?.[kind] || []).includes(who.username);
+  const toggle = async kind => {
+    try { await request(`/api/chat/rooms/${name}/react`, { id: m.id, kind, on: !mine(kind) }); await open(name); }
+    catch (error) { status(`No reaction: ${error.message}`); }
+  };
+  for (const [kind, people] of Object.entries(m.reactions || {})) {
+    const chip = el("button", null, "react"); chip.type = "button"; chip.title = `${kind}: ${people.join(", ")}`;
+    chip.setAttribute("aria-pressed", String(mine(kind))); chip.setAttribute("aria-label", `${kind}, ${people.length}: ${people.join(", ")}`);
+    chip.append(emojiCell(kind, 18), el("span", String(people.length)));
+    chip.onclick = () => toggle(kind);
+    box.append(chip);
+  }
+  if (atlas.kinds.length) {
+    const add = el("button", "+", "react add"), bar = el("div", null, "quickbar");
+    add.type = "button"; add.setAttribute("aria-label", "React with one of the site's emoji"); add.setAttribute("aria-expanded", "false");
+    bar.hidden = true;
+    for (const k of atlas.kinds) {
+      const pick = el("button", null, "react"); pick.type = "button"; pick.title = k.name; pick.setAttribute("aria-label", k.name);
+      pick.append(emojiCell(k.name, 22));
+      pick.onclick = () => toggle(k.name);
+      bar.append(pick);
+    }
+    add.onclick = () => { bar.hidden = !bar.hidden; add.setAttribute("aria-expanded", String(!bar.hidden)); };
+    box.append(add, bar);
+  }
+  return box;
+}
+
+// Stickers: pictures the site made. Yours to post are your own finished studio photos (the server checks they are yours);
+// everyone in the room then sees the one you post, through the room.
+function stickerPicker(name, text) {
+  const picker = el("div", null, "picker");
+  picker.hidden = true;
+  let loaded = false;
+  picker.load = async () => {
+    if (loaded) return;
+    loaded = true;
+    picker.replaceChildren(el("p", "Reading your studio photos…", "muted"));
+    try {
+      const { entries } = await request("/api/marble_photo/jobs");
+      const done = (entries || []).filter(e => e.state === "complete" && e.image);
+      picker.replaceChildren(el("p", done.length ? "Your studio photos: choose one to post as a sticker." :
+        "You have no finished studio photo yet. Take one in the Marble studio.", "muted"));
+      for (const e of done) {
+        const pick = el("button", null, "pick"), thumb = document.createElement("img");
+        pick.type = "button"; pick.setAttribute("aria-label", `Post your photo from ${when(e.created_at)}`);
+        thumb.alt = ""; thumb.loading = "lazy";
+        thumb.src = `/api/marble_photo/image?digest=${encodeURIComponent(e.digest)}&name=${encodeURIComponent(e.image)}`;
+        pick.append(thumb);
+        pick.onclick = async () => {
+          try { await request(`/api/chat/rooms/${name}`, { body: text.value, sticker: { kind: "photo", digest: e.digest, name: e.image } });
+            text.value = ""; picker.hidden = true; await open(name); }
+          catch (error) { status(`Not sent: ${error.message}`); }
+        };
+        picker.append(pick);
+      }
+    } catch (error) { loaded = false; picker.replaceChildren(el("p", `Your studio photos could not be read: ${error.message}`, "muted")); }
+  };
+  return picker;
+}
+
+// The round table (chat_rooms.py): whether it is on, whose turn it is, and, for whoever runs it, the switch. The runner
+// (Start-RoundTable.ps1) starts the agents' seats when it is switched on and stops them when it is switched off.
+function roundTable(name, settings, table) {
+  const box = el("section", null, "table " + (table.state === "on" ? "on" : "off"));
+  if (table.state === "on") {
+    box.append(el("strong", "Round table on"), el("span", ` · seats in turn: ${table.seats.join(" → ")}`),
+      el("div", table.turn ? `Now: ${table.turn}'s turn, round ${table.round} (since ${when(table.turn_at)})`
+                           : "Waiting for the runner to start the seats…"),
+      el("small", `Switched on by ${table.owner} at ${when(table.switched_at)}. Messages from the seats are marked with their round.`));
+  } else {
+    box.append(el("span", "Round table off: this is the usual chat."));
+    if (table.switched_by) box.append(el("small", ` Last ended ${when(table.switched_at)} by ${table.switched_by}${table.note ? `: ${table.note}` : ""}.`));
+  }
+  const runs = who && (who.role === "admin" || (!settings.system && settings.owner_name === who.username));
+  if (!runs) return box;
+  const controls = el("div", null, "actions");
+  if (table.state === "on") {
+    const stop = el("button", "Switch the round table off"); stop.type = "button";
+    stop.onclick = async () => {
+      try { await request(`/api/chat/rooms/${name}/table`, { state: "off", note: `switched off by ${who.username}` }); await open(name); }
+      catch (error) { status(`Not switched off: ${error.message}`); }
+    };
+    controls.append(stop);
+  } else {
+    const seats = input(`${who.username}, claude, codex, gemini`); seats.setAttribute("aria-label", "Seats in turn order");
+    const start = el("button", "Switch the round table on"); start.type = "button";
+    start.onclick = async () => {
+      const chosen = seats.value.split(",").map(s => s.trim()).filter(Boolean);
+      try { await request(`/api/chat/rooms/${name}/table`, { state: "on", seats: chosen }); await open(name); }
+      catch (error) { status(`Not switched on: ${error.message}`); }
+    };
+    controls.append(field("Seats, in turn order (yours among them)", seats), start);
+  }
+  box.append(controls);
+  return box;
+}
+
+function roomSet(name, set) {
+  const box = el("section", null, "part");
+  box.append(el("h3", "The room's set"), el("p", set.say, "muted"));
+  box.append(el("p", set.objects.length ? "Site objects: " + set.objects.map(o => `${o.kind} ${o.ref}`).join(", ") : "No site objects.", null),
+             el("p", set.bridges.length ? "Bridges: " + set.bridges.join(", ") : "No bridges.", null));
+  for (const grant of set.forwarded) {
+    const row = el("div", null, "part");
+    row.append(el("p", `${grant.owner} forwards ${grant.provider}: ${grant.tools.join(", ")} (until ${when(grant.expires)})`));
+    const tool = choice(grant.tools, grant.tools[0]), args = document.createElement("textarea"), call = el("button", "Call");
+    args.rows = 2; args.value = "{}"; call.type = "button";
+    const out = el("pre", null, "muted");
+    call.onclick = async () => {
+      let parsed;
+      try { parsed = JSON.parse(args.value || "{}"); } catch (error) { status("The arguments must be a JSON object."); return; }
+      try { const { result } = await request(`/api/chat/rooms/${name}/forward/${grant.grant}/call`, { name: tool.value, arguments: parsed });
+        out.textContent = JSON.stringify(result, null, 2); } catch (error) { out.textContent = error.message; }
+    };
+    row.append(field("Tool", tool), field("Arguments (JSON)", args), call, out);
+    if (grant.owner === who.username) {
+      const back = el("button", "Take it back"); back.type = "button";
+      back.onclick = async () => { try { await request(`/api/chat/rooms/${name}/forward/${grant.grant}/revoke`, {}); await open(name); } catch (error) { status(error.message); } };
+      row.append(back);
+    }
+    box.append(row);
+  }
+  return box;
+}
+
+function ownerSettings(name, settings) {
+  const box = el("section", null, "part");
+  const title = input(settings.title), about = input(settings.about), stage = choice(["dev", "release"], settings.stage);
+  const write = choice(["members", "owner"], settings.write), objects = document.createElement("textarea"), bridges = input(settings.bridges.join(", "));
+  const hosted = input((settings.hosted_agents || ["llama"]).join(", "));
+  objects.rows = 3; objects.value = JSON.stringify(settings.objects);
+  const save = el("button", "Save settings"); save.type = "button";
+  save.onclick = async () => {
+    let parsed;
+    try { parsed = JSON.parse(objects.value || "[]"); } catch (error) { status("Site objects must be a JSON list of {kind, ref}."); return; }
+    try {
+      await request(`/api/chat/rooms/${name}/settings`, { title: title.value, about: about.value, stage: stage.value, write: write.value,
+        objects: parsed, bridges: bridges.value.split(",").map(t => t.trim()).filter(Boolean),
+        hosted_agents: hosted.value.split(",").map(t => t.trim()).filter(Boolean) });
+      status("Settings saved."); await load();
+    } catch (error) { status(`Not saved: ${error.message}`); }
+  };
+  const sharing = settings.sharing || { visibility: "personal", revision: 0 };
+  const visibility = choice(["personal", "group", "public"], sharing.visibility), group = input(sharing.group_id || "");
+  const share = el("button", "Share"); share.type = "button";
+  share.onclick = async () => {
+    if (visibility.value === "public" && !confirm("Public means everyone the stage allows may enter. Sign off on that?")) return;
+    try {
+      await request(`/api/chat/rooms/${name}/access`, { visibility: visibility.value, group_id: visibility.value === "group" ? group.value : null,
+        expected_revision: sharing.revision, sign_off: visibility.value === "public" });
+      status(`Now ${visibility.value}.`); await load();
+    } catch (error) { status(`Not shared: ${error.message}`); }
+  };
+  box.append(el("h3", "Settings (owner)"), field("Title", title), field("About", about),
+    field("Stage: dev is the development site and needs dev permission; release is public facing", stage),
+    field("Who writes", write), field("Site objects (JSON list of {kind, ref}; kinds: page, render, mesh, shader, media, room; at most 8)", objects),
+    field("Bridges (tool names, comma separated; at most 8)", bridges),
+    field("Hosted agent accounts (comma separated; llama is on by default; sharing still controls access)", hosted), save,
+    el("h3", "Who may enter, beyond the stage"), field("Sharing", visibility), field("Group id (for group)", group), share);
+  return box;
+}
+
+function forwarding(name, set) {
+  const box = el("section", null, "part");
+  const tools = document.createElement("select"); tools.multiple = true; tools.size = 4;
+  const hours = input("24", "number"), lend = el("button", "Forward to this room"); lend.type = "button";
+  const loadTools = el("button", "Load my Suno tools"); loadTools.type = "button";
+  loadTools.onclick = async () => {
+    try { const result = await request("/api/connections/suno/tools");
+      tools.replaceChildren(...result.tools.map(t => { const o = el("option", t.name); o.value = t.name; return o; }));
+      if (!result.tools.length) status("Your Suno connection offers no tools."); }
+    catch (error) { status(`No tools to lend: ${error.message}`); }
+  };
+  lend.onclick = async () => {
+    const chosen = [...tools.selectedOptions].map(o => o.value);
+    if (!chosen.length) { status("Choose the tools to lend."); return; }
+    if (!confirm(`Lend ${chosen.join(", ")} to ${name}? Its members will call them under your connection until you take them back.`)) return;
+    try { await request(`/api/chat/rooms/${name}/forward`, { provider: "suno", tools: chosen, hours: Number(hours.value) || 24 });
+      status("Forwarded."); await open(name); } catch (error) { status(`Not forwarded: ${error.message}`); }
+  };
+  box.append(el("h3", "Forward your own connection"), el("p", "Lend some tools of a connection you secured (Connected services) to " +
+    "this room. Calls run under your connection, are limited per member and recorded; take them back at any time.", "muted"),
+    loadTools, field("Tools", tools), field("For how many hours (at most 720)", hours), lend);
+  return box;
+}
+
+async function main() {
+  try { who = await request("/api/whoami"); } catch (error) { status(error.message); return; }
+  if (!who.signed_in) { byId("signin").hidden = false; status("Sign in to see your rooms."); return; }
+  byId("content").hidden = false;
+  byId("make").hidden = !(who.capabilities || []).includes("dev_ui");
+  byId("agents").hidden = byId("make").hidden;
+  byId("make").onsubmit = async event => {
+    event.preventDefault();
+    try {
+      const { settings } = await request("/api/chat/rooms", { room: byId("make-room").value, title: byId("make-title").value, about: byId("make-about").value });
+      byId("make").reset(); selected = settings.room; await load(); status(`Room ${settings.room} made: personal, on the development site.`);
+    } catch (error) { status(`Not made: ${error.message}`); }
+  };
+  byId("refresh").onclick = load;
+  byId("tail").onchange = () => selected && open(selected);
+  await loadAgentPresence();
+  await load();
+  setInterval(() => { if (!document.hidden) { load(); loadAgentPresence(); } }, 20000);
+  setInterval(() => tickAgentCountdowns(byId("agent-presence")), 1000);
+}
+main();

@@ -53,6 +53,9 @@ def _retry(db, where: str, args: tuple, limit: int, window: float, now: float) -
 
 def check(db, client_ip: str, username: str, now: float | None = None) -> float:
     """0 when the attempt may proceed, otherwise the whole seconds (>= 1) to wait."""
+    from meowdoku import rate_limits
+    if not rate_limits.enabled():
+        return 0.0
     now = time.time() if now is None else now
     user, client = _norm(username), str(client_ip)
     wait = max(_retry(db, "client = ? AND username = ?", (client, user), PAIR_LIMIT, PAIR_WINDOW, now),

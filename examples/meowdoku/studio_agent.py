@@ -45,9 +45,7 @@ class StudioAgentProducts:
     def __init__(self, assets: Path, *, defaults: Path | None = None, node: str | None = None, timeout: float = 60, phong_host=None):
         self.assets = Path(assets).resolve(strict=True)
         self.defaults = Path(defaults).resolve(strict=True) if defaults is not None else None
-        self.node = node or shutil.which("node")
-        if not self.node:
-            raise StudioAgentError("Node is required for the existing Studio scene builders")
+        self.node = node
         if not 0 < timeout <= 120:
             raise StudioAgentError("Invalid Studio worker timeout")
         self.timeout = timeout
@@ -71,7 +69,10 @@ class StudioAgentProducts:
         raw = json.dumps(request, allow_nan=False, separators=(",", ":")).encode()
         if len(raw) > MAX_BYTES:
             raise StudioAgentError("Studio request exceeds byte budget")
-        command = [self.node, str(ROOT / "tools/studio_agent_product.mjs"), "--assets", str(self.assets)]
+        node = shutil.which(self.node or "node")
+        if not node:
+            raise StudioAgentError("Node is required for the existing Studio scene builders")
+        command = [node, str(ROOT / "tools/studio_agent_product.mjs"), "--assets", str(self.assets)]
         if self.defaults:
             command += ["--defaults", str(self.defaults)]
         try:

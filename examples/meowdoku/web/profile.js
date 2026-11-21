@@ -64,7 +64,7 @@ async function refresh() {
   if (mine.status !== 200) {
     $("status").textContent = "Sign in to see your profile.";
     $("status").className = "bad";
-    $("me").replaceChildren(el("a", "Sign in")); $("me").firstChild.href = "/login.html";
+    $("me").replaceChildren(el("a", "Sign in")); $("me").firstChild.href = "/login.html?next=" + encodeURIComponent(location.pathname + location.search + location.hash);
     return;
   }
   renderMe(mine.body);

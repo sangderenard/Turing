@@ -148,8 +148,8 @@ _CAST_NATIVE: dict[str, str] = {
 # checked first).
 _UNARY_EXTINST: dict[str, str] = {
     "sqrt": "Sqrt", "Sqrt": "Sqrt",
-    "exp": "Exp", "log": "Log",
-    "sin": "Sin", "cos": "Cos", "tan": "Tan",
+    "exp": "Exp", "Exp": "Exp", "log": "Log",
+    "sin": "Sin", "Sin": "Sin", "cos": "Cos", "Cos": "Cos", "tan": "Tan",
     "asin": "Asin", "acos": "Acos", "atan": "Atan",
     "sinh": "Sinh", "cosh": "Cosh", "tanh": "Tanh",
     "asinh": "Asinh", "acosh": "Acosh", "atanh": "Atanh",

@@ -9,7 +9,7 @@ import pytest
 MEOW = Path(__file__).resolve().parents[1] / "examples" / "meowdoku"
 AUTHZ = MEOW / "authz.py"
 OPERATORS = MEOW / "deploy" / "operators.py"
-USERS = "admin,codex,claude,guest_agent"
+USERS = "admin,codex,claude"
 
 
 def run(script, *args, **kw):
@@ -33,7 +33,7 @@ def test_bootstrap_roles_access_secrets(boot):
     db, sec, r = boot
     conn = sqlite3.connect(db)
     roles = dict(conn.execute("SELECT u.username, r.role FROM account_roles r JOIN users u ON u.id = r.user_id"))
-    assert roles == {"admin": "admin", "codex": "operator", "claude": "operator", "guest_agent": "operator"}
+    assert roles == {"admin": "admin", "codex": "operator", "claude": "operator"}
     assert {x[0] for x in conn.execute("SELECT username FROM script_access")} == set(USERS.split(","))
     secrets_text = []
     for name in USERS.split(","):
@@ -45,7 +45,7 @@ def test_bootstrap_roles_access_secrets(boot):
     r2 = run(OPERATORS, "bootstrap", "--db", db, "--users", USERS, "--secrets-dir", sec)
     assert r2.returncode == 0, r2.stderr
     assert before == [(sec / f"{n}.secret").read_text() for n in USERS.split(",")]
-    assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 4
+    assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == len(USERS.split(","))
 
 
 def test_auth_ok_and_audit(boot):

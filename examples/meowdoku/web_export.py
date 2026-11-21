@@ -36,6 +36,7 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import tiles, tree  # noqa: E402
+from meowdoku.game_pages import export_game_pages  # noqa: E402
 from meowdoku.phong_tiles import PHONG_MATERIALS, LIGHTS, _spectral, glyph_mesh  # noqa: E402
 from meowdoku.material_catalog import MATERIAL_CATALOG  # noqa: E402
 from meowdoku.phong_tiles import token_mesh as _token_mesh  # noqa: E402
@@ -430,7 +431,19 @@ def export_assets(out: Path) -> dict:
 EMOJI_ATLAS_CELL = 128         # texels per cell edge
 EMOJI_ATLAS_COLS = 4
 EMOJI_ATLAS_INK = 0.875        # the glyph's longer side as a share of the cell (the rest is a margin that mip levels do not bleed across)
-EMOJI_FONT = "C:/Windows/Fonts/seguiemj.ttf"
+# ---- [PLATFORM] the colour emoji font the atlas is baked from -------------------------------------------------------
+# Program: web_export.py on the Oracle A1 host (Ubuntu 24.04, 2026-11-21).  Wrong record: the font was the Windows path
+# alone, so the export stopped at "OSError: cannot open resource".  Rule: each platform names its own colour emoji font
+# here and nowhere else.  Noto Color Emoji (package fonts-noto-color-emoji) is a bitmap (CBDT) font that opens only at
+# its fixed 109 px strike; bake_emoji_atlas crops each glyph to its ink and scales it to the cell, so the strike only
+# bounds the source resolution.  The atlas is the same layout on every platform; the glyph art is the platform font's.
+if sys.platform == "win32":
+    EMOJI_FONT, EMOJI_FONT_STRIKE = "C:/Windows/Fonts/seguiemj.ttf", None
+elif sys.platform.startswith("linux"):
+    EMOJI_FONT, EMOJI_FONT_STRIKE = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 109
+else:
+    raise RuntimeError(f"web_export.py: name this platform's colour emoji font ({sys.platform})")
+# ---- end [PLATFORM] --------------------------------------------------------------------------------------------------
 
 
 def emoji_kinds() -> list[dict]:
@@ -446,7 +459,8 @@ def emoji_kinds() -> list[dict]:
               {"name": "bat", "glyph": DELVE_EMOJI["bat"], "color": [0.55, 0.42, 0.7]},
               {"name": "wolf", "glyph": TILE_EMOJI["wolf"], "color": [0.62, 0.64, 0.7]},
               {"name": "fish", "glyph": "\U0001F41F", "color": [0.98, 0.62, 0.2]},
-              {"name": "crab", "glyph": INVADER_EMOJI["crab"], "color": [0.9, 0.3, 0.22]}]
+              {"name": "crab", "glyph": INVADER_EMOJI["crab"], "color": [0.9, 0.3, 0.22]},
+              {"name": "llama", "glyph": "\U0001F999", "color": [0.86, 0.78, 0.62]}]
     for kind in kinds:
         kind["mesh"] = f"emoji_{kind['name']}"
     return kinds
@@ -462,7 +476,8 @@ def bake_emoji_atlas(kinds: list[dict], cell: int = EMOJI_ATLAS_CELL, cols: int 
     rows = -(-len(kinds) // cols)
     atlas = np.zeros((rows * cell, cols * cell, 4), np.uint8)
     big = 4 * cell
-    font = ImageFont.truetype(font_path, int(big * 0.85))
+    strike = EMOJI_FONT_STRIKE if font_path == EMOJI_FONT else None   # a bitmap font opens only at its own strike
+    font = ImageFont.truetype(font_path, strike or int(big * 0.85))
     for index, kind in enumerate(kinds):
         canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
         ImageDraw.Draw(canvas).text((big // 2, big // 2), kind["glyph"], font=font, embedded_color=True, anchor="mm")
@@ -556,21 +571,28 @@ def main(argv: list[str] | None = None) -> int:
     for name in SHADERS:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
-    for name in ("index.html", "app.js", "marble_controls.js", "marble_mesh.js", "dice_mesh.js", "marble_mass.js", "marble_roll.js", "marble_studio.html", "marble_studio.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "compute_state.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js", "settings_reset.js", "tickets.html", "tickets.js"):
+    for name in ("index.html", "pages.js", "palette.html", "palette.js", "palette-theme.js", "play.html", "app.js", "marble_controls.js", "marble_mesh.js", "dice_mesh.js", "marble_mass.js", "marble_roll.js", "marble_studio.html", "marble_studio.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "compute_state.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js", "settings_reset.js", "tickets.html", "tickets.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("marble_jobs.js", "marble_jobs.html", "marble_photo_participation.js", "marble_live_participation.js", "client_ray_participation.js", "client_ray_settings.js", "client_ray_controls.js", "client_ray_diagnostic.js", "client_ray_kernel.js", "client_triangle_kernel.js", "studio_bvh_compute.js", "studio_traversal_compute.js", "studio_triangle_compute.js", "studio_slab_compute.js", "studio_compiled_law_batch.js", "marble_bubbles.js", "marble_object.js", "case_motion.js", "case_vibration.js", "marble_preview_motion.js", "marble_sim_preview.js", "marble_drive_input.js", "marble_chase_camera.js", "marble_studio_scene.js", "studio_scene_builder.js", "studio_lighting_fields.js", "marble_studio_agent.js", "marble_studio_transition.js", "marble_studio_phong.js", "marble_studio_dof.js", "marble_camera_toolbox.js", "marble_camera_toolbox_mount.js", "marble_spot_sample.js", "marble_rangefinder.js", "marble_rangefinder_panel.js", "marble_camera_binding.js", "marble_photo.js", "marble_live.js", "marble_light_field.js", "marble_studio_subject_renderer.js", "marble_downloads.js", "marble_autosave.js", "marble_object_snapshot.js", "marble_geometry_policy.js", "marble_hdr_retouch.js", "npz.js", "marble_rotation.js", "emoji_tumble.js", "loading_candidate.js", "marble_calibration.js", "marble_calibration_map.js", "calibration_rgb_single_light.yaml", "marble_lighting.js", "marble_lighting_profiles.js", "marble_backdrop.js", "marble_backdrop_fabric.js", "marble_studio_grid.js", "marble_studio_lighting.js", "marble_fixture_sizes.js", "marble_light_placement.js", "marble_light_strengths.js", "marble_film_response.js", "marble_film_science.js", "marble_room.js", "marble_glass_preview.js", "marble_materials.js", "marble_studio_surfaces.js", "marble_studio_table.js", "marble_studio_scale.js", "marble_table_lights.js", "marble_studio_gobos.js"):
+    shutil.copyfile(SPECTRAL_ROOT / "wave_arena_web_demo.html", out / "wave_arena.html")
+    export_game_pages(out)
+    shutil.copyfile(HERE / "web" / "pages.css", out / "pages.css")
+    for name in ("marble_jobs.js", "marble_jobs.html", "marble_photo_participation.js", "marble_live_participation.js", "client_ray_participation.js", "client_ray_settings.js", "client_ray_controls.js", "client_ray_diagnostic.js", "client_ray_kernel.js", "client_triangle_kernel.js", "studio_bvh_compute.js", "studio_traversal_compute.js", "studio_triangle_compute.js", "studio_slab_compute.js", "studio_compiled_law_batch.js", "marble_bubbles.js", "marble_object.js", "case_motion.js", "case_vibration.js", "marble_preview_motion.js", "marble_sim_preview.js", "marble_drive_input.js", "marble_chase_camera.js", "marble_studio_scene.js", "studio_scene_builder.js", "studio_lighting_fields.js", "marble_studio_agent.js", "marble_studio_transition.js", "marble_studio_phong.js", "marble_studio_dof.js", "marble_autofocus.js", "living_data_focus.js", "marble_camera_toolbox.js", "marble_camera_toolbox_mount.js", "marble_spot_sample.js", "marble_rangefinder.js", "marble_rangefinder_panel.js", "marble_camera_binding.js", "marble_photo.js", "marble_live.js", "marble_light_field.js", "marble_studio_subject_renderer.js", "marble_downloads.js", "marble_autosave.js", "marble_object_snapshot.js", "marble_geometry_policy.js", "marble_hdr_retouch.js", "npz.js", "marble_rotation.js", "emoji_tumble.js", "loading_candidate.js", "marble_calibration.js", "marble_calibration_map.js", "calibration_rgb_single_light.yaml", "marble_lighting.js", "marble_lighting_profiles.js", "marble_backdrop.js", "marble_backdrop_fabric.js", "marble_studio_grid.js", "marble_studio_lighting.js", "marble_fixture_sizes.js", "marble_light_placement.js", "marble_light_strengths.js", "marble_film_response.js", "marble_film_science.js", "marble_room.js", "marble_glass_preview.js", "marble_materials.js", "marble_studio_surfaces.js", "marble_studio_table.js", "marble_studio_scale.js", "marble_table_lights.js", "marble_studio_gobos.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("gem_cutter.js", "marble_stage_programmer.js", "marble_trigger_grid.js", "marble_phong_capture.js", "marble_secondary_field.js", "marble_field_categories.js", "marble_phong_id_pass.js", "marble_phong_visibility.js", "marble_optical_authoring.js", "marble_studio_optical.js", "marble_optical_diagnostic.js", "marble_lens_controls.js", "marble_camera_back.js", "marble_response_lineage.js", "marble_scene_responses.js", "marble_response_application.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("marble_calibration_watch.html", "marble_calibration_watch.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("mathlab.html", "mathlab.js", "mathlab_wgsl_timing.js", "divider.html", "divider.js", "login.html", "login.js", "messenger-widget.js", "site-nav.js", "profile.html", "profile.js", "worldmap.html", "worldmap.js", "nodus.html", "nodus.js"):                              # [MATHLAB] the math lab page (server.py /api/mathlab/*)
+    shutil.copyfile(HERE / "web" / "llms.txt", out / "llms.txt")   # [LLMS] directions for agents (llmstxt.org), case 7ab138b9
+    for name in ("mathlab.html", "mathlab.js", "mathlab_wgsl_timing.js", "divider.html", "divider.js", "login.html", "login.js", "messenger-widget.js", "site-nav.js", "operator-control.html", "operator-control.js", "agent-workspace.html", "agent-workspace.js", "agent-controls.html", "agent-controls.js", "agent-training-arena.html", "agent-training-arena.js", "radio-hls.min.js", "RADIO_HLS_LICENSE.txt", "profile.html", "profile.js", "worldmap.html", "worldmap.js", "agent-presence.js", "agent-presence.css", "console.html", "console.js", "nodus.html", "nodus.js"):  # [MATHLAB] the math lab page (server.py /api/mathlab/*)
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("files.html", "files.js", "file-crypto.js", "keys.html", "keys.js", "markets.html", "markets.js"):
+    for name in ("files.html", "files.js", "file-crypto.js", "keys.html", "keys.js", "connected-services.html", "connected-services.js", "markets.html", "markets.js",
+                 "register.html", "register.js", "invited.html", "invited.js", "invite.html", "invite.js"):   # [INVITE] registration by invitation (invitations.py)
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("browse.html", "browse.js"):                                                            # [LISTING] the /browse page (server.py /browse/*, listing.py)
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("issues.html", "issues.js", "reviews.html", "reviews.js", "reports.html", "reports.js"):   # [REVIEWS] change reviews; [REPORTS] the report reader
+    for name in ("people.html", "people.js", "look-queue.html", "look-queue.js", "newsletter.html", "newsletter.js"):                       # [PEOPLE] account admin (account_admin.py); [NEWSLETTER] newsletter.py
+        shutil.copyfile(HERE / "web" / name, out / name)
+    for name in ("issues.html", "issues.js", "research.html", "research.js", "development.html", "development.js", "research.css", "reviews.html", "reviews.js", "rooms.html", "rooms.js", "reports.html", "reports.js"):   # [REVIEWS] change reviews; [TALK] rooms; [REPORTS] the report reader
         shutil.copyfile(HERE / "web" / name, out / name)
     # Studio imports these authored modules transitively. A partial publication
     # leaves the whole ES module graph (including loading_panel.js) unstarted.
@@ -595,4 +617,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -88,6 +88,51 @@ globalThis.livingDataStaticHost = Object.freeze({
       throw Error('Static realized mesh changed after attachment; reload a new host');}
     return result;
   },
+  async admitScene({world_id,host_token}) {
+    // Explicit owner action; use the existing authenticated same-origin service.
+    if(!/^[a-f0-9]{32}$/.test(world_id)||typeof host_token!=='string'||!host_token)
+      throw Error('Registered world identity and private host token required');
+    await livingDataStaticReady;
+    const scene=this.meshSnapshot();
+    const response=await fetch('/api/living-data/dm/worlds/'+world_id+'/host',{
+      method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'scene',host_token,scene})});
+    const result=await response.json();
+    if(!response.ok)throw Error(result.error||'Scene admission failed');
+    livingDataStaticCheckPinned();
+    return result;
+  },
+  async reside({start_position,start_facing,interval_ms=500,signal}={}) {
+    // [FOYER] Become the resident host of the one shared demo world (owner, 2026-11-13): register this static map as the
+    // foyer (the signed-in account needs library_manage), then render every queued visitor picture through render() below,
+    // until the signal aborts or the service refuses.  Explicit operator action; it never starts on its own.
+    await livingDataStaticReady;
+    const call=async(path,body)=>{
+      const response=await fetch(path,{method:'POST',credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const value=await response.json();
+      if(!response.ok)throw Error(path+' '+response.status+' '+(value.error||''));
+      return value;};
+    const snapshot=this.snapshot(), base='/api/living-data/dm/worlds';
+    const attached=await call(base,{map:snapshot.map,source_sha256:snapshot.source_sha256,
+      renderer_identity:snapshot.renderer_identity,request_id:'foyer-resident',
+      foyer:{start_position,start_facing}});
+    const host=base+'/'+attached.world_id+'/host', token=attached.host_token;
+    while(!signal?.aborted){
+      const work=await call(host,{host_token:token,action:'poll'});
+      if(!work.request_id){await new Promise(done=>setTimeout(done,interval_ms));continue;}
+      let result;
+      try{
+        const rendered=await this.render(work.camera);
+        result={png_base64:rendered.data_url.split(',')[1],width:rendered.width,height:rendered.height,
+          source_sha256:rendered.source_sha256,renderer_identity:rendered.renderer_identity,
+          position:work.camera.position,facing:work.camera.facing,actual_camera:rendered.camera};
+      }catch(error){result={error:String(error.message||error).slice(0,500)};}
+      await call(host,{host_token:token,action:'complete',request_id:work.request_id,result});
+    }
+    await call(base+'/'+attached.world_id+'/close',{});
+    return {closed:true,world_id:attached.world_id};
+  },
   async render(request={}) {
     await livingDataStaticReady;
     if(stateLoopRuntime.worker) throw Error('Static host refuses a physics worker');
@@ -101,7 +146,13 @@ globalThis.livingDataStaticHost = Object.freeze({
     const camera={position:[...position],facing:normalized3(facing),width,height};
     livingDataStaticCheckPinned();
     // Only renderer-local camera variables change. Never set an actor pose.
-    updateShaderViewer(camera);
+    let focus=null;
+    if(request.optics){
+      const {renderLivingDataFocus}=await import('./living_data_focus.js');
+      focus=await renderLivingDataFocus({gl:shaderViewer.gl,canvas:shaderViewer.canvas,
+        mesh:this.meshSnapshot(),camera:{...camera,optics:request.optics},check:livingDataStaticCheckPinned,
+        draw:(beforeDraw,afterDraw)=>updateShaderViewer({...camera,beforeDraw,afterDraw})});
+    }else updateShaderViewer(camera);
     livingDataStaticCheckPinned();
     const gl=shaderViewer.gl, pixels=new Uint8Array(width*height*4);
     gl.finish();gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
@@ -111,7 +162,7 @@ globalThis.livingDataStaticHost = Object.freeze({
     for(let y=0;y<height;y++)frame.data.set(pixels.subarray((height-1-y)*width*4,(height-y)*width*4),y*width*4);
     context.putImageData(frame,0,0);
     livingDataStaticCheckPinned();
-    return {...livingDataStaticReceipt(),camera,width,height,
+    return {...livingDataStaticReceipt(),camera:{...camera,...(focus?{optics:focus}:{})},width,height,
       data_url:output.toDataURL('image/png')};
   }
 });
