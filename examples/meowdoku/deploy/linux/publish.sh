@@ -2,10 +2,9 @@
 # publish.sh -- Update-LiveCheckouts.ps1 for Linux: move each live checkout (branch_policy.json's repositories, under
 # SPEAKTOME_ROOT) to what landed on the remote, then re-export the site's pages when turing or spectral-analyzer moved.
 #
-# A checkout moves only when it is on its default branch with no tracked changes. A full clone only fast-forwards
-# (ahead / diverged are reported and left). A shallow clone -- what bootstrap_linux.sh makes -- cannot prove ancestry, so
-# it moves only when it sits exactly at the remote tip it last fetched (no commits of its own), with reset --keep, which
-# refuses rather than discard a change. Nothing is pushed, merged or deleted. A restart is what loads moved code.
+# A checkout moves only when it is on its default branch with no tracked changes, and only by fast-forward: ahead and
+# diverged are reported and left. A shallow clone -- what bootstrap_linux.sh makes -- is deepened first until git can
+# prove whether one tip descends from the other. Nothing is pushed, reset or deleted. A restart loads moved code.
 #   publish.sh [--what-if] [--export-web]
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -27,6 +26,22 @@ import json, sys
 for name, entry in json.load(open(sys.argv[1]))["repositories"].items():
     print(name, entry["path"], entry["default"])' "$POLICY")
 
+# Deepen a shallow clone (200 commits a round, at most 25, then the whole history) until either tip is an ancestor of
+# the other or the clone is complete; a full clone returns at once. Non-zero only when a fetch fails.
+deepen_until_related() {
+  local path="$1" remote="$2" base="$3" here="$4" there="$5" round
+  for round in $(seq 1 26); do
+    [ "$(git -C "$path" rev-parse --is-shallow-repository)" = true ] || return 0
+    if git -C "$path" merge-base --is-ancestor "$here" "$there" 2>/dev/null ||
+       git -C "$path" merge-base --is-ancestor "$there" "$here" 2>/dev/null; then return 0; fi
+    if [ "$round" -lt 26 ]; then
+      git -C "$path" fetch --quiet --deepen=200 "$remote" "$base" || return 1
+    else
+      git -C "$path" fetch --quiet --unshallow "$remote" "$base" || return 1
+    fi
+  done
+}
+
 MOVED=()
 printf '%-18s %-11s %s\n' REPOSITORY STATE DETAIL
 for entry in "${ENTRIES[@]}"; do
@@ -39,18 +54,14 @@ for entry in "${ENTRIES[@]}"; do
   if [ -n "$(git -C "$path" status --porcelain --untracked-files=no)" ]; then row skipped "tracked changes"; continue; fi
   shallow="$(git -C "$path" rev-parse --is-shallow-repository)"
   here="$(git -C "$path" rev-parse HEAD)"
-  last="$(git -C "$path" rev-parse -q --verify "$REMOTE/$base" || true)"
   depth=(); [ "$shallow" != true ] || depth=(--depth 1)
   if ! git -C "$path" fetch --quiet "${depth[@]}" "$REMOTE" "$base"; then row failed "fetch failed"; continue; fi
   there="$(git -C "$path" rev-parse "$REMOTE/$base")"
   if [ "$here" = "$there" ]; then row current "at ${here:0:8}"; continue; fi
-  if [ "$shallow" = true ]; then
-    if [ "$here" != "$last" ]; then row unproven "shallow, and ${here:0:8} is not the last fetched tip: left as it is"; continue; fi
-    if [ "$WHATIF" -eq 1 ]; then row "would move" "${here:0:8} -> ${there:0:8}"; continue; fi
-    if git -C "$path" reset --keep --quiet "$REMOTE/$base"; then row moved "${here:0:8} -> ${there:0:8}"; MOVED+=("$name")
-    else row blocked "reset --keep refused (a local change would be lost)"; fi
-    continue
-  fi
+  # A shallow clone (bootstrap_linux.sh makes them) proves nothing until its history reaches back far enough: deepen
+  # until git can say whether one tip descends from the other, or the clone is complete. Fetching moves no checkout,
+  # so --what-if stays repeatable; the move below is the same fast-forward as for a full clone (review 100f9c6d).
+  if ! deepen_until_related "$path" "$REMOTE" "$base" "$here" "$there"; then row failed "fetch failed while deepening"; continue; fi
   if git -C "$path" merge-base --is-ancestor "$there" "$here"; then row ahead "commits not on $REMOTE"; continue; fi
   if ! git -C "$path" merge-base --is-ancestor "$here" "$there"; then row diverged "both have commits of their own"; continue; fi
   if [ "$WHATIF" -eq 1 ]; then row "would move" "${here:0:8} -> ${there:0:8}"; continue; fi
