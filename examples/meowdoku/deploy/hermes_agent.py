@@ -7,14 +7,25 @@ prepare regenerates <hermes-root>/<account>/ every time: config.yaml, .env, plug
 speaktome_hermes memory-provider package) and SOUL.md (via hermes_soul.py, not copied). Only the memory, todo and
 SpeakToMe-MCP toolsets are ever enabled: no shell, file or web tools. Secrets stay in their files; only paths are written.
 run starts `hermes chat -q` with HERMES_HOME set to that directory and kills the whole process tree at the timeout.
+
+    python hermes_agent.py cycle --account gemma --work-seconds 900 --wind-down-seconds 120 --rest-ratio 1.0
+
+cycle is the sleep cycle: wake (a work turn), wind-down (a short turn in the same session), rest in proportion to the work
+done, wake early if SpeakToMe has something waiting, repeat. One cycle per account (an OS lock in the home), so it can never
+pile up processes. The session id is kept in <home>/cycle_state.json and every later wake resumes it.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
+import signal
+import sqlite3
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,7 +59,7 @@ def _venv_python(root):
     return Path(root) / ".venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
 
 
-# ---- platform section: the only OS-specific code (directory link, process-tree kill) ----
+# ---- platform section: the only OS-specific code (directory link, process-tree kill, file lock) ----
 def link_directory(link, target):
     link, target = Path(link), Path(target)
     if os.path.lexists(link):
@@ -72,11 +83,37 @@ def kill_tree(process):
     if os.name == "nt":
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True)
     else:
-        import signal
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     with contextlib.suppress(Exception):
         process.kill()
+
+
+def acquire_lock(path):
+    """Exclusive, non-blocking OS lock on a file. Returns the open handle (the lock lives as long as it is open) or None."""
+    handle = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def release_lock(handle):
+    with contextlib.suppress(Exception):
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    with contextlib.suppress(Exception):
+        handle.close()
 # ---- end platform section ----
 
 
@@ -127,32 +164,235 @@ def prepare(args):
     return 0
 
 
+def run_turn(home, prompt, timeout_seconds, exe, resume=None):
+    """One headless Hermes turn in `home` (cwd = home). Returns the exit code, TIMEOUT_EXIT after the tree was killed."""
+    environment = dict(os.environ, HERMES_HOME=str(home), PYTHONUTF8="1")
+    # Hermes loads context files (AGENTS.md, .hermes.md, .cursorrules) from its working directory: start it in the
+    # account's own home so no repository's guidance becomes the agent's (2026-11-20: turing's AGENTS.md leaked in).
+    command = [str(exe), "chat", "-q", prompt] + (["--resume", str(resume)] if resume else [])
+    process = subprocess.Popen(command, env=environment, cwd=str(home), **spawn_kwargs())
+    try:
+        return process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        kill_tree(process)
+        process.wait()
+        print(f"hermes timed out after {timeout_seconds}s; process tree killed", file=sys.stderr)
+        return TIMEOUT_EXIT
+    except BaseException:  # Ctrl-C or termination: never leave the turn running
+        kill_tree(process)
+        raise
+
+
+def _exe(args):
+    return Path(args.hermes_exe) if args.hermes_exe else _program(args.program_dir)
+
+
 def run(args):
     home = Path(args.hermes_root) / args.account
     if not (home / "config.yaml").is_file():
         print(f"{home} is not prepared; run prepare first", file=sys.stderr)
         return 1
-    exe = Path(args.hermes_exe) if args.hermes_exe else _program(args.program_dir)
-    environment = dict(os.environ, HERMES_HOME=str(home), PYTHONUTF8="1")
-    # Hermes loads context files (AGENTS.md, .hermes.md, .cursorrules) from its working directory: start it in the
-    # account's own home so no repository's guidance becomes the agent's (2026-11-20: turing's AGENTS.md leaked in).
-    process = subprocess.Popen([str(exe), "chat", "-q", args.prompt], env=environment, cwd=str(home), **spawn_kwargs())
+    return run_turn(home, args.prompt, args.timeout_seconds, _exe(args), args.resume)
+
+
+# ---- the sleep cycle ----
+FIRST_WAKE = ("You are starting a work cycle. Do your every-run steps: read your memory file and your decision place, "
+              "then messages first, then your watch and your learning.")
+LATER_WAKE = "You are awake again. Continue: messages first, then your watch and your learning."
+WIND_DOWN = ("You will sleep soon. Save what you learned, your Watching list and what is in flight to your memory file now, "
+             "then stop.")
+
+
+def rest_seconds(work, ratio, low, high):
+    """Rest in proportion to the work done, bounded."""
+    return max(low, min(high, ratio * work))
+
+
+def read_session(home, resume_id, since):
+    """Hermes' own session table (state.db in the home) is the structured source of the session id and tool-call count.
+
+    Resuming: the saved id, followed down any compression continuation (a child session) to the live one. New: the newest
+    session started since `since`. Returns (session id, tool_call_count), or None when there is none."""
+    db = Path(home) / "state.db"
+    if not db.is_file():
+        return None
+    connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=10)
     try:
-        return process.wait(timeout=args.timeout_seconds)
-    except subprocess.TimeoutExpired:
-        kill_tree(process)
-        process.wait()
-        print(f"hermes timed out after {args.timeout_seconds}s; process tree killed", file=sys.stderr)
-        return TIMEOUT_EXIT
+        if resume_id:
+            row = connection.execute("SELECT id, tool_call_count FROM sessions WHERE id = ?", (resume_id,)).fetchone()
+            for _ in range(100):
+                if row is None:
+                    return None
+                child = connection.execute("SELECT id, tool_call_count FROM sessions WHERE parent_session_id = ? "
+                                           "ORDER BY started_at DESC LIMIT 1", (row[0],)).fetchone()
+                if child is None:
+                    break
+                row = child
+        else:
+            row = connection.execute("SELECT id, tool_call_count FROM sessions WHERE started_at >= ? "
+                                     "ORDER BY started_at DESC LIMIT 1", (since,)).fetchone()
+    finally:
+        connection.close()
+    return (row[0], int(row[1] or 0)) if row else None
+
+
+def make_pending_check(home, speaktome):
+    """A callable returning (message count, highest message id or None) for the account, through the existing
+    speaktome_mcp.rest client and the route behind the `pending` verb (GET /api/messages/inbox). Only that client ever
+    reads the secret, from its file; nothing here prints it."""
+    env = {}
+    for line in (Path(home) / ".env").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip()
+    if str(speaktome) not in sys.path:
+        sys.path.insert(0, str(speaktome))
+    from speaktome_mcp.rest import Rest
+    client = Rest.from_env(env)
+
+    def check():
+        messages = client.call("/api/messages/inbox").get("messages", [])
+        ids = [m["id"] for m in messages if isinstance(m, dict) and isinstance(m.get("id"), int)]
+        return len(messages), (max(ids) if ids else None)
+    return check
+
+
+def _newer(now, baseline):
+    count, top = now
+    base_count, base_top = baseline
+    if top is not None:
+        return base_top is None or top > base_top
+    return count > base_count
+
+
+def rest(seconds, poll_seconds, check, sleep, clock, log):
+    """Rest for `seconds`; every poll ask `check` (message count, top id) whether something new has arrived since the rest
+    began. Returns "early" or "rested". A failing check is logged and the rest goes on at the same pace."""
+    end = clock() + seconds
+    baseline = None
+    while True:
+        try:
+            now = check()
+            if baseline is None:
+                baseline = now
+            elif _newer(now, baseline):
+                return "early"
+        except Exception as error:  # noqa: BLE001 - a failure to ask must neither end nor spin the rest
+            log(f"pending check failed: {type(error).__name__}: {error}")
+        remaining = end - clock()
+        if remaining <= 0:
+            return "rested"
+        sleep(min(poll_seconds, remaining))
+
+
+def _load_state(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _no_check():
+    raise RuntimeError("no pending check available")
+
+
+def cycle(args, pending_check=None, session_probe=None, sleep=time.sleep, clock=time.monotonic):
+    """The sleep cycle for one account. `pending_check`, `session_probe`, `sleep` and `clock` are injectable for tests."""
+    home = Path(args.hermes_root) / args.account
+    if not (home / "config.yaml").is_file():
+        print(f"{home} is not prepared; run prepare first", file=sys.stderr)
+        return 1
+    if args.work_seconds <= args.wind_down_seconds or args.min_rest > args.max_rest:
+        print("need --work-seconds > --wind-down-seconds and --min-rest <= --max-rest", file=sys.stderr)
+        return 2
+    lock = acquire_lock(home / "cycle.lock")
+    if lock is None:
+        print(f"a cycle is already running for {args.account} ({home / 'cycle.lock'} is locked); not starting another")
+        return 0
+
+    def log(line):
+        line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {line}"
+        print(line, flush=True)
+        with open(home / "cycle.log", "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    old_handlers = {}
+    try:
+        for name in ("SIGTERM", "SIGBREAK"):
+            if hasattr(signal, name):
+                with contextlib.suppress(ValueError, OSError):
+                    old_handlers[name] = signal.signal(getattr(signal, name), stop)
+        state_path = home / "cycle_state.json"
+        state = _load_state(state_path)
+        exe = _exe(args)
+        probe = session_probe or read_session
+        check = pending_check
+        if check is None:
+            try:
+                check = make_pending_check(home, args.speaktome)
+            except Exception as error:  # noqa: BLE001
+                log(f"cannot build the pending check ({type(error).__name__}: {error}); resting without early wake")
+                check = _no_check
+        done = 0
+        while args.cycles == 0 or done < args.cycles:
+            session = state.get("session_id")
+            before_tools = int(state.get("tool_total") or 0)
+            wake_wall = time.time()
+            started = time.monotonic()
+            log(f"wake cycle={int(state.get('cycles') or 0) + 1} session={session or 'new'}")
+            work_code = run_turn(home, LATER_WAKE if session else FIRST_WAKE, args.work_seconds - args.wind_down_seconds,
+                                 exe, session)
+            found = probe(home, session, wake_wall - 2)
+            if found is None and session:
+                log(f"session {session} not found in Hermes' state; the next wake starts a new one")
+                session, before_tools = None, 0
+            elif found:
+                session = found[0]
+            wind_code = None
+            if session:
+                log(f"wind-down session={session} work_exit={work_code}")
+                wind_code = run_turn(home, WIND_DOWN, args.wind_down_seconds, exe, session)
+                found = probe(home, session, wake_wall - 2) or found
+            else:
+                log(f"wind-down skipped: no session exists (work_exit={work_code})")
+            work = time.monotonic() - started
+            tools = None
+            if found:
+                session = found[0]
+                tools = found[1] - (before_tools if state.get("session_id") == session else 0)
+                state["tool_total"] = found[1]
+            wait = rest_seconds(work, args.rest_ratio, args.min_rest, args.max_rest)
+            done += 1
+            state.update(session_id=session, wake_started=datetime.fromtimestamp(wake_wall, timezone.utc).isoformat(),
+                         work_seconds=round(work, 1), tool_calls=tools, rest_seconds=round(wait, 1),
+                         cycles=int(state.get("cycles") or 0) + 1,
+                         last_exit_codes={"work": work_code, "wind_down": wind_code})
+            hermes_soul.write_atomic(state_path, json.dumps(state, indent=2) + "\n")
+            log(f"rest planned seconds={wait:.0f} work_seconds={work:.0f} tool_calls={tools} session={session}")
+            if args.cycles and done >= args.cycles:
+                break
+            outcome = rest(wait, args.poll_seconds, check, sleep, clock, log)
+            log("woke early: something is waiting" if outcome == "early" else "rested the full time")
+        return 0
     except KeyboardInterrupt:
-        kill_tree(process)
-        raise
+        with contextlib.suppress(Exception):
+            log("stopped (interrupt or termination); any running turn's process tree was killed")
+        return 130
+    finally:
+        for name, handler in old_handlers.items():
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(getattr(signal, name), handler)
+        release_lock(lock)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "run"):
+    for name in ("prepare", "run", "cycle"):
         item = sub.add_parser(name)
         item.add_argument("--account", required=True)
         item.add_argument("--hermes-root", type=Path, default=DEFAULT_HERMES_ROOT)
@@ -172,11 +412,25 @@ def build_parser():
     r.add_argument("--timeout-seconds", type=float, default=900)
     r.add_argument("--program-dir", type=Path, default=DEFAULT_PROGRAM)
     r.add_argument("--hermes-exe", type=Path, help="override the hermes executable (tests)")
+    r.add_argument("--resume", help="resume this Hermes session id")
+    c = sub.choices["cycle"]
+    c.add_argument("--work-seconds", type=float, default=900, help="whole wake budget, wind-down included")
+    c.add_argument("--wind-down-seconds", type=float, default=120)
+    c.add_argument("--rest-ratio", type=float, default=1.0)
+    c.add_argument("--min-rest", type=float, default=60)
+    c.add_argument("--max-rest", type=float, default=3600)
+    c.add_argument("--poll-seconds", type=float, default=60)
+    c.add_argument("--cycles", type=int, default=0, help="0 = forever")
+    c.add_argument("--program-dir", type=Path, default=DEFAULT_PROGRAM)
+    c.add_argument("--hermes-exe", type=Path, help="override the hermes executable (tests)")
+    c.add_argument("--speaktome", type=Path, default=DEFAULT_SPEAKTOME, help="speaktome tree holding speaktome_mcp")
     return parser
 
 
-def main(argv=None):
+def main(argv=None, **hooks):
     args = build_parser().parse_args(argv)
+    if args.command == "cycle":
+        return cycle(args, **hooks)
     return prepare(args) if args.command == "prepare" else run(args)
 
 
