@@ -1,10 +1,11 @@
-// Meowdoku site controls: ONE self-contained ES module (no imports).  HAND-AUTHORED, not produced by the Turing compiler.
+// Meowdoku site controls. HAND-AUTHORED, not produced by the Turing compiler.
+// The local HLS decoder is loaded only after a listener explicitly starts audio.
 // Opt in: <script type="module" src="/site-nav.js" data-site-nav="allow"></script>.  Without that attribute it does nothing.
 // Signed out: a small "Sign in" link to /login.html.  Signed in: "<username> · <server>" opening a menu of the pages this account's
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 8;
+const VERSION = 12;
 
 function allowed() {
   const here = import.meta.url;
@@ -50,6 +51,7 @@ const CSS = `
         color: #e8e8ee; font: inherit; text-decoration: none; display: inline-block; }
 .chip:hover, .chip:focus-visible { background: rgba(48,48,62,.95); outline: 2px solid #7aa2ff; outline-offset: 1px; }
 .chip.quiet { opacity: .55; } .chip.quiet:hover, .chip.quiet:focus-visible { opacity: 1; }
+.chip:disabled, .chip.quiet:disabled { opacity: .35; cursor: default; }
 .menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 210px; max-width: calc(100vw - 48px); max-height: 65vh; overflow: auto; background: #1c1c24; border: 1px solid rgba(255,255,255,.18);
         border-radius: 8px; padding: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
 .menu a, .menu button { all: unset; display: block; box-sizing: border-box; width: 100%; padding: 6px 10px; border-radius: 5px; cursor: pointer;
@@ -66,6 +68,11 @@ const CSS = `
 .binding.active { border-color: #ffd166; background: #80551e; }
 .radio-bands { display: flex; gap: 4px; align-items: center; min-height: 30px; }
 .radio-bands meter { flex: 1; min-width: 0; width: 40px; height: 24px; }
+.radio-audio { width: 100%; margin: 8px 0; }
+.suite[aria-label="Nodus Radio"] { border-radius: 2px; background: #171b20; border-color: #5f747d; font: 12px/1.35 ui-monospace, Consolas, monospace; }
+.suite[aria-label="Nodus Radio"] .radio-bands { padding: 4px; border: 1px solid #435960; background: #071317; }
+.suite[aria-label="Nodus Radio"] .chip { border-radius: 2px; }
+.suite[aria-label="Nodus Radio"] input[type="search"], .suite[aria-label="Nodus Radio"] select { box-sizing: border-box; width: 100%; margin: 4px 0; padding: 5px; color: #e8f7f4; background: #101a1e; border: 1px solid #5f747d; font: inherit; }
 [hidden] { display: none !important; }
 .note { padding: 4px 10px; color: #ffb3a8; font-size: 12px; }
 `;
@@ -156,18 +163,188 @@ function mountControlSuite(wrap, host, spec) {
   };
 }
 
-// Nodus owns capture/FFT; Python reads its existing UDP relay inbox.
-// This widget shows NRAD bands, not a browser FFT or an invented audio stream.
+// Nodus analyzes uploaded tracks once; the browser reads their stored NRAD bands
+// against the HLS media clock. The live relay remains a station diagnostic.
 function mountRadio(wrap, host, canControl = false) {
   const chip = el("button", {class: "chip", type: "button", text: "Nodus Radio", "aria-expanded": "false"});
   const panel = el("section", {class: "suite", hidden: "", "aria-label": "Nodus Radio"});
   const close = el("button", {class: "chip", type: "button", text: "Close radio"});
-  const title = el("strong", {text: "Nodus Radio"});
+  const title = el("strong", {text: "Server station · Nodus Radio"});
   const status = el("p", {role: "status", text: "Waiting for Nodus"});
   const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
-  panel.append(close, title, status, bands,
-    el("p", {text: "Live spectrum from Nodus. This feed carries levels, not playable audio."}));
+  const audio = el("audio", {class: "radio-audio", preload: "none", "aria-label": "Nodus Radio audio"});
+  const nativeHls = !!audio.canPlayType("application/vnd.apple.mpegurl");
+  const listen = el("button", {class: "chip", type: "button", text: "Listen in this browser"});
+  const stopListening = el("button", {class: "chip", type: "button", text: "Stop listening"});
+  const audioNote = el("p", {role: "status", text: "Audio starts when you choose Listen."});
+  audio.hidden = audioNote.hidden = listen.hidden = stopListening.hidden = true;
+  panel.append(close, title, status, bands, listen, stopListening, audioNote);
+  // Keep the media element outside the collapsible menu so iOS can keep playing.
+  document.body.append(audio);
+  const listeningKey = "meowdoku.radio.listening";
+  let wantsAudio = false;
+  try { wantsAudio = sessionStorage.getItem(listeningKey) === "1"; } catch (_error) {}
+  let hlsEngine = null, audioEpoch = 0, audioAvailable = false, connecting = false, audioRetryAt = 0;
+  let analysisView = null, analysisSong = null, analysisRequest = 0, analysisRetryAt = 0, audibleRms = null;
+  function renderBands(frame) {
+    bands.replaceChildren();
+    for (const [index, value] of (frame.bands || []).slice(0, 128).entries()) {
+      const level = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+      bands.append(el("meter", {min: "0", max: "1", value: String(frame.status === "live" ? level : 0),
+        "aria-label": "Band " + (index + 1), title: "Band " + (index + 1) + ": " + level.toFixed(3)}));
+    }
+  }
+  function updateAudioControls() {
+    const playing = !audio.paused && !audio.ended;
+    chip.textContent = playing ? "Nodus Radio · listening" : wantsAudio ? "Nodus Radio · resume" : "Nodus Radio";
+    listen.textContent = wantsAudio ? "Resume listening" : "Listen in this browser";
+    listen.hidden = !audioAvailable || playing;
+    listen.disabled = connecting;
+    stopListening.hidden = !wantsAudio;
+    audioNote.hidden = !audioAvailable && !wantsAudio;
+  }
+  function stopAudio() {
+    audioEpoch++;
+    connecting = false;
+    audioRetryAt = Date.now() + 5000;
+    audio.pause();
+    if (hlsEngine) { hlsEngine.destroy(); hlsEngine = null; }
+    audio.removeAttribute("src"); audio.load();
+    audio.hidden = true;
+    audibleRms = null;
+    bands.replaceChildren();
+    updateAudioControls();
+  }
+  async function tryPlay(epoch) {
+    try {
+      await audio.play();
+    } catch (error) {
+      if (epoch !== audioEpoch) return;
+      audioNote.textContent = error?.name === "NotAllowedError"
+        ? "Tap Resume listening to let this browser play Radio."
+        : "Could not start radio: " + String(error.message || error);
+      updateAudioControls();
+    }
+  }
+  async function startAudio() {
+    if (!wantsAudio || !audioAvailable || connecting) return;
+    const epoch = ++audioEpoch;
+    if (audio.getAttribute("src") || hlsEngine) { await tryPlay(epoch); return; }
+    connecting = true;
+    audioNote.textContent = "Connecting to the station…";
+    updateAudioControls();
+    try {
+      if (nativeHls) {
+        audio.src = "/api/radio/hls/radio.m3u8";
+        audio.hidden = false;
+        connecting = false;
+        updateAudioControls();
+        await tryPlay(epoch);
+      } else {
+        const {default: Hls} = await import("./radio-hls.min.js");
+        if (epoch !== audioEpoch || !audioAvailable) return;
+        if (!Hls.isSupported()) throw new Error("This browser cannot decode the radio stream");
+        hlsEngine = new Hls({lowLatencyMode: true});
+        hlsEngine.on(Hls.Events.MEDIA_ATTACHED, () => { if (epoch === audioEpoch) hlsEngine?.loadSource("/api/radio/hls/radio.m3u8"); });
+        hlsEngine.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (epoch === audioEpoch) {
+            connecting = false;
+            updateAudioControls();
+            tryPlay(epoch);
+          }
+        });
+        hlsEngine.on(Hls.Events.ERROR, (_event, data) => {
+          if (epoch === audioEpoch && data.fatal) {
+            stopAudio();
+            audioNote.textContent = "Radio stream error: " + data.details;
+          }
+        });
+        audio.hidden = false;
+        hlsEngine.attachMedia(audio);
+      }
+    } catch (error) {
+      if (epoch === audioEpoch) {
+        stopAudio();
+        audioNote.textContent = "Could not start radio: " + String(error.message || error);
+      }
+    }
+  }
+  listen.addEventListener("click", () => {
+    if (!audioAvailable) return;
+    wantsAudio = true;
+    try { sessionStorage.setItem(listeningKey, "1"); } catch (_error) {}
+    updateAudioControls();
+    startAudio();
+  });
+  stopListening.addEventListener("click", () => {
+    wantsAudio = false;
+    try { sessionStorage.removeItem(listeningKey); } catch (_error) {}
+    stopAudio();
+    audioNote.textContent = "Audio starts when you choose Listen.";
+  });
+  audio.addEventListener("playing", () => {
+    connecting = false;
+    audioNote.textContent = "Listening here. Server speakers are separate.";
+    updateAudioControls();
+  });
+  audio.addEventListener("pause", updateAudioControls);
+  audio.addEventListener("ended", updateAudioControls);
+  function showAudibleFrame() {
+    if (audio.paused || !Number.isFinite(audio.currentTime) || !analysisView) return;
+    // NRAD frames use the source's 48 kHz clock, which also starts HLS PTS.
+    const view = analysisView, count = view.byteLength / 48;
+    const target = audio.currentTime * 48000;
+    let lo = 0, hi = count;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (Number(view.getBigUint64(mid * 48 + 16, true)) <= target) lo = mid + 1;
+      else hi = mid;
+    }
+    if (!lo) return;
+    const at = (lo - 1) * 48, frameNumber = Number(view.getBigUint64(at + 16, true));
+    if (target - frameNumber > 12000) return;
+    const frame = {status: "live", sample_rate: 48000, frame: String(frameNumber),
+      rms: view.getFloat32(at + 24, true), bands: Array.from({length: 5}, (_, n) => view.getFloat32(at + 28 + 4 * n, true))};
+    audibleRms = frame.rms;
+    renderBands(frame);
+    window.dispatchEvent(new CustomEvent("nodus-radio-audible-frame", {detail: frame}));
+  }
+  async function loadLevels(songId) {
+    if (songId === analysisSong && (analysisView || Date.now() < analysisRetryAt)) return;
+    analysisSong = songId; analysisView = null;
+    analysisRetryAt = Date.now() + 5000;
+    audibleRms = null;
+    bands.replaceChildren();
+    const requestId = ++analysisRequest;
+    if (!songId?.startsWith("upload:") && !songId?.startsWith("suno:")) return;
+    try {
+      const response = await fetch("/api/radio/levels?id=" + encodeURIComponent(songId),
+        {credentials: "same-origin", cache: "force-cache"});
+      if (!response.ok) return;
+      if (response.headers.get("X-Radio-Track-Id") !== songId ||
+          response.headers.get("X-Radio-Analysis-Version") !== "1" ||
+          response.headers.get("X-Radio-Frame-Hop") !== "256" ||
+          response.headers.get("X-Radio-Band-Count") !== "5" ||
+          response.headers.get("X-Radio-Sample-Rate") !== "48000") return;
+      const buffer = await response.arrayBuffer();
+      if (requestId !== analysisRequest || !buffer.byteLength || buffer.byteLength > 16 * 1024 * 1024 || buffer.byteLength % 48) return;
+      const view = new DataView(buffer);
+      if (view.getUint32(0, true) !== 0x4441524e || view.getUint32(4, true) !== 1 ||
+          view.getUint32(8, true) !== 5 || view.getUint32(12, true) !== 48000) return;
+      analysisView = view;
+      showAudibleFrame();
+    } catch (_error) { /* The station still plays if stored levels are unavailable. */ }
+  }
+  let meterFrame = 0;
+  function tickMeters() {
+    showAudibleFrame();
+    if (!audio.paused && !audio.ended) meterFrame = requestAnimationFrame(tickMeters);
+    else meterFrame = 0;
+  }
+  audio.addEventListener("playing", () => { if (!meterFrame) meterFrame = requestAnimationFrame(tickMeters); });
+  audio.addEventListener("seeked", showAudibleFrame);
   const queueStatus = el("p", {role: "status", text: "Jukebox: checking configuration"});
+  const search = el("input", {type: "search", placeholder: "Search station tracks", "aria-label": "Search station tracks"});
   const songs = el("select", {"aria-label": "Song to request"});
   const request = el("button", {class: "chip", type: "button", text: "Request song"});
   const queue = el("div", {"aria-label": "Radio request lists"});
@@ -179,17 +356,63 @@ function mountRadio(wrap, host, canControl = false) {
   const adminButtons = [];
   let jukeboxBusy = false, currentPlay = null;
   request.disabled = vote.disabled = true;
-  panel.append(queueStatus, songs, request, rating, vote, queue, charts);
+  panel.append(queueStatus, search, songs, request, rating, vote, queue, charts);
+  const uploadFile = el("input", {type: "file", accept: ".flac,audio/flac", "aria-label": "FLAC master to add to the jukebox"});
+  const uploadTitle = el("input", {type: "text", maxlength: "200", placeholder: "Track title", "aria-label": "Jukebox track title"});
+  const uploadButton = el("button", {class: "chip", type: "button", text: "Upload FLAC to jukebox"});
+  const uploadStatus = el("p", {role: "status", text: "Choose a FLAC master to offer to the shared jukebox. Upload requires the server Radio codec to be configured."});
+  uploadFile.addEventListener("change", () => {
+    if (uploadFile.files?.[0] && !uploadTitle.value.trim()) uploadTitle.value = uploadFile.files[0].name.replace(/\.flac$/i, "");
+  });
+  uploadButton.addEventListener("click", async () => {
+    const file = uploadFile.files?.[0], name = uploadTitle.value.trim();
+    if (!file || !/\.flac$/i.test(file.name) || !name || name.length > 200) {
+      uploadStatus.textContent = "Choose a FLAC file and enter a track title.";
+      return;
+    }
+    if (file.size < 42 || file.size > 256 * 1024 * 1024) {
+      uploadStatus.textContent = "FLAC must be between 42 bytes and 256 MiB.";
+      return;
+    }
+    uploadButton.disabled = true;
+    uploadStatus.textContent = "Uploading " + file.name + "…";
+    try {
+      const response = await fetch("/api/radio/uploads?title=" + encodeURIComponent(name), {
+        method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "audio/flac", "X-Meowdoku-Radio": "1"}, body: file
+      });
+      const isJson = response.headers.get("content-type")?.includes("application/json");
+      const data = isJson ? await response.json() : {};
+      if (!response.ok) throw new Error(data.error || "Radio upload failed (HTTP " + response.status + ")");
+      uploadStatus.textContent = "Added " + data.title + " to the jukebox · SHA-256 " + data.sha256;
+      uploadFile.value = "";
+      const latest = await getJson("/api/radio/jukebox");
+      if (!panel.hidden) showJukebox(latest);
+    } catch (error) {
+      uploadStatus.textContent = String(error.message || error);
+    } finally {
+      uploadButton.disabled = false;
+    }
+  });
+  panel.append(el("strong", {text: "Add a lossless track"}), uploadFile, uploadTitle, uploadButton, uploadStatus);
+  let availableSongs = [];
+  function filterSongs() {
+    const selected = songs.value;
+    const query = String(search.value || "").trim().toLocaleLowerCase();
+    const matching = availableSongs.filter(song => song.title.toLocaleLowerCase().includes(query));
+    songs.replaceChildren(...matching.map(song => el("option", {value: song.id, text: song.title})));
+    if (matching.some(song => song.id === selected)) songs.value = selected;
+    request.disabled = jukeboxBusy || !matching.length;
+  }
+  search.addEventListener("input", filterSongs);
   function showJukebox(data) {
     const catalogue = data.catalogue || [];
     const names = new Map(catalogue.map(s => [s.id, s.title]));
-    const selected = songs.value;
-    songs.replaceChildren(...catalogue.map(s => el("option", {value: s.id, text: s.title})));
-    if (names.has(selected)) songs.value = selected;
+    availableSongs = catalogue;
+    filterSongs();
     currentPlay = data.current?.id || null;
     queueStatus.textContent = data.error || data.runner?.error || (data.paused ? "Jukebox paused" : "Jukebox running") +
       (data.current ? ": " + (names.get(data.current.song_id) || data.current.song_id) : ": no song playing");
-    request.disabled = jukeboxBusy || !catalogue.length;
     vote.disabled = jukeboxBusy || !currentPlay;
     for (const button of adminButtons) button.disabled = jukeboxBusy || !!data.error;
     queue.replaceChildren();
@@ -229,6 +452,85 @@ function mountRadio(wrap, host, canControl = false) {
     button.disabled = true; button.addEventListener("click", () => commandJukebox({action}));
     adminButtons.push(button); panel.append(button);
   }
+  // [RADIO] Suno playlists onto the jukebox (suno_playlists.py). Shown only to an account with a Suno connection, its
+  // own or one an owner shares with it; each song is saved as MP3 and requested in the playlist's order.
+  const sunoBox = el("div", {"aria-label": "Suno playlists", hidden: ""});
+  const sunoLists = el("select", {"aria-label": "Suno playlist"});
+  const sunoMore = el("button", {class: "chip", type: "button", text: "More playlists", hidden: ""});
+  const sunoQueue = el("button", {class: "chip", type: "button", text: "Put playlist on the jukebox"});
+  const sunoCredit = el("button", {class: "chip", type: "button", hidden: ""});
+  const sunoStatus = el("p", {role: "status", text: ""});
+  sunoBox.append(el("strong", {text: "Suno playlists"}), sunoLists, sunoMore, sunoQueue, sunoCredit, sunoStatus);
+  panel.append(sunoBox);
+  let sunoCursor = null, sunoBusy = false, sunoTimer = null, sunoLoaded = false, sunoRunning = false;
+  async function loadPlaylists(more) {
+    if (sunoBusy) return;
+    sunoBusy = true; sunoMore.disabled = sunoQueue.disabled = true;
+    try {
+      const data = await getJson("/api/radio/suno/playlists" + (more && sunoCursor ? "?cursor=" + encodeURIComponent(sunoCursor) : ""));
+      if (!more) sunoLists.replaceChildren();
+      for (const p of data.playlists || [])
+        sunoLists.append(el("option", {value: p.id, text: p.name + (p.songs != null ? " · " + p.songs + " songs" : "")}));
+      sunoCursor = data.next_cursor || null;
+      sunoMore.hidden = !sunoCursor;
+      sunoBox.hidden = false; sunoLoaded = true;
+      if (!more && !sunoRunning) sunoStatus.textContent = "Playlists of " + data.owner + "'s Suno" +
+        (data.shared ? " (shared with you)" : "") + ". Songs are saved as MP3 and requested in order.";
+    } catch (_error) {
+      if (!more) sunoBox.hidden = true;            // no Suno connection for this account: the section stays hidden
+    } finally {
+      sunoBusy = false; sunoMore.disabled = false; sunoQueue.disabled = sunoRunning || !sunoLists.value;
+    }
+  }
+  function showSunoJob(job) {
+    if (!job) return;
+    sunoRunning = job.state === "running";
+    const counts = {};
+    for (const song of job.songs || []) {
+      const kind = String(song.outcome).split(":")[0];
+      counts[kind] = (counts[kind] || 0) + 1;
+    }
+    const summary = Object.entries(counts).map(([kind, n]) => n + " " + kind).join(", ");
+    const credit = job.needs_credit ? " " + job.needs_credit + " need a Suno download credit" +
+      (job.credits_remaining != null ? " (" + job.credits_remaining + " credits left)" : "") + "." : "";
+    sunoStatus.textContent = sunoRunning
+      ? "Putting the playlist on the jukebox: " + job.done + " of " + (job.total ?? "?") + " songs" + (summary ? " (" + summary + ")" : "")
+      : job.state === "failed" ? "The playlist could not be put on the jukebox: " + job.error
+      : "Done: " + (summary || "no songs") + "." + credit;
+    sunoCredit.hidden = !(job.state === "done" && job.needs_credit > 0 && !job.confirm_credit);
+    sunoCredit.textContent = "Spend " + job.needs_credit + " Suno download credit(s) and add those songs";
+    sunoQueue.disabled = sunoRunning || sunoBusy || !sunoLists.value;
+  }
+  async function pollSunoJob(epoch) {
+    try {
+      const data = await getJson("/api/radio/suno/playlist-job");
+      if (epoch !== generation || panel.hidden) return;
+      showSunoJob(data.job);
+      if (data.job?.state === "running") sunoTimer = setTimeout(() => pollSunoJob(epoch), 2000);
+    } catch (_error) { /* not signed in, or no job: nothing to show */ }
+  }
+  async function queuePlaylist(confirmCredit) {
+    const id = sunoLists.value;
+    if (!id || sunoBusy || sunoRunning) return;
+    sunoBusy = true; sunoQueue.disabled = true; sunoCredit.hidden = true;
+    try {
+      const response = await fetch("/api/radio/suno/playlists/" + encodeURIComponent(id) + "/queue", {method: "POST",
+        credentials: "same-origin", cache: "no-store", headers: {"Content-Type": "application/json", "X-Meowdoku-Radio": "1"},
+        body: JSON.stringify({confirm_credit: confirmCredit})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
+      sunoBusy = false;
+      showSunoJob(data.job);
+      clearTimeout(sunoTimer); pollSunoJob(generation);
+    } catch (error) {
+      sunoStatus.textContent = error.message;
+    } finally {
+      sunoBusy = false; sunoQueue.disabled = sunoRunning || !sunoLists.value;
+    }
+  }
+  sunoMore.addEventListener("click", () => loadPlaylists(true));
+  sunoQueue.addEventListener("click", () => queuePlaylist(false));
+  sunoCredit.addEventListener("click", () => queuePlaylist(true));
   let paTimer = null, paBusy = false;
   const paStatus = el("p", {role: "status", text: "Server speakers: checking configuration"});
   const play = el("button", {class: "chip", type: "button", text: "Play on server speakers"});
@@ -279,34 +581,41 @@ function mountRadio(wrap, host, canControl = false) {
   async function poll(epoch) {
     try {
       const data = await getJson("/api/radio");
-      if (epoch !== generation || panel.hidden) return;
+      if (epoch !== generation || (panel.hidden && !wantsAudio)) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: data}));
       title.textContent = data.title || "Nodus Radio";
-      status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
+      const available = data.audio === true;
+      audioAvailable = available;
+      loadLevels(data.song_id || null);
+      if (wantsAudio && available && audio.paused && !connecting &&
+          !audio.getAttribute("src") && !hlsEngine && Date.now() >= audioRetryAt) startAudio();
+      if (!available && (audio.getAttribute("src") || hlsEngine)) stopAudio();
+      updateAudioControls();
+      status.textContent = !audio.paused && audibleRms !== null ? "Listening · RMS " + audibleRms.toFixed(3)
+        : !audio.paused && !analysisView ? "Listening · stored levels unavailable"
+        : data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
         : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
         : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
-      bands.replaceChildren();
-      for (const [index, value] of (data.bands || []).slice(0, 128).entries()) {
-        const level = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
-        const meter = el("meter", {min: "0", max: "1", value: String(data.status === "live" ? level : 0),
-          "aria-label": "Band " + (index + 1), title: "Band " + (index + 1) + ": " + level.toFixed(3)});
-        bands.append(meter);
-      }
+      if (!analysisView) renderBands({bands: [], status: "waiting"});
+      else showAudibleFrame();
     } catch (error) {
-      if (epoch !== generation || panel.hidden) return;
+      if (epoch !== generation || (panel.hidden && !wantsAudio)) return;
       window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
       status.textContent = "Radio unavailable";
       bands.replaceChildren();
     }
-    if (epoch === generation && !panel.hidden) timer = setTimeout(() => poll(epoch), 100);
+    if (epoch === generation && (!panel.hidden || wantsAudio)) timer = setTimeout(() => poll(epoch), panel.hidden ? 1000 : 100);
   }
   function setOpen(open) {
+    if (open === !panel.hidden) return;
     if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
     dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
     generation++; clearTimeout(timer); timer = null; clearTimeout(paTimer); paTimer = null;
-    if (!open) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
+    clearTimeout(sunoTimer); sunoTimer = null;
+    if (!open && audio.paused) window.dispatchEvent(new CustomEvent("nodus-radio-signal", {detail: {status: "unavailable"}}));
     panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
-    if (open) {poll(generation); pollPA(generation);}
+    if (open) {poll(generation); pollPA(generation); if (!sunoLoaded) loadPlaylists(false); pollSunoJob(generation);}
+    else if (wantsAudio) poll(generation);
   }
   chip.addEventListener("click", () => setOpen(panel.hidden));
   close.addEventListener("click", () => {setOpen(false); chip.focus();});
@@ -315,8 +624,113 @@ function mountRadio(wrap, host, canControl = false) {
   });
   document.addEventListener("pointerdown", event => {if (!event.composedPath().includes(host)) setOpen(false);});
   window.addEventListener("pagehide", () => setOpen(false));
-  document.addEventListener("visibilitychange", () => {if (document.hidden) setOpen(false);});
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) setOpen(false);
+    else if (wantsAudio && audioAvailable && audio.paused) startAudio();
+  });
+  window.addEventListener("pageshow", event => {
+    if (event.persisted && wantsAudio && audioAvailable && audio.paused) startAudio();
+  });
   wrap.append(chip, panel);
+  updateAudioControls();
+  if (wantsAudio) poll(generation);
+}
+
+// [NOTICE] The site's header notice (site_condition.py; GET /api/condition/notice, public). mountNotice is exported so a page
+// can block one element of its own the same way:
+//   mountNotice(element, {title, body, mode: "overlay", block: true})  ->  {remove()}
+// mode "push" takes the space it needs at the top of the target; "overlay" sits on top of it (as tall as it needs, up to the
+// target's height, scrolling inside). With block, the target's other content is made inert (no click, focus or typing);
+// for the whole page the site header and its menu are never blocked. Text only: nothing in a notice is read as HTML.
+const NOTICE_CSS = `
+:host { all: initial; }
+.notice { box-sizing: border-box; font: 15px/1.45 system-ui, sans-serif; color: #f3f6f8; background: #13202a;
+  border-bottom: 3px solid #e0a526; padding: 14px 18px; max-height: 100%; overflow: auto; }
+.notice.overlay { box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+.notice.block { height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;
+  background: rgba(10, 16, 22, .94); border-bottom: none; }
+.notice.block > * { max-width: 72ch; }
+h2 { margin: 0 0 6px; font-size: 18px; color: #ffd26a; }
+p { margin: 6px 0; white-space: pre-wrap; }
+.eta { font-weight: 700; color: #ffd26a; }
+.countdown { font: 700 22px/1.3 ui-monospace, monospace; color: #ffd26a; margin: 8px 0; }
+.countdown small { display: block; font: 600 12px/1.3 system-ui, sans-serif; opacity: .8; }
+.posted { font-size: 12px; opacity: .7; }
+button { font: inherit; margin-top: 8px; padding: 5px 12px; border-radius: 6px; border: 1px solid #5f747d; background: #1d2c35;
+  color: inherit; cursor: pointer; }
+`;
+
+export function mountNotice(target, notice, { top = 0, keep = [] } = {}) {
+  const host = document.createElement("div");
+  host.setAttribute("data-site-notice", "");
+  const shadow = host.attachShadow({ mode: "open" });
+  const overlay = notice.mode === "overlay";
+  const block = overlay && !!notice.block;
+  const box = el("section", { class: "notice" + (overlay ? " overlay" : "") + (block ? " block" : ""),
+    role: block ? "alertdialog" : "region", "aria-label": notice.title || "Notice" });
+  if (notice.title) box.append(el("h2", { text: notice.title }));
+  for (const para of String(notice.body || "").split(/\n\s*\n/)) if (para.trim()) box.append(el("p", { text: para.trim() }));
+  if (notice.eta) box.append(el("p", { class: "eta", text: notice.eta }));
+  let timer = 0;
+  if (Number.isFinite(Number(notice.until)) && Number(notice.until) > 0) {   // a live countdown to notice.until (epoch s)
+    const end = Number(notice.until) * 1000;
+    const label = el("small", { text: notice.until_label || "Time remaining" });
+    const clock = el("span", { role: "timer" });
+    box.append(el("div", { class: "countdown" }, label, clock));
+    const tick = () => {
+      let left = Math.max(0, Math.floor((end - Date.now()) / 1000));
+      if (left === 0) { clock.textContent = "Now"; clearInterval(timer); return; }
+      const d = Math.floor(left / 86400); left %= 86400;
+      const h = Math.floor(left / 3600); left %= 3600;
+      const m = Math.floor(left / 60), s = left % 60;
+      clock.textContent = (d ? d + "d " : "") + String(h).padStart(2, "0") + "h " + String(m).padStart(2, "0") + "m " +
+        String(s).padStart(2, "0") + "s";
+    };
+    tick();
+    timer = setInterval(tick, 1000);
+    clock.title = "until " + new Date(end).toLocaleString();
+  }
+  const blocked = [];
+  const remove = () => { clearInterval(timer); host.remove(); for (const node of blocked) node.inert = false; };
+  if (notice.dismissible && !block) {
+    box.append(el("button", { type: "button", text: "Dismiss", onclick: () => { remove(); if (notice.onDismiss) notice.onDismiss(); } }));
+  }
+  shadow.append(el("style", { text: NOTICE_CSS }), box);
+  const whole = target === document.body;
+  if (!overlay) {
+    host.style.cssText = "display:block;position:relative;z-index:1;";
+    if (whole && keep[0] && keep[0].parentNode === target) keep[0].after(host); else target.prepend(host);
+    return { remove };
+  }
+  if (whole) {
+    host.style.cssText = `position:fixed;left:0;right:0;top:${top}px;z-index:2147482000;` +
+      (block ? "bottom:0;" : `max-height:calc(100vh - ${top}px);`);
+    target.append(host);
+  } else {
+    if (getComputedStyle(target).position === "static") target.style.position = "relative";
+    host.style.cssText = "position:absolute;left:0;right:0;top:0;z-index:2147482000;" + (block ? "bottom:0;" : "max-height:100%;");
+    target.append(host);
+  }
+  if (block) {
+    for (const child of Array.from(target.children)) {
+      if (child !== host && !keep.includes(child)) { child.inert = true; blocked.push(child); }
+    }
+  }
+  return { remove };
+}
+
+async function showSiteNotice(header, headerBottom) {
+  let notice;
+  try { notice = (await getJson("/api/condition/notice")).notice; } catch (e) { return; }
+  if (!notice) return;
+  const paths = Array.isArray(notice.paths) ? notice.paths : [];
+  if (paths.length && !paths.some(prefix => location.pathname.startsWith(prefix))) return;
+  const key = "meowdoku_notice_dismissed";
+  let dismissed = null;
+  try { dismissed = sessionStorage.getItem(key); } catch (e) { dismissed = null; }
+  if (notice.dismissible && dismissed === String(notice.version)) return;
+  notice.onDismiss = () => { try { sessionStorage.setItem(key, String(notice.version)); } catch (e) { /* storage off */ } };
+  mountNotice(document.body, notice, { top: headerBottom(), keep: [header] });
 }
 
 async function main() {
@@ -354,12 +768,20 @@ async function main() {
   suiteMount = spec => mountControlSuite(actions, host, spec);
   for (const record of suites.values()) record.dispose = suiteMount(record.spec);
   window.dispatchEvent(new Event("site-controls-ready"));
+  showSiteNotice(host, () => Math.ceil(wrap.getBoundingClientRect().bottom));   // [NOTICE] for everyone, signed in or not
   let who;
   try { who = await getJson("/api/whoami"); } catch (e) { return; }
   const caps = new Set(who.capabilities || []);
+  // Sign in from any page returns to that page: login.js reads ?next= and accepts only a same-site path.
+  const signInHref = () => location.pathname === "/login.html" ? "/login.html"
+    : "/login.html?next=" + encodeURIComponent(location.pathname + location.search + location.hash);
 
   if (!who.signed_in) {
-    actions.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }));
+    try { sessionStorage.removeItem("meowdoku.radio.listening"); } catch (_error) {}
+    actions.append(el("a", { class: "chip", href: "/palette.html", text: "Color game" }),
+      el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: signInHref(), text: "Sign in" }),
+      el("button", { class: "chip quiet", type: "button", disabled: "", text: "Register", title: "General registration is not open" }),
+      el("a", { class: "chip quiet", href: "/register.html#alpha-form", text: "Alpha user request" }));
     reserveSpace();
     return;
   }
@@ -372,6 +794,8 @@ async function main() {
       text: "Tickets ▾", title: "Issue tickets and change reviews" });
     const ticketsMenu = el("div", { class: "menu", role: "menu", hidden: "" });
     ticketsMenu.append(el("a", { href: "/issues.html", role: "menuitem", text: "Issue tickets" }));
+    ticketsMenu.append(el("a", { href: "/research.html", role: "menuitem", text: "Research" }));
+    ticketsMenu.append(el("a", { href: "/development.html", role: "menuitem", text: "Development" }));
     if (caps.has("dev_ui")) ticketsMenu.append(el("a", { href: "/reviews.html", role: "menuitem",
       text: who.role === "admin" ? "Change reviews (approve)" : "Change reviews" }));
     const dismissTickets = () => setTicketsOpen(false);
@@ -393,9 +817,11 @@ async function main() {
   }
 
   let route = {};
-  if (caps.has("dev_ui")) { try { route = await getJson("/api/route"); } catch (e) { route = {}; } }
+  const pageRouteControl = who.signed_in && (caps.has("dev_ui") || location.pathname === "/" ||
+    location.pathname === "/index.html");
+  if (pageRouteControl) { try { route = await getJson("/api/route"); } catch (e) { route = {}; } }
   const onDev = !!(route.dev_route && route.route === route.dev_route);
-  const serverName = caps.has("dev_ui") ? (onDev ? "development" : "stable") : "";
+  const serverName = pageRouteControl ? (onDev ? "development" : "stable") : "";
   const chip = el("button", { class: "chip", "aria-haspopup": "true", "aria-expanded": "false",
     text: who.username + (serverName ? " · " + serverName : "") });
   const menu = el("div", { class: "menu", role: "menu", hidden: "" });
@@ -408,7 +834,14 @@ async function main() {
     if (href === here) a.setAttribute("aria-current", "page");
     return a;
   }
+  // [LOAN] the dev Apache sends a request carrying meowdoku_loan=<port> to that branch server (deploy/apache/dev-proxy.conf);
+  // choosing Stable or Development forgets it.
+  const loanCookie = (document.cookie.match(/(?:^|;\s*)meowdoku_loan=(\d+)/) || [])[1] || "";
+  function setLoan(port) {
+    document.cookie = "meowdoku_loan=" + (port || "") + "; path=/; Secure; SameSite=Lax" + (port ? "" : "; Max-Age=0");
+  }
   async function choose(site) {
+    setLoan("");
     const res = await postJson("/api/route", { site });
     if (res.status === 200) { location.reload(); return; }
     note.textContent = (res.body && res.body.error) || "could not switch server";
@@ -421,6 +854,13 @@ async function main() {
   }
 
   menu.append(el("div", { class: "head", text: "Signed in as " + who.username + " (" + (who.role || "member") + ")" }));
+  if (who.role === "admin" || who.role === "operator") {
+    // [CONDITION] The yellow and red card switch. Its code is not in this public file: the server answers the module only to
+    // an operator or an admin and checks the role again on every switch (site_condition.py).
+    const slot = el("div", { class: "condition" });
+    menu.append(slot, el("div", { class: "sep" }));
+    import("/api/condition/controls.js").then(m => m.mount(slot)).catch(() => slot.remove());
+  }
   if (caps.has("message")) menu.append(el("button", { role: "menuitem", type: "button", text: "Messages", onclick: () => {
     setOpen(false);
     if (window.MeowdokuMessenger) window.MeowdokuMessenger.open();
@@ -428,8 +868,12 @@ async function main() {
   } }));
   for (const item of [
     link("Home", "/"),
+    link("Color game", "/palette.html"),
+    link("Newsletter", "/newsletter.html"),
+    link("Games", "/games.html", !onDev || caps.has("dev_ui")),
     link("Profile and servers", "/profile.html"),
     link("Keys", "/keys.html", caps.has("message")),
+    link("Connected services", "/connected-services.html"),
     link("My files", "/files.html", caps.has("message")),
     link("Paper markets", "/markets.html", caps.has("message")),
     link("Browse the site", "/browse"),
@@ -438,16 +882,38 @@ async function main() {
     link("Math lab", "/mathlab.html", caps.has("compile_submit")),
     link("Source divider", "/divider.html", caps.has("compile_submit")),
     link("Marble studio", "/marble_studio.html", caps.has("dev_ui")),
+    link("T4 wave arena", "/wave_arena.html", caps.has("dev_ui")),
     link("Creature studio", "/mechanical_creature_studio.html", caps.has("dev_ui")),
+    link("People (accounts and groups)", "/people.html", caps.has("account_manage")),
+    link("Operator control", "/operator-control.html", caps.has("deploy_scripts")),
+    link("Agent workspace", "/agent-workspace.html", caps.has("operator_workspace")),
+    link("Agent controls", "/agent-controls.html", caps.has("operator_workspace")),
+    link("Agent training arena", "/agent-training-arena.html", caps.has("operator_workspace")),
+    link("Rooms", "/rooms.html"),
     link("Account and password", "/login.html"),
+    link("Invite someone", "/invite.html"),                                         // [INVITE] invitations.py: a link and a QR code, once
   ]) if (item) menu.append(item);
-  if (caps.has("dev_ui")) {
+  if (pageRouteControl) {
     menu.append(el("div", { class: "sep" }), el("div", { class: "head", text: "Server: " + (who.instance || serverName) }),
       serverButton("Stable server", "stable", !onDev, false),
-      serverButton("Development server", "dev", onDev, route.dev_available === false));
+      serverButton("Development server", "dev", onDev && !loanCookie, route.dev_available === false));
+    if (onDev && caps.has("dev_ui")) {                 // [LOAN] every ready branch server, hosted by the dev site
+      let loans = [];
+      try { loans = ((await getJson("/api/loans")).loans || []).filter(loan => loan.state === "ready"); } catch (e) { loans = []; }
+      for (const loan of loans) {
+        const b = el("button", { role: "menuitemradio", "aria-pressed": String(String(loan.port) === loanCookie),
+          text: "Branch " + loan.branch + " (" + loan.repository + ", " + (loan.username || "?") + ")",
+          onclick: () => { setLoan(String(loan.port)); location.reload(); } });
+        menu.append(b);
+      }
+    }
   }
   menu.append(note, el("div", { class: "sep" }),
-    el("button", { role: "menuitem", text: "Sign out", onclick: async () => { await postJson("/api/account/logout", {}); location.reload(); } }));
+    el("button", { role: "menuitem", text: "Sign out", onclick: async () => {
+      const result = await postJson("/api/account/logout", {});
+      if (result.status === 200) try { sessionStorage.removeItem("meowdoku.radio.listening"); } catch (_error) {}
+      location.reload();
+    } }));
 
   const dismiss = () => setOpen(false);
   function setOpen(open) {
@@ -463,5 +929,5 @@ async function main() {
   reserveSpace();
 }
 
-window.MeowdokuSiteNav = { version: VERSION, registerControlSuite };
+window.MeowdokuSiteNav = { version: VERSION, registerControlSuite, mountNotice };
 main();

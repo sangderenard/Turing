@@ -139,6 +139,29 @@ def test_a_task_is_offered_only_when_what_it_needs_was_given():
     assert sorted(both) == ["manual.hardcopy", "state.backup"]
 
 
+def test_hosted_dispatch_sends_nodus_control_not_chat_content(tmp_path):
+    import sqlite3
+    from meowdoku import messaging
+    path = tmp_path / "accounts.db"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, display_name TEXT)")
+    db.executemany("INSERT INTO users(id,username,display_name) VALUES(?,?,?)",
+                   [(1, "svc-nodus-messenger", "Nodus"), (2, "llama", "Llama")])
+    db.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT)")
+    db.execute("INSERT INTO account_roles VALUES(2,'intern')")
+    db.commit()
+    db.close()
+    assert scheduled_tasks.dispatch_hosted_agents(path, "svc-nodus-messenger", ["llama"], messaging=messaging) == ["llama:agents"]
+    db = messaging.connect(path)
+    try:
+        inbox = messaging.inbox(db, 2)["messages"]
+        assert len(inbox) == 1
+        assert inbox[0]["subject"] == {"kind": "control", "ref": "agents"}
+        assert inbox[0]["from"] == "svc-nodus-messenger"
+    finally:
+        db.close()
+
+
 def test_the_worker_bakes_at_its_own_start_and_idles_without_a_cron_port(tmp_path):
     if rest_api.manual is None:
         pytest.skip("the SpeakToMe checkout has no manual")

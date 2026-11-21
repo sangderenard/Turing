@@ -5,6 +5,7 @@ whoever holds the Git credential (an operator, or a worker started by one), neve
 
     python branch_gate.py --policy deploy/branch_policy.json --db <accounts.db> status
     ... submit <repository> <branch> --as <username> [--timeout-hours N] [--keep]
+    ... sync-loan <repository> <branch> --for <borrower> [--apply]
     ... land  [--apply]        fast-forward each accepted change onto its default branch, then remove or keep it
     ... clean [--apply]        remove branches that have been fully merged for the grace period
     ... check-push <repository>    the pre-push hook: refuse a push to a default branch that no review accepts
@@ -95,7 +96,7 @@ HOOK_MARK = "# speaktome branch gate"
 DEFAULTS = {"grace_days": 14, "stale_days": 30, "unregistered_days": 30, "registered_days": 365, "lock": "mock",
             "worktree_idle_days": 1, "cleaner": "svc-pale-rider", "cleaner_display_name": "Pale Rider",
             "notices_file": "C:/dev/Powershell/REMOVAL_NOTICES.csv",
-            "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
+            "review_timeout_hours": 0.5, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
 
@@ -265,8 +266,29 @@ def remove_branch(path, branch, head, *, remote, delete_remote, local, skipped=N
     return "; ".join(done)
 
 
+def folder_state(path) -> str:
+    """present, gone, or unreadable. A folder this account may not open (another account's profile) is unreadable, never
+    gone: to the service account, a worktree in the operator's profile can look missing, and a missing worktree is
+    pruned (2026-11-14: 91 worktrees under C:/Users/alber, which the cleanup account cannot read)."""
+    import os
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "gone"
+    except OSError:
+        return "unreadable"
+    try:
+        os.listdir(path)
+    except NotADirectoryError:
+        return "gone"
+    except OSError:
+        return "unreadable"
+    return "present" if Path(path).is_dir() else "gone"
+
+
 def side_worktrees(path, remote="origin") -> list:
-    """Every worktree of a repository except its own checkout, with what removing it would lose."""
+    """Every worktree of a repository except its own checkout, with what removing it would lose. ``state`` is the
+    folder's (folder_state); an unreadable one is not looked into."""
     entries, current = [], None
     for line in git(path, "worktree", "list", "--porcelain").splitlines():
         if line.startswith("worktree "):
@@ -280,23 +302,27 @@ def side_worktrees(path, remote="origin") -> list:
             current["locked"] = True
     out = []
     for entry in entries[1:]:
-        entry["exists"] = Path(entry["path"]).is_dir()
+        entry["state"] = folder_state(entry["path"])
+        entry["exists"] = entry["state"] != "gone"
         entry["on_remote"] = bool(entry["head"]) and bool(git(path, "branch", "-r", "--contains", entry["head"], check=False))
         entry["same_on_remote"] = bool(entry["branch"]) and git(
             path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{entry['branch']}", check=False) == entry["head"]
         entry["dirty"], entry["touched"] = 0, None
-        if entry["exists"]:
-            # Looking must not count as use: no optional locks, so this status never rewrites the index.
-            entry["dirty"] = len(git(entry["path"], "--no-optional-locks", "status", "--porcelain", check=False).splitlines())
-            # When HEAD last really moved (a checkout, a commit, a reset), from the reflog entry itself. File times
-            # are not evidence: Git's housekeeping rewrites every worktree's reflog and made 49 idle worktrees look
-            # used within the day (2026-11-12).
-            moved = re.search(r"\{(\d+)\}", git(entry["path"], "log", "-g", "-1", "--date=unix", "--format=%gd", "HEAD", check=False))
-            if moved:
-                entry["touched"] = float(moved[1])
-            else:                                # no reflog: the commit's own time
-                stamp = git(entry["path"], "log", "-1", "--format=%ct", "HEAD", check=False)
-                entry["touched"] = float(stamp) if stamp.isdigit() else None
+        if entry["state"] == "present":
+            try:
+                # Looking must not count as use: no optional locks, so this status never rewrites the index.
+                entry["dirty"] = len(git(entry["path"], "--no-optional-locks", "status", "--porcelain", check=False).splitlines())
+                # When HEAD last really moved (a checkout, a commit, a reset), from the reflog entry itself. File times
+                # are not evidence: Git's housekeeping rewrites every worktree's reflog and made 49 idle worktrees look
+                # used within the day (2026-11-12).
+                moved = re.search(r"\{(\d+)\}", git(entry["path"], "log", "-g", "-1", "--date=unix", "--format=%gd", "HEAD", check=False))
+                if moved:
+                    entry["touched"] = float(moved[1])
+                else:                                # no reflog: the commit's own time
+                    stamp = git(entry["path"], "log", "-1", "--format=%ct", "HEAD", check=False)
+                    entry["touched"] = float(stamp) if stamp.isdigit() else None
+            except OSError:                      # listed, but git may not run in it as this account
+                entry["state"], entry["dirty"], entry["touched"] = "unreadable", 0, None
         out.append(entry)
     return out
 
@@ -413,13 +439,27 @@ def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> li
         path = declared["path"]
         if not Path(path, ".git").exists():
             continue
-        for tree in side_worktrees(path, policy["remote"]):
+        try:
+            trees = side_worktrees(path, policy["remote"])
+        except OSError as error:                 # one repository this account cannot look into never stops the others
+            actions.append({"repository": name, "branch": "(worktrees)", "head": None, "worktree": path, "action": "keep",
+                            "reason": f"its worktrees could not be listed: {type(error).__name__}"})
+            continue
+        unreadable = [tree for tree in trees if tree["state"] == "unreadable"]
+        for tree in trees:
             label = tree["branch"] or f"(detached at {(tree['head'] or '')[:12]})"
             entry = {"repository": name, "branch": label, "head": tree["head"], "worktree": tree["path"]}
-            if not tree["exists"]:
-                if apply:
-                    git(path, "worktree", "prune", check=False)
-                entry.update(action="pruned" if apply else "would prune", reason="its folder is gone; only the record was left")
+            if tree["state"] == "unreadable":
+                entry.update(action="keep", reason="the cleanup account cannot read this folder (another account's, such as "
+                                                   "the operator's profile); the operator removes it")
+            elif not tree["exists"]:
+                if unreadable:                   # git prune would drop every worktree it cannot see, the unreadable ones too
+                    entry.update(action="keep", reason=f"its folder is gone, but {len(unreadable)} worktree(s) here cannot be "
+                                                       "read, and git worktree prune would drop them as well")
+                else:
+                    if apply:
+                        git(path, "worktree", "prune", check=False)
+                    entry.update(action="pruned" if apply else "would prune", reason="its folder is gone; only the record was left")
             elif tree["locked"]:
                 entry.update(action="keep", reason="locked")
             elif tree["touched"] is None or now - tree["touched"] < idle:
@@ -518,10 +558,65 @@ def clean(policy, db, *, apply, actor=None, now=None, log=print) -> list:
     return actions
 
 
-def land(policy, db, *, apply, now=None, log=print, gh=run_gh) -> list:
+def land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None, trigger="cli") -> list:
+    """Land each accepted change that is a fast-forward of its base. ``only`` (review ids) limits the run to those changes:
+    the landing queue's "land now". Every change tried and not landed keeps why (branch_review.mark_tried).
+
+    Each run is recorded for the reviews page (branch_review.run_started / run_finished): when it started and finished,
+    what asked for it (``trigger``: schedule, request or cli), what it did, and the error that stopped it, if one did. A
+    run that never finishes (a Git call waiting on a sign-in nobody sees) stays "running", and the page says so."""
+    run = branch_review.run_started(db, trigger=trigger, asked=only, apply=apply, now=now,
+                                    cooldown_s=300.0 if apply and trigger in ("schedule", "request") else 0.0)
+    if run is None:
+        log("[reviews] landing attempt deferred: the previous attempt started less than five minutes ago")
+        return []
+    try:
+        results = _land(policy, db, apply=apply, now=now, log=log, gh=gh, only=only)
+    except BaseException as error:
+        branch_review.run_finished(db, run, [], error=f"{type(error).__name__}: {error}")
+        raise
+    branch_review.run_finished(db, run, results)
+    return results
+
+
+LANDER_IDENTITY = ("SpeakToMe lander", "lander@speaktome.invalid")   # the author of a landing merge, never a person
+
+
+def landing_merge(path, base, head):
+    """(tree, None) when Git merges ``head`` onto ``base`` without a conflict; otherwise (None, why), naming the
+    conflicted files. The owner's rule (2026-11-15): land by an automatic merge unless the merge has an error. The two
+    sides may change the same file, in places Git can combine. The tree is made without a working folder
+    (git merge-tree --write-tree), so the same answer comes from the lander and from the push check."""
+    ancestor = git(path, "merge-base", base, head, check=False)
+    if not ancestor:
+        return None, "it has no common ancestor with the default branch"
+    done = subprocess.run(["git", "-C", str(path), "merge-tree", "--write-tree", "--name-only", "--no-messages", base, head],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    lines = done.stdout.splitlines()
+    tree = lines[0].strip() if lines else ""
+    if done.returncode == 1 and len(tree) == 40:
+        # A conflict: with --name-only the lines after the tree are the conflicted files, up to a blank line.
+        conflicted = []
+        for line in lines[1:]:
+            if not line.strip():
+                break
+            conflicted.append(line.strip())
+        conflicted = list(dict.fromkeys(conflicted))
+        return None, (f"git could not merge it: conflict in {', '.join(conflicted[:5])}"
+                      f"{' ...' if len(conflicted) > 5 else ''}")
+    if done.returncode != 0 or len(tree) != 40:
+        return None, f"git could not merge it ({(done.stderr or done.stdout).strip()[-200:]})"
+    return tree, None
+
+
+def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> list:
     now = time.time() if now is None else now
+    wanted = None if only is None else {str(review_id) for review_id in only}
     results = []
+    fetched = set()                                # one fetch per repository per run, not one per change
     for review in branch_review.landable(db, now):
+        if wanted is not None and review["id"] not in wanted:
+            continue
         entry = {"review": review["id"], "repository": review["repository"], "branch": review["branch"], "head": review["head"]}
         declared = policy["repositories"].get(review["repository"])
         try:
@@ -530,28 +625,59 @@ def land(policy, db, *, apply, now=None, log=print, gh=run_gh) -> list:
             path, remote = declared["path"], policy["remote"]
             if review["base"] != declared["default"]:
                 raise GateError("the review's base is not the repository's default branch")
-            git(path, "fetch", "--quiet", remote)
+            if (path, remote) not in fetched:
+                git(path, "fetch", "--quiet", remote)
+                fetched.add((path, remote))
+            base = f"refs/remotes/{remote}/{review['base']}"
+            if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", review["head"], base],
+                              capture_output=True).returncode == 0:
+                # Already in the base (it came in through another change, a merge or an integration): there is nothing to
+                # push, and holding it as "not a fast-forward" would keep it in the queue for ever. It is recorded as landed.
+                detail = f"already in {review['base']}: nothing to push"
+                if apply:
+                    branch_review.mark_landed(db, review["id"], detail, now)
+                entry.update(action="contained" if apply else "would record contained", reason=detail)
+                log(f"[reviews] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
+                results.append(entry)
+                continue
             if git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{review['branch']}", check=False) != review["head"]:
                 if git(path, "rev-parse", "-q", "--verify", f"refs/heads/{review['branch']}", check=False) != review["head"]:
                     raise GateError("the branch is not at the reviewed commit, here or on the remote; submit the commit it is at")
                 if apply:                        # the author never pushed: this tool does the talking to GitHub
                     git(path, "push", remote, f"{review['head']}:refs/heads/{review['branch']}")
-            base = f"refs/remotes/{remote}/{review['base']}"
+            landing, how = review["head"], f"a fast-forward of {review['base']}"
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
                               capture_output=True).returncode != 0:
-                raise GateError(f"not a fast-forward of {review['base']}; merge {review['base']} into the branch and submit again")
+                # Not a fast-forward: the default branch moved after the change was made. When Git merges the two
+                # without a conflict, the reviewed commit lands unchanged as the second parent of that merge; a
+                # conflict is held, for its author to bring up to date.
+                tree, why = landing_merge(path, base, review["head"])
+                if tree is None:
+                    raise GateError(f"not a fast-forward of {review['base']}, and {why}; merge {review['base']} into "
+                                    f"the branch and submit again")
+                how = f"merged onto {review['base']} (Git merged it with what landed meanwhile, without a conflict)"
+                if apply:
+                    tip = git(path, "rev-parse", base)
+                    message = (f"Land {review['branch']} (review {review['id'][:8]}) onto {review['base']}\n\n"
+                               f"{review['base']} moved after this change was made, and Git merges the two without a "
+                               f"conflict, so the reviewed commit {review['head'][:12]} is merged as it was accepted "
+                               f"({review['standing']}).")
+                    landing = git(path, "-c", f"user.name={LANDER_IDENTITY[0]}", "-c", f"user.email={LANDER_IDENTITY[1]}",
+                                  "commit-tree", tree, "-p", tip, "-p", review["head"], "-m", message)
             authors = [line for line in git(path, "log", "--format=%an <%ae>", f"{base}..{review['head']}").splitlines() if line]
             authors = list(dict.fromkeys(authors))
             authorship = branch_review.authorship(db, review, authors)
             if not apply:
-                entry.update(action="would land", reason=f"{review['standing']}; a fast-forward of {review['base']}")
+                entry.update(action="would land", reason=f"{review['standing']}; {how}")
             else:
                 # The record on GitHub: a pull request naming who submitted and who accepted, opened before the push
                 # so that GitHub marks it merged when the fast-forward arrives. A remote that is not GitHub has none.
                 slug = github_slug(path, remote)
                 pull = record_pull_request(slug, review, authors, authorship=authorship, gh=gh) if slug else None
-                git(path, "push", remote, f"{review['head']}:refs/heads/{review['base']}")
-                detail = f"{review['base']} is at {review['head'][:12]}"
+                git(path, "push", remote, f"{landing}:refs/heads/{review['base']}")
+                detail = f"{review['base']} is at {landing[:12]}"
+                if landing != review["head"]:
+                    detail += f" ({how}; the reviewed commit {review['head'][:12]} is its second parent)"
                 if pull:
                     detail += f"; {pull}"
                 detail += f"; authors {', '.join(authors) or 'none'}; {authorship}"
@@ -571,13 +697,28 @@ def land(policy, db, *, apply, now=None, log=print, gh=run_gh) -> list:
                 entry.update(action="landed", reason=detail)
         except GateError as error:
             entry.update(action="held", reason=str(error))
+        if entry["action"] != "landed":
+            branch_review.mark_tried(db, review["id"], f"{entry['action']}: {entry['reason']}", now)
         log(f"[reviews] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
         results.append(entry)
     return results
 
 
-def check_push(policy, db, repository, lines, now=None) -> list:
-    """The refusals for one push (empty when it may go): a default branch moves only to a commit a review accepts."""
+def _is_landing_merge(path, db, repository, default, sha, old, now) -> bool:
+    """A merge the lander makes (landing_merge): two parents, the first the default branch as it was, the second a
+    commit a review accepts, and a tree exactly what landing_merge makes of them. Checked by recomputing it."""
+    if path is None or set(old) == {"0"}:
+        return False
+    parents = git(path, "rev-list", "--parents", "-n", "1", sha, check=False).split()
+    if len(parents) != 3 or parents[1] != old or not branch_review.accepted_head(db, repository, default, parents[2], now):
+        return False
+    tree, _ = landing_merge(path, parents[1], parents[2])
+    return tree is not None and tree == git(path, "rev-parse", f"{sha}^{{tree}}", check=False)
+
+
+def check_push(policy, db, repository, lines, now=None, path=None) -> list:
+    """The refusals for one push (empty when it may go): a default branch moves only to a commit a review accepts, or to
+    the lander's merge of one (``path``: the repository, to recompute that merge)."""
     declared = policy["repositories"][repository]
     target = f"refs/heads/{declared['default']}"
     refused = []
@@ -588,7 +729,8 @@ def check_push(policy, db, repository, lines, now=None) -> list:
         sha = parts[1]
         if set(sha) == {"0"}:
             refused.append(f"{declared['default']} is never deleted")
-        elif not branch_review.accepted_head(db, repository, declared["default"], sha, now):
+        elif not branch_review.accepted_head(db, repository, declared["default"], sha, now) and \
+                not _is_landing_merge(path, db, repository, declared["default"], sha, parts[3], now):
             refused.append(f"{sha[:12]} has no accepted review")
     return refused
 
@@ -637,6 +779,64 @@ def _user(db, username):
     return row
 
 
+def sync_loan(policy, db, repository, branch, borrower, *, apply=False) -> dict:
+    """A Git-credential operator merges the default into a borrower's registered open worktree.
+
+    The caller must have the borrower's request. This command never switches the core checkout or lands a review.
+    On a content conflict, it leaves the merge in the borrower's worktree for their explicit resolution and resubmission.
+    """
+    declared = policy["repositories"].get(repository)
+    if declared is None:
+        raise GateError("the policy does not name that repository")
+    if branch == declared["default"]:
+        raise GateError("a loan cannot be the repository default branch")
+    account = _user(db, borrower)
+    held = branch_review.owner(db, repository, branch)
+    if held is None or held["user_id"] != account[0]:
+        raise GateError("that branch is not registered to the named borrower")
+    row = db.execute("SELECT user_id, path FROM checkouts WHERE repository = ? AND branch = ?",
+                     (repository, branch)).fetchone()
+    if row is None or row[0] != account[0]:
+        raise GateError("the borrower has no open checkout of that branch")
+    folder = Path(row[1]).resolve()
+    if not folder.is_dir() or Path(git(folder, "rev-parse", "--show-toplevel")).resolve() != folder:
+        raise GateError("the registered loan worktree is unavailable")
+    if git(folder, "symbolic-ref", "-q", "--short", "HEAD") != branch:
+        raise GateError("the loan worktree is not on its registered branch")
+    if git(folder, "status", "--porcelain", "--untracked-files=all"):
+        raise GateError("the loan has uncommitted work; commit it before sync")
+    if git(folder, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False):
+        raise GateError("the loan already has a merge in progress")
+    remote = policy["remote"]
+    default = declared["default"]
+    if apply:
+        git(declared["path"], "fetch", "--quiet", remote, default)
+    upstream = f"refs/remotes/{remote}/{default}"
+    target = git(declared["path"], "rev-parse", "--verify", f"{upstream}^{{commit}}")
+    before = git(folder, "rev-parse", "HEAD")
+    if not apply:
+        return {"state": "ready", "repository": repository, "branch": branch,
+                "borrower": borrower, "head": before, "default_head": target,
+                "note": "dry run uses the locally known default; --apply fetches it first"}
+    if before == target or subprocess.run(["git", "-C", str(folder), "merge-base", "--is-ancestor",
+                                          target, before], capture_output=True).returncode == 0:
+        return {"state": "current", "repository": repository, "branch": branch,
+                "borrower": borrower, "head": before, "default_head": target}
+    git(folder, "merge", "--no-edit", upstream, check=False)
+    if git(folder, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False):
+        conflicts = git(folder, "diff", "--name-only", "--diff-filter=U").splitlines()
+        return {"state": "conflict", "repository": repository, "branch": branch,
+                "borrower": borrower, "head": before, "default_head": target,
+                "conflicts": conflicts,
+                "next": "borrower resolves conflicts in this loan, commits the merge, and resubmits review"}
+    after = git(folder, "rev-parse", "HEAD")
+    if after == before:
+        raise GateError("Git did not advance the loan; inspect its merge result")
+    return {"state": "synced", "repository": repository, "branch": branch,
+            "borrower": borrower, "head": after, "default_head": target,
+            "next": "borrower resubmits review at this head"}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--policy", required=True)
@@ -646,6 +846,11 @@ def main(argv=None) -> int:
     sub.add_parser("status")
     for name in ("land", "clean", "worktrees"):
         sub.add_parser(name).add_argument("--apply", action="store_true")
+    sync = sub.add_parser("sync-loan", help="merge the current default into an owner's open loan checkout")
+    sync.add_argument("repository")
+    sync.add_argument("branch")
+    sync.add_argument("--for", dest="borrower", required=True, help="the registered loan owner who requested this")
+    sync.add_argument("--apply", action="store_true", help="perform the merge; otherwise only inspect")
     submit = sub.add_parser("submit")
     submit.add_argument("repository")
     submit.add_argument("branch")
@@ -694,13 +899,17 @@ def main(argv=None) -> int:
                 return 0
             if args.command == "check-push":
                 name = args.repository or repository_of(policy, os.getcwd())
-                refused = check_push(policy, db, name, sys.stdin.read().splitlines()) if name else []
+                refused = check_push(policy, db, name, sys.stdin.read().splitlines(), path=os.getcwd()) if name else []
                 mock = policy["lock"] != "enforce"
                 for line in refused:
                     print(f"{'would be refused' if mock else 'refused'}: {line}", file=sys.stderr)
                 if refused:
                     print(branch_review.advice(policy, name), file=sys.stderr)
                 return 0 if mock or not refused else 1
+            if args.command == "sync-loan":
+                print(json.dumps(sync_loan(policy, db, args.repository, args.branch, args.borrower,
+                                           apply=args.apply)))
+                return 0
             if args.command == "submit":
                 declared = policy["repositories"].get(args.repository)
                 if declared is None:

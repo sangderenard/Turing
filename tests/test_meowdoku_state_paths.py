@@ -18,6 +18,7 @@ SUP = ROOT / "examples" / "meowdoku" / "deploy" / "apache_supervisor.py"
 
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
+from meowdoku.secure_records import RecordCipher  # noqa: E402
 from meowdoku.state_paths import StatePaths  # noqa: E402
 
 
@@ -128,7 +129,7 @@ def test_supervisor_state_dir_in_instances_json(tmp_path):
             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
     inst = tmp_path / "instances.json"
     inst.write_text(json.dumps({"state_dir": str(root), "instances": [spec]}), encoding="utf-8")
-    token = root / "secrets" / "operator_credentials" / "nodus-stub.console.secret"
+    token = root / "run" / "console" / "nodus-stub.console.secret"
     cmd = [sys.executable, str(SUP), "--instances", str(inst)]                         # no --db, no --state-dir: both come from the file
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
@@ -137,7 +138,9 @@ def test_supervisor_state_dir_in_instances_json(tmp_path):
         _wait(lambda: token.exists())
         assert len(token.read_text(encoding="utf-8")) >= 32
         access = root / "logs" / "apache-access.log"
-        assert _wait(lambda: access.exists() and b"GET /" in access.read_bytes())
+        assert _wait(lambda: access.exists() and access.stat().st_size > 0)
+        assert b"GET /" not in access.read_bytes()
+        assert b"GET /" in RecordCipher(StatePaths(root).records_key).open(access.read_bytes())
         assert list((root / "logs").glob("nodus-stub-*.log")) and (root / "logs" / "apache-supervisor.log").exists()
         assert (root / "run" / "supervisor.lock").exists() and (root / "sql" / "accounts.db").exists()
         status = subprocess.run([*cmd, "--status"], capture_output=True, text=True, timeout=60)         # --status reads the same db

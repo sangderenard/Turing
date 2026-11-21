@@ -2210,6 +2210,11 @@ def adapt_physical_call_inputs(
     state = _adaptation_state_signature(functions)
     seen_states = {state: -1}
     for round_index in range(round_bound):
+        # The helper may borrow caller-owned descriptor spans. Publish the
+        # actual call positions before demanding its formal physical layout.
+        from .identity_concordance import publish_formal_actual_occurrences
+        round_occurrences = publish_formal_actual_occurrences(
+            functions, book=book, call_table=call_records)
         sources = round_sources()
         if not sources:
             raise ConcordanceRefusal("physical call-input adaptation has no recorded call inputs")
@@ -2230,6 +2235,15 @@ def adapt_physical_call_inputs(
                   int(changed), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
                   provenance=Derived(tuple(dict.fromkeys((*sources, *round_sources(previous_edges))))),
                   mode=Mode.CONCORD)
+        # Program: loop corpus c124/c209.  This round's census named calls
+        # by block index; this round's Casts, and later dead-work reduction
+        # and pruning, move those calls.  Rows left live named a Cast or Ret
+        # as the call, and late frame-formal classification indexed an absent
+        # operand.  The view closes with the round; later censuses restate.
+        from .source_formal_occurrence_pruning import close_round_occurrences
+        close_round_occurrences(
+            book, round_occurrences,
+            book.latest_ref(PHYSICAL_CALL_INPUT_ADAPTATION_ROUND, (round_scope, round_index)))
         total += changed
         if changed == 0:
             report(

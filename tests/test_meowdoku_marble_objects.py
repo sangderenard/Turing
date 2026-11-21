@@ -57,15 +57,19 @@ def test_library_routes_save_list_and_load(tmp_path):
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     port = httpd.server_address[1]
-    def request(method, path, value=None, headers=None):
+    # a visitor with no account is a guest and never holds studio_write (owner, 2026-11-13): the studio saves as a signed-in member
+    member = {"Cookie": f"{srv.ACCOUNT_COOKIE}={sessions.accounts.create_session(sessions.accounts.ensure_user('marble_cat', 'correcthorse1'))}"}
+    def request(method, path, value=None, headers=None, account=True):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         body = None if value is None else json.dumps(value).encode("utf-8")
-        conn.request(method, path, body=body, headers=headers or {})
+        conn.request(method, path, body=body, headers={**(member if account else {}), **(headers or {})})
         response = conn.getresponse()
         status, content = response.status, json.loads(response.read() or b"{}")
         conn.close()
         return status, content
     try:
+        assert request("POST", "/api/marble_objects", example(), {"Content-Type": "application/json", "X-Meowdoku-Marble": "1"},
+                       account=False) == (403, {"error": "this needs studio_write"})
         status, saved = request("POST", "/api/marble_objects", example(),
                                 {"Content-Type": "application/json", "X-Meowdoku-Marble": "1"})
         assert status == 201, saved
@@ -74,5 +78,6 @@ def test_library_routes_save_list_and_load(tmp_path):
         status, loaded = request("GET", f"/api/marble_objects/{saved['digest']}")
         assert status == 200 and loaded["design"]["seed"] == 42
         assert request("GET", "/api/marble_objects/garbage")[0] == 404
+        assert request("GET", f"/api/marble_objects/{saved['digest']}", account=False)[0] == 200      # the reads stay open to guests
     finally:
         httpd.shutdown(); httpd.server_close()

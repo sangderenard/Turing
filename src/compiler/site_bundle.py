@@ -315,6 +315,7 @@ def publish_prebuilt_program_bundle(
     source: str | bytes,
     artifacts: Mapping[str, str | bytes] | None = None,
     runtime: Mapping[str, Any] | None = None,
+    page_contract: Mapping[str, Any] | None = None,
     refresh_gallery: bool = False,
 ) -> ProgramBundle:
     """Publish an already-assembled program interior through the common ABI.
@@ -350,6 +351,8 @@ def publish_prebuilt_program_bundle(
         identity.update(body)
         identity.update(b"\0")
     identity.update(json.dumps(runtime or {}, sort_keys=True, default=str).encode("utf-8"))
+    if page_contract is not None:
+        identity.update(json.dumps(page_contract, sort_keys=True, default=str).encode("utf-8"))
     version_id = "v1-" + identity.hexdigest()[:16]
     versions = root / "site" / "programs" / page_slug / "versions"
     final_directory = versions / version_id
@@ -386,6 +389,7 @@ def publish_prebuilt_program_bundle(
             },
             "compiler": {"backend": "prebuilt-program-interior"},
             "runtime": dict(runtime or {}),
+            **({"page_contract": dict(page_contract)} if page_contract is not None else {}),
             "artifacts": _artifact_inventory(temporary),
         }
         (temporary / "bundle.json").write_text(
@@ -4481,6 +4485,16 @@ def build_program_bundle(
                     "presentation": shader_execution,
                 },
                 "audio": audio_runtime,
+            },
+            "page_contract": {
+                "schema": "meowdoku.page.v1",
+                "presentation": {"title": contract.title, "summary": "", "poster": None,
+                                 "surface": "webgl" if shader_execution else "dom"},
+                "execution": {"standalone": "unknown", "network": "unknown",
+                              "compute": ["browser.wasm"] + (["browser.webgl"] if shader_execution else []),
+                              "site_endpoints": []},
+                "access": {"required_capabilities": []},
+                "controls": {"local": None, "server": None},
             },
             "source": {
                 "path": f"source/python_source/{Path(source_filename).name}",

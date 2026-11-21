@@ -665,6 +665,29 @@ SOURCE_RESOURCE_CONTROL = declare_page("source_resource_control", (
 SOURCE_EXCEPTION_INGESTION = declare_page("source_exception_ingestion", (
     RowField("source", K.PAGE_REF),
 ), tuple)  # exact source body, proposed primitive/control body, check count
+#: One authored ``x.requires_grad_(flag)`` the gradient-tracking filter
+#: (ast_control_normalization._filter_gradient_tracking_marks) replaced by its
+#: receiver ``x``.  Row: the call's SOURCE_SPAN cell.  Fact: (the requires-grad
+#: flag -- the literal bool, or None when the argument is not a literal --, the
+#: receiver's SOURCE_SPAN cell).  ``requires_grad_`` returns its receiver and
+#: only marks gradient ownership (operator_catalog.NON_OPERATOR_PUBLIC_API); a
+#: reverse graph selects its differentiation inputs from these marks, as
+#: abstract_nn.reverse_program selects ``wrt`` from ``requires_grad`` feeds.
+SOURCE_GRADIENT_TRACKING_MARK = declare_page("source_gradient_tracking_mark", (
+    RowField("call", K.PAGE_REF),
+), tuple)
+#: A source identity wash: an authored construct rewritten into an exactly
+#: equal one the compiler lowers.  Row: the rewritten construct's SOURCE_SPAN
+#: cell.  Fact: (identity name, SOURCE_SPAN cells the identity reads), DERIVED
+#: from those cells.  ``tensor_tuple_data_as_list``: ``AbstractTensor.tensor
+#: ((a, b), ...)`` -> ``AbstractTensor.tensor([a, b], ...)``; fact cells are
+#: (call span, data display span).
+#: ``tensor_rect_literal_as_flat_reshape``: ``AbstractTensor.tensor(<R x C
+#: constant literal>, ...)`` -> ``AbstractTensor.tensor(<flat>, ...).reshape(R, C)``;
+#: fact cells are (call span, nested literal span).
+SOURCE_IDENTITY_WASH = declare_page("source_identity_wash", (
+    RowField("site", K.PAGE_REF),
+), tuple)
 SOURCE_EXCEPTION_NORMAL_BINDING = declare_page(
     "source_exception_normal_binding", (
         RowField("read_scope", K.SCOPE),
@@ -1317,6 +1340,7 @@ class MetadataRule(Enum):
     ATTRIBUTE = "attribute"
     PYTHON_ROUTING_INDEX = "python_routing_index"
     PYTHON_SHAPE_INDEX = "python_shape_index"
+    RESIDENT_STRING_COMPARISON = "resident_string_comparison"
     COMPARES_NONE = "compares_none"
     NON_NUMERIC_CONSTANT_OPERAND = "non_numeric_constant_operand"
     COORDINATOR_ACCESSOR = "coordinator_accessor"
@@ -1615,6 +1639,89 @@ SOURCE_SEQUENCE_CAPACITY_BOUND = declare_page(
 
 
 @dataclass(frozen=True)
+class PublicSourceEntry:
+    """An authored pursuit root selected at the actual public export boundary."""
+
+    lowered_source_cell: Ref
+    function_address_cell: Ref
+    source_definition_cell: Ref
+    activation_cell: Ref
+    root_demand_cell: Ref
+
+
+PUBLIC_SOURCE_ENTRY = declare_page(
+    "public_source_entry", (RowField("function", K.NAME),), PublicSourceEntry,
+)
+
+
+@dataclass(frozen=True)
+class SourceFieldSequenceElement:
+    """One declared field annotation bound to exact admitted builtin symbols."""
+
+    annotation_cell: Ref
+    module_cell: Ref
+    field_occurrence_cell: Ref
+    container_cell: Ref
+    element_cell: Ref
+    rebound_names: tuple[str, ...]
+
+
+SOURCE_FIELD_SEQUENCE_ELEMENT = declare_page(
+    "source_field_sequence_element", (
+        RowField("field_declaration", K.PAGE_REF),
+    ), SourceFieldSequenceElement,
+)
+
+
+@dataclass(frozen=True)
+class RecordOwnedReturnProjection:
+    """Exact source-to-public mapping and native transfer instruction witnesses.
+
+    Member order is columns, length, capacity, optional status, then owner.
+    Status is a mapped private frame cell, not a surviving public ABI port.
+    This record must be checked against the actual IR and source receipts;
+    its presence alone is never a permission to transfer ownership.
+    """
+
+    entry_cell: Ref
+    source_record_id: int
+    field_name: str
+    source_sequence_id: int
+    source_owner_id: int
+    source_return_slot_cell: Ref
+    source_constructor_operands_cell: Ref
+    source_cell: Ref
+    source_descriptor_cell: Ref
+    source_record_cell: Ref
+    source_return_layout_cell: Ref
+    element_declaration_cell: Ref
+    element_binding_cell: Ref
+    element_class_cell: Ref
+    public_descriptor_cell: Ref
+    public_record_cell: Ref
+    public_return_layout_cell: Ref
+    member_pairs: tuple[tuple[Ref, Ref], ...]
+    snapshot_cells: tuple[Ref, ...]
+    null_cell: Ref
+    block_geometry_cell: Ref
+    terminal_lifetime_cells: tuple[Ref, ...]
+    writer_cells: tuple[Ref, ...]
+
+
+RECORD_OWNED_RETURN_PROJECTION_VALUE = declare_transform(
+    "record_owned_return_projection_value", 1,
+)
+
+
+RECORD_OWNED_RETURN_PROJECTION = declare_page(
+    "record_owned_return_projection", (
+        RowField("function", K.NAME),
+        RowField("public_sequence_id", K.VALUE_ID),
+    ), RecordOwnedReturnProjection,
+)
+
+
+@dataclass(frozen=True)
 class SourceOwnedSequenceReturn:
     """An authored bytes concat returned from its exact source slot."""
 
@@ -1770,6 +1877,14 @@ SPILL_COLD_PAGES_POLICY = ("spill_cold_pages",)
 CALLSITE_DESCRIPTOR_REUSE = declare_page("callsite_descriptor_reuse", (
     RowField("caller", K.SCOPE), RowField("callee", K.SCOPE),
     RowField("call", K.VALUE_ID), RowField("round", K.INDEX),
+), tuple)
+#: ``_returned_aggregate_call_cell``: a call whose authored tuple result its
+#: caller returns unchanged, so callsite specialization publishes the call's
+#: members (the caller's output carries the callee's member identities).
+#: Fact: (callee name, "tuple", call identity cell, callee return-site
+#: container cells); DERIVED from those cells.
+RETURNED_AGGREGATE_CALL = declare_page("returned_aggregate_call", (
+    RowField("caller", K.SCOPE), RowField("call", K.VALUE_ID),
 ), tuple)
 
 # ============================================================================
@@ -2230,6 +2345,33 @@ SSA_CONSTANT_HOIST = declare_page("ssa_constant_hoist", (
     RowField("to_block", K.NAME),
     RowField("from_geometry", K.PAGE_REF),
 ), tuple)                              # exact geometry/value inputs; CONCORD
+
+
+@dataclass(frozen=True)
+class SequenceHelperHeapOperation:
+    """Existing heap ABI as declared at source-linked helper registration.
+
+    This records producer semantics, not bounds, nonaliasing, or permission
+    to export an allocation. Those remain separate reader obligations.
+    """
+    control_cell: Ref
+    block_cell: Ref
+    operation: str
+    argument_cells: tuple[Ref, ...]
+    result_cell: Ref | None
+    allocation_kind: str | None
+    element_dtype: str | None
+    zero_initialize: bool | None
+    callee: str | None
+    native_heap_abi: str | None
+    # Exact carrier, owner, element layout at the allocating/copying factory.
+    carrier_layouts: tuple[tuple[Ref, Ref, str], ...]
+
+
+SEQUENCE_HELPER_HEAP_OPERATION = declare_page("sequence_helper_heap_operation", (
+    RowField("scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("block", K.NAME), RowField("instruction", K.INDEX),
+), SequenceHelperHeapOperation)        # DERIVED(source control/block/SSA); CONCORD
 #: ``Unsourced`` reasons of ``_post_loop_result_reconciliation``: a pass that
 #: states something different about the same unchanged cells (the IR was
 #: rewritten between two runs by a pass whose cell is not in hand), and a
@@ -2989,6 +3131,11 @@ PHI_EDGE_PROJECTION_PLACEMENT = declare_page("phi_edge_projection_placement_conc
     RowField("position", K.INDEX), RowField("predecessor", K.NAME),
     RowField("value_id", K.VALUE_ID),
 ), tuple)                              # CONCORD
+FORMAL_OCCURRENCE_PRUNED = declare_reason("formal_occurrence_pruned")
+#: A positional occurrence published for one physical-call adaptation round
+#: is that round's view of call positions; later passes add and remove
+#: instructions.  read = (the occurrence, the round's ledger cell).
+FORMAL_OCCURRENCE_ROUND_CLOSED = declare_reason("formal_occurrence_round_closed")
 PRUNED_CALLEE_FORMAL = declare_page("pruned_callee_formal_concordance", (
     RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), str)                                # CONCORD
@@ -3186,6 +3333,9 @@ class ControlBlockFact:
     cases: tuple = ()
     diagnostics: tuple = ()
     target: Ref | None = None
+    # Exact resident mutations, including loop-owned publications. Each entry
+    # names canonical target/arguments/effect and the accepted object receipt.
+    sequence_mutations: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -3219,6 +3369,9 @@ class ControlProgramFact:
     # Kept last so older serialized facts and positional seed construction
     # retain their field order.
     projected_iterable_bindings: tuple = ()
+    # Ordinary iterable targets need the same exact identity receipt as
+    # projected rows; this records the existing control relation, not ownership.
+    iterable_bindings: tuple = ()
 
 
 #: ``CONTROL_PROGRAM.program`` for the shell's one program.
@@ -5571,3 +5724,66 @@ SCALAR_BATCH_LOWERING = declare_stage('scalar_batch_lowering')
 SCALAR_BATCH_CONTRACT = declare_page('scalar_batch_contract', (
     RowField('function', K.SCOPE),
 ), ScalarBatchContract)
+
+
+@dataclass(frozen=True)
+class SourceComprehensionCapacityBound:
+    """One scalar mapping row per iteration of an exact source sequence."""
+
+    destination_cell: Ref
+    source_cell: Ref
+    loop_cell: Ref
+    materializer_cell: Ref
+    publication_cell: Ref
+    loop_operands_cell: Ref
+    control_cell: Ref
+    placement_cell: Ref
+    publication_path: tuple[Ref, ...] = ()
+
+
+SOURCE_COMPREHENSION_CAPACITY_BOUND = declare_page(
+    "source_comprehension_capacity_bound", (
+        RowField("source_scope", K.SCOPE),
+        RowField("destination_value_id", K.VALUE_ID),
+    ), SourceComprehensionCapacityBound,
+)
+
+
+class SequenceLifetimeKind(Enum):
+    LOCAL_NEW = "local_new"
+    BORROWED = "borrowed"
+    ADOPTED = "adopted"
+
+
+@dataclass(frozen=True)
+class SequenceStorageLifetime:
+    """Descriptor birth lifetime; not permission to escape its native frame."""
+    kind: SequenceLifetimeKind
+    source_cell: Ref
+    contract_cell: Ref
+    column_cells: tuple[Ref, ...]
+    length_cell: Ref
+    capacity_cell: Ref
+    owner_cell: Ref | None
+    birth_cells: tuple[Ref, ...]
+    parent_cell: Ref | None = None
+
+
+SEQUENCE_STORAGE_LIFETIME = declare_page("sequence_storage_lifetime", (
+    RowField("function_scope", K.SCOPE), RowField("sequence_value_id", K.VALUE_ID),
+), SequenceStorageLifetime)
+
+
+@dataclass(frozen=True)
+class BorrowedRecordSpanRole:
+    """Birth role of one direct-input record field pool member."""
+    control_cell: Ref
+    parent_cell: Ref
+    projection: tuple
+
+
+BORROWED_RECORD_SPAN_ROLE = declare_page("borrowed_record_span_role", (
+    RowField("function_scope", K.SCOPE),
+    RowField("field_source", K.PAGE_REF),
+    RowField("role", K.LABEL),
+), BorrowedRecordSpanRole)

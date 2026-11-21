@@ -232,12 +232,13 @@ def test_a_kept_branch_stays_and_is_never_cleaned(world):
 
 def test_a_change_that_is_not_a_fast_forward_or_has_moved_is_held(world):
     work, db, policy = world["work"], world["db"], world["policy"]
-    head = branch(world, "feature")
-    commit(work, "meanwhile.txt")
+    head = branch(world, "feature", file="shared.txt")
+    commit(work, "shared.txt", "main's own text")         # the default branch changed the same file meanwhile
     run(work, "push", "-q", "origin", "main")
     submit(world, "feature", head, timeout_s=0)
     held = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
     assert held[0]["action"] == "held" and "not a fast-forward" in held[0]["reason"]
+    assert "conflict in shared.txt" in held[0]["reason"], "the hold names the conflicted file"
     assert remote_has(world, "feature") == head and remote_has(world, "main") != head
     other = branch(world, "second", push=True)
     submit(world, "second", "f" * 40, timeout_s=0)
@@ -353,6 +354,34 @@ def test_reviews_over_rest_take_identity_from_the_session_only(world):
     assert listed["your_branches"] == [] and ask("GET", "/api/reviews", user=ANN, username="ann")[1]["your_branches"][0]["branch"] == "feature"
     assert ask("POST", "/api/reviews", user=ANN, username="ann", body={"repository": "nowhere", "branch": "x", "head": head})[0] == 404
     assert ask("POST", "/api/reviews/nothing", user=ANN, username="ann", body={})[0] == 404
+
+
+def test_any_reviewer_reads_exactly_the_change_a_review_names_and_git_is_not_changed(world):
+    policy, db_file, work = world["policy"], world["db_file"], world["work"]
+    head = branch(world, "feature", "feature.txt")
+    review = submit(world, "feature", head)
+    commit(work, "later.txt")                    # main moves on; the diff still starts at the merge base
+    refs_before = run(work, "for-each-ref")
+
+    def ask(path, **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path.split("?")[0], "GET", policy=policy, accounts_db=db_file)
+        return handler.sent
+
+    url = f"/api/reviews/diff?id={review['id']}"
+    assert ask(url)[0] == 401
+    assert ask(url, user=BOB, username="bob", capabilities=())[0] == 403
+    status, answer = ask(url, user=BOB, username="bob")
+    assert status == 200 and answer["head"] == head and answer["truncated"] is False and answer["branch"] == "feature"
+    assert "feature.txt" in answer["diff"] and "later.txt" not in answer["diff"] and "base.txt" not in answer["diff"]
+    status, summary = ask(url + "&stat=1", user=BOB, username="bob")
+    assert status == 200 and summary["stat"] is True and "1 file changed" in summary["diff"]
+    status, other = ask(url + "&path=base.txt", user=BOB, username="bob")
+    assert status == 200 and other["diff"] == ""
+    for bad in ("../x", "/x", "C:/x", "a/../../x"):
+        assert ask(url + "&path=" + bad, user=BOB, username="bob")[0] == 400, bad
+    assert ask("/api/reviews/diff?id=nothing", user=BOB, username="bob")[0] == 404
+    assert run(work, "for-each-ref") == refs_before, "reading a diff changes no ref"
 
 
 def test_the_task_worker_offers_land_and_clean_and_reports_while_apply_is_off(world):
@@ -628,3 +657,446 @@ def test_an_account_declares_its_own_git_identity_and_mismatches_are_named(world
     assert branch_review.authorship(db, review, ["Ann <ann@example.invalid>"]) == "every commit is by ann's declared identity"
     assert branch_review.authorship(db, review, ["Albert <albert@example.invalid>"]) == \
         "commits not by ann's declared identity: Albert <albert@example.invalid>"
+
+
+def test_the_landing_queue_lands_only_what_is_asked_and_keeps_why_the_rest_held(world):
+    db, policy = world["db"], world["policy"]
+    first = branch(world, "first", file="same.txt")       # both change one file, differently: no merge, the second holds
+    run(world["work"], "checkout", "-q", "-b", "second", "main")
+    second = commit(world["work"], "same.txt", "the second's own text")
+    run(world["work"], "push", "-q", "origin", "second")
+    run(world["work"], "checkout", "-q", "main")
+    one, two = submit(world, "first", first, timeout_s=0), submit(world, "second", second, timeout_s=0)
+    assert [r["id"] for r in branch_review.queue(db, now=1000.0)] == [one["id"], two["id"]]
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[two["id"]])
+    assert actions(done) == {"second": "landed"} and remote_has(world, "main") == second
+    queued = branch_review.queue(db, now=1000.0)
+    assert [r["id"] for r in queued] == [one["id"]] and queued[0]["land_tried_at"] is None, "only the asked change was tried"
+    done = branch_gate.land(policy, db, apply=True, now=1001.0, log=lambda line: None, only=[one["id"]])
+    assert actions(done) == {"first": "held"}
+    held = branch_review.queue(db, now=1001.0)[0]
+    assert held["land_tried_at"] == 1001.0 and held["land_result"].startswith("held: not a fast-forward of main")
+    assert branch_review.get(db, two["id"])["land_result"] is None, "a landed change keeps its landing record, not a hold"
+
+
+def test_the_queue_columns_are_added_to_a_database_made_before_them(tmp_path):
+    db = sqlite3.connect(tmp_path / "old.db", isolation_level=None)
+    db.execute(branch_review.DDL[0].replace(", land_tried_at REAL, land_result TEXT", ""))
+    branch_review.ensure(db)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(branch_reviews)")}
+    assert {"land_tried_at", "land_result"} <= columns
+    branch_review.ensure(db)                     # idempotent
+
+
+def test_accepted_queue_timer_reads_the_installed_cron_table(tmp_path):
+    table = tmp_path / "cron.table"
+    assert branch_review.next_scheduled_landing(table, now=600) is None
+    table.write_text("# UTC\nreviews.land */10 * * * * missed=once\n", encoding="utf-8")
+    assert branch_review.next_scheduled_landing(table, now=600) == {
+        "next_at": 1200, "interval_seconds": 600}
+    table.write_text("reviews.land 3 * * * * missed=once\n", encoding="utf-8")
+    assert branch_review.next_scheduled_landing(table, now=600) is None
+
+
+def test_review_window_and_landing_schedule_are_five_minute_batches(world, monkeypatch):
+    source = Path(__file__).resolve().parents[1] / "examples" / "meowdoku" / "deploy"
+    policy = branch_gate.load_policy(source / "branch_policy.json")
+    assert policy["review_timeout_hours"] == branch_gate.DEFAULTS["review_timeout_hours"] == 0.5
+    assert branch_review.next_scheduled_landing(source / "cron.table", now=1800) == {
+        "next_at": 2100, "interval_seconds": 300}
+    first = submit(world, "first", "a" * 40, timeout_s=1800, now=1000)
+    second = submit(world, "second", "b" * 40, timeout_s=1800, now=1100)
+    assert first["accept_after"] == 2800 and second["accept_after"] == 2900
+    assert [r["id"] for r in branch_review.landable(world["db"], 2800)] == [first["id"]]
+    assert {r["id"] for r in branch_review.landable(world["db"], 2900)} == {first["id"], second["id"]}
+
+    attempts = []
+    monkeypatch.setattr(branch_gate, "_land", lambda *args, **kwargs: attempts.append(kwargs["now"]) or [])
+    db = world["db"]
+    branch_gate.land(world["policy"], db, apply=True, now=2900, trigger="schedule", log=lambda line: None)
+    branch_gate.land(world["policy"], db, apply=True, now=2901, trigger="request", log=lambda line: None)
+    branch_gate.land(world["policy"], db, apply=True, now=3200, trigger="schedule", log=lambda line: None)
+    assert attempts == [2900, 3200]
+    assert [r["started"] for r in branch_review.lander_status(db, now=3200)["recent"]] == [3200, 2900]
+
+
+def test_land_now_over_rest_is_an_admins_and_asks_the_updater_for_exactly_the_queue(world):
+    policy, db_file = world["policy"], world["db_file"]
+    head = branch(world, "feature")
+    made = submit(world, "feature", head, timeout_s=0)
+    asked = []
+
+    def updater(ids):
+        asked.append(ids)
+        return {"outcome": "done", "status": 2}
+
+    def ask(path, land_request=updater, **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path, "POST" if "body" in kw else "GET", policy=policy, accounts_db=db_file,
+                                 land_request=land_request)
+        return handler.sent
+
+    status, listing = ask("/api/reviews", user=ANN, username="ann")
+    assert status == 200 and listing["updater"] is True and [r["id"] for r in listing["queue"]] == [made["id"]]
+    assert ask("/api/reviews", user=ANN, username="ann", land_request=None)[1]["updater"] is False
+    assert ask("/api/reviews/land", user=ANN, username="ann", body={"all": True})[0] == 403, "only an admin lands"
+    assert ask("/api/reviews/land", user=ADMIN, username="admin", body={"all": True}, land_request=None)[0] == 503
+    assert ask("/api/reviews/land", user=ADMIN, username="admin", body={"ids": ["nope"]})[0] == 409
+    assert ask("/api/reviews/land", user=ADMIN, username="admin", body={"ids": []})[0] == 400
+    assert asked == [], "nothing refused reached the updater"
+    status, answer = ask("/api/reviews/land", user=ADMIN, username="admin", body={"ids": [made["id"]]})
+    assert status == 200 and answer == {"asked": [made["id"]], "outcome": {"outcome": "done", "status": 2}}
+    status, answer = ask("/api/reviews/land", user=ADMIN, username="admin", body={"all": True})
+    assert status == 200 and answer["asked"] == [made["id"]]
+    assert asked == [[made["id"]], None], "ids for those, none (the whole queue) for all"
+
+
+def test_a_one_off_land_request_names_its_reviews_to_the_task_worker(world):
+    from types import SimpleNamespace
+    from meowdoku import scheduled_tasks
+    first, second = branch(world, "first"), branch(world, "second")
+    one = submit(world, "first", first, timeout_s=0)
+    submit(world, "second", second, timeout_s=0)
+    table = scheduled_tasks.handlers(SimpleNamespace(DONE=2, UNCHANGED=3), branches={
+        "policy": world["policy_file"], "accounts_db": world["db_file"], "module": branch_gate})
+    status, said, detail = table["reviews.land"]({"task": "reviews.land", "reviews": [one["id"]]})
+    assert said == "1 would land" and [e["branch"] for e in detail] == ["first"]
+    status, said, detail = table["reviews.land"]({"task": "reviews.land"})
+    assert said == "2 would land", "a request that names none is the whole queue, as the schedule's"
+
+
+def test_a_change_already_in_its_base_is_recorded_landed_instead_of_held_for_ever(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    head = branch(world, "feature")
+    commit(work, "meanwhile.txt")
+    run(work, "merge", "-q", "--no-ff", "-m", "integrate feature", "feature")     # it reached main through another change
+    run(work, "push", "-q", "origin", "main")
+    made = submit(world, "feature", head, timeout_s=0)
+    preview = branch_gate.land(policy, db, apply=False, now=1000.0, log=lambda line: None)
+    assert preview[0]["action"] == "would record contained" and branch_review.get(db, made["id"], 1000.0)["standing"] == "accepted"
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "contained" and "already in main" in done[0]["reason"]
+    record = branch_review.get(db, made["id"], 1000.0)
+    assert record["standing"] == "landed" and record["landed_detail"].startswith("already in main")
+    assert branch_review.queue(db, now=1000.0) == [] and branch_gate.land(policy, db, apply=True, now=1001.0, log=lambda l: None) == []
+
+
+def test_the_author_withdraws_an_approved_change_before_it_lands_but_not_after(world):
+    db, policy = world["db"], world["policy"]
+    first, second = branch(world, "first"), branch(world, "second")
+    one, two = submit(world, "first", first), submit(world, "second", second)
+    for made in (one, two):
+        branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=made["head"], decision="approved")
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.withdraw(db, one["id"], user_id=BOB)                        # only its author
+    assert branch_review.withdraw(db, one["id"], user_id=ANN)["standing"] == "withdrawn", "superseded while waiting to land"
+    assert [r["id"] for r in branch_review.queue(db)] == [two["id"]]
+    branch_gate.land(policy, db, apply=True, log=lambda line: None)
+    with pytest.raises(branch_review.ReviewError, match="before it lands"):
+        branch_review.withdraw(db, two["id"], user_id=ANN)
+
+
+def _with_operator(world):
+    world["db"].execute("INSERT INTO users VALUES (4, 'opal')")
+    world["db"].execute("INSERT INTO account_roles VALUES (4, 'operator')")
+    return 4
+
+
+def test_an_operator_revokes_an_approval_and_the_change_stops_until_approved_again(world):
+    db, policy = world["db"], world["policy"]
+    opal = _with_operator(world)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head, timeout_s=0)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    with pytest.raises(branch_review.ReviewError, match="operator or admin"):
+        branch_review.revoke(db, made["id"], user_id=BOB, username="bob", reason="no")
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason=" ")
+    told = branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="it breaks the paper tests")
+    record = told["review"]
+    assert record["standing"] == "revoked" and record["revoked_by"] == "opal" and told["tell"] == ["admin", "ann"]
+    assert branch_review.queue(db) == [] and branch_gate.land(policy, db, apply=True, log=lambda line: None) == []
+    assert not branch_review.accepted_head(db, "work", "main", head), "the push check refuses a revoked change too"
+    with pytest.raises(branch_review.ReviewError, match="approved change"):
+        branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="again")
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    assert branch_review.get(db, made["id"])["standing"] == "approved", "an admin approves it again"
+
+
+def test_a_changes_thread_is_a_comments_post_and_attention_follows_who_wrote_last(world):
+    from meowdoku import comments
+    db = world["db"]
+    opal = _with_operator(world)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    branch_review.revoke(db, made["id"], user_id=opal, username="opal", reason="conflicts with the gate", now=2000.0)
+    waiting = branch_review.attention(db, username="ann", now=2001.0)
+    assert [w["id"] for w in waiting] == [made["id"]] and waiting[0]["why"] == "opal revoked its approval: conflicts with the gate"
+    assert branch_review.attention(db, username="admin", now=2001.0)[0]["why"].startswith("opal revoked"), "the approver too"
+    assert branch_review.attention(db, username="opal", now=2001.0) == [] and branch_review.attention(db, username="bob") == []
+    comments.post(db, "review", made["id"], user_id=ANN, username="ann", body="merged main; please look", now=2002.0)
+    assert branch_review.attention(db, username="ann", now=2003.0) == []
+    assert [w["why"] for w in branch_review.attention(db, username="opal", now=2003.0)] == ["ann wrote in its thread"]
+    kind = branch_review.comment_kind()
+    bob = {"user_id": BOB, "username": "bob", "caps": frozenset()}
+    ann = {"user_id": ANN, "username": "ann", "caps": frozenset()}
+    assert kind.may_write(db, ann, made["id"]) is True, "the author keeps the board without dev_ui"
+    assert isinstance(kind.may_write(db, bob, made["id"]), str), "a stranger without dev_ui does not"
+    assert kind.may_read(db, {**bob, "caps": frozenset({"dev_ui"})}, made["id"]) is True
+    assert sorted(kind.tell(db, made["id"], None)) == ["admin", "ann", "opal"]
+    with pytest.raises(comments.CommentError):
+        kind.may_read(db, ann, "no-such-review")
+    for n in range(25):
+        comments.post(db, "review", made["id"], user_id=BOB, username="bob", body=f"note {n}", now=2010.0 + n)
+    (thread,) = branch_review.threads(db, 20)
+    assert len(thread["comments"]) == 20 and thread["comments"][-1]["body"] == "note 24", "the tail, oldest first"
+
+
+def test_revoke_and_threads_over_rest_and_the_notice_they_send(world):
+    from meowdoku import comments
+    policy, db_file = world["policy"], world["db_file"]
+    opal = _with_operator(world)
+    head = branch(world, "feature")
+    made = submit(world, "feature", head)
+    branch_review.decide(world["db"], made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    told = []
+
+    def ask(path, method="GET", route="reviews", **kw):
+        handler = Handler(path, **kw)
+        if route == "reviews":
+            branch_review.http_route(handler, path.split("?")[0], method, policy=policy, accounts_db=db_file,
+                                     notify=lambda names, text, review_id: told.append((names, text, review_id)))
+        else:
+            comments.http_route(handler, path.split("?")[0], method, accounts_db=db_file,
+                                kinds={"review": branch_review.comment_kind()},
+                                notify=lambda names, text, kind, ref: told.append((names, text, (kind, ref))))
+        return handler.sent
+
+    status, answer = ask("/api/reviews/revoke", "POST", user=opal, username="opal", body={"id": made["id"], "reason": "wait"})
+    assert status == 200 and answer["review"]["standing"] == "revoked"
+    assert told[-1][0] == ["admin", "ann"] and "opal revoked the approval of work feature" in told[-1][1] and told[-1][2] == made["id"]
+    status, answer = ask("/api/comments", "POST", route="comments", user=ANN, username="ann", capabilities=(),
+                         body={"kind": "review", "ref": made["id"], "body": "fixed"})
+    assert status == 200 and answer["told"] == ["admin", "opal"] and told[-1][2] == ("review", made["id"])
+    assert "ann wrote in the thread of work feature" in told[-1][1]
+    status, answer = ask("/api/reviews/threads?tail=1", user=ANN, username="ann")
+    assert status == 200 and answer["tail"] == 1 and [c["body"] for c in answer["threads"][0]["comments"]] == ["fixed"]
+    assert ask("/api/reviews/attention", user=opal, username="opal")[1]["attention"][0]["why"] == "ann wrote in its thread"
+    assert ask("/api/reviews/threads?tail=nope", user=ANN, username="ann")[0] == 400
+
+
+def test_a_revoked_change_leaves_the_default_listing_when_read_or_a_week_old_and_is_never_deleted(world):
+    db, policy, db_file = world["db"], world["policy"], world["db_file"]
+    opal = _with_operator(world)
+    one, two = branch(world, "one"), branch(world, "two")
+    first, second = submit(world, "one", one), submit(world, "two", two)
+    for made, head in ((first, one), (second, two)):
+        branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    branch_review.revoke(db, first["id"], user_id=opal, username="opal", reason="superseded", now=2000.0)
+    branch_review.revoke(db, second["id"], user_id=opal, username="opal", reason="superseded")    # revoked just now
+    revoked_at = branch_review.get(db, second["id"])["revoked_at"]
+    shown = {r["id"]: r["hidden"] for r in branch_review.listing(db, now=2001.0)}
+    assert shown == {first["id"]: False, second["id"]: False}
+    with pytest.raises(branch_review.ReviewError, match="author or an admin"):
+        branch_review.mark_read(db, first["id"], user_id=BOB, username="bob")
+    with pytest.raises(branch_review.ReviewError, match="author or an admin"):
+        branch_review.mark_read(db, first["id"], user_id=opal, username="opal")
+    assert branch_review.mark_read(db, first["id"], user_id=ANN, username="ann", now=2002.0)["standing"] == "revoked"
+    shown = {r["id"]: r["hidden"] for r in branch_review.listing(db, now=2003.0)}
+    assert shown == {first["id"]: True, second["id"]: False}, "read by its author: hidden, still listed"
+    week = revoked_at + branch_review.REVOKED_SHOWN_S
+    assert [r["hidden"] for r in branch_review.listing(db, now=week - 1.0) if r["id"] == second["id"]] == [False]
+    assert all(r["hidden"] for r in branch_review.listing(db, now=week)), "a week after its revoke, unread too"
+
+    def ask(path, method="GET", **kw):
+        handler = Handler(path, **kw)
+        branch_review.http_route(handler, path.split("?")[0], method, policy=policy, accounts_db=db_file)
+        return handler.sent
+
+    status, answer = ask("/api/reviews", user=BOB, username="bob")
+    assert status == 200 and [r["id"] for r in answer["reviews"]] == [second["id"]] and answer["hidden"] == 1
+    status, answer = ask("/api/reviews?all=1", user=BOB, username="bob")
+    assert answer["hidden"] == 0 and {r["id"] for r in answer["reviews"]} == {first["id"], second["id"]}
+    assert ask("/api/reviews/read", "POST", user=BOB, username="bob", body={"id": second["id"]})[0] == 403
+    status, answer = ask("/api/reviews/read", "POST", user=ADMIN, username="admin", body={"id": second["id"]})
+    assert status == 200 and answer["review"]["standing"] == "revoked"
+    assert ask("/api/reviews", user=BOB, username="bob")[1]["reviews"] == []
+    branch_review.decide(db, second["id"], user_id=ADMIN, username="admin", head=two, decision="approved")
+    assert ask("/api/reviews/read", "POST", user=ADMIN, username="admin", body={"id": second["id"]})[0] == 409
+    assert [r["id"] for r in ask("/api/reviews", user=BOB, username="bob")[1]["reviews"]] == [second["id"]], \
+        "approved again: shown, whatever was read before"
+
+
+def test_each_landing_run_is_recorded_for_the_page_with_its_trigger_and_outcome(world, monkeypatch):
+    import time as clock
+    from types import SimpleNamespace
+    from meowdoku import scheduled_tasks
+    db, policy = world["db"], world["policy"]
+    assert branch_review.lander_status(db)["last"] is None and branch_review.lander_status(db)["running"] is None
+    first = branch(world, "first")
+    submit(world, "first", first, timeout_s=0)
+    branch_gate.land(policy, db, apply=False, log=lambda line: None)
+    assert branch_review.lander_status(db)["last"]["summary"] == "1 would land", "report-only says so"
+    branch_gate.land(policy, db, apply=True, log=lambda line: None)
+    last = branch_review.lander_status(db)["last"]
+    assert last["trigger"] == "cli" and last["landed"] == 1 and last["summary"] == "1 landed" and last["error"] is None
+    table = scheduled_tasks.handlers(SimpleNamespace(DONE=2, UNCHANGED=3), branches={
+        "policy": world["policy_file"], "accounts_db": world["db_file"], "module": branch_gate})
+    table["reviews.land"]({"task": "reviews.land"})
+    assert branch_review.lander_status(db)["last"]["trigger"] == "schedule"
+    table["reviews.land"]({"task": "reviews.land", "trigger": "request"})
+    assert branch_review.lander_status(db)["last"]["trigger"] == "request"
+
+    def broken(*args, **kwargs):
+        raise OSError("git is not on PATH")
+    monkeypatch.setattr(branch_gate, "_land", broken)
+    with pytest.raises(OSError):
+        branch_gate.land(policy, db, apply=True, log=lambda line: None)
+    assert branch_review.lander_status(db)["last"]["error"] == "OSError: git is not on PATH", "a crash is reported, and still raised"
+    run = branch_review.run_started(db, trigger="schedule")
+    db.execute("UPDATE branch_land_runs SET started = ? WHERE id = ?", (clock.time() - branch_review.STUCK_AFTER_S - 60, run))
+    running = branch_review.lander_status(db)["running"]
+    assert running["id"] == run and running["stuck"] is True, "a run that never finishes is reported stuck"
+
+    def ask(path):
+        handler = Handler(path, user=ANN, username="ann")
+        branch_review.http_route(handler, path, "GET", policy=policy, accounts_db=world["db_file"])
+        return handler.sent
+    status, answer = ask("/api/reviews")
+    assert status == 200 and answer["lander"]["running"]["stuck"] is True and answer["lander"]["last"]["error"]
+
+
+def test_a_landing_run_fetches_each_repository_once_and_still_lands_a_chain(world, monkeypatch):
+    db, policy, work = world["db"], world["policy"], world["work"]
+    first = branch(world, "first")
+    run(work, "checkout", "-q", "-b", "second", "first")
+    second = commit(work, "second.txt")
+    run(work, "push", "-q", "origin", "second")
+    run(work, "checkout", "-q", "main")
+    run(work, "checkout", "-q", "-b", "third", "main")      # third changes first.txt as well, with its own text
+    third = commit(work, "first.txt", "third's own text")
+    run(work, "push", "-q", "origin", "third")
+    run(work, "checkout", "-q", "main")
+    for name, head in (("first", first), ("second", second), ("third", third)):
+        submit(world, name, head, timeout_s=0)
+    fetches = []
+    real = branch_gate.git
+
+    def counting(path, *args, **kwargs):
+        if args[:1] == ("fetch",):
+            fetches.append(path)
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(branch_gate, "git", counting)
+    done = actions(branch_gate.land(policy, db, apply=True, log=lambda line: None))
+    assert len(fetches) == 1, "one fetch for the one repository, not one per change"
+    assert done["first"] == "landed" and done["second"] == "landed", "a chain lands in one run: the push moved the tracked base"
+    assert done["third"] == "held" and remote_has(world, "main") == second, "third changed first.txt too: held, not merged"
+
+
+def test_a_worktree_the_cleaner_cannot_read_is_kept_and_never_lets_a_prune_drop_it(world, monkeypatch, tmp_path):
+    import shutil
+    work, db, policy = world["work"], world["db"], world["policy"]
+    branch(world, "theirs")
+    branch(world, "gone")
+    theirs, gone = tmp_path / "wt-theirs", tmp_path / "wt-gone"
+    run(work, "worktree", "add", "-q", str(theirs), "theirs")
+    run(work, "worktree", "add", "-q", str(gone), "gone")
+    shutil.rmtree(gone)
+    assert branch_gate.folder_state(str(theirs)) == "present" and branch_gate.folder_state(str(gone)) == "gone"
+    real = branch_gate.folder_state
+    monkeypatch.setattr(branch_gate, "folder_state",
+                        lambda path: "unreadable" if Path(path).resolve() == theirs.resolve() else real(path))
+    done = {Path(e["worktree"]).name: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, log=lambda l: None)}
+    assert done["wt-theirs"]["action"] == "keep" and "cannot read" in done["wt-theirs"]["reason"]
+    assert done["wt-gone"]["action"] == "keep" and "git worktree prune would drop them" in done["wt-gone"]["reason"]
+    listed = run(work, "worktree", "list")
+    assert "wt-theirs" in listed and "wt-gone" in listed, "nothing was pruned while a worktree could not be read"
+    monkeypatch.setattr(branch_gate, "folder_state", real)
+    done = {Path(e["worktree"]).name: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, log=lambda l: None)}
+    assert done["wt-gone"]["action"] == "pruned" and "wt-gone" not in run(work, "worktree", "list")
+    assert "wt-theirs" in run(work, "worktree", "list")
+
+
+def test_an_unreadable_folder_is_never_reported_gone(monkeypatch, tmp_path):
+    import os
+    folder = tmp_path / "locked"
+    folder.mkdir()
+
+    def denied(path, *args, **kwargs):
+        raise PermissionError(5, "Access is denied", str(path))
+    monkeypatch.setattr(os, "listdir", denied)
+    assert branch_gate.folder_state(str(folder)) == "unreadable"
+    assert branch_gate.folder_state(str(tmp_path / "nothing")) == "gone"
+
+
+def parents_of(world, ref):
+    return run(world["remote"], "rev-list", "--parents", "-n", "1", ref).split()[1:]
+
+
+def test_a_change_that_touches_no_file_main_changed_lands_as_a_merge_of_the_reviewed_commit(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    head = branch(world, "feature")                         # adds feature.txt
+    before = commit(work, "meanwhile.txt")                  # main moves meanwhile, in another file
+    run(work, "push", "-q", "origin", "main")
+    made = submit(world, "feature", head, timeout_s=0)
+    dry = branch_gate.land(policy, db, apply=False, now=1000.0, log=lambda line: None)
+    assert dry[0]["action"] == "would land" and "merged onto main" in dry[0]["reason"]
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "landed", done[0]["reason"]
+    landed = remote_has(world, "main")
+    assert landed not in (head, before) and parents_of(world, landed) == [before, head], \
+        "a merge whose second parent is exactly the reviewed commit"
+    files = set(run(world["remote"], "ls-tree", "--name-only", landed).split())
+    assert {"base.txt", "meanwhile.txt", "feature.txt"} <= files
+    record = branch_review.get(db, made["id"])
+    assert record["standing"] == "landed" and "second parent" in record["landed_detail"]
+    assert "SpeakToMe lander" in run(world["remote"], "log", "-1", "--format=%an", landed)
+
+
+def test_a_change_to_a_file_main_also_changed_lands_when_git_merges_it_cleanly(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    lines = [f"line {n}" for n in range(1, 21)]
+    commit(work, "shared.txt", "\n".join(lines) + "\n")
+    run(work, "push", "-q", "origin", "main")
+    run(work, "checkout", "-q", "-b", "feature", "main")
+    head = commit(work, "shared.txt", "\n".join(["feature's top"] + lines[1:]) + "\n")       # the first line
+    run(work, "push", "-q", "origin", "feature")
+    run(work, "checkout", "-q", "main")
+    before = commit(work, "shared.txt", "\n".join(lines[:-1] + ["main's bottom"]) + "\n")   # the last line
+    run(work, "push", "-q", "origin", "main")
+    made = submit(world, "feature", head, timeout_s=0)
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "landed", done[0]["reason"]
+    landed = remote_has(world, "main")
+    assert parents_of(world, landed) == [before, head]
+    text = run(world["remote"], "show", f"{landed}:shared.txt").splitlines()
+    assert text[0] == "feature's top" and text[-1] == "main's bottom" and text[1:-1] == lines[1:-1]
+    assert branch_review.get(db, made["id"])["standing"] == "landed"
+
+
+def test_the_push_check_accepts_the_landers_merge_and_nothing_dressed_as_one(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    assert branch_gate.install_hooks(policy, world["policy_file"], world["db_file"], log=lambda line: None) == [("work", "installed")]
+    head = branch(world, "feature")
+    made = submit(world, "feature", head)
+    branch_review.decide(db, made["id"], user_id=ADMIN, username="admin", head=head, decision="approved")
+    other = branch(world, "elsewhere")
+    second = submit(world, "elsewhere", other)
+    branch_review.decide(db, second["id"], user_id=ADMIN, username="admin", head=other, decision="approved")
+    first = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[second["id"]])
+    assert actions(first) == {"elsewhere": "landed"}
+    tip = remote_has(world, "main")
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None, only=[made["id"]])
+    assert actions(done) == {"feature": "landed"}, done
+    merged = remote_has(world, "main")
+    assert parents_of(world, merged) == [tip, head], "the installed hook let the lander's merge through"
+    run(work, "fetch", "-q", "origin")
+    lines = lambda sha: [f"{sha} {sha} refs/heads/main {merged}"]
+    tree = run(work, "rev-parse", f"{head}^{{tree}}")
+    forged = run(work, "commit-tree", tree, "-p", merged, "-p", head, "-m", "dressed as a landing")
+    assert branch_gate.check_push(policy, db, "work", lines(forged), 1000.0, path=work), "a merge with another tree is refused"
+    stray = branch(world, "stray")
+    unreviewed = run(work, "commit-tree", run(work, "rev-parse", f"{stray}^{{tree}}"), "-p", merged, "-p", stray, "-m", "x")
+    assert branch_gate.check_push(policy, db, "work", lines(unreviewed), 1000.0, path=work), "a second parent nobody accepted"
+    branch_gate.install_hooks(policy, world["policy_file"], world["db_file"], remove=True, log=lambda line: None)

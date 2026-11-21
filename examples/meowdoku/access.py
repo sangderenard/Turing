@@ -14,7 +14,7 @@ TIER of an origin: ``build/meowdoku/access.json`` (gitignored with build/; read 
 needs no restart).  A missing or unreadable file means the defaults.
 
     {
-      "policy": {"lan": "edit", "ip": "dev", "dns": "shader"},
+      "policy": {"lan": "edit", "ip": "shader", "dns": "shader"},
       "public_ip": null,
       "public_ip_service": "https://api.ipify.org",
       "public_ip_ttl_seconds": 3600
@@ -29,10 +29,12 @@ needs no restart).  A missing or unreadable file means the defaults.
     shader   a FULLSCREEN SHADER ONLY page (shader.html: the loading panel's animation full window, no controls).  The server answers
              every request with that page, or 403 for APIs (only /api/whoami, a reduced /api/ready and /api/loading_anim are served).
 
-Defaults, in origin order the user's triple (edit / development options / fullscreen shader only): lan -> edit, ip -> dev, dns -> shader.
-A bare IP is findable by ordinary developer means, so whoever reaches it sees the development options (read-only: dev cannot call the
-owner endpoints, and edit actions need the tier AND their tokens from anywhere); the hostname is the public face and gets the shader only.
-Set "dns" to "play" to open the real site to the name, or any origin to any tier.
+Defaults: lan -> edit, ip -> shader, dns -> shader.  THE HOST HEADER NEVER RAISES A TIER (case d56a1d9d843b447c87aa607a78e36069,
+2026-11-17): the Host header is the client's own text, and Apache passes it through, so "ip" used to mean "whoever writes an address,
+127.0.0.1 or any other, in its Host header" and earned the dev tier (dev_ui) from anywhere.  ``tier_of`` therefore holds ip at or below
+dns, whatever the file says; to give the bare address more, raise dns, the public name, with it.  lan comes only from the socket peer
+or a trusted proxy's own appended client hop.  A signed-in account still lifts the shader tier by its role (server.py SHADER_LIFT).
+Set "dns" to "play" to open the real site to the name, or any origin to any tier (ip never above dns).
 
 ``public_ip`` is the server's own public address(es) for the hairpin rule: a string or a list of strings.  When it is null the address is
 asked of ``public_ip_service`` (default https://api.ipify.org, which answers the caller's address as plain text) once at startup in a
@@ -57,7 +59,7 @@ from pathlib import Path
 ORIGINS = ("lan", "dns", "ip")
 TIERS = ("shader", "play", "dev", "edit")
 RANK = {"shader": 0, "play": 1, "dev": 2, "edit": 3}
-DEFAULT_POLICY = {"lan": "edit", "dns": "shader", "ip": "dev"}
+DEFAULT_POLICY = {"lan": "edit", "dns": "shader", "ip": "shader"}
 DEFAULT_SERVICE = "https://api.ipify.org"
 DEFAULT_TTL = 3600
 RETRY_SECONDS = 60
@@ -66,18 +68,23 @@ LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
     "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fe80::/10", "fc00::/7"))
 
 # The shader tier's whole world: these files (the page, the panel script that draws the animation, its decoder) and three small APIs.
-SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js")
+SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js",
+                "/llms.txt")              # [LLMS] directions for agents (llmstxt.org), for anyone, case 7ab138b9813e4cceb687b9fc47149329
 SHADER_PAGE = "/shader.html"
-# Public sign-in: the only other things the shader tier may reach (server.py _shader_request / _login_post).  Sign-up stays closed.
+# Public sign-in, preview, and consented alpha registration (server.py _shader_request / _login_post).
 SHADER_LOGIN_FILES = ("/login.html", "/login.js", "/messenger-widget.js", "/site-nav.js")   # the widget renders nothing without the message capability
 SHADER_LOGIN_GETS = ("/api/account/me",)
-SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout")
+SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout", "/api/account/preview", "/api/account/recover", "/api/account/keep")
 # GET routing only: the photo handlers still require photo_read and check ownership.
 PHOTO_READ_APIS = ("/api/marble_photo/jobs", "/api/marble_photo/lenses", "/api/marble_photo",
                    "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation")
 # /api/reviews/standing answers accepted true/false for one commit id and how to get a review; the review-gate
 # check on GitHub asks it from outside with no account (branch_review.http_route). It reads no identity and no row's text.
 SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim", "/api/reviews/standing") + PHOTO_READ_APIS
+# [GUEST] sockets a visitor with no account may open (server.py _kiosk_gate; the REST entries are declared in speaktome_api.catalog):
+# the game table's input socket and a viewer's push socket, and, by prefix, the federation bridge whose peer grant is the authority.
+GUEST_SOCKETS = ("/ws", "/ws/spectate")
+CREDENTIAL_SOCKETS = ("/ws/contract/",)
 
 # /api/action types that act on the whole process (the shared learner, the Lichess client, the pilot weights), not on the caller's table.
 EDIT_ACTIONS = frozenset({"demo_learning", "arena_save", "arena_stop", "arena_resume", "lichess_pause", "lichess_resume", "pilot_arch"})
@@ -123,7 +130,12 @@ def classify(peer: str, host_header: str | None, public_ips=()) -> str:
 
 
 def tier_of(origin: str, policy: dict) -> str:
-    return policy.get(origin) or DEFAULT_POLICY[origin]
+    tier = policy.get(origin) or DEFAULT_POLICY[origin]
+    if origin == "ip":                   # the Host header is the client's own text: it never ranks a request above the public name
+        public = policy.get("dns") or DEFAULT_POLICY["dns"]
+        if RANK[tier] > RANK[public]:
+            tier = public
+    return tier
 
 
 def load_config(path: Path | None) -> dict:

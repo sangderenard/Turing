@@ -1124,6 +1124,72 @@ def _concorded_tensor_result_class(
     }, cell
 
 
+def _returned_aggregate_call_cell(
+    caller: Any, node_id: int, callee: Any,
+) -> Any:
+    """The cell proving a call's tuple result is its caller's output, or None.
+
+    Two records together: the caller's positional output is this exact call
+    value (the last identity of an output binding, read from the caller's
+    identity table), and every return site of the callee is an authored
+    tuple (its RETURN_SITE_CONTAINER rows).  The answer derives from the
+    call's identity cell and those container rows.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _operand_position_scope, node_identity_cell,
+    )
+    from .concordance_declarations import RETURN_SITE_CONTAINER
+    from .identity_concordance import Derived, current_identity_book
+
+    G = caller.G
+    call_value = int(G.nodes[int(node_id)].get("value_id", node_id))
+    identities = G.graph.get("identity_table") or {}
+    returned = any(
+        tuple(identities.get(str(name), ()))
+        and int(tuple(identities.get(str(name), ()))[-1]) == call_value
+        for name in G.graph.get("positional_output_names") or ()
+    )
+    if not returned:
+        return None
+    kinds = set(dict(callee.G.graph.get("return_container_kinds") or {}).values())
+    if kinds != {"tuple"}:
+        return None
+    book = current_identity_book()
+    scope = _operand_position_scope(callee)
+    container = book.pages.get(RETURN_SITE_CONTAINER.name)
+    if scope is None or container is None:
+        return None
+    container_cells = tuple(
+        cell for cell in (
+            book.latest_ref(RETURN_SITE_CONTAINER, row)
+            for row in container.scope_rows(scope)
+        ) if cell is not None
+    )
+    try:
+        call_cell = node_identity_cell(caller, int(node_id))
+    except ValueError:
+        call_cell = None
+    if call_cell is None or not container_cells:
+        return None
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, RETURNED_AGGREGATE_CALL,
+    )
+    from .identity_concordance import Mode, shape_scope_of
+
+    return book.post(
+        RETURNED_AGGREGATE_CALL,
+        (shape_scope_of(caller), call_value),
+        (
+            str(callee.G.graph.get("function_name") or ""), "tuple",
+            call_cell, container_cells,
+        ),
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived((call_cell, *container_cells)),
+        mode=Mode.CONCORD,
+    )
+
+
 def _planned_scalar_actual_descriptor(caller: Any, argument_id: int) -> Any:
     """A scalar actual's rank-0 descriptor from the caller's proven dtype.
 
@@ -2265,13 +2331,29 @@ def _post_call_result_projections(graph, node_id):
     return caller_paths
 
 
-def _call_result_bindings(graph, node_id, output_paths):
-    """One projection operator for authored bodies and accepted native headers."""
+def _call_result_bindings(graph, node_id, output_paths, *, result_is_output=False):
+    """One projection operator for authored bodies and accepted native headers.
+
+    ``result_is_output``: the callee has one output and every return site
+    returns a value, not a tuple display (RETURN_SITE_CONTAINER VALUE), so
+    the call's result IS that output.  Program: ``def mid(): t = (a, e);
+    return t`` (or ``def outer(): return mid()``), then ``a, e = mid();
+    use(e, a)`` (scratch n3/n4).  Wrong record: the output's member paths
+    are ``(0, k)`` and the caller's ``r[k]`` is ``(k,)``, so no member bound
+    and ``use``'s formal had no dtype.  Rule: output path ``(0, *p)`` is the
+    caller's projection path ``(*p)``, as one output over returns of
+    different arity already binds (``_return_output_arms_members``).
+    """
     caller_paths = _post_call_result_projections(graph, node_id)
     if tuple(output_paths) == ((0,),) and not (
         graph.G.nodes[int(node_id)].get("attributes") or {}
     ).get("authored_return_container"):
         return ((output_paths[(0,)], int(node_id)),)
+    if result_is_output and output_paths and all(
+        len(path) >= 2 and path[0] == 0 for path in output_paths
+    ):
+        return tuple((output_paths[path], caller_paths[path[1:]])
+                     for path in output_paths if path[1:] in caller_paths)
     return tuple((output_paths[path], caller_paths[path])
                  for path in output_paths if path in caller_paths)
 
@@ -3290,6 +3372,20 @@ def _planned_scalar_dtypes_from_graph(
     # A list of lists holds one element class per row: ``row_element`` is
     # the class every row of a collection-of-collections shares.
     row_element: dict[int, str] = {}
+    # A sequence of fixed-width tuples holds one class per tuple position:
+    # ``row_columns`` is that per-position dtype tuple (``pairs.append((a,
+    # b))``, ``[(k, k + 1) for k in ...]``, a display of tuple rows).
+    row_columns: dict[int, tuple] = {}
+
+    def tuple_row_dtypes(node_id):
+        """The member dtypes of a tuple display ``node_id``, or None."""
+
+        node_attributes = G.nodes.get(int(node_id), {}).get("attributes") or {}
+        leaves = tuple(node_attributes.get("aggregate_leaf_value_ids") or ())
+        if node_attributes.get("aggregate_kind") != "tuple" or len(leaves) < 2:
+            return None
+        dtypes = tuple(scalar.get(int(leaf)) for leaf in leaves)
+        return None if any(dtype is None for dtype in dtypes) else dtypes
 
     def join(dtypes):
         known = {dtype for dtype in dtypes if dtype is not None}
@@ -3656,6 +3752,15 @@ def _planned_scalar_dtypes_from_graph(
                     and not tuple(receiver_tensor.get("shape") or ())
                 ):
                     settle(scalar, node_id, receiver_dtype)
+                elif (
+                    len(receivers) == 1
+                    and operation(G.nodes[receivers[0]]) in {"argmax", "argmin"}
+                ):
+                    # Program: ``AbstractTensor.argmax(m.to(...)).item()``
+                    # (scratch nz/c07).  The receiver is an index tensor:
+                    # its element class is int64 by the operator's law,
+                    # whatever its catalogue record holds.
+                    settle(scalar, node_id, "int64")
                 continue
             # Program: ``v = maybe(row, flag); if v is not None: total +=
             # v`` with ``maybe`` returning ``row + 1`` or ``None`` (corpus
@@ -3928,6 +4033,31 @@ def _planned_scalar_dtypes_from_graph(
                 # int rows through float64.  Rule: the i-th name of a tuple
                 # target over ``zip(a, b, ...)`` is an element of the i-th
                 # argument.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and iterable
+                    and len(row_columns.get(iterable[0], ()))
+                    == len(loop_expression.target.elts)
+                ):
+                    # ``for a, b in pairs`` over tuple rows: the i-th name is
+                    # the rows' i-th column.
+                    for item, held in zip(
+                        loop_expression.target.elts, row_columns[iterable[0]],
+                    ):
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
                 zipped = G.nodes.get(iterable[0], {}) if iterable else {}
                 if (
                     isinstance(loop_expression, ast.For)
@@ -4150,6 +4280,30 @@ def _planned_scalar_dtypes_from_graph(
                     isinstance(expression.target, ast.Tuple)
                     and all(isinstance(item, ast.Name)
                             for item in expression.target.elts)
+                    and iterable
+                    and len(row_columns.get(iterable[0], ()))
+                    == len(expression.target.elts)
+                ):
+                    # ``for v1, v2 in active_edges`` over tuple rows: the
+                    # i-th name is the rows' i-th column.
+                    for item, held in zip(
+                        expression.target.elts, row_columns[iterable[0]],
+                    ):
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
+                if (
+                    isinstance(expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in expression.target.elts)
                     and identity in {"builtins.zip", "builtins.enumerate"}
                 ):
                     arguments = sorted(
@@ -4195,6 +4349,9 @@ def _planned_scalar_dtypes_from_graph(
                 if carried in row_element:
                     # A carried list of lists keeps its row class.
                     settle(row_element, node_id, row_element[carried])
+                if carried in row_columns:
+                    # A carried list of tuple rows keeps its columns.
+                    settle(row_columns, node_id, row_columns[carried])
                 settle(element, node_id, element.get(carried))
                 settle(scalar, node_id, scalar.get(carried))
                 continue
@@ -4365,6 +4522,43 @@ def _planned_scalar_dtypes_from_graph(
                                 observed_writers[node_id] = None
                         continue
                 writers = [scalar.get(member) for member in members]
+                # Program: YoungMan ``_build_triangle_map``:
+                # ``active_edges = []``, ``active_edges.append((v1, v2))``
+                # with ``v1 = int(v1)``, then ``[(vertex_offsets[v1] +
+                # vertex_offsets[v2]) / 2 for v1, v2 in active_edges]``.
+                # Wrong record: a tuple writer has no scalar class, so the
+                # list's rows had none and each unpacked target had "no
+                # settled dtype".  Rule: a list/set whose every writer --
+                # display member, ``append``/``add``/``insert`` argument,
+                # comprehension ``elt`` -- is a tuple display of one width
+                # with known member dtypes holds rows of those columns,
+                # joined per position.
+                if attributes.get("aggregate_kind") != "dict" and not isinstance(
+                    expression, ast.Dict,
+                ):
+                    row_writer_nodes = list(members)
+                    for record in records.values():
+                        if int(record.get("sequence_value_id", -1)) == int(
+                            data.get("value_id", node_id)
+                        ) and str(record.get("operator")) in {
+                            "append", "add", "insert",
+                        }:
+                            arguments = tuple(record.get("argument_value_ids") or ())
+                            if arguments:
+                                row_writer_nodes.append(int(arguments[-1]))
+                    if isinstance(expression, (ast.ListComp, ast.SetComp)):
+                        row_writer_nodes.extend(parents(data, "elt"))
+                    row_dtypes = [tuple_row_dtypes(writer) for writer in row_writer_nodes]
+                    if (
+                        row_dtypes
+                        and all(row is not None for row in row_dtypes)
+                        and len({len(row) for row in row_dtypes}) == 1
+                    ):
+                        columns = tuple(
+                            join(list(position)) for position in zip(*row_dtypes)
+                        )
+                        if all(column is not None for column in columns):
+                            settle(row_columns, node_id, columns)
                 # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
                 # (corpus c127, c129).  ``sorted`` returns a new list of its
                 # argument's rows; nobody read that, so every row of ``ys``
@@ -6491,6 +6685,13 @@ def _build_shell_hierarchy_plan(
                 )
                 result_bindings = _call_result_bindings(
                     graph, node_id, child_output_paths,
+                    result_is_output=(
+                        len(child_outputs) == 1
+                        and set(dict(
+                            child_graph.graph.get("return_container_kinds")
+                            or {}
+                        ).values()) == {"value"}
+                    ),
                 )
                 arms_members = _return_output_arms_members(
                     child.process_graph, child_outputs,
@@ -6569,6 +6770,7 @@ def _build_shell_hierarchy_plan(
         )
         region_node_set = set(region_nodes)
         numerical_dtype_metadata = {}
+        numerical_contract_keyword_metadata: dict[int, dict[str, str]] = {}
         numerical_constructor_dimension_cells = {}
 
         def numerical_region_parents(
@@ -6778,6 +6980,32 @@ def _build_shell_hierarchy_plan(
                             )
                         numerical_dtype_metadata[int(node_id)] = target_layout.name
                         continue
+                if (
+                    operation == "pad"
+                    and str(role) == "kw:mode"
+                    and str(parent_data.get("type")) in {
+                        "Const", "const", "Constant",
+                    }
+                ):
+                    # ``a.pad(pad=(1, 1), value=0, mode="constant")``: the
+                    # mode spelling selects pad's kernel, as a dtype spelling
+                    # selects a cast's.  It is not a runtime operand: as a
+                    # region capture it had no dtype and refused ("region
+                    # value 5 has no settled dtype in the region's value
+                    # records", 2026-11-18, case 6393486c).  Project the
+                    # exact literal onto the line as ``mode``; lowering
+                    # admits "constant" and refuses every other mode.
+                    mode_literal = _constant_value(parent_data)
+                    if mode_literal not in _OPERATOR_CONTRACT_STRING_KEYWORDS[
+                        ("pad", "kw:mode")
+                    ]:
+                        raise ValueError(
+                            f"pad has no admitted mode {mode_literal!r}"
+                        )
+                    numerical_contract_keyword_metadata.setdefault(
+                        int(node_id), {},
+                    )["mode"] = mode_literal
+                    continue
                 identity_row = attributes.get("source_python_identity_row")
                 if identity_row is not None:
                     from .concordance_declarations import (
@@ -7123,6 +7351,9 @@ def _build_shell_hierarchy_plan(
                     line_attributes["intrinsic_named_call_id"] = int(value)
             if int(value) in numerical_dtype_metadata:
                 line_attributes["dtype"] = numerical_dtype_metadata[int(value)]
+            line_attributes.update(
+                numerical_contract_keyword_metadata.get(int(value), {})
+            )
             if int(value) in numerical_constructor_dimension_cells:
                 line_attributes["numerical_constructor_dimension_cell"] = (
                     numerical_constructor_dimension_cells[int(value)]
@@ -7813,8 +8044,9 @@ def _build_shell_hierarchy_plan(
                         dtype = parent_dtypes[0]
                 # DomainNode historically pads scalars with unit axes. If it
                 # says scalar but a canonical tensor op consumes a shaped
-                # tensor, carry that shape through.
-                if operation in {
+                # tensor, carry that shape through.  The unary elementwise
+                # vocabulary is the one table, _ELEMENTWISE_UNARY_OPERATIONS.
+                if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
                     "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
                     "floor", "ceil", "isfinite", "isnan", "isinf",
                     "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
@@ -7826,7 +8058,8 @@ def _build_shell_hierarchy_plan(
                     "atanh", "sign", "add", "sub", "mul", "truediv", "div",
                     "floordiv", "mod", "pow", "less", "less_equal",
                     "greater", "greater_equal", "equal", "not_equal",
-                    "maximum", "minimum", "where", "float", "double",
+                    "maximum", "minimum", "clamp", "clamp_min", "clamp_max",
+                    "where", "float", "double",
                     "long", "int", "to", "to_dtype", "astype", "cbrt",
                     "zeros_like", "empty_like", "ones_like", "full_like",
                 }:
@@ -8375,12 +8608,23 @@ def _build_shell_hierarchy_plan(
                     )
                     # So is a call named by its static reference
                     # (``Precision.width_of(x)``): an unlinked callee.
+                    # Program: ``AbstractTensor.argmax(m.to(...)).item()``
+                    # (scratch nz/c07).  Wrong record: the static reference
+                    # names a tensor OPERATION whose result law already
+                    # states its contract (``argmax`` -> int64); no callee
+                    # body will ever attach, so every value computed from it
+                    # stayed deferred and the region's value records had no
+                    # dtype.  Rule: a static-reference call whose own
+                    # descriptor states a tensor contract is not unlinked.
                     or (
                         (graph.G.nodes[source].get("attributes") or {}).get(
                             "source_type"
                         ) == "Call"
                         and (graph.G.nodes[source].get("attributes") or {})
                         .get("static_python_reference") is not None
+                        and not _descriptor_states_tensor_contract(
+                            _tensor_descriptor(graph, int(source))
+                        )
                     )
                 )
                 and source not in call_result_dtypes
@@ -11931,7 +12175,7 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
 
 # Serialized ProcessGraphs retain this derived cache. Bump its schema when
 # classification semantics change, so a compiler replay recomputes old facts.
-_DISPATCH_METADATA_CACHE_SCHEMA = 4
+_DISPATCH_METADATA_CACHE_SCHEMA = 6
 
 
 def _dispatch_metadata_node_classifier(graph: Any):
@@ -11993,6 +12237,8 @@ def _dispatch_metadata_node_classifier(graph: Any):
                 f"executable_node: no source cell for {row!r} -- {exc}"
             ) from exc
         cells = [cell]
+        if rule is MetadataRule.RESIDENT_STRING_COMPARISON:
+            cells.extend(_resident_string_comparison_cells(graph, node_id))
         if rule is MetadataRule.COORDINATOR_NODE_TYPE:
             # An Input the reducer declared scalar: the rule read that row.
             scalar = book.latest_ref(SCALAR_PARAMETER, (cell.row[0], int(node_id)))
@@ -12051,6 +12297,77 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     return _dispatch_metadata_rule(graph, node_id) not in _EXECUTABLE_RULES
+
+
+def _resident_string_comparison_cells(graph: Any, node_id: int) -> tuple:
+    """Prove full-content glyph-span equality, not scalar vocabulary tokens."""
+    from ..common.tensors.topological_reducer import _source_numeric_scope, node_identity_cell
+    from .identity_concordance import SHAPE_STATE_PAGE, current_identity_book, shape_scope_of
+    from .planner_concordance_posts import _class_proves_value
+    from .source_evidence_resolver import ClassEvidence, require_class
+
+    data = graph.G.nodes[int(node_id)]
+    if str(data.get("op") or data.get("type")).casefold() not in {"equal", "not_equal"}:
+        return ()
+    parents = tuple(data.get("parents", ()))
+    if len(parents) != 2:
+        return ()
+    book = current_identity_book()
+    cells = []
+    for parent, _role in parents:
+        value_id = int(graph.G.nodes[int(parent)].get("value_id", parent))
+        identity = node_identity_cell(graph, int(parent))
+        # Literal glyphs have their own exact materialization recipe. Their
+        # scalar token descriptor is not the storage of that glyph alternate.
+        from .concordance_declarations import (
+            SOURCE_GLYPH_SEQUENCE, SourceGlyphSequence,
+            CANONICAL_VALUE, INGESTION_VALUE,
+        )
+        from .concorded_literals import origin_cell
+        literal_row = (graph.G.nodes[int(parent)].get("attributes") or {}).get(
+            "source_literal_glyph_sequence_row"
+        )
+        if isinstance(literal_row, (tuple, list)) and len(literal_row) == 2 and int(literal_row[1]) == value_id:
+            literal_cell = book.latest_ref(SOURCE_GLYPH_SEQUENCE, tuple(literal_row))
+            recipe = book.page(SOURCE_GLYPH_SEQUENCE).latest(tuple(literal_row))
+            exact_literal = (
+                isinstance(recipe, SourceGlyphSequence)
+                and len(recipe.components) == 1
+                and recipe.components[0].kind == "literal"
+                and int(recipe.components[0].component_value_id) == value_id
+            )
+            pending = [literal_cell] if literal_cell is not None else []
+            visited = set()
+            grounded = False
+            while pending:
+                candidate = pending.pop()
+                if candidate in visited:
+                    continue
+                visited.add(candidate)
+                for cause, _stage in book.edges_into(candidate):
+                    if cause.page == SOURCE_GLYPH_SEQUENCE:
+                        pending.append(cause)
+                    elif cause.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                        grounded |= origin_cell(book, cause) == origin_cell(book, identity)
+            if exact_literal and grounded:
+                cells.extend((identity, literal_cell))
+                continue
+        evidence = require_class(_source_numeric_scope(graph.G), value_id, book=book)
+        if (not isinstance(evidence, ClassEvidence)
+                or evidence.class_identity != "builtins.str"
+                or evidence.precision_limbs != 1):
+            return ()
+        identity = node_identity_cell(graph, int(parent))
+        if not _class_proves_value(book, evidence.class_cell, identity):
+            return ()
+        descriptor = _tensor_descriptor(graph, int(parent))
+        if descriptor is None or descriptor.get("rank") != 1 or descriptor.get("dtype") != "int64":
+            return ()
+        shape_cell = book.latest_ref(SHAPE_STATE_PAGE, (shape_scope_of(graph), value_id))
+        if shape_cell is None:
+            return ()
+        cells.extend((identity, evidence.class_cell, *evidence.proof_cells, shape_cell))
+    return tuple(dict.fromkeys(cells))
 
 
 def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
@@ -12194,14 +12511,15 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             and isinstance(_constant_value(parent_data), str)
         ):
             continue
-        # Scatter's reduction name is part of the numerical operator contract.
-        # It must stay attached to the executable region so tensor SSA lowering
-        # can select the matching kernel (or refuse it precisely); treating the
-        # string as a Python object dependency erased the whole scatter node.
-        if (
-            str(role) == "kw:reduce"
-            and str(data.get("op") or node_type) == "scatter"
-            and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
+        # A string keyword that names part of the numerical operator contract
+        # (scatter's reduction, pad's mode) stays attached to the executable
+        # region, so tensor SSA lowering can select the matching kernel or
+        # refuse it precisely.  Treated as a Python object dependency, the
+        # string erased the whole node: scatter, and ``a.pad(pad=(1, 1),
+        # value=0, mode="constant")``, whose root then returned nothing
+        # (2026-11-18, case 6393486c).  The declared table is the proof.
+        if _constant_value(parent_data) in _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
+            (str(data.get("op") or node_type), str(role)), frozenset()
         ):
             continue
         # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
@@ -12496,6 +12814,8 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
         return Rule.PYTHON_ROUTING_INDEX
     if python_shape_index:
         return Rule.PYTHON_SHAPE_INDEX
+    if _resident_string_comparison_cells(graph, node_id):
+        return Rule.RESIDENT_STRING_COMPARISON
     if compares_none:
         return Rule.COMPARES_NONE
     if non_numeric_constant_operand:
@@ -15443,15 +15763,35 @@ def _control_partition_keys(
                 branch_frontiers_by_node.setdefault(
                     int(node_id), []
                 ).append(int(control_id))
-    callsites = tuple(
+    # Program: ``for i in range(len(xs)): zs.append(xs[(i + 1) % len(xs)]);
+    # zs.append(ys[(i + 1) % len(xs)])`` (scratch modix3/c8).  Wrong record:
+    # the two ``len(xs)`` calls are host-evaluated at their own statements,
+    # but both index computations shared one region; it was emitted after
+    # the second ``len`` (ordered after the first append), while the first
+    # read's bounds check had already consumed its index ("Lt reads a value
+    # defined at sequence_index_in_range.2").  Rule: a host-evaluated call
+    # that a region captures is a frontier exactly as a user call is -- its
+    # descendants are keyed apart from work that does not depend on it.
+    eligible = frozenset(node_ids)
+    host_calls = tuple(
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
-        for attributes in ((data.get("attributes") or {}),)
-        if (
-            attributes.get("callee_ref") is not None
-            or attributes.get("method_ref") is not None
-        )
+        if str(data.get("type") or "") == "Call"
+        and int(node_id) not in eligible
+        and any(int(child) in eligible for child in graph.G.successors(node_id))
     )
+    callsites = tuple(dict.fromkeys((
+        *(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            for attributes in ((data.get("attributes") or {}),)
+            if (
+                attributes.get("callee_ref") is not None
+                or attributes.get("method_ref") is not None
+            )
+        ),
+        *host_calls,
+    )))
     call_descendants = {
         callsite: nx.descendants(graph.G, callsite)
         for callsite in callsites
@@ -24737,13 +25077,30 @@ def _propagate_callsite_tensor_specializations(
         tensor_result_class, tensor_result_class_cell = (
             _concorded_tensor_result_class(caller, call_value)
         )
+        # Program: ``def mid(): ...; return a, e`` and ``def outer(): return
+        # mid()``, then ``a, e = outer(); use(e, a)`` (scratch n3; YoungMan's
+        # ``_configure_geometry`` returning ``configure_geometry(...)``).
+        # Wrong record: ``outer``'s call has no tensor-bearing actual, so this
+        # gate skipped it; ``outer`` holds no projection of the call, so its
+        # one output had no member identities and ``root``'s projections were
+        # bound to nothing (``use``'s formal ``a`` refused with no dtype).  A
+        # direct ``a, e = mid()`` works only because the caller's own
+        # projections bind ``mid``'s members.  Rule: a call whose aggregate
+        # result its caller returns unchanged is that caller's output; its
+        # members are published on the call (the member ledger below), so
+        # the output carries the callee's member identities.
+        returned_aggregate_cell = None
         if (
             not descriptors
             and not aggregate_descriptors
             and not record_descriptors
             and not tensor_result_class
         ):
-            return ()
+            returned_aggregate_cell = _returned_aggregate_call_cell(
+                caller, int(node_id), callee,
+            )
+            if returned_aggregate_cell is None:
+                return ()
 
         def any_descriptor(item: Any) -> bool:
             if isinstance(item, tuple):
@@ -25055,7 +25412,68 @@ def _propagate_callsite_tensor_specializations(
                         f"selected_node={specialized.G.nodes[value_id]!r}",
                         file=sys.stderr, flush=True,
                     )
-                if not _descriptor_states_tensor_contract(descriptor):
+                selected_merge = str(
+                    specialized.G.nodes[value_id].get("type") or ""
+                ) == "Phi"
+                if (
+                    selected_merge
+                    and not _descriptor_states_tensor_contract(descriptor)
+                ):
+                    # Program: ``if g == "tetra": e = tensor(6x2) elif g ==
+                    # "ico": e = tensor(5x2) else: raise`` then ``return e,
+                    # 4`` with ``g`` a runtime value (scratch n8; YoungMan
+                    # ``configure_geometry``'s ``edge_pairs``, where the
+                    # icosahedron's (30, 2) reached ``_build_triangle_map``
+                    # for a tetrahedron).  Wrong record: the returned value is
+                    # the control-owned merge of the arms; it states no
+                    # contract, and the identity walk below took the LAST
+                    # arm's (5, 2) as the call's proven member.  Rule: a
+                    # merge's contract is its arms' contract only when every
+                    # arm states the same one; arms that disagree leave the
+                    # merge without one, and no single arm stands in for it.
+                    def merge_contract(node_id: int, seen: frozenset = frozenset()):
+                        node = specialized.G.nodes.get(int(node_id)) or {}
+                        if str(node.get("type") or "") != "Phi":
+                            answer = _structured_output_descriptor(
+                                specialized, int(node_id),
+                            )
+                            return (
+                                answer
+                                if isinstance(answer, Mapping)
+                                and _descriptor_states_tensor_contract(answer)
+                                else None
+                            )
+                        if int(node_id) in seen:
+                            return None
+                        arms = tuple(
+                            int(parent)
+                            for parent, role in node.get("parents") or ()
+                            if str(role) in {"body", "orelse"}
+                            and int(parent) in specialized.G
+                        )
+                        answers = tuple(
+                            merge_contract(arm, seen | {int(node_id)})
+                            for arm in arms
+                        )
+                        if not answers or any(item is None for item in answers):
+                            return None
+                        facts = {
+                            (
+                                tuple(item.get("shape") or ()),
+                                str(item.get("dtype") or "unknown"),
+                                int(item.get("rank", len(tuple(
+                                    item.get("shape") or ()
+                                ))) or 0),
+                                item.get("metadata_state"),
+                            )
+                            for item in answers
+                        }
+                        return answers[0] if len(facts) == 1 else None
+
+                    agreed = merge_contract(value_id)
+                    if agreed is not None:
+                        descriptor = copy.deepcopy(dict(agreed))
+                elif not _descriptor_states_tensor_contract(descriptor):
                     # The identity table lists every value that IS this
                     # binding; they are one storage by construction.  The last
                     # resident one is what the return names, but a store or a
@@ -25183,6 +25601,7 @@ def _propagate_callsite_tensor_specializations(
             provenance=Derived(tuple(
                 cell for cell in (
                     reuse_policy_cell, tensor_result_class_cell,
+                    returned_aggregate_cell,
                 ) if cell is not None
             )),
             mode=Mode.CONCORD,
@@ -26858,6 +27277,10 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "eq", "ne", "lt", "le", "gt", "ge",
     "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
+    # ``clamp`` is these two in sequence: the tensor and its present bounds
+    # (``kw:min`` / ``kw:max``, below) are its operands, joined and promoted
+    # exactly as ``maximum(x, lo)`` then ``minimum(.., hi)`` would be.
+    "clamp",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
     # The process graph spells Python's bit operators ``bitand``/``bitor``/
@@ -26867,6 +27290,40 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     # (``(low ^ byte) % m``) typed that operand float64.
     "bitand", "bitor", "bitxor", "shl", "shr",
 })
+
+#: The unary elementwise operations: one result element per operand element,
+#: so the result keeps its operand's shape. This is the unary vocabulary the
+#: DomainNode carry-shape rule already lists. The two tensor-descriptor sites
+#: (``_tensor_descriptor_rule`` and ``_fold_callsite_structural_values``) each
+#: kept a hand-written subset of it (neg, abs, sin, cos, tan, exp, log, sqrt,
+#: tanh), so round, floor, sign, the inverse and hyperbolic functions, invert,
+#: logical_not and the finiteness predicates got no descriptor: their result's
+#: physical span was never posted and the final concordance refused "elementwise
+#: span input has no matching physical span result" (2026-11-18, case 6393486c).
+_ELEMENTWISE_UNARY_OPERATIONS = frozenset({
+    "neg", "abs", "sqrt", "exp", "log", "round", "trunc", "floor", "ceil",
+    "sign", "tanh", "sin", "cos", "tan", "asin", "acos", "atan", "sinh",
+    "cosh", "asinh", "acosh", "atanh", "invert", "logical_not",
+    "isfinite", "isnan", "isinf",
+    # The activations: one result element per operand element, float.
+    # Absent here, ``a.sigmoid()`` and ``a.log_softmax(dim=-1)`` carried no
+    # dtype and refused "has no settled dtype" (2026-11-18, case 6393486c).
+    "sigmoid", "softmax", "log_softmax",
+})
+
+#: The unary elementwise operations whose result is a truth value: the operand's
+#: shape, but the dtype is bool (the unary counterpart of the predicates below).
+_ELEMENTWISE_UNARY_PREDICATE_OPERATIONS = frozenset({
+    "logical_not", "isfinite", "isnan", "isinf",
+})
+
+#: String-valued keywords that are part of an operator's numerical contract,
+#: by (operation, parent role): the strings each admits.  Read by the
+#: dispatch-metadata rule; lowering selects a kernel for each or refuses it.
+_OPERATOR_CONTRACT_STRING_KEYWORDS: dict[tuple[str, str], frozenset[str]] = {
+    ("scatter", "kw:reduce"): frozenset({"sum", "mean", "max", "min"}),
+    ("pad", "kw:mode"): frozenset({"constant", "reflect", "replicate", "circular"}),
+}
 
 #: The elementwise binary operations whose result is a truth value.
 _ELEMENTWISE_PREDICATE_OPERATIONS = frozenset({
@@ -27887,6 +28344,89 @@ def _topk_named_member_descriptor(graph, receiver, field_name, seen=None):
     return result
 
 
+def pad_extents(pad: Any, dims: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """AbstractTensor's pad convention: the (left, right) extent per axis.
+
+    The pairs apply from the LAST dimension backward, exactly as the C
+    backend's ``pad_`` states them: ``left[dims-k+i] = pad[-2(i+1)]`` and
+    ``right[dims-k+i] = pad[-2(i+1)+1]`` for ``k = len(pad) // 2``.  A pad
+    that is not a sequence of integers of even length refuses by name.
+    """
+
+    if not isinstance(pad, (tuple, list)) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in pad
+    ):
+        raise ValueError(
+            f"pad has no admitted non-constant or non-integer pad tuple {pad!r}"
+        )
+    if len(pad) % 2 != 0:
+        raise ValueError("pad has no admitted odd-length pad tuple")
+    count = len(pad) // 2
+    if count > int(dims):
+        raise ValueError(
+            "pad tuple pads more dimensions than the operand has"
+        )
+    left = [0] * int(dims)
+    right = [0] * int(dims)
+    for index in range(count):
+        left[int(dims) - count + index] = int(pad[-2 * (index + 1)])
+        right[int(dims) - count + index] = int(pad[-2 * (index + 1) + 1])
+    if any(extent < 0 for extent in (*left, *right)):
+        raise ValueError("pad has no admitted negative pad extent")
+    return tuple(left), tuple(right)
+
+
+def _pad_result_descriptor(graph: Any, data: Mapping, seen: Any) -> dict[str, Any] | None:
+    """``a.pad(pad=..., value=..., mode="constant")``: the operand's dtype,
+    every axis widened by its declared (left, right) extents.
+
+    The pad tuple is the node's constant ``kw:pad`` operand; mode is its
+    constant ``kw:mode`` operand.  A non-constant pad or a mode other than
+    ``"constant"`` refuses by name.
+    """
+
+    parents = tuple(
+        (int(parent), str(role)) for parent, role in data.get("parents") or ()
+        if int(parent) in graph.G
+    )
+    source_id = next((
+        parent for parent, role in parents
+        if role.casefold() in {"operand", "arg:0", "self", "receiver", "base"}
+    ), None)
+    source = (
+        _tensor_descriptor(graph, source_id, seen)
+        if source_id is not None else None
+    )
+    if source is None or not descriptor_states_a_shape(source):
+        return None
+    pad_parent = next((parent for parent, role in parents if role == "kw:pad"), None)
+    mode_parent = next((parent for parent, role in parents if role == "kw:mode"), None)
+    if pad_parent is None:
+        raise ValueError("pad has no kw:pad operand")
+    try:
+        pad = _constant_value(graph.G.nodes[pad_parent])
+    except KeyError:
+        raise ValueError("pad has no admitted non-constant pad tuple") from None
+    if mode_parent is not None:
+        try:
+            mode = _constant_value(graph.G.nodes[mode_parent])
+        except KeyError:
+            raise ValueError("pad has no admitted non-constant mode") from None
+        if mode != "constant":
+            raise ValueError(f"pad has no admitted mode {mode!r}")
+    shape = tuple(map(int, source.get("shape") or ()))
+    left, right = pad_extents(pad, len(shape))
+    new_shape = tuple(
+        extent + before + after
+        for extent, before, after in zip(shape, left, right)
+    )
+    return {
+        "shape": new_shape,
+        "dtype": _recorded_dtype(source.get("dtype"), "pad source tensor", source_id),
+        "rank": len(new_shape),
+    }
+
+
 def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -28373,8 +28913,13 @@ def _tensor_descriptor_rule(
             and str(field.get("storage") or "").casefold() == "scalar"
             and int(field.get("rank", 0)) == 0
         )
+        declared_dynamic_span = bool(
+            isinstance(field, Mapping)
+            and str(field.get("storage") or "").casefold() == "span"
+            and int(field.get("rank", 0)) > 0
+        )
         if isinstance(field, Mapping) and (
-            field.get("shape") is not None or declared_scalar
+            field.get("shape") is not None or declared_scalar or declared_dynamic_span
         ):
             field_shape = tuple(map(int, field.get("shape") or ()))
             field_rank = int(field.get("rank", len(field_shape)))
@@ -29184,6 +29729,10 @@ def _tensor_descriptor_rule(
                         "rank": 1,
                         "metadata_state": "dynamic",
                     }
+        if operation == "pad":
+            pad_descriptor = _pad_result_descriptor(graph, data, seen)
+            if pad_descriptor is not None:
+                return pad_descriptor
         if operation in {"reshape", "view"}:
             parents = data.get("parents") or ()
             source_id = next((
@@ -29488,6 +30037,22 @@ def _tensor_descriptor_rule(
                     # A method call's argument (``x.maximum(y)``) is an
                     # operand under role ``arg:0``, as a builtin's are.
                     or str(role).casefold().startswith("arg:")
+                    # ``x.clamp(min=lo, max=hi)`` names its bounds by keyword;
+                    # a bound spelled ``None`` is absent, not an operand.
+                    or (
+                        operation == "clamp"
+                        and str(role).casefold() in {"kw:min", "kw:max"}
+                        and not (
+                            str(graph.G.nodes[int(parent)].get("type"))
+                            in {"Constant", "Const", "const"}
+                            and graph.G.nodes[int(parent)].get("constant")
+                            is None
+                            and (
+                                graph.G.nodes[int(parent)].get("attributes")
+                                or {}
+                            ).get("value") is None
+                        )
+                    )
                 )
                 and int(parent) in graph.G
             )
@@ -30031,6 +30596,27 @@ def _tensor_descriptor_rule(
                 ).get("identity") == "builtins.sum"
             )
             builtin_sum_start = None
+            # Program: ``AbstractTensor.argmax(m.to(dtype="int64")).item()``
+            # in a loop (scratch nz/c07).  Wrong record: the static form has
+            # no receiver role -- its tensor is ``arg:0`` -- so this law found
+            # no source, the result had no descriptor, and the region's value
+            # records had no dtype for it.  Rule: with no receiver role the
+            # static call's ``arg:0`` is the reduced tensor (and is then not
+            # a positional axis below).
+            static_form = bool(
+                source_id is None and not builtin_sum
+                and any(
+                    str(role).casefold() == "arg:0"
+                    for _parent, role in data.get("parents") or ()
+                )
+            )
+            if static_form:
+                source_id = next((
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role).casefold() == "arg:0"
+                    and int(parent) in graph.G
+                ), None)
             if source_id is None and builtin_sum:
                 # Program: ``sum(i * k for i in range(6))``.  Wrong record:
                 # the builtin's iterable is its ``arg:0`` (not a receiver
@@ -30069,7 +30655,7 @@ def _tensor_descriptor_rule(
             if source is not None:
                 attributes = data.get("attributes") or {}
                 axis = attributes.get("axis", attributes.get("dim"))
-                if axis is None:
+                if axis is None and not static_form:
                     # ``x.sum(0)``: the reduction axis is the first positional
                     # argument (``AbstractTensor.sum(self, dim, keepdim)``),
                     # read as the literal its node carries -- the same
@@ -30237,9 +30823,27 @@ def _tensor_descriptor_rule(
                         source_expression
                     )
                     if aggregate_shape is not None:
+                        # Program: ``AbstractTensor.tensor([(0, 1), ...],
+                        # dtype="int64")`` (YoungMan ``edge_pairs``; scratch
+                        # n7).  Wrong record: this branch stated float64 for
+                        # every authored literal, so the int64 edge table
+                        # crossed the call boundary as float64.  Rule: the
+                        # exact ``dtype=`` argument names the element class,
+                        # read as ``zeros``/``arange`` read it; float64
+                        # remains the class of an unnamed literal.
+                        named_dtype = next((
+                            named
+                            for parent, role in data.get("parents") or ()
+                            if str(role).casefold() == "kw:dtype"
+                            and int(parent) in graph.G
+                            for named in (
+                                _dtype_argument_name(graph, int(parent), seen),
+                            )
+                            if named is not None
+                        ), None)
                         return {
                             "shape": tuple(map(int, aggregate_shape)),
-                            "dtype": "float64",
+                            "dtype": named_dtype or "float64",
                             "rank": len(aggregate_shape),
                         }
                 from .planner_concordance_posts import materialized_sequence_row_dtype
@@ -30338,9 +30942,8 @@ def _tensor_descriptor_rule(
                     if selected_dtype is not None:
                         return {**normalized, "dtype": selected_dtype}
                     return normalized
-        if operation in {
-            "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
-            "tanh", "clone", "copy", "identity", "real", "imag", "conj",
+        if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
+            "clone", "copy", "identity", "real", "imag", "conj",
             # A prefix scan is not a reduction: it emits one element per
             # input element, so it keeps its operand's shape exactly.  With
             # no rule here it answered nothing, its result was never proven,
@@ -30360,7 +30963,13 @@ def _tensor_descriptor_rule(
                 and int(parent) in graph.G
             )
             if len(parents) == 1:
-                return _tensor_descriptor(graph, parents[0], seen)
+                inherited = _tensor_descriptor(graph, parents[0], seen)
+                if (
+                    inherited is not None
+                    and operation in _ELEMENTWISE_UNARY_PREDICATE_OPERATIONS
+                ):
+                    return {**inherited, "dtype": "bool"}
+                return inherited
         if operation == "cast_like":
             # ``value.cast_like(reference)`` keeps the VALUE's extents and
             # takes the REFERENCE's dtype.  Neither operand is optional: with
@@ -34169,9 +34778,9 @@ def _fold_callsite_structural_values(
                     )
                 )
                 and (
-                    operation in {
-                        "neg", "abs", "sin", "cos", "tan", "exp", "log",
-                        "sqrt", "tanh", "clone", "copy", "identity", "indexedstore",
+                    operation in _ELEMENTWISE_UNARY_OPERATIONS
+                    or operation in {
+                        "clone", "copy", "identity", "indexedstore",
                         "index_set", "setitem", "indexed", "getitem",
                         "subscript", "real", "imag", "conj",
                     }

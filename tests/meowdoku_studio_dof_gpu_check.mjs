@@ -26,3 +26,5 @@ document.getElementById('run').onclick=()=>{try{
  canvas.width=256;canvas.height=128;pixels(.002);canvas.width=384;canvas.height=192;pixels(.006);
  const ext=gl.getExtension('WEBGL_debug_renderer_info');out.textContent=JSON.stringify({passed:true,renderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),statistics,blueLeak,receipt:wide.receipt,resize:true,cancel:true,glErrors:0},null,2);
  }catch(error){out.textContent=error.stack;}};
+
+export {pixels};

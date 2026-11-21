@@ -128,7 +128,7 @@ def test_the_export_bakes_one_atlas_cell_per_animal_from_the_emoji_font(tmp_path
     kinds = we.emoji_kinds()
     names = [k["name"] for k in kinds]
     assert len(set(names)) == len(names) <= 16
-    assert {"frog", "cat", "fox", "owl", "panda", "rabbit", "bear", "dog", "snail", "bat", "wolf"} <= set(names)
+    assert {"frog", "cat", "fox", "owl", "panda", "rabbit", "bear", "dog", "snail", "bat", "wolf", "llama"} <= set(names)
     assert all(k["mesh"] == f"emoji_{k['name']}" for k in kinds)
     atlas, meta = we.bake_emoji_atlas(kinds[:5], cell=64, cols=3)
     assert atlas.shape == (128, 192, 4) and meta["rows"] == 2 and meta["size"] == [192, 128]

@@ -717,16 +717,24 @@ def _post_callsite_activation(
 
 
 def _control_specialization_scope(graph: Any) -> tuple:
-    """The deciding graph's own read scope: one per callsite copy."""
+    """The deciding graph's own read scope: one per callsite copy.
 
-    scope = graph.G.graph.get("lexical_read_scope") if hasattr(graph, "G") else (
-        getattr(graph, "graph", {}) or {}
-    ).get("lexical_read_scope")
+    Program: ``if True: ...`` in ``root`` (scratch iftrue/c1).  Wrong record:
+    the structural fold also decides controls on the deployment's synthetic
+    wrapper graph, which has no ``lexical_read_scope``, and the key refused
+    there.  Rule: a graph with no read scope is keyed by its own numeric scope
+    (``_source_numeric_scope``: the authored identity, or the book-minted
+    synthetic scope) -- still one key per deciding graph.
+    """
+
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+
+    target = graph.G if hasattr(graph, "G") else graph
+    scope = (getattr(target, "graph", {}) or {}).get("lexical_read_scope")
     if scope is None:
-        raise ValueError(
-            "source_control_specialization_concordance: the deciding graph "
-            "has no lexical_read_scope to key its decision by"
-        )
+        return tuple(_source_numeric_scope(target)) if isinstance(
+            _source_numeric_scope(target), tuple,
+        ) else (_source_numeric_scope(target),)
     return tuple(scope)
 
 

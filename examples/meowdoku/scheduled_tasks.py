@@ -43,7 +43,8 @@ SYSTEM_DISPLAY_NAME = "Nodus"
 USERLIST_ENGINE_ID = 7203
 # Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
 PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean",
-                         "core.index"),
+                         "core.index", "hosted.dispatch", "dev.follow", "loans.refresh",
+                         "stable.candidate", "stable.follow"),
                 "userlist": ("identity.search", "identity.represent")}
 
 
@@ -91,13 +92,19 @@ def befriend_everyone(accounts_db, system_username, *, messaging) -> str:
 
 def broadcast(accounts_db, system_username, request, *, messaging, userlist=None) -> str:
     """One system event to an audience, as messages from the system account.  The request carries ``text``, and
-    either ``audience`` (admin | everyone) or ``terms`` (search terms of the user list), and optionally ``msg_type``
-    and ``subject`` ({kind, ref}).  The audience is found by searching the user list (``find_identities``); each
+    either ``audience`` (admin | everyone), ``terms`` (search terms of the user list) or ``usernames`` (exactly those
+    accounts, each found by identity_tools.represent: a search term matches parts of names), and optionally
+    ``msg_type`` and ``subject`` ({kind, ref}).  The audience is found by searching the user list (``find_identities``); each
     identity found is made a contact of the system (one that blocked it is skipped) and told.  Returns the sentence."""
     text, audience = request.get("text"), request.get("audience", "admin")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("a broadcast needs text")
-    if "terms" in request:
+    if "usernames" in request:
+        names = request["usernames"]
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) and n for n in names):
+            raise ValueError("usernames must be a list of account names")
+        terms, audience = None, "named"
+    elif "terms" in request:
         terms, audience = request["terms"], "matching"
     elif audience in AUDIENCE_TERMS:
         terms = AUDIENCE_TERMS[audience]
@@ -107,7 +114,13 @@ def broadcast(accounts_db, system_username, request, *, messaging, userlist=None
     sent, skipped = 0, 0
     try:
         system_id = _system(db, system_username)
-        identities, how = find_identities(db, terms, userlist)
+        if terms is None:                        # named accounts: each one exactly, never a partial match
+            from meowdoku import identity_tools
+            found = [identity_tools.represent(db, name) for name in request["usernames"]]
+            identities, how = [i for i in found if i is not None], "by name"
+            skipped += len(found) - len(identities)
+        else:
+            identities, how = find_identities(db, terms, userlist)
         for identity in identities:
             user_id = int(identity["identity"].split(":", 1)[1])
             if user_id == system_id:
@@ -178,15 +191,56 @@ def load_cron_host(nodus_tools):
     return sys.modules[name]
 
 
+def dispatch_hosted_agents(accounts_db, system_username, agent_names, *, messaging):
+    """Send a room assignment as Nodus control data; the agent never trains on it."""
+    from meowdoku import chat_rooms, schema_version
+    db = messaging.connect(accounts_db)
+    try:
+        schema_version.declare(db, "hosted_dispatch", 1)
+        db.execute("CREATE TABLE IF NOT EXISTS hosted_dispatch_cursor "
+                   "(agent_id INTEGER PRIMARY KEY, room TEXT NOT NULL, updated REAL NOT NULL)")
+        chat_rooms.ensure(db)
+        system_id = _system(db, system_username)
+        sent = []
+        for name in agent_names:
+            row = db.execute("SELECT id,username FROM users WHERE username=? COLLATE NOCASE", (name,)).fetchone()
+            if row is None or row["id"] == system_id:
+                continue
+            agent_id, canonical = row["id"], row["username"]
+            available = sorted(r["room"] for r in chat_rooms.rooms_for(db, agent_id)
+                               if canonical in r.get("hosted_agents", []))
+            if not available:
+                continue
+            old = db.execute("SELECT room FROM hosted_dispatch_cursor WHERE agent_id=?", (agent_id,)).fetchone()
+            room = available[(available.index(old[0]) + 1) % len(available)] if old and old[0] in available else available[0]
+            messaging.befriend_all(db, system_id, [agent_id])
+            messaging.send(db, system_id, canonical, f"hosted-dispatch: visit {room}",
+                           subject={"kind": "control", "ref": room}, msg_type="status")
+            db.execute("INSERT INTO hosted_dispatch_cursor(agent_id,room,updated) VALUES(?,?,?) "
+                       "ON CONFLICT(agent_id) DO UPDATE SET room=excluded.room,updated=excluded.updated",
+                       (agent_id, room, time.time()))
+            sent.append(f"{canonical}:{room}")
+        return sent
+    finally:
+        db.close()
+
+
 def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None,
-             branches=None) -> dict:
+             branches=None, dev=None, loans=None, stable=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
 
     `system` is `{"accounts_db", "username", "module", "userlist"?}` (module = messaging): the account system events
     are sent as, and optionally the userlist table to ask for an audience ({"port", "jobs_dir", "native", "task_request"}).
     `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "text_only", "module"}` (module = state_backup).
     `branches` is `{"policy", "accounts_db", "module"}` (module = branch_gate): reviewed changes are landed and merged
-    branches cleaned by that module's rules; while the policy's `apply` is false both tasks only report."""
+    branches cleaned by that module's rules; while the policy's `apply` is false both tasks only report.
+    `dev` is `{"instances", "instance", "module"}` (module = dev_follow), with `branches`: dev.follow moves that one
+    instance's declared dev trees to what landed and asks for its restart (Research case 8bbe0de7, Stage 1).
+    `loans` is `{"instances", "module"}` (module = branch_servers), with `branches`: loans.refresh exports each branch
+    loan's pages, restarts it after a new commit, ends closed loans and idles unused ones (Stage 3).
+    `stable` is `{"instances", "instance", "dev", "module"}` (module = stable_release), with `branches`: stable.candidate
+    records what dev runs as a candidate an admin may sign off, and stable.follow moves stable to what was signed off
+    and asks for its counted-down restart (Stage 2)."""
     table = {}
     if branches is not None:
         def branch_task(which):
@@ -199,14 +253,17 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                     if which == "clean":         # the worker performs the cleaning as the policy's cleanup account, and
                         acting = {"apply": bool(policy["apply"]), "actor": policy["cleaner"]}    # as no other
                         done = gate.clean_worktrees(policy, db, **acting) + gate.clean(policy, db, **acting)
-                    else:
-                        done = getattr(gate, which)(policy, db, apply=bool(policy["apply"]))
+                    else:                # a one-off request may name the reviews to land (the landing queue's "land now")
+                        only = request.get("reviews") if isinstance(request, dict) else None
+                        only = [str(r) for r in only] if isinstance(only, list) and only else None
+                        trigger = "request" if isinstance(request, dict) and request.get("trigger") == "request" else "schedule"
+                        done = gate.land(policy, db, apply=bool(policy["apply"]), only=only, trigger=trigger)
                 finally:
                     db.close()
                 counts = {}
                 for entry in done:
                     counts[entry["action"]] = counts.get(entry["action"], 0) + 1
-                acted = any(entry["action"] in ("landed", "removed") for entry in done)
+                acted = any(entry["action"] in ("landed", "removed", "contained") for entry in done)
                 said = ", ".join(f"{count} {action}" for action, count in sorted(counts.items())) or "nothing to do"
                 if which == "clean" and any(entry["action"] == "removed" for entry in done):
                     try:                         # the record of what was removed goes into Git's history as well as SQL
@@ -229,6 +286,75 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
             made = file_index.build(policy, Path(branches["accounts_db"]).with_name("file_index.db"), actor=policy["cleaner"])
             return cron_host.DONE, f"{made['entries']} entries indexed in {made['seconds']} s", made
         table["core.index"] = core_index
+        if dev is not None:
+            def dev_follow(request):
+                import sqlite3
+                policy = branches["module"].load_policy(branches["policy"])
+                db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                try:
+                    row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (policy["cleaner"],)).fetchone()
+                    if row is None:
+                        return cron_host.UNCHANGED, f"the cleanup account {policy['cleaner']!r} does not exist", None
+                    done = dev["module"].follow(instances_path=dev["instances"], instance=dev["instance"], policy=policy, db=db,
+                                                requester=(row[0], policy["cleaner"]), apply=bool(policy["apply"]))
+                finally:
+                    db.close()
+                moved = [t for t in done["trees"] if t["action"] in ("moved", "would move")]
+                said = "; ".join(f"{t.get('repository', '?')} {t['action']} ({t['reason']})" for t in done["trees"])
+                for key in ("pages", "restart"):
+                    if done.get(key):
+                        said += f"; {done[key]}"
+                return (cron_host.DONE if moved else cron_host.UNCHANGED), said, done
+            table["dev.follow"] = dev_follow
+        if loans is not None:
+            def loans_refresh(request):
+                import sqlite3
+                module = loans["module"]
+                cfg = module.config(loans["instances"])
+                if cfg is None:
+                    return cron_host.UNCHANGED, "instances.json has no loans block: no branch servers are lent", None
+                policy = branches["module"].load_policy(branches["policy"])
+                db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                try:
+                    from meowdoku import central_checkout
+                    central_checkout.ensure(db)
+                    row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (policy["cleaner"],)).fetchone()
+                    if row is None:
+                        return cron_host.UNCHANGED, f"the cleanup account {policy['cleaner']!r} does not exist", None
+                    done = module.refresh(db, cfg, requester=(row[0], policy["cleaner"]))
+                finally:
+                    db.close()
+                said = "; ".join(f"{d['instance']} {d['action']}" for d in done) or "no loan changed"
+                return (cron_host.DONE if done else cron_host.UNCHANGED), said, done
+            table["loans.refresh"] = loans_refresh
+        if stable is not None:
+            def stable_task(which):
+                def task(request):
+                    import sqlite3
+                    module = stable["module"]
+                    policy = branches["module"].load_policy(branches["policy"])
+                    db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                    try:
+                        if which == "candidate":
+                            made = module.propose(db, instances_path=stable["instances"], stable=stable["instance"], dev=stable["dev"])
+                            said = "; ".join(f"candidate {m['id']}: {m['repository']} {m['commit'][:12]} ({m['commits']} commits)"
+                                             for m in made) or "stable already runs what dev runs"
+                            return (cron_host.DONE if made else cron_host.UNCHANGED), said, made
+                        row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (policy["cleaner"],)).fetchone()
+                        if row is None:
+                            return cron_host.UNCHANGED, f"the cleanup account {policy['cleaner']!r} does not exist", None
+                        done = module.follow(db, instances_path=stable["instances"], stable=stable["instance"], policy=policy,
+                                             requester=(row[0], policy["cleaner"]), apply=bool(policy["apply"]))
+                    finally:
+                        db.close()
+                    moved = [t for t in done["trees"] if t["action"] in ("moved", "would move")]
+                    said = "; ".join(f"{t['repository']} {t['action']} ({t['reason']})" for t in done["trees"])
+                    if done.get("restart"):
+                        said += "; " + done["restart"]
+                    return (cron_host.DONE if moved else cron_host.UNCHANGED), said, done
+                return task
+            table["stable.candidate"] = stable_task("candidate")
+            table["stable.follow"] = stable_task("follow")
         table["reviews.land"] = branch_task("land")
         table["branches.clean"] = branch_task("clean")
     if web_dir is not None and manual is not None:
@@ -244,6 +370,13 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                                                 text_only=bool(backup.get("text_only")))
         table["state.backup"] = state_backup_task
     if system is not None:
+        if system.get("hosted_agents"):
+            def hosted_dispatch(request):
+                sent = dispatch_hosted_agents(system["accounts_db"], system["username"], system["hosted_agents"],
+                                              messaging=system["module"])
+                return (cron_host.DONE if sent else cron_host.UNCHANGED), ", ".join(sent) or "no enrolled hosted agents"
+            table["hosted.dispatch"] = hosted_dispatch
+
         def system_broadcast(request):
             return cron_host.DONE, broadcast(system["accounts_db"], system["username"], request, messaging=system["module"],
                                              userlist=system.get("userlist"))

@@ -6,6 +6,7 @@ This module only bounds live sessions and uses the site's normal game cookie.
 from __future__ import annotations
 
 from collections import OrderedDict
+import importlib.util
 from pathlib import Path
 import sys
 import threading
@@ -25,13 +26,19 @@ class WaveArenaService:
 
     def _type(self):
         if self.wave_type is None:
-            if not (self.spectral_root / "wave_arena_web_demo.py").is_file():
+            source = self.spectral_root / "wave_arena_web_demo.py"
+            if not source.is_file():
                 raise RuntimeError("Spectral T4 wave arena source is unavailable")
             root = str(self.spectral_root)
             if root not in sys.path:
                 sys.path.insert(0, root)
-            from wave_arena_web_demo import WaveArena
-            self.wave_type = WaveArena
+            spec = importlib.util.spec_from_file_location(
+                "spectral_wave_arena_site", source)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("Spectral T4 wave arena source cannot be loaded")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.wave_type = module.WaveArena
         return self.wave_type
 
     def command(self, session: str, payload: dict | None = None) -> dict:

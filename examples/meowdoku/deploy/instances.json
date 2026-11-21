@@ -1,7 +1,12 @@
 {
   "supervisor_python": "C:/dev/Powershell/srv/python/python.exe",
+  "firewall": [
+    {"name": "apache", "protocol": "TCP", "port": 443, "program": "C:/Apache24/bin/httpd.exe"},
+    {"name": "apache", "protocol": "TCP", "port": 80, "program": "C:/Apache24/bin/httpd.exe"}
+  ],
   "restart_account": "svc-pale-horse",
   "restart_account_display_name": "Pale Horse",
+  "hosted_tasks": ["SpeakToMe hosted llama", "SpeakToMe gemma"],
   "instances": [
     {
       "name": "meowdoku-a",
@@ -16,12 +21,16 @@
         "build/meowdoku/tls/cert.pem",
         "--tls-key",
         "build/meowdoku/tls/key.pem",
+        "--condition-dir",
+        "C:/dev/Powershell/srv/state/condition",
         "--retain-fountain-products",
         "C:/dev/Powershell/turing/build/dot-retained-fountain-20261109/fountain-receipt.json",
         "--studio-assets",
         "C:/dev/Powershell/srv/state/content/studio_agent/assets.json",
         "--studio-defaults",
         "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json",
+        "--studio-node",
+        "C:/nvm4w/nodejs/node.exe",
         "--fabric-row-host",
         "C:/dev/Powershell/srv/state/products/fabric-row/spring_network_nodus_host.exe",
         "--fabric-row-plugin",
@@ -29,13 +38,24 @@
         "--fabric-core-dir",
         "C:/dev/Powershell/srv/state/products/fabric-row",
         "--fabric-udp-port",
-        "48768"
+        "48768",
+        "--nodus-ui",
+        "nodus-messenger:47614",
+        "--nodus-ui",
+        "nodus-training:47620"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
       "studio_prefix": "studio.product",
+      "system_events": true,
+      "firewall": [
+        {"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}
+      ],
       "env": {
+        "SPEAKTOME_AGENT_DAYS": "C:/Users/alber/AgentDays",
+        "SPEAKTOME_PUBLIC_ORIGIN": "https://stichka.duckdns.org:8766",
+        "SPEAKTOME_MCP_ALLOWED_ORIGINS": "https://chatgpt.com",
         "GIT_CONFIG_COUNT": "5",
         "GIT_CONFIG_KEY_0": "safe.directory",
         "GIT_CONFIG_VALUE_0": "C:/dev/Powershell",
@@ -64,6 +84,8 @@
         "build/meowdoku/tls/cert.pem",
         "--tls-key",
         "build/meowdoku/tls/key.pem",
+        "--condition-dir",
+        "C:/dev/Powershell/srv/state/condition",
         "--web-dir",
         "C:/dev/Powershell/srv/state-dev/web",
         "--require-cap",
@@ -78,7 +100,11 @@
         "--fabric-core-dir",
         "C:/dev/Powershell/srv/state/products/fabric-row",
         "--fabric-udp-port",
-        "48771"
+        "48771",
+        "--nodus-ui",
+        "nodus-messenger:47614",
+        "--nodus-ui",
+        "nodus-training:47620"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
@@ -137,6 +163,96 @@
       "python": "C:/dev/Powershell/srv/python/python.exe"
     },
     {
+      "name": "nodus-ui-mirror",
+      "kind": "command",
+      "port": 47614,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-ui-mirror",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "C:/dev/Powershell/nodus/demo_canvas_tables.py",
+        "--mode", "server",
+        "--host", "127.0.0.1",
+        "--port", "47614",
+        "--attach-console", "127.0.0.1:47612",
+        "--console-token-file", "C:/dev/Powershell/srv/state/run/console/nodus-messenger.console.secret"
+      ],
+      "nodus": {
+        "path_prepend": [
+          "C:/dev/Powershell/srv/python/Lib/site-packages/torch/lib",
+          "C:/dev/Powershell/nodus/build-service/Release"
+        ]
+      },
+      "env": {
+        "CANVAS_TABLES_LIB": "C:/dev/Powershell/nodus/build-service/Release/canvas_tables.dll"
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "nodus-training",
+      "autostart": false,
+      "kind": "nodus",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-training",
+      "args": [
+        "--history-file", "C:/dev/Powershell/srv/state/content/paper_training/history.json",
+        "--output", "C:/dev/Powershell/srv/state/products/paper-training",
+        "--turing-root", "C:/dev/Powershell/turing",
+        "--native-nodus-root", "C:/dev/Powershell/srv/state/products/nodus-training-runtime",
+        "--publish-db", "C:/dev/Powershell/srv/state/sql/paper_arena.sqlite",
+        "--worker", "nodus-training",
+        "--autosave-seconds", "60",
+        "--validation-epochs", "1000",
+        "--market-owner", "admin",
+        "--accounts-db", "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--secrets-dir", "C:/dev/Powershell/srv/state/secrets",
+        "--market-poll-seconds", "60"
+      ],
+      "leases": [],
+      "nodus": {
+        "tool": "C:/dev/Powershell/nodus/tools/train_aapl_continuous.py",
+        "canvas": "C:/dev/Powershell/srv/state/content/paper_training/training.canvas",
+        "create_canvas": true,
+        "rate": 60,
+        "console_port": 47616,
+        "dll": "C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release/nodus_headless.dll",
+        "path_prepend": ["C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release"]
+      },
+      "env": {
+        "NODUS_TENSOR_CORE": "C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release/nodus_tensor_core.dll"
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "nodus-training-ui-mirror",
+      "autostart": false,
+      "kind": "command",
+      "port": 47620,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-training-ui-mirror",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "C:/dev/Powershell/nodus/demo_canvas_tables.py",
+        "--mode", "server",
+        "--host", "127.0.0.1",
+        "--port", "47620",
+        "--attach-console", "127.0.0.1:47616",
+        "--console-token-file", "C:/dev/Powershell/srv/state/run/console/nodus-training.console.secret",
+        "--attach-wait", "240"
+      ],
+      "nodus": {"path_prepend": ["C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release"]},
+      "env": {
+        "CANVAS_TABLES_LIB": "C:/dev/Powershell/srv/state/products/nodus-training-runtime/build/Release/canvas_tables.dll"
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
       "name": "task-worker",
       "kind": "command",
       "port": null,
@@ -164,14 +280,21 @@
         "C:/dev/Powershell/srv/state/sql/accounts.db",
         "--system-account",
         "svc-nodus-messenger",
+        "--hosted-agents",
+        "llama",
         "--userlist-jobs-dir",
         "C:/dev/Powershell/srv/state/jobs/userlist",
         "--branch-policy",
         "C:/dev/Powershell/turing/examples/meowdoku/deploy/branch_policy.json"
       ],
       "userlist_prefix": "userlist",
+      "env_files": {
+        "GH_TOKEN": "C:/dev/Powershell/srv/state/secrets/github/landing.token"
+      },
       "env": {
-        "GIT_CONFIG_COUNT": "5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "8",
         "GIT_CONFIG_KEY_0": "safe.directory",
         "GIT_CONFIG_VALUE_0": "C:/dev/Powershell",
         "GIT_CONFIG_KEY_1": "safe.directory",
@@ -181,7 +304,13 @@
         "GIT_CONFIG_KEY_3": "safe.directory",
         "GIT_CONFIG_VALUE_3": "C:/dev/Powershell/speaktome",
         "GIT_CONFIG_KEY_4": "safe.directory",
-        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer"
+        "GIT_CONFIG_VALUE_4": "C:/dev/Powershell/spectral-analyzer",
+        "GIT_CONFIG_KEY_5": "credential.helper",
+        "GIT_CONFIG_VALUE_5": "",
+        "GIT_CONFIG_KEY_6": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_6": "!gh auth git-credential",
+        "GIT_CONFIG_KEY_7": "url.https://github.com/.insteadOf",
+        "GIT_CONFIG_VALUE_7": "git@github.com:"
       }
     },
     {
@@ -191,11 +320,28 @@
       "route": "",
       "bind": "0.0.0.0",
       "account": "svc-udp-router",
+      "firewall": [
+        {"protocol": "UDP", "port": "47700-47763", "program": "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe"}
+      ],
       "leases": [],
       "args": [
         "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
         "0.0.0.0",
         "47699"
+      ]
+    },
+    {
+      "name": "udp-router-radio",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-radio-router",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
+        "127.0.0.1",
+        "47698"
       ]
     },
     {
@@ -213,6 +359,25 @@
         "C:/dev/Powershell/srv/state/sql/accounts.db",
         "--config",
         "C:/dev/Powershell/turing/examples/meowdoku/deploy/relay.json"
+      ]
+    },
+    {
+      "name": "link-broker",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-link-broker",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/link_broker.py",
+        "--state-dir",
+        "C:/dev/Powershell/srv/state",
+        "--router",
+        "127.0.0.1:47699",
+        "--port",
+        "47702"
       ]
     }
   ],

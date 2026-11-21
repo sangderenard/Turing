@@ -56,6 +56,21 @@ class MarketDataTest(unittest.TestCase):
         self.assertEqual(result["book_note"], "book unavailable")
         self.assertIn("BTC/USD", result["bars"])
 
+    def test_latest_prices_share_one_cached_mark_set(self):
+        calls = []
+
+        def fetch(path, params, keys):
+            calls.append((path, params["symbols"]))
+            symbols = params["symbols"].split(",")
+            return {"bars": {symbol: {"c": 100} for symbol in symbols}}, {}
+
+        with patch.object(market_data, "_fetch", side_effect=fetch):
+            first = market_data.latest_prices(self.secrets, 1)
+            self.assertEqual(first, market_data.latest_prices(self.secrets, 1))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], "SPY,QQQ,IWM,AAPL,MSFT,NVDA,TSLA")
+        self.assertEqual(first["BTC/USD"], 100)
+
     def test_history_collects_later_symbol_and_crypto_pages(self):
         calls = []
 

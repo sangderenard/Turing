@@ -3007,6 +3007,41 @@ def _int64_binary_kernel(
     )
 
 
+_FLOAT_KERNEL_DTYPES = frozenset({
+    "float64", "f64", "double", "float", "float32", "f32", "float16", "f16",
+})
+
+
+def _reference_kernel_lacks_dtype(
+    operation: str, result: Any, operands: Any, *, owner: Any, book: Any,
+) -> bool:
+    """Whether no repository reference kernel has this elementwise op's dtype.
+
+    The reference's elementwise kernels are double kernels (``binary_double``,
+    ``unary_double``); the only other is ``binary_int64`` for int64
+    add/sub/mul/mod (``_int64_binary_kernel``).  Program: ``a & b`` and
+    ``a << b`` on int64 tensors, ``a < b`` (a bool result) and ``a & b`` on
+    bool tensors.  Wrong record: the op name alone selected ``binary_double``,
+    the int64 lanes came back as double bit patterns (1 as 4607182418800017408)
+    and the bool results were stored eight bytes wide (2026-11-18, case
+    6393486c).  Rule: the kernel's dtype is part of its identity.  A double
+    kernel stands for the op only when its result and every data operand are
+    float; otherwise (and outside the int64 kernel) the op stays the
+    instruction itself, which each backend's elementwise span loop spells on
+    its own dtype, as int64 neg/abs already do.
+    """
+
+    operands = list(operands or ())
+    if all(
+        str(value.dtype or "").casefold() in _FLOAT_KERNEL_DTYPES
+        for value in (result, *operands)
+    ):
+        return False
+    return not _int64_binary_kernel(
+        operation, result, operands, owner=owner, book=book,
+    )
+
+
 def _int64_lane_stays_elementwise(
     instruction: Any, operation: str, result: Any, operands: Any,
     *, owner: Any, book: Any,
@@ -7075,9 +7110,24 @@ def lower_tensor_calls_to_repository_ssa(
                 # int64 storage. A missing input proof remains missing for
                 # the adapter/physical-call gate to resolve or refuse.
                 is_output = position == output_argument or position == len(arguments)
+                # An input stored in a narrower lossless form of the formal's
+                # (bool, int32 or float32 into float64) is converted at the
+                # kernel boundary by the call-input adapter
+                # (ssa_call_input_adapters), which already does this for a
+                # read-only span actual.  Program: ``AbstractTensor.where(mask,
+                # b, c)`` with a bool program feed: the mask's ProgramABI bool
+                # was refused here before the adapter could convert it
+                # (2026-11-18, case 6393486c).  Any other mismatch, such as a
+                # float64 buffer into an int64 formal, stays refused.
+                adapter_converts = (
+                    expected_physical == "float64"
+                    and current is not None
+                    and current.physical_dtype in {"bool", "int32", "float32"}
+                )
                 if (not is_output and current is not None
                         and current.physical_dtype is not None
-                        and current.physical_dtype != expected_physical):
+                        and current.physical_dtype != expected_physical
+                        and not adapter_converts):
                     raise ValueError(
                         "selected tensor kernel input physical dtype conflicts with source"
                     )
@@ -12346,6 +12396,13 @@ def lower_tensor_calls_to_repository_ssa(
                                 book=_opcode_book,
                                 physical={
                                     "physical_dtype": (
+                                        str(result.dtype) if _reference_kernel_lacks_dtype(
+                                            operation, result, data_args,
+                                            owner=_opcode_owner, book=_opcode_book,
+                                        ) and not _int64_lane_stays_elementwise(
+                                            instruction, operation, result, data_args,
+                                            owner=_opcode_owner, book=_opcode_book,
+                                        ) else
                                         "int64" if _int64_lane_stays_elementwise(
                                             instruction, operation, result, data_args,
                                             owner=_opcode_owner, book=_opcode_book,
@@ -12441,11 +12498,37 @@ def lower_tensor_calls_to_repository_ssa(
                 # before any descriptor is created.  Doing this only while
                 # constructing the eventual Call is too late: byte_size has
                 # already been frozen as one byte per semantic bool.
+                _stays_instruction = (
+                    opcode_contract is not None
+                    and lowering_at[0] is not None
+                    and _reference_kernel_lacks_dtype(
+                        operation, result, data_args,
+                        owner=lowering_at[0], book=identity_book(module),
+                    )
+                )
+                # The stamp is for values this lowering mints (the result).  An
+                # operand whose storage its producer or the ProgramABI already
+                # posted keeps it; a call-input adapter converts it at the kernel
+                # boundary (ssa_call_input_adapters).  Program:
+                # ``AbstractTensor.where(mask, b, c)`` with a bool program feed:
+                # the stamp revised the feed's own row to float64 against its
+                # ProgramABI bool ("physical concordance disagreement ...
+                # 'float64' versus 'bool'", 2026-11-18, case 6393486c).
+                from .ssa_record_return_state import (
+                    posted_ssa_value_fact as _posted_operand_fact,
+                )
                 for value in (*data_args, result):
                     if (
-                        tuple(value.shape or ())
+                        not _stays_instruction
+                        and tuple(value.shape or ())
                         and str(value.dtype or "").casefold() in {"bool", "i1"}
                     ):
+                        if value is not result and lowering_at[0] is not None:
+                            _operand_fact = _posted_operand_fact(
+                                lowering_at[0], int(value.id), book=identity_book(module),
+                            )
+                            if _operand_fact is not None and _operand_fact.physical_dtype:
+                                continue
                         _post_double_backed_boolean(
                             lowering_at[0], value, module,
                         )
@@ -13236,7 +13319,10 @@ def lower_tensor_calls_to_repository_ssa(
                             fill_value, "float64"
                         )
                         prefix.append(scalar_def)
-                    elif operation in {"fill", "full"} and len(args) > 1:
+                    # ``full_like(tensor, fill_value)`` (creation.py) takes its fill
+                    # as the second operand, as ``full`` does; left out, a runtime
+                    # fill emitted nothing (2026-11-18, case 6393486c).
+                    elif operation in {"fill", "full", "full_like"} and len(args) > 1:
                         fill_operand = args[1]
                     if fill_operand is not None and count is not None:
                         emitted.append(call(
@@ -13321,6 +13407,41 @@ def lower_tensor_calls_to_repository_ssa(
                         posted_ssa_value_fact as _copy_source_fact,
                     )
                     copy_source_fact = _copy_source_fact(function, source.id, book=book)
+                    # The cast kernel's dtypes are part of its identity, as for
+                    # elementwise ops (_reference_kernel_lacks_dtype).  The
+                    # reference casts read and write double storage, plus the
+                    # int64 kernels.  Program: ``a.to_dtype('uint64')`` on a
+                    # uint32 tensor, ``a.to_dtype('int64')`` on int32 and
+                    # ``a.to_dtype('float64')`` on uint64.  Wrong record: the
+                    # substring match above picked a double kernel ("int" is
+                    # in "uint64"), so "storage types are immutable" refused
+                    # the uint32/uint64 operands (2026-11-18, case 6393486c).
+                    # Rule: a cast whose source is stored neither as float nor
+                    # as int64, or whose target is a narrower or unsigned
+                    # integer, stays the instruction, which the backend's cast
+                    # span loop emits on the real types.  Double-backed
+                    # logical values (a bool target, a float-stored source)
+                    # keep the reference kernels.
+                    _source_storage = str(
+                        (copy_source_fact.physical_dtype if copy_source_fact is not None
+                         and copy_source_fact.physical_dtype else None)
+                        or source.dtype or ""
+                    ).casefold()
+                    _native_integer = {
+                        "int8", "int16", "int32", "i32", "uint8", "uint16",
+                        "uint32", "uint64", "u32", "u64",
+                    }
+                    if operation == "to_dtype" and (
+                        dtype_hint in _native_integer
+                        or (
+                            _source_storage not in _FLOAT_KERNEL_DTYPES
+                            and _source_storage not in {"int64", "i64", "long"}
+                            and _source_storage not in {"bool", "i1"}
+                        )
+                    ):
+                        rewritten.extend(prefix)
+                        rewritten.append(instruction)
+                        continue
                     if (
                         operation == "to_dtype"
                         and dtype_hint in {"int64", "long"}
@@ -15059,6 +15180,25 @@ def lower_tensor_calls_to_repository_ssa(
                     )
 
                 elif operation == "stack" and data_args:
+                    # Program: ``AbstractTensor.stack([a, b], dim=0)``.  As for
+                    # ``cat`` below, the region carve passes ``dim`` as a
+                    # trailing integer scalar formal, so it sat in
+                    # ``data_args``, failed the equal-shape test and left
+                    # ``stack`` unlowered (2026-11-18, case 6393486c).  Stack
+                    # (unlike cat) accepts 0-d operands, so the trailing
+                    # operand is the axis only when it is a 0-d integer and
+                    # every other operand is a shaped tensor of one shape.
+                    if len(data_args) > 1:
+                        *stacked, trailing = data_args
+                        stacked_shapes = {tuple(value.shape or ()) for value in stacked}
+                        if (
+                            tuple(trailing.shape or ()) == ()
+                            and str(trailing.dtype or "").startswith(("int", "uint"))
+                            and len(stacked_shapes) == 1
+                            and next(iter(stacked_shapes)) != ()
+                        ):
+                            data_args = list(stacked)
+                            source = data_args[0]
                     operand_shape = tuple(source.shape or ())
                     statically_known = (
                         bool(operand_shape)
@@ -15103,6 +15243,78 @@ def lower_tensor_calls_to_repository_ssa(
                                 rank_value, dim_value, result,
                             ],
                             result, instruction, output_argument=5,
+                        ))
+
+                elif operation == "pad" and source is not None:
+                    # ``a.pad(pad=(1, 1), value=0, mode="constant")``: the
+                    # reference ``pad_double_nd(input, output, shape,
+                    # new_shape, left_pad, dims, value)``.  The pad tuple and
+                    # mode are the line's structural attributes (the graph
+                    # node's literal keywords; the planner projects
+                    # ``kw:mode`` onto ``mode``), read as ``cat`` reads its
+                    # ``dim``.  Extents follow AbstractTensor's convention
+                    # (``pad_extents``, the C backend's ``pad_``).
+                    from .glsl_deployment_strategy import pad_extents
+
+                    pad_spec = _attribute(instruction.attributes, "pad")
+                    pad_mode = _attribute(instruction.attributes, "mode")
+                    operand_shape = tuple(map(int, source.shape or ()))
+                    pad_refusal = None
+                    if pad_mode is not None and pad_mode != "constant":
+                        pad_refusal = f"pad has no admitted mode {pad_mode!r}"
+                    elif not isinstance(pad_spec, (tuple, list)):
+                        pad_refusal = "pad has no admitted non-constant pad tuple"
+                    elif not operand_shape:
+                        pad_refusal = "pad has no admitted operand without a static shape"
+                    roles = tuple(map(str, instruction.arg_roles or ()))
+                    value_operand = next((
+                        argument for argument, role in zip(args, roles)
+                        if role == "kw:value"
+                    ), None) if len(roles) == len(args) else None
+                    authored_value = _attribute(instruction.attributes, "value")
+                    pad_value_operand = None
+                    if pad_refusal is None:
+                        if value_operand is not None and int(value_operand.id) in constants:
+                            authored_value = constants[int(value_operand.id)]
+                        if isinstance(authored_value, (int, float)) and not isinstance(
+                            authored_value, bool,
+                        ):
+                            pad_value_operand, value_def = constant(
+                                float(authored_value), "float64",
+                            )
+                            prefix.append(value_def)
+                        elif value_operand is not None and str(
+                            value_operand.dtype or ""
+                        ) == "float64" and not tuple(value_operand.shape or ()):
+                            pad_value_operand = value_operand
+                        elif authored_value is None and value_operand is None:
+                            pad_value_operand, value_def = constant(0.0, "float64")
+                            prefix.append(value_def)
+                        else:
+                            pad_refusal = "pad has no admitted fill value operand"
+                    if pad_refusal is None:
+                        left, right = pad_extents(tuple(pad_spec), len(operand_shape))
+                        new_shape = tuple(
+                            extent + before + after
+                            for extent, before, after in zip(operand_shape, left, right)
+                        )
+                        result.shape = new_shape
+                        shape_value, shape_def = int_vector(operand_shape)
+                        new_shape_value, new_shape_def = int_vector(new_shape)
+                        left_value, left_def = int_vector(left)
+                        dims_value, dims_def = constant(len(operand_shape), "int32")
+                        prefix.extend((shape_def, new_shape_def, left_def, dims_def))
+                        emitted.append(call(
+                            "pad_double_nd",
+                            [
+                                source, result, shape_value, new_shape_value,
+                                left_value, dims_value, pad_value_operand,
+                            ],
+                            result, instruction, output_argument=1,
+                        ))
+                    else:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation, pad_refusal,
                         ))
 
                 elif operation in {"cat", "concat", "concatenate"} and data_args:
@@ -15680,6 +15892,21 @@ def lower_tensor_calls_to_repository_ssa(
                         post_unary_geometry(operation, source, result, unary_geometry)
                         if private_dynamic_result(result):
                             own_dynamic_tensor(result, unary_geometry[0][2], "int64", prefix)
+                    rewritten.extend(prefix)
+                    rewritten.append(instruction)
+                    continue
+
+                elif (
+                    c_tensor_opcode(operation) is not None
+                    and source is not None
+                    and _reference_kernel_lacks_dtype(
+                        operation, result, data_args, owner=function, book=book,
+                    )
+                ):
+                    # The op stays the instruction itself: no reference kernel
+                    # has its dtype (``_reference_kernel_lacks_dtype``).
+                    if unary_geometry is not None:
+                        post_unary_geometry(operation, source, result, unary_geometry)
                     rewritten.extend(prefix)
                     rewritten.append(instruction)
                     continue

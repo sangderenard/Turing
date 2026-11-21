@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent training arena</title><link rel="stylesheet" href="/pages.css">
+<style>
+body{margin:0;background:#10151d;color:#edf1f8;font:16px system-ui}.arena{max-width:1150px;margin:auto;padding:5rem 1rem 3rem}
+h1,h2,h3{margin:.2rem 0 .7rem}p{line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+.panel,.team,.receipt{background:#1a2330;border:1px solid #536070;border-radius:.6rem;padding:1rem;margin:.8rem 0}
+label{display:block;margin:.65rem 0}input,select,textarea,button{font:inherit}input,select,textarea{box-sizing:border-box;width:100%;padding:.55rem;background:#0c121b;color:inherit;border:1px solid #8795a8;border-radius:.3rem}textarea{min-height:6rem;resize:vertical}
+input[type=checkbox]{width:auto;margin-right:.4rem}button{background:#354a67;color:white;border:1px solid #8198b3;border-radius:.35rem;padding:.5rem .8rem;cursor:pointer;margin:.2rem}button:hover,button:focus-visible{background:#48688e}button:disabled{opacity:.5}.row{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}.row>*{flex:1}.row button{flex:0 auto}.muted{color:#bac7d7}pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer}.scores{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:.4rem}.scores span{background:#26354a;padding:.4rem;border-radius:.3rem}#status{min-height:1.5rem}@media(max-width:760px){.grid{grid-template-columns:1fr}.scores{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main class="arena">
+<h1>Agent training arena</h1><p>Give every team the same real ticket or Research case and one goal. Each team crafts a target system prompt and first message. A separate agent scores the target result and records demonstrated tests.</p>
+<p id="status" role="status"></p>
+<div class="grid"><section class="panel"><h2>One runnable task</h2>
+<label>Task category<select id="source-kind"><option value="ticket">Ticket → Research</option><option value="research">Research → Development</option></select></label>
+<label>Ticket or case<select id="source-select"><option value="">Choose a real source</option></select></label>
+<label>Source ID <input id="source-id" maxlength="128" required></label>
+<label>Shared goal <textarea id="goal" maxlength="16000" required placeholder="Describe the concrete result this task should produce."></textarea></label>
+<div class="row"><label>Target agent<select id="target"><option>codex</option><option>claude</option></select></label><label>Scoring agent<select id="judge"><option>claude</option><option>codex</option></select></label></div>
+<label><input id="target-stateful" type="checkbox" checked>Target instance is stateful</label><label><input id="training-mode" type="checkbox">Training mode: retain this run as scored training data</label>
+<div class="row"><label>Turn limit, seconds <input id="seconds" type="number" min="30" max="1800" value="600"></label><label>Model used (recorded) <input id="model" maxlength="160" placeholder="Record the actual model"></label></div>
+<label>Additional runtime metadata (JSON object, recorded) <textarea id="parameters" spellcheck="false">{}</textarea></label>
+</section><section class="panel"><h2>Teams</h2><p class="muted">Use one agent for both tasks, or give prompt crafting and communication to separate agents. Stateful is the default.</p>
+<div id="teams"></div><button id="add-team" type="button">Add team</button><button id="submit" type="button">Queue arena run</button>
+</section></div>
+<section class="panel"><div class="row"><h2>Runs and scores</h2><button id="refresh" type="button">Refresh</button></div><p class="muted">The operator's PowerShell arena coordinator must be running to claim queued tasks. Scores are 0–4 on understandability, actionability, completeness, experience demonstrated, and code elegance. Test evidence is shown separately.</p><div id="runs"></div><div id="detail"></div></section>
+</main><script type="module" src="/site-nav.js" data-site-nav="allow"></script><script type="module" src="/agent-training-arena.js"></script></body></html>

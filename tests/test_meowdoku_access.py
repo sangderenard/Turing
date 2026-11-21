@@ -78,7 +78,7 @@ def test_forwarding_headers_are_ignored():
 
 # ---------------------------------------------------------------- the policy
 def test_policy_defaults_and_overrides(tmp_path):
-    assert A.load_config(None)["policy"] == {"lan": "edit", "ip": "dev", "dns": "shader"}
+    assert A.load_config(None)["policy"] == {"lan": "edit", "ip": "shader", "dns": "shader"}
     path = tmp_path / "access.json"
     assert A.Access(path).config()["policy"] == A.DEFAULT_POLICY                       # missing file
     path.write_text(json.dumps({"policy": {"ip": "shader", "dns": "play", "lan": "bogus", "moon": "edit"}}), encoding="utf-8")
@@ -91,11 +91,12 @@ def test_policy_defaults_and_overrides(tmp_path):
 def test_policy_file_is_reread_on_change(tmp_path):
     path = tmp_path / "access.json"
     access = A.Access(path)
-    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "dev")
+    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "shader")
     assert access.decide("8.8.8.8", "cats.example.org") == ("dns", "shader")
     assert access.decide("127.0.0.1", "cats.example.org") == ("lan", "edit")
-    path.write_text(json.dumps({"policy": {"ip": "shader"}}), encoding="utf-8")
-    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "shader")
+    path.write_text(json.dumps({"policy": {"dns": "play", "ip": "play"}}), encoding="utf-8")
+    assert access.decide("8.8.8.8", "cats.example.org") == ("dns", "play")
+    assert access.decide("8.8.8.8", "1.2.3.4") == ("ip", "play")
 
 
 def test_public_ip_lookup_is_cached_and_fails_soft():
@@ -140,7 +141,8 @@ def _web(tmp_path):
     web.mkdir(parents=True)
     (web / "boards.json").write_text(json.dumps({"boards": [], "levels": {}}), encoding="utf-8")
     (web / "shader.html").write_text("<html>SHADER-PAGE</html>", encoding="utf-8")
-    (web / "index.html").write_text("<html>GAME-PAGE</html>", encoding="utf-8")
+    (web / "index.html").write_text("<html>FEED-PAGE</html>", encoding="utf-8")
+    (web / "play.html").write_text("<html>GAME-PAGE</html>", encoding="utf-8")
     (web / "loading_panel.js").write_text("// panel", encoding="utf-8")
     (web / "secret.json").write_text("{}", encoding="utf-8")
     return web
@@ -176,20 +178,33 @@ def tiered(tmp_path):
     httpd.server_close()
 
 
+def _member(sessions, name="tier_cat"):
+    """A signed-in account's cookie: a visitor with no account is a guest, held to view_site/photo_read/play on every tier (owner, 2026-11-13)."""
+    return {"Cookie": f"{srv.ACCOUNT_COOKIE}={sessions.accounts.create_session(sessions.accounts.ensure_user(name, 'correcthorse1'))}"}
+
+
 def test_whoami_reports_the_tier_and_nothing_else(tiered):
-    port, set_tier, _ = tiered
+    port, set_tier, sessions = tiered
+    member = _member(sessions)
     for tier in ("edit", "dev", "play", "shader"):
         set_tier(tier)
         status, who = _get(port, "/api/whoami", {"X-Secret": "abc"})
         assert status == 200 and who["tier"] == tier and who["origin"] == "lan"
-        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities", "instance", "signed_in", "username", "origin_tier"}
-        assert who["edit"] == (tier == "edit") and who["dev"] == (tier in ("edit", "dev")) and who["shader"] == (tier == "shader")
+        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities", "instance", "signed_in", "username", "origin_tier",
+                            "kiosk", "guest"}
+        assert who["edit"] is False and who["dev"] is False and who["shader"] == (tier == "shader")      # a guest, on any tier
+        if tier != "shader":                                                                     # an account on shader is lifted to play
+            who = _get(port, "/api/whoami", member)[1]
+            assert who["tier"] == tier and who["edit"] == (tier == "edit") and who["dev"] == (tier in ("edit", "dev"))
 
 
 def test_shader_tier_gets_the_shader_page_or_403(tiered):
     port, set_tier, _ = tiered
     set_tier("shader")
-    for path in ("/", "/index.html", "/app.js", "/boards.json", "/secret.json", "/whatever/else"):
+    for path in ("/", "/index.html"):
+        status, body = _get(port, path)
+        assert status == 200 and "FEED-PAGE" in body, path
+    for path in ("/play.html", "/app.js", "/boards.json", "/secret.json", "/whatever/else"):
         status, body = _get(port, path)
         assert status == 200 and "SHADER-PAGE" in body, path                              # the game page and its files are not served
     assert _get(port, "/loading_panel.js")[1] == "// panel"                              # its own asset is
@@ -207,7 +222,8 @@ def test_normal_tiers_serve_the_game(tiered):
     port, set_tier, _ = tiered
     for tier in ("edit", "dev", "play"):
         set_tier(tier)
-        assert "GAME-PAGE" in _get(port, "/index.html")[1]
+        assert "FEED-PAGE" in _get(port, "/index.html")[1]
+        assert "GAME-PAGE" in _get(port, "/play.html")[1]
         assert _get(port, "/api/catalog")[0] == 200
 
 
@@ -218,7 +234,10 @@ def test_edit_endpoints_are_refused_below_edit(tiered):
     port, set_tier, sessions = tiered
     for tier in ("play", "dev", "shader"):
         set_tier(tier)
-        assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"X-Meowdoku-Admin": "x"})[0] == 403
+        # the lifecycle is answered by its own loopback + admin token check (catalog credential admin_token), here with no lifecycle
+        # configured (503); the shader tier refuses every POST before it
+        assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"X-Meowdoku-Admin": "x"})[0] == (
+            403 if tier == "shader" else 503)
         assert _get(port, "/api/loading_anim", method="POST", body=b"xx", headers={"X-Meowdoku-Loading": "1"})[0] == 403
         if tier != "shader":
             for kind in OWNER_ACTIONS:
@@ -230,13 +249,16 @@ def test_edit_endpoints_are_refused_below_edit(tiered):
 def test_edit_tier_keeps_the_token_checks(tiered):
     port, set_tier, sessions = tiered
     set_tier("edit")
+    member = _member(sessions)
     # the tier gate passes, then the old checks still apply: the lifecycle admin token, the loading header
     sessions.lifecycle = type("L", (), {"token": "t" * 40})()
     assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"Host": f"127.0.0.1:{port}"})[0] == 401
     assert _get(port, "/api/admin/lifecycle", method="POST", body=b"{}", headers={"Host": "evil.example", "X-Meowdoku-Admin": "t" * 40})[0] == 403
-    assert _get(port, "/api/loading_anim", method="POST", body=b"xx", headers={"X-Meowdoku-Loading": "0"})[0] == 403
+    assert _get(port, "/api/loading_anim", method="POST", body=b"xx", headers={**member, "X-Meowdoku-Loading": "0"})[0] == 403
+    status, body = _get(port, "/api/action", method="POST", body=json.dumps({"type": "arena_save"}).encode(), headers=member)
+    assert status == 400 and "no game" in body["error"]
     status, body = _get(port, "/api/action", method="POST", body=json.dumps({"type": "arena_save"}).encode())
-    assert status == 400 and "no game" in body["error"]                                   # past the tier gate: the action's own refusal
+    assert status == 403 and body["error"] == "this needs owner_tools"                       # a guest on the edit tier is not an owner                                   # past the tier gate: the action's own refusal
 
 
 def test_require_tier_is_generic():

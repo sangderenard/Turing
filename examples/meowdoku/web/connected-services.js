@@ -1,0 +1,253 @@
+// Reuse the account and Keys status routes. No provider credentials are read.
+const $ = (id) => document.getElementById(id);
+let pending = false;
+async function json(path) {
+  const response = await fetch(path, { credentials: "same-origin", cache: "no-store", redirect: "error" });
+  if (!response.ok) throw new Error("status unavailable");
+  return response.json();
+}
+async function refreshAccount() {
+  if (pending) return;
+  pending = true;
+  $("refresh").disabled = true;
+  resetSuno();
+  $("sign-in").hidden = true;
+  $("paper-actions").hidden = true;
+  $("paper-status").textContent = "Sign in to check the credential stored for your account.";
+  $("identity").textContent = "Checking your site account.";
+  try {
+    const who = await json("/api/whoami");
+    if (who.signed_in !== true || typeof who.username !== "string") {
+      $("identity").textContent = "You are not signed in to this site.";
+      $("sign-in").hidden = false;
+      return;
+    }
+    $("identity").textContent = "Site account: " + who.username + ".";
+    $("paper-actions").hidden = false;
+    sunoSignedIn = true;
+    void refreshSuno();
+    try {
+      const paper = await json("/api/user-secrets/alpaca-paper");
+      if (typeof paper.configured !== "boolean") throw new Error("invalid status");
+      $("paper-status").textContent = paper.configured ? "Paper credential stored for this account." : "No paper credential stored for this account.";
+    } catch {
+      $("paper-status").textContent = "Unable to check the paper connection. No connection was changed.";
+    }
+  } catch {
+    $("identity").textContent = "Unable to check your site account. No connection was changed.";
+  } finally {
+    pending = false;
+    $("refresh").disabled = false;
+  }
+}
+
+
+
+// Suno is a real session-owned backend connection, not a browser token store.
+let sunoSignedIn = false, sunoBusy = false, sunoEpoch = 0, sunoState = "disconnected";
+let sunoTools = [], sunoTimer;
+let radioBusy = false, radioSongs = [];
+const sunoBase = "/api/connections/suno/";
+const workingStates = ["connecting", "authorization_required", "finishing"];
+function resetSuno() {
+  sunoEpoch++; sunoSignedIn = false; sunoBusy = false;
+  clearTimeout(sunoTimer);
+  sunoTools = []; $("suno-tools").hidden = true;
+  radioSongs = []; $("suno-radio").hidden = true; $("suno-radio-song").replaceChildren();
+  $("suno-share").hidden = true; $("suno-share-list").replaceChildren(); $("suno-share-status").textContent = "";
+  $("suno-radio-credit").hidden = true; $("suno-radio-status").textContent = "";
+  $("suno-authorize").hidden = true; $("suno-authorize").removeAttribute("href");
+  $("suno-schema").textContent = ""; $("suno-result").textContent = "";
+  $("suno-arguments").value = "{}";
+  $("suno-status").textContent = "Sign in to manage Suno.";
+  sunoState = "disconnected"; updateSunoButtons();
+}
+function updateSunoButtons() {
+  const locked = !sunoSignedIn || sunoBusy;
+  $("suno-connect").disabled = locked || workingStates.includes(sunoState) || sunoState === "connected";
+  $("suno-disconnect").disabled = locked || sunoState === "disconnected";
+  $("suno-refresh").disabled = locked;
+  $("suno-tools-refresh").disabled = locked || !["connected", "authorized"].includes(sunoState);
+  $("suno-call").disabled = locked || !sunoTools.length || !["connected", "authorized"].includes(sunoState);
+  $("suno-radio-load").disabled = locked || radioBusy;
+  $("suno-radio-import").disabled = locked || radioBusy || !radioSongs.length;
+  $("suno-radio-credit").disabled = locked || radioBusy;
+}
+async function sunoRequest(action, body) {
+  const options = {credentials:"same-origin", cache:"no-store", redirect:"error"};
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers = {"Content-Type":"application/json", "X-Meowdoku-Secret":"1"};
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(sunoBase + action, options);
+  if (response.status === 401) { resetSuno(); throw Error("Sign in to this site again."); }
+  if (!response.ok) throw Error("Suno request failed (HTTP " + response.status + "). Refresh status before retrying.");
+  return response.json();
+}
+function showSunoStatus(data) {
+  const messages = {
+    disconnected:"Suno is not connected.",
+    authorized:"Saved Suno authorization. Load tools to verify access.",
+    connecting:"Connecting to Suno…",
+    authorization_required:"Waiting for your approval at Suno.",
+    finishing:"Completing Suno authorization…",
+    connected:"Connected to Suno.",
+    failed:"Suno connection failed. You can retry connecting."
+  };
+  if (!data || !Object.hasOwn(messages, data.status)) throw Error("Invalid Suno connection status.");
+  sunoState = data.status;
+  $("suno-status").textContent = messages[sunoState] + (data.error ? " " + String(data.error) : "") + (data.required_origin ? " Required provider origin: " + String(data.required_origin) : "");
+  $("suno-authorize").hidden = true; $("suno-authorize").removeAttribute("href");
+  if (data.authorization_url && sunoState === "authorization_required") {
+    const url = new URL(data.authorization_url);
+    if (url.protocol !== "https:" || url.username || url.password) throw Error("Invalid authorization destination.");
+    // The backend validates discovered OAuth origins; never synthesize a login URL here.
+    $("suno-authorize").href = url.href;
+    $("suno-authorize").hidden = false;
+  }
+  if (!["connected", "authorized"].includes(sunoState)) {
+    sunoTools = []; $("suno-tools").hidden = true;
+    $("suno-schema").textContent = ""; $("suno-result").textContent = "";
+  }
+  $("suno-radio").hidden = !["connected", "authorized"].includes(sunoState);
+  const sharing = ["connected", "authorized"].includes(sunoState);
+  if (sharing && $("suno-share").hidden) void loadShares();
+  $("suno-share").hidden = !sharing;
+  clearTimeout(sunoTimer);
+  if (workingStates.includes(sunoState)) sunoTimer = setTimeout(refreshSuno, 2000);
+}
+async function sunoAction(action, body, consume = showSunoStatus) {
+  if (!sunoSignedIn || sunoBusy) return;
+  const epoch = sunoEpoch;
+  sunoBusy = true; updateSunoButtons();
+  try {
+    const data = await sunoRequest(action, body);
+    if (epoch !== sunoEpoch) return;
+    consume(data);
+  } catch (error) {
+    if (epoch === sunoEpoch) $("suno-status").textContent = error.message;
+  } finally {
+    if (epoch === sunoEpoch) { sunoBusy = false; updateSunoButtons(); }
+  }
+}
+function refreshSuno() { return sunoAction("status"); }
+// Sharing: the owner ticks which operator and admin accounts may call this connection's tools (connection_shares.py).
+function showShares(data) {
+  if (!data || !Array.isArray(data.accounts)) throw Error("Invalid share list.");
+  $("suno-share-list").replaceChildren();
+  for (const account of data.accounts) {
+    if (!account || typeof account.username !== "string") continue;
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox"; box.checked = account.shared === true;
+    box.addEventListener("change", () => setShare(account.username, box));
+    label.append(box, " " + account.username + " (" + String(account.role) + ")");
+    $("suno-share-list").appendChild(label);
+    $("suno-share-list").appendChild(document.createElement("br"));
+  }
+  $("suno-share-status").textContent = data.accounts.length ? "" : "There are no other operator or admin accounts.";
+}
+async function loadShares() {
+  try { showShares(await sunoRequest("shares")); }
+  catch (error) { $("suno-share-status").textContent = error.message; }
+}
+async function setShare(username, box) {
+  box.disabled = true;
+  try {
+    showShares(await sunoRequest("shares", {account:username, shared:box.checked}));
+    $("suno-share-status").textContent = box.checked ? username + " may now use this connection." :
+      username + " may no longer use this connection.";
+  } catch (error) {
+    box.checked = !box.checked;
+    $("suno-share-status").textContent = error.message;
+  } finally { box.disabled = false; }
+}
+function showTool() {
+  const tool = sunoTools[Number($("suno-tool").value)];
+  $("suno-schema").textContent = tool ? JSON.stringify(tool, null, 2) : "";
+}
+function showTools(data) {
+  if (!data || !Array.isArray(data.tools) || data.tools.some(t => !t || typeof t.name !== "string"))
+    throw Error("Invalid Suno tool catalogue.");
+  sunoTools = data.tools;
+  $("suno-tool").replaceChildren();
+  sunoTools.forEach((tool, index) => {
+    const option = document.createElement("option");
+    option.value = String(index); option.textContent = tool.title || tool.name;
+    $("suno-tool").appendChild(option);
+  });
+  $("suno-tool").value = "0"; $("suno-tools").hidden = false;
+  $("suno-status").textContent = sunoTools.length ? "Suno tools loaded. Select a tool to inspect its full schema." : "Suno returned no tools.";
+  showTool();
+}
+$("suno-connect").addEventListener("click", () => sunoAction("connect", {}));
+$("suno-disconnect").addEventListener("click", () => sunoAction("disconnect", {}));
+$("suno-refresh").addEventListener("click", refreshSuno);
+$("suno-tools-refresh").addEventListener("click", () => sunoAction("tools", undefined, showTools));
+$("suno-tool").addEventListener("change", () => { showTool(); $("suno-arguments").value = "{}"; $("suno-result").textContent = ""; });
+$("suno-call").addEventListener("click", () => {
+  const tool = sunoTools[Number($("suno-tool").value)];
+  if (!tool || sunoBusy) return;
+  let args;
+  try {
+    args = JSON.parse($("suno-arguments").value);
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw Error();
+  } catch { $("suno-result").textContent = "Enter a JSON object for the arguments. Nothing was sent."; return; }
+  return sunoAction("call", {name:tool.name, arguments:args}, data => {
+    $("suno-result").textContent = JSON.stringify(data, null, 2);
+  });
+});
+function sunoTextResult(result) {
+  if (!result || result.isError || !Array.isArray(result.content)) throw Error("Suno returned no song list.");
+  const part = result.content.find(item => item?.type === "text");
+  if (!part) throw Error("Suno returned no song list.");
+  return JSON.parse(part.text);
+}
+$("suno-radio-load").addEventListener("click", async () => {
+  if (radioBusy || !sunoSignedIn) return;
+  radioBusy = true; updateSunoButtons(); $("suno-radio-credit").hidden = true;
+  try {
+    const answer = sunoTextResult(await sunoRequest("call", {name:"library-list", arguments:{limit:50}}));
+    if (!Array.isArray(answer.items)) throw Error("Suno did not return a song list.");
+    radioSongs = answer.items.filter(song => song?.status === "complete" &&
+      /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(song.id));
+    $("suno-radio-song").replaceChildren();
+    for (const song of radioSongs) {
+      const option = document.createElement("option");
+      option.value = song.id; option.textContent = song.title || song.id;
+      $("suno-radio-song").appendChild(option);
+    }
+    $("suno-radio-status").textContent = radioSongs.length ?
+      `Choose one of ${radioSongs.length} finished songs to offer to Radio.` : "No finished songs on this page.";
+  } catch (error) { $("suno-radio-status").textContent = error.message; }
+  finally { radioBusy = false; updateSunoButtons(); }
+});
+async function importSunoRadio(confirmCredit) {
+  if (radioBusy || !radioSongs.some(song => song.id === $("suno-radio-song").value)) return;
+  radioBusy = true; updateSunoButtons(); $("suno-radio-credit").hidden = true;
+  const songId = $("suno-radio-song").value;
+  const storage = $("suno-radio-storage").value;
+  try {
+    const response = await fetch("/api/radio/suno/import", {method:"POST", credentials:"same-origin",
+      cache:"no-store", redirect:"error", headers:{"Content-Type":"application/json", "X-Meowdoku-Radio":"1"},
+      body:JSON.stringify({song_id:songId, storage, confirm_credit:confirmCredit})});
+    const data = await response.json();
+    if (!response.ok) throw Error(data.error || `Import failed (HTTP ${response.status}).`);
+    if (data.status === "requires_credit") {
+      $("suno-radio-status").textContent = `Suno requires one download credit (${data.credits_remaining} remain). The song has not been imported.`;
+      $("suno-radio-credit").hidden = false;
+    } else if (data.status === "processing") {
+      $("suno-radio-status").textContent = "Suno is preparing the audio. Retry the check shortly.";
+    } else if (data.status === "ready") {
+      $("suno-radio-status").textContent = `${data.title || "Song"} is saved in your server assets and offered to Radio.`;
+    } else throw Error("Unexpected import response.");
+  } catch (error) { $("suno-radio-status").textContent = error.message; }
+  finally { radioBusy = false; updateSunoButtons(); }
+}
+$("suno-radio-import").addEventListener("click", () => importSunoRadio(false));
+$("suno-radio-credit").addEventListener("click", () => importSunoRadio(true));
+$("suno-radio-song").addEventListener("change", () => { $("suno-radio-credit").hidden = true; });
+$("suno-radio-storage").addEventListener("change", () => { $("suno-radio-credit").hidden = true; });
+$("refresh").addEventListener("click", refreshAccount);
+void refreshAccount();

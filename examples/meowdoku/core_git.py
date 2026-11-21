@@ -122,8 +122,28 @@ def _tree(a):
     return command + ([_path(a.get("path"))] if a.get("path") else [])
 
 
+# The markdown of a repository, read for the agent orientation map (orientation.py). Each of these declares its own pathspec,
+# the only one it can have, so it alone runs with pathspec magic on; every other operation keeps --literal-pathspecs.
+MARKDOWN = ":(glob,icase)**/*.md"
+
+
+def _markdown_links(a):
+    """Every markdown link to a .md file, ``<ref>:<path>:<line>:](<target>`` in file and line order."""
+    _only(a, ("ref",))
+    return ["grep", "--no-color", "-I", "-i", "-n", "-o", "-E", r"\]\([^)#> ]+\.md", _ref(a.get("ref", "HEAD")), "--", MARKDOWN]
+
+
+def _markdown_added(a):
+    """The commits that added a markdown file, newest first: ``NUL<commit time>`` then the paths it added."""
+    _only(a, ("ref",))
+    return ["log", "--no-color", "--diff-filter=A", "--no-renames", "--format=%x00%ct", "--name-only",
+            _ref(a.get("ref", "HEAD")), "--", MARKDOWN]
+
+
 OPERATIONS = {"status": _status, "branches": _branches, "log": _log, "commit": _commit, "diff": _diff, "file": _file,
-              "tree": _tree}
+              "tree": _tree, "markdown_links": _markdown_links, "markdown_added": _markdown_added}
+DECLARED_PATHSPEC = {"markdown_links", "markdown_added"}
+NOTHING_FOUND = {"markdown_links"}   # git grep exits 1 when nothing matches: an empty answer, not a failure
 
 
 def inside_core(policy, path) -> str | None:
@@ -157,10 +177,11 @@ def exec_refusal(policy, program, working_dir) -> str | None:
     return None
 
 
-def _execute(root, command) -> tuple:
+def _execute(root, command, literal=True) -> tuple:
     """(exit code, output bytes, truncated). Output is cut at MAX_OUTPUT and the process ended."""
     environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_PAGER="cat", LC_ALL="C")
-    process = subprocess.Popen(["git", "-C", str(root), "--no-pager", "--no-optional-locks", "--literal-pathspecs",
+    process = subprocess.Popen(["git", "-C", str(root), "--no-pager", "--no-optional-locks",
+                                *(["--literal-pathspecs"] if literal else []),
                                 "-c", "core.fsmonitor=false", *command],
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=environment)
     try:
@@ -196,9 +217,11 @@ def run(db, policy, *, user_id, username, repository, operation, arguments=None,
     now = time.time() if now is None else now
     made = db.execute("INSERT INTO git_calls (user_id, username, repository, operation, arguments, at) VALUES (?,?,?,?,?,?)",
                       (user_id, username, repository, operation, json.dumps(arguments, sort_keys=True), now))
-    code, data, truncated = _execute(root, command)
+    code, data, truncated = _execute(root, command, literal=operation not in DECLARED_PATHSPEC)
     db.execute("UPDATE git_calls SET exit_code = ?, bytes = ?, truncated = ? WHERE id = ?",
                (code, len(data), int(truncated), made.lastrowid))
+    if code == 1 and not data and operation in NOTHING_FOUND:
+        code = 0
     if code != 0 and not truncated:
         raise GitError("Git could not do that (no such ref or path)", 404)
     return {"call": made.lastrowid, "repository": repository, "operation": operation, "truncated": truncated,
@@ -220,7 +243,7 @@ def http_route(self, path, method, *, policy, accounts_db):
         GET  /api/git/calls                        the record of calls
         POST /api/git/<operation>  {repository, ...the operation's arguments}
              status | branches | log {ref?, path?, count?} | commit {commit} | diff {base, head, path?} |
-             file {ref?, path} | tree {ref?, path?}
+             file {ref?, path} | tree {ref?, path?} | markdown_links {ref?} | markdown_added {ref?}
     """
     import sqlite3
     self._set_cookie = []

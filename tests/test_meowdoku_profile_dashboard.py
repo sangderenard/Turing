@@ -110,10 +110,11 @@ def test_member_sees_me_only(server):
 
 
 def test_anonymous_and_guest_refused(server):
-    assert _call(server.port, "/api/profile/me")[0] == 403
+    # the guest gate answers first (owner, 2026-11-13): 401 sign in where the entry needs only an account, 403 naming a capability
+    assert _call(server.port, "/api/profile/me")[0] == 401
     assert _call(server.port, "/api/profile/instances")[0] == 403
     assert _call(server.port, "/api/profile/instances", headers=OUTSIDE)[0] == 403
-    assert _call(server.port, "/api/profile/me", "POST", body={})[0] in (403, 405)
+    assert _call(server.port, "/api/profile/me", "POST", body={})[0] == 401
 
 
 @pytest.mark.parametrize("role", ["admin", "operator"])

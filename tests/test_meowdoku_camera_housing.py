@@ -95,10 +95,12 @@ def test_real_housing_http_transport_and_guards(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions.marble_photos, 'submit', lambda *a, **kw: pytest.fail('housing started an exposure'), raising=False)
     httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    def request(body, extra=None):
+    # a visitor with no account is a guest and never holds studio_write (owner, 2026-11-13): the studio asks as a signed-in member
+    member = {'Cookie': f"{server.ACCOUNT_COOKIE}={sessions.accounts.create_session(sessions.accounts.ensure_user('housing_cat', 'correcthorse1'))}"}
+    def request(body, extra=None, account=True):
         connection = http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=20)
         connection.request('POST', '/api/marble_camera/housing', body,
-                           {'Content-Type': 'application/json', **(extra or {})})
+                           {'Content-Type': 'application/json', **(member if account else {}), **(extra or {})})
         response = connection.getresponse()
         data = response.read()
         status = response.status
@@ -118,8 +120,7 @@ def test_real_housing_http_transport_and_guards(tmp_path, monkeypatch):
         assert request(wire)[1] == data
         assert request(b'x' * 4097)[0] == 413
         assert request(b'{')[0] == 400
-        sessions.access.config()['policy']['lan'] = 'play'
-        assert request(wire)[0] == 403
+        assert request(wire, account=False) == (403, b'{"error": "this needs studio_write"}')
     finally:
         httpd.shutdown()
         httpd.server_close()

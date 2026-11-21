@@ -1,3 +1,4 @@
+import { CHANNELS, renderAgentPresence, tickAgentCountdowns } from "./agent-presence.js";
 // /worldmap.html: a compact repository world map.  Regions (folders) nest as a squarified treemap by bytes, rooms (files) are the
 // cells inside them, portals (cross-file references) are curves drawn only for the selected room.  Plain ES module, canvas 2D, no libraries;
 // everything is set with textContent / createElement, never innerHTML.  The layout functions at the top are pure and exported so Node can test them.
@@ -115,9 +116,10 @@ function startPage() {
   const $ = (id) => document.getElementById(id);
   const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined && text !== null) n.textContent = String(text); if (cls) n.className = cls; return n; };
   const canvas = $("map"), ctx = canvas.getContext("2d");
-  const S = { map: null, idx: null, adj: null, layout: null, view: 0, sel: -1, hover: -1, cam: { k: 1, x: 0, y: 0 }, links: false,
-              query: "", matches: null, paths: null, langColor: new Map(), W: 0, H: 0, dpr: 1 };
+  const S = { map: null, idx: null, adj: null, layout: null, view: 0, sel: -1, region: -1, hover: -1, cam: { k: 1, x: 0, y: 0 }, links: false,
+              query: "", matches: null, paths: null, langColor: new Map(), presence: null, W: 0, H: 0, dpr: 1 };
   let drag = null;
+  let mapRequest = 0;
 
   async function getJson(url) {
     const r = await fetch(url, { credentials: "same-origin", cache: "no-store" });
@@ -128,7 +130,66 @@ function startPage() {
 
   const roomPath = (m) => { const room = S.map.rooms[m], g = S.map.regions[room.region]; return g.path ? g.path + "/" + room.name : room.name; };
   const colorOf = (lang) => S.langColor.get(lang || "") || OTHER;
+  const placeRoom = (place) => {
+    if (!S.map || !place || String(S.map.repo || "").split("/").pop().toLowerCase() !== String(place.repository || "").toLowerCase()) return -1;
+    return S.map.rooms.findIndex((_, m) => roomPath(m) === place.path);
+  };
+  function renderAgentMapEntities() {
+    const shelf = $("agent-map-entities");
+    shelf.replaceChildren();
+    if (!S.presence?.agents) return;
+    const places = new Map((S.presence.locations || []).map(place => [place.username, place]));
+    for (const agent of S.presence.agents) {
+      const place = places.get(agent.username), room = placeRoom(place);
+      const item = el(room >= 0 ? "button" : "span", null, "agent-map-entity");
+      for (const [key, label] of CHANNELS) {
+        const state = agent.channels?.[key]?.state || "unknown";
+        const lit = state === "active" || state === "recent";
+        const light = el("span", lit ? "■" : "□", lit ? "agent-map-light active" : "agent-map-light");
+        light.title = `${label}: ${state}${state === "recent" ? " (authenticated call in the last 30 seconds)" : ""}`;
+        item.append(light);
+      }
+      item.append(document.createTextNode(" " + agent.username));
+      if (room >= 0) {
+        item.type = "button";
+        item.title = `Last checkout file: ${place.repository}/${place.path}; click to find it`;
+        item.addEventListener("click", () => jumpTo(room));
+      } else {
+        item.title = place ? `Last checkout in ${place.repository}/${place.path}; absent from this map` : "Repository location unknown";
+        item.append(el("span", place ? " elsewhere" : " location unknown", "agent-map-where"));
+      }
+      item.setAttribute("aria-label", `${agent.username}; ${CHANNELS.map(([key, label]) => `${label}: ${agent.channels?.[key]?.state || "unknown"}`).join("; ")}; ${place ? `last checkout ${place.repository}/${place.path}` : "repository location unknown"}`);
+      shelf.append(item);
+    }
+  }
+  async function loadPresence() {
+    const box = $("agent-locations");
+    try {
+      const { status, body } = await getJson("/api/worldmap/presence");
+      if (status !== 200 || !body) {
+        S.presence = null; renderAgentMapEntities(); draw();
+        box.textContent = status === 403 ? "Developer access is required for agent activity." : `Agent activity unavailable (${status}).`;
+        return;
+      }
+      S.presence = body;
+      renderAgentMapEntities();
+      renderAgentPresence(box, body, { locations: true, onLocation: place => {
+        const m = placeRoom(place);
+        if (m >= 0) jumpTo(m);
+        else setStatus("That last checkout file is absent from this generated map or belongs to another repository.", true);
+      }});
+      draw();
+    } catch (_) { S.presence = null; renderAgentMapEntities(); draw(); box.textContent = "Agent activity unavailable."; }
+  }
   const setStatus = (text, bad) => { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : "mut"; };
+
+  function showOverview() {
+    mapRequest++;
+    $("overview").hidden = false;
+    for (const id of ["map-controls", "crumbs", "agent-section", "map-layout", "stats", "legend"]) $(id).hidden = true;
+    $("action-status").textContent = "";
+    setStatus("Choose a repository region. Each map is a generated snapshot, not live Git status.");
+  }
 
   async function loadIndex() {
     const { status, body } = await getJson("/api/worldmap/index");
@@ -138,17 +199,32 @@ function startPage() {
     sel.replaceChildren();
     for (const r of repos) { const o = el("option", r.repo + " @ " + String(r.commit || "").slice(0, 8)); o.value = r.dir + "|" + r.commit; sel.append(o); }
     if (!repos.length) return setStatus("No world maps have been generated yet.");
+    const overview = $("overview");
+    overview.replaceChildren();
+    for (const r of repos) {
+      const counts = r.latest?.summary?.counts;
+      const card = el("button", null, "repo-region");
+      card.type = "button";
+      card.append(el("strong", r.repo), el("small", `${counts ? counts.regions + " regions · " + counts.rooms + " files · " : ""}commit ${String(r.commit || "").slice(0, 8)}`));
+      card.addEventListener("click", () => { sel.value = r.dir + "|" + r.commit; loadMap(sel.value); });
+      overview.append(card);
+    }
     sel.addEventListener("change", () => loadMap(sel.value));
-    loadMap(sel.value);
+    $("all-repos").addEventListener("click", showOverview);
+    showOverview();
   }
 
   async function loadMap(value) {
+    const request = ++mapRequest;
     const [dir, commit] = value.split("|");
     setStatus("Loading map...");
     const { status, body } = await getJson("/api/worldmap/map?repo=" + encodeURIComponent(dir) + "&commit=" + encodeURIComponent(commit));
+    if (request !== mapRequest) return;
     if (status !== 200 || !body || !body.regions) return setStatus(status === 404 ? "That map is missing." : "Could not load the map (" + status + ").", true);
     S.map = body; S.idx = buildIndex(body); S.adj = buildAdjacency(body);
-    S.paths = null; S.matches = null; S.sel = -1; S.hover = -1; S.view = 0;
+    S.paths = null; S.matches = null; S.sel = -1; S.region = -1; S.hover = -1; S.view = 0;
+    $("overview").hidden = true;
+    for (const id of ["map-controls", "crumbs", "agent-section", "map-layout", "stats", "legend"]) $(id).hidden = false;
     const counts = new Map();
     for (const m of body.rooms) counts.set(m.language || "", (counts.get(m.language || "") || 0) + weight(m.bytes));
     const langs = [...counts.entries()].sort((a, b) => b[1] - a[1]);
@@ -162,7 +238,7 @@ function startPage() {
     $("stats").textContent = body.regions.length + " regions, " + body.rooms.length + " rooms, " + (body.portals || []).length + " portals, " +
       (body.unresolved_count || 0) + " unresolved, commit " + String(body.commit || "").slice(0, 8) + ", generated " + when;
     setStatus("");
-    relayout(); renderPanel(); draw();
+    resize(); renderPanel(); renderAgentMapEntities(); draw(); loadPresence();
   }
 
   function relayout() {
@@ -180,7 +256,7 @@ function startPage() {
       if (i) bar.append(document.createTextNode(" / "));
       const b = el("button", r === 0 ? (S.map.repo || "root") : S.map.regions[r].path.split("/").pop(), "crumb");
       b.type = "button";
-      b.addEventListener("click", () => { S.view = r; relayout(); draw(); });
+      b.addEventListener("click", () => { S.view = r; S.region = r; S.sel = -1; relayout(); renderPanel(); draw(); });
       bar.append(b);
     });
   }
@@ -236,6 +312,19 @@ function startPage() {
     }
     if (S.links) drawRegionLinks();
     if (S.sel >= 0) drawPortals(S.sel);
+    if (S.presence) {
+      const places = S.presence.locations || [];
+      for (let i = 0; i < places.length; i++) {
+        const m = placeRoom(places[i]);
+        if (m < 0) continue;
+        const center = roomCenter(m);
+        if (!center) continue;
+        ctx.beginPath(); ctx.arc(center[0], center[1], 7, 0, Math.PI * 2);
+        ctx.fillStyle = "#101820"; ctx.fill(); ctx.strokeStyle = "#9ce8af"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.font = "bold 9px system-ui, sans-serif"; ctx.textBaseline = "middle";
+        ctx.fillText(String(i + 1), center[0] - 3, center[1]); ctx.textBaseline = "top"; ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1;
+      }
+    }
     for (const m of [S.hover, S.sel]) {
       if (m < 0 || rm[4 * m + 2] <= 0) continue;
       ctx.strokeStyle = m === S.sel ? "#ffd166" : "#fff"; ctx.lineWidth = 2;
@@ -278,12 +367,111 @@ function startPage() {
     ctx.globalAlpha = 1; ctx.lineWidth = 1;
   }
 
+  const shellQuote = (value) => "'" + String(value).replaceAll("'", "''") + "'";
+  async function copyCommand(command) {
+    try { await navigator.clipboard.writeText(command); $("action-status").textContent = "Command copied. Run it from the selected repository root after reviewing the path."; }
+    catch (_) { $("action-status").textContent = "Clipboard unavailable. Select and copy this command: " + command; }
+  }
+
+  function fileActions(m) {
+    const path = roomPath(m), room = S.map.rooms[m], row = el("div", null, "file-actions");
+    const observation = room.in === 0
+      ? "No incoming references were found in this compiled snapshot; entry points and unresolved references still need inspection."
+      : `${room.in} incoming and ${room.out} outgoing references were found in this compiled snapshot.`;
+    row.append(el("span", observation, "mut"));
+    const target = el("input");
+    target.type = "text"; target.placeholder = "Destination path within this repository";
+    target.setAttribute("aria-label", `Move destination for ${path}`);
+    const action = (label, title, description, kind, needsTarget = false) => {
+      const button = el("button", label);
+      button.type = "button";
+      let key = null, fingerprint = null;
+      button.addEventListener("click", async () => {
+        const destination = target.value.trim();
+        if (needsTarget && (!destination || destination.startsWith("/") || destination.includes("..") || destination.includes("\\"))) {
+          $("action-status").textContent = "Enter a repository relative destination without '..' or backslashes."; return;
+        }
+        const current = `${S.map.repo}|${S.map.commit}|${path}|${kind}|${needsTarget ? destination : ""}`;
+        if (fingerprint !== current) { key = crypto.randomUUID().replaceAll("-", ""); fingerprint = current; }
+        button.disabled = true;
+        $("action-status").textContent = "Creating review ticket…";
+        const payload = {
+          title: `${title}: ${path}`.slice(0, 200),
+          description: `${description}\n\nRepository: ${S.map.repo}\nSnapshot commit: ${S.map.commit}\nFile: ${path}\nMap observation: ${observation}${needsTarget ? `\nProposed destination: ${destination}` : ""}\n\nVerify against current HEAD before changing files.`,
+          diagnostics: { source: "worldmap", action: kind, repository: S.map.repo, commit: S.map.commit, path, incoming: room.in, outgoing: room.out, ...(needsTarget ? { destination } : {}) },
+          client_key: key,
+        };
+        try {
+          const response = await fetch("/api/issues", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "X-Meowdoku-Issue": "1" }, body: JSON.stringify(payload) });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+          const link = el("a", `Ticket ${result.id.slice(0, 8)} created`);
+          link.href = `/issues.html?id=${encodeURIComponent(result.id)}`;
+          $("action-status").replaceChildren(link);
+          key = null; fingerprint = null;
+        } catch (error) { $("action-status").textContent = `Ticket was not confirmed: ${error.message}. Retry with the same submission key.`; }
+        finally { button.disabled = false; }
+      });
+      row.append(button);
+    };
+    action("Ticket: inspect", "Inspect file", "Inspect this file and its references to determine the next action.", "inspect");
+    action("Ticket: deletion review", "Review file for deletion", "Assess whether this file is unused or superseded. Check callers, history, ownership, and generated artifacts before recommending deletion.", "deletion-review");
+    row.append(target);
+    action("Ticket: move", "Review file move", "Review a move to the proposed destination and update references if approved.", "move-review", true);
+    const inspect = el("button", "Copy inspect command"); inspect.type = "button";
+    inspect.addEventListener("click", () => copyCommand(`git show ${shellQuote(S.map.commit + ":" + path)}`));
+    row.append(inspect);
+    const move = el("button", "Copy move command"); move.type = "button";
+    move.addEventListener("click", () => {
+      const destination = target.value.trim();
+      if (!destination || destination.startsWith("/") || destination.includes("..") || destination.includes("\\")) {
+        $("action-status").textContent = "Enter a repository relative destination before copying the move command."; return;
+      }
+      copyCommand(`git mv -- ${shellQuote(path)} ${shellQuote(destination)}`);
+    });
+    row.append(move);
+    return row;
+  }
+
   function renderPanel() {
     const box = $("panel");
     box.replaceChildren();
-    if (S.sel < 0) { box.append(el("p", "Click a room to see what it calls and what calls it.", "mut")); return; }
+    if (S.sel < 0) {
+      const r = S.region >= 0 ? S.region : S.view;
+      const region = S.map.regions[r];
+      box.append(el("h2", region.path || S.map.repo), el("p", `${region.total_files} files in this region and its subregions. Select a file to inspect its links. Tickets are proposals based on commit ${String(S.map.commit).slice(0, 8)}.`, "mut"));
+      const children = S.idx.kids[r];
+      if (children.length) {
+        box.append(el("h3", `Child regions (${children.length})`));
+        const links = el("div", null, "bar");
+        for (const child of children) {
+          const button = el("button", S.map.regions[child].path.split("/").pop() + ` (${S.map.regions[child].total_files})`);
+          button.type = "button";
+          button.addEventListener("click", () => { S.view = child; S.region = child; relayout(); renderPanel(); draw(); });
+          links.append(button);
+        }
+        box.append(links);
+      }
+      const files = S.idx.roomsOf[r];
+      const list = el("div", null, "region-files");
+      let shown = 0;
+      const more = el("button", "Show more files"); more.type = "button";
+      const addPage = () => {
+        for (const m of files.slice(shown, shown + 30)) {
+          const item = el("div", null, "region-file"), name = el("button", roomPath(m), "link");
+          name.type = "button"; name.addEventListener("click", () => jumpTo(m));
+          item.append(name, fileActions(m)); list.append(item);
+        }
+        shown = Math.min(shown + 30, files.length); more.hidden = shown >= files.length;
+      };
+      more.addEventListener("click", addPage); addPage();
+      box.append(list, more);
+      if (!files.length) box.append(el("p", "Select a child region for its files.", "mut"));
+      return;
+    }
     const m = S.sel, room = S.map.rooms[m], { out, inn } = portalLists(m);
     box.append(el("h2", roomPath(m)), el("p", [room.language || "other", room.lines + " lines", room.bytes + " bytes"].join(", "), "mut"));
+    box.append(el("p", "Review actions for this snapshot file:", "mut"), fileActions(m));
     const section = (title, list, which) => {
       box.append(el("h3", title + " (" + list.length + ")"));
       if (list.length > PORTAL_CAP) box.append(el("p", "Showing the first " + PORTAL_CAP + " of " + list.length + "; the map draws the same " + PORTAL_CAP + ".", "mut"));
@@ -304,7 +492,7 @@ function startPage() {
 
   function jumpTo(m) {
     if (S.layout.rm[4 * m + 2] <= 0) { S.view = S.map.rooms[m].region; relayout(); }
-    S.sel = m; renderPanel(); draw();
+    S.sel = m; S.region = S.map.rooms[m].region; renderPanel(); draw();
   }
 
   const pointer = (ev) => { const b = canvas.getBoundingClientRect(); return [(ev.clientX - b.left - S.cam.x) / S.cam.k, (ev.clientY - b.top - S.cam.y) / S.cam.k]; };
@@ -324,8 +512,8 @@ function startPage() {
   canvas.addEventListener("click", (ev) => {
     if (!S.map || (drag && drag.moved)) return;
     const [x, y] = pointer(ev), h = hitTest(S.idx, S.layout, x, y);
-    if (h.room >= 0) { S.sel = h.room; renderPanel(); draw(); }
-    else if (h.region >= 0 && h.region !== S.view) { S.view = h.region; relayout(); draw(); }   // zoom into the clicked folder
+    if (h.room >= 0) { S.sel = h.room; S.region = h.region; renderPanel(); draw(); }
+    else if (h.region >= 0) { S.view = h.region; S.region = h.region; S.sel = -1; relayout(); renderPanel(); draw(); }
   });
   canvas.addEventListener("wheel", (ev) => {
     ev.preventDefault();
@@ -352,6 +540,8 @@ function startPage() {
   window.addEventListener("resize", resize);
   resize();
   loadIndex();
+  setInterval(() => { if (!document.hidden && S.map) loadPresence(); }, 20000);
+  setInterval(() => tickAgentCountdowns($("agent-locations")), 1000);
 }
 
 if (typeof document !== "undefined" && document.getElementById("map")) startPage();

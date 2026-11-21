@@ -9,13 +9,30 @@
 # Check that the published hard copy of the manual still matches the manual; rebuild it when it does not.
 manual.hardcopy 17 * * * * missed=once
 
+# Send each hosted agent to its next eligible room every five minutes; gaps do not replay chat visits.
+hosted.dispatch */5 * * * * missed=skip
+
 # One snapshot of the state root each night (09:30 UTC): the databases and the text files, no binary files, and
 # only the last one is kept (no rolling window). Binary products are a different policy. After a gap, one run covers it.
 state.backup 30 9 * * * missed=once
 
-# Land the changes whose review is accepted (branch_review.py), every ten minutes. While the branch policy's
+# Land the changes whose individual review window has expired (branch_review.py), every five minutes. While the branch policy's
 # apply is false this only reports what it would land.
-reviews.land */10 * * * * missed=once
+reviews.land */5 * * * * missed=once
+
+# Every ten minutes, two minutes after the landing task, the dev server follows what landed (dev_follow.py): its own
+# locked worktrees fast-forward to each default branch, its pages are exported, and it restarts after its running jobs.
+# Offered only when the task worker is given --instances and --follow-instance. Stable is never moved by this task.
+dev.follow 2-59/10 * * * * missed=once
+
+# Every two minutes, the branch servers (branch_servers.py): a new checkout's pages are exported and it starts; a new
+# commit is exported and that loan restarts; closed loans end, unused ones idle. Only with a "loans" block in instances.json.
+loans.refresh */2 * * * * missed=skip
+
+# Stable is a nightly copy an admin signs off (stable_release.py). At 08:00 UTC what dev runs becomes a candidate; every
+# ten minutes stable moves to the newest signed-off commit, and its restart counts down five minutes, announced to admins.
+stable.candidate 0 8 * * * missed=once
+stable.follow 5-59/10 * * * * missed=once
 
 # Once a day (09:45 UTC), remove branches that have been fully merged for the policy's grace period. While the
 # branch policy's apply is false this only reports what it would remove.

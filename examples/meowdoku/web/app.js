@@ -7741,6 +7741,8 @@ function syncMeowdokuBar(game) {
 function fillPickers() {
   const games = state.catalog.games, gameSelect = $("game"), levelSelect = $("level"), boardSelect = $("board");
   gameSelect.innerHTML = games.map((g) => `<option value="${g}">${g}</option>`).join("");
+  const pageGame = document.body.dataset.pageGame;
+  if (pageGame && games.includes(pageGame)) gameSelect.value = pageGame;
   const levels = Object.keys(state.catalog.meowdoku.levels);
   levelSelect.innerHTML = levels.map((k) => `<option value="${k}">${k} (${state.catalog.meowdoku.levels[k]})</option>`).join("");
   const refill = () => {

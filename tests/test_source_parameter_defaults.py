@@ -195,3 +195,56 @@ def test_creation_zeros_authored_defaults_exist_at_source_ingestion(source_book)
     assert CorrelationTable._source_parameter_default_findings(module) == []
 
 
+
+
+def test_rewritten_body_revises_default_receipt_not_its_value(source_book):
+    from src.transmogrifier.graph.graph_express2 import post_source_parameter_defaults
+    tree = ast.parse("def f(x, *, result=None):\n    return x\n")
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(tree)
+    definition = tree.body[0]
+    page = source_book.page(SOURCE_PARAMETER_DEFAULT)
+    row = next(row for row in page.rows() if row[1] == "result")
+    before = source_book.latest_ref(SOURCE_PARAMETER_DEFAULT, row)
+    definition.body[0].value = ast.copy_location(ast.Constant(1), definition.body[0].value)
+    post_source_parameter_defaults(definition)
+    after = source_book.latest_ref(SOURCE_PARAMETER_DEFAULT, row)
+    assert after != before
+    assert page.cell(before.row, before.column) == page.cell(after.row, after.column)
+    causes = tuple(c for c, _ in source_book.edges_into(after))
+    assert before in causes
+    assert len([c for c in causes if c.page == SOURCE_SPAN]) == 3
+    module = SimpleNamespace(metadata={"identity_book": source_book})
+    assert CorrelationTable._source_parameter_default_findings(module) == []
+    post_source_parameter_defaults(definition)
+    assert source_book.latest_ref(SOURCE_PARAMETER_DEFAULT, row) == after
+
+
+def test_rewritten_default_value_still_refuses_disagreement(source_book):
+    from src.transmogrifier.graph.graph_express2 import post_source_parameter_defaults
+    tree = ast.parse("def f(x, *, result=None):\n    return x\n")
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(tree)
+    definition = tree.body[0]
+    definition.args.kw_defaults[0] = ast.copy_location(
+        ast.Constant(7), definition.args.kw_defaults[0])
+    with pytest.raises(ValueError):
+        post_source_parameter_defaults(definition)
+
+
+def test_default_revision_rejects_a_different_source_occurrence(source_book, monkeypatch):
+    import src.transmogrifier.graph.graph_express2 as ingestion
+    tree = ast.parse("def f(x, *, result=None):\n    return x\n"
+                     "def g(x, *, result=None):\n    return x\n")
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(tree)
+    f, g = tree.body
+    original = ingestion.post_source_span
+    foreign = original(g, g.args.kw_defaults[0])
+    monkeypatch.setattr(ingestion, "post_source_span", lambda owner, node:
+                        foreign if node is f.args.kw_defaults[0] else original(owner, node))
+    with pytest.raises(ValueError, match="changed source occurrence"):
+        ingestion.post_source_parameter_defaults(f)

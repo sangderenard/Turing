@@ -85,6 +85,23 @@ def _send(server, cookie, to, text):
     return _call(server.port, "/api/messages/send", "POST", cookie, {"to": to, "body": text})
 
 
+def test_agent_introductions_reconcile_existing_accounts_without_overriding_blocks(server):
+    accounts = server.sessions.accounts
+    ann = accounts.ensure_user("ann", PASSWORD)
+    codex = accounts.ensure_user("codex", PASSWORD)
+    accounts.ensure_user("gemini", PASSWORD)
+    db = messaging.connect(server.sessions.accounts_db)
+    try:
+        messaging.block(db, ann, "codex")
+        assert messaging.introduce_agents(db) == 3  # ann/gemini and codex/gemini; blocked ann/codex is excluded
+        assert messaging._state(db, ann, codex) == "blocked"
+        assert messaging._state(db, codex, ann) is None
+        assert messaging.introduce_agents(db) == 3
+        assert {row[0] for row in db.execute("SELECT username FROM users")} == {"ann", "codex", "gemini"}
+    finally:
+        db.close()
+
+
 def test_guest_is_refused_naming_message(server):
     for path in ("/api/messages/contacts", "/api/messages/since?after=0"):
         status, body = _call(server.port, path)
@@ -144,7 +161,8 @@ def test_exact_key_sets_a_peer_sees(server):
     _friends(server, "ann", ca, "ben", cb)
     _send(server, ca, "ben", "hello")
     contact = _call(server.port, "/api/messages/contacts", cookie=cb)[1]["contacts"][0]
-    assert set(contact) == {"username", "display_name", "unread", "last"} and contact["display_name"] == "Ann A"
+    assert set(contact) == {"username", "display_name", "verified_role", "unread", "last"}
+    assert contact["display_name"] == "Ann A" and contact["verified_role"] is None
     message = _call(server.port, "/api/messages/thread?peer=ann", cookie=cb)[1]["messages"][0]
     assert set(message) == {"id", "from", "to", "created", "body", "removed", "subject", "type"}
     polled = _call(server.port, "/api/messages/since?after=0", cookie=ca)[1]["messages"][0]       # the sender sees no read state either
@@ -153,7 +171,19 @@ def test_exact_key_sets_a_peer_sees(server):
     cc = _user(server, "cyd", "Cyd")
     _call(server.port, "/api/messages/contacts", "POST", cc, {"username": "ben", "action": "request"})
     request = _call(server.port, "/api/messages/contacts", cookie=cb)[1]["requests"][0]
-    assert set(request) == {"username", "display_name", "created"}
+    assert set(request) == {"username", "display_name", "verified_role", "created"}
+
+
+def test_contact_name_verification_uses_current_permission(server):
+    ca, cb = _user(server, "operator-gpt"), _user(server, "ben")
+    _friends(server, "operator-gpt", ca, "ben", cb)
+    def badge():
+        return _call(server.port, "/api/messages/contacts", cookie=cb)[1]["contacts"][0]["verified_role"]
+    assert badge() is None
+    authz.grant_role(server.sessions.accounts_db, "operator-gpt", "operator", "operator:test")
+    assert badge() == "operator"
+    authz.grant_role(server.sessions.accounts_db, "operator-gpt", "member", "operator:test")
+    assert badge() is None
 
 
 def test_block_stops_delivery(server):

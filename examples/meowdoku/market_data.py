@@ -150,3 +150,17 @@ def now(secrets_dir, account_id: int, stock: str = "AAPL") -> dict:
                 "rate_limit": {"stocks": equity_quota, "crypto": crypto_quota, "book": book_quota}}
 
     return _cached(account_id, "now", stock, NOW_SECONDS, load)
+
+
+def latest_prices(secrets_dir, account_id: int) -> dict[str, float]:
+    """One bounded mark set for the paper strategy scoreboard."""
+    keys = alpaca_credentials.load_paper(secrets_dir, account_id)
+
+    def load():
+        equities, _ = _fetch("/v2/stocks/bars/latest", {"symbols": ",".join((*ETFS, *WILDCARDS)), "feed": "iex"}, keys)
+        crypto, _ = _fetch("/v1beta3/crypto/us/latest/bars", {"symbols": CRYPTO}, keys)
+        bars = {**(equities.get("bars") or {}), **(crypto.get("bars") or {})}
+        return {symbol: bar["c"] for symbol, bar in bars.items()
+                if symbol in {*ETFS, *WILDCARDS, CRYPTO} and isinstance(bar, dict) and isinstance(bar.get("c"), (int, float))}
+
+    return _cached(account_id, "prices", "all", NOW_SECONDS, load)

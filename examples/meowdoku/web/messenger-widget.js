@@ -10,10 +10,12 @@
 // `message` capability (GET /api/whoami) it renders nothing at all.  Closed: only a small launcher button with an unread badge
 // (a light unread check every 60 s).  Open: contact list, add-contact field, incoming requests, one conversation at a time, and a
 // long poll that runs only while open.  All DOM is built with createElement/textContent. Message bodies are plain text;
-// validated file subjects render as download links. Styles live in a closed Shadow DOM.
+// validated file subjects render as download links. Styles live in a closed Shadow DOM.  In a conversation the panel shows only
+// the messages and the text box with Send; the image, file and key controls sit in an options drawer that slides out from the
+// panel's left edge (the ☰ button beside the text box opens it; its Close button or Escape slides it back).
 // Global surface: window.MeowdokuMessenger = {open, close, version}.
 import * as fileCrypto from "/file-crypto.js";
-const VERSION = "5";
+const VERSION = "6";
 const MAX_IMAGE_BYTES = 2097152;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 function safeImageURL(image, id) {
@@ -60,6 +62,7 @@ input { background: #0b0e14; color: #e8ecf4; border: 1px solid #556; border-radi
 .body { flex: 1; overflow-y: auto; padding: 6px 10px; }
 .item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; margin: 2px 0; }
 .item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.verified-role { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 8px; background: #153d35; color: #b8f3dd; font-size: 11px; font-weight: 600; }
 .unread { background: #d33; border-radius: 10px; padding: 0 6px; font-size: 12px; }
 .note { color: #9aa4b8; font-size: 12px; padding: 4px 10px; }
 .msg { max-width: 85%; margin: 4px 0; padding: 5px 8px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; background: #232b3d; }
@@ -68,6 +71,13 @@ input { background: #0b0e14; color: #e8ecf4; border: 1px solid #556; border-radi
 .attachment { display:block; width:100%; max-width:280px; height:180px; object-fit:contain; }
 .when { display: block; color: #9aa4b8; font-size: 11px; }
 h3 { margin: 8px 0 2px; font-size: 12px; text-transform: uppercase; color: #9aa4b8; }
+.drawer { position: absolute; top: 0; bottom: 0; left: 0; width: 88%; z-index: 1; display: flex; flex-direction: column;
+  background: #171c28; border-right: 1px solid #556; box-shadow: 4px 0 12px rgba(0,0,0,.4); overflow-y: auto;
+  transform: translateX(-105%); visibility: hidden; transition: transform .2s ease, visibility 0s linear .2s; }
+.drawer.open { transform: translateX(0); visibility: visible; transition: transform .2s ease, visibility 0s; }
+.drawer .row { flex-wrap: wrap; }
+.drawer input { flex: 1 1 140px; }
+@media (prefers-reduced-motion: reduce) { .drawer, .drawer.open { transition: none; } }
 `;
 
 function el(tag, props, ...kids) {
@@ -135,7 +145,8 @@ async function start() {
   async function loadContacts() {
     state.contacts = await api("/api/messages/contacts");
     setUnread(countUnread(state.contacts));
-    if (state.open && !state.peer) renderBody();   // an open thread re-renders itself; rebuilding here looped loadThread
+    if (state.open && state.peer) updatePeerHeader();
+    else if (state.open) renderBody();   // rebuilding an open thread here looped loadThread
   }
   async function lightCheck() { if (!state.open) { try { await loadContacts(); } catch (e) { /* keep the last badge */ } } }
   lightCheck();
@@ -162,6 +173,7 @@ async function start() {
   function renderBody() {
     if (!state.panel) return;
     state.view = null;
+    if (state.panel.drawer) { state.panel.drawer.remove(); state.panel.drawer = null; }
     clear(bodyEl); clear(footEl);
     state.panel.back.toggleAttribute("hidden", !state.peer);
     if (state.peer) return renderThread();
@@ -171,7 +183,7 @@ async function start() {
     if (c.requests.length) {
       bodyEl.appendChild(el("h3", { text: "Requests" }));
       for (const r of c.requests) {
-        bodyEl.appendChild(el("div", { class: "row" }, el("span", { class: "name", text: label(r) }),
+        bodyEl.appendChild(el("div", { class: "row" }, nameBlock(r),
           el("button", { type: "button", class: "small", text: "Accept", on: { click: () => act("accept", r.username) } }),
           el("button", { type: "button", class: "small", text: "Decline", on: { click: () => act("decline", r.username) } })));
       }
@@ -179,13 +191,13 @@ async function start() {
     bodyEl.appendChild(el("h3", { text: "Contacts" }));
     if (!c.contacts.length) bodyEl.appendChild(el("div", { class: "note", text: "No contacts yet." }));
     for (const p of c.contacts) {
-      const item = el("button", { type: "button", class: "item", on: { click: () => selectPeer(p.username) } }, el("span", { class: "name", text: label(p) }));
+      const item = el("button", { type: "button", class: "item", on: { click: () => selectPeer(p.username) } }, nameBlock(p));
       if (p.unread) item.appendChild(el("span", { class: "unread", text: String(p.unread) }));
       bodyEl.appendChild(item);
     }
     if (c.outgoing.length) {
       bodyEl.appendChild(el("h3", { text: "Waiting for a reply" }));
-      for (const o of c.outgoing) bodyEl.appendChild(el("div", { class: "note", text: o.username }));
+      for (const o of c.outgoing) bodyEl.appendChild(el("div", { class: "note" }, nameBlock(o)));
     }
     const input = el("input", { type: "text", placeholder: "Add contact by username", "aria-label": "Add contact by username", maxlength: "200", autocomplete: "off" });
     const add = () => { const v = input.value.trim(); if (v) { input.value = ""; act("request", v, "If that account exists, a request was sent."); } };
@@ -193,6 +205,21 @@ async function start() {
     footEl.appendChild(el("div", { class: "row" }, input, el("button", { type: "button", text: "Add", on: { click: add } })));
   }
   function label(p) { return p.display_name && p.display_name !== p.username ? p.display_name + " (" + p.username + ")" : p.username; }
+  function verifiedBadge(p) {
+    if (p.verified_role !== "operator" && p.verified_role !== "admin") return null;
+    return el("span", { class: "verified-role", text: `✓ Verified ${p.verified_role}`,
+      "aria-label": `Verified ${p.verified_role} permission` });
+  }
+  function nameBlock(p) { return el("span", { class: "name" }, document.createTextNode(label(p)), verifiedBadge(p)); }
+  function updatePeerHeader() {
+    if (!titleEl) return;
+    const info = state.contacts && state.contacts.contacts.find((x) => x.username === state.peer);
+    titleEl.textContent = info ? label(info) : state.peer;
+    if (info) {
+      const badge = verifiedBadge(info);
+      if (badge) titleEl.appendChild(badge);
+    }
+  }
 
   async function act(action, username, okNote) {
     try { await api("/api/messages/contacts", { username, action }); note(okNote || ""); await loadContacts(); }
@@ -247,8 +274,7 @@ async function start() {
     state.view = view;
     const active = () => state.open && state.peer === peer && state.view === view;
     const viewNote = text => { if (active()) note(text); };
-    const info = state.contacts && state.contacts.contacts.find((x) => x.username === peer);
-    titleEl.textContent = info ? label(info) : peer;
+    updatePeerHeader();
     threadEl = el("div");
     olderBtn = el("button", { type: "button", class: "small", text: "Load older", hidden: "", on: { click: () => loadThread(true) } });
     bodyEl.appendChild(olderBtn); bodyEl.appendChild(threadEl);
@@ -278,8 +304,20 @@ async function start() {
       catch (error) { viewNote(error.message); }
       finally { keyPassphrase.value = ""; unlockFileKey.disabled = false; }
     } } });
+    // Options drawer: every control except the text box and Send.  It stays in the panel's DOM while closed.
+    const drawer = el("div", { class: "drawer", role: "region", "aria-label": "Message options", id: "messenger-options" });
+    const menu = el("button", { type: "button", class: "menu", text: "☰", title: "Options: images, files, keys",
+      "aria-label": "Message options", "aria-controls": "messenger-options", "aria-expanded": "false" });
+    const setDrawer = (shown) => {
+      drawer.classList.toggle("open", shown);
+      menu.setAttribute("aria-expanded", shown ? "true" : "false");
+      if (shown) { const first = drawer.querySelector("button:not([disabled]), input:not([disabled])"); if (first) first.focus(); }
+    };
+    menu.addEventListener("click", () => setDrawer(!drawer.classList.contains("open")));
+    drawer.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); setDrawer(false); menu.focus(); } });
     const updateControls = () => {
       const setting = view.imageState;
+      menu.textContent = image || fileAttachment ? "☰•" : "☰";
       const busy = !!pendingSends.get(peer) || choosing || uploading || view.toggling;
       toggle.disabled = !setting || busy || view.refreshing;
       chooser.disabled = !setting || !setting.enabled || busy;
@@ -350,13 +388,20 @@ async function start() {
       fileAttachment = null; draft.file = null; updateControls();
     });
     input.addEventListener("input", () => { draft.body = input.value; });
-    footEl.appendChild(imageStatus);
-    footEl.appendChild(el("div", { class: "row" }, toggle, chooser));
-    footEl.appendChild(el("div", { class: "row" }, selected, removeImage));
-    footEl.appendChild(el("div", { class: "row" }, keyPassphrase, unlockFileKey));
-    footEl.appendChild(el("div", { class: "note" }, el("a", { href: "/keys.html", text: "Set up file keys" })));
-    footEl.appendChild(el("div", { class: "row" }, fileChooser));
-    footEl.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
+    drawer.appendChild(el("div", { class: "bar" }, el("span", { class: "title", text: "Options" }),
+      el("button", { type: "button", class: "small", text: "Close options", on: { click: () => { setDrawer(false); menu.focus(); } } })));
+    drawer.appendChild(el("h3", { class: "row", text: "Images" }));
+    drawer.appendChild(imageStatus);
+    drawer.appendChild(el("div", { class: "row" }, toggle, chooser));
+    drawer.appendChild(el("div", { class: "row" }, selected, removeImage));
+    drawer.appendChild(el("h3", { class: "row", text: "Files" }));
+    drawer.appendChild(el("div", { class: "row" }, keyPassphrase, unlockFileKey));
+    drawer.appendChild(el("div", { class: "note" }, el("a", { href: "/keys.html", text: "Set up file keys" })));
+    drawer.appendChild(el("div", { class: "row" }, fileChooser));
+    drawer.appendChild(el("div", { class: "row" }, fileStatus, removeFile));
+    state.panel.drawer = drawer;
+    state.panel.appendChild(drawer);
+    const sendButton = el("button", { type: "button", text: "Send" });
     let sending = false;
     let pending = pendingSends.get(peer) || null;
     if (pending) { input.value = pending.body; image = pending.image || null; draft.image = image;
@@ -385,7 +430,7 @@ async function start() {
       pending.inFlight = true;
       const operation = pending;
       sending = true;
-      input.disabled = true; updateControls();
+      input.disabled = true; sendButton.disabled = true; sendButton.textContent = "Sending…"; updateControls();
       try {
         for (let attempt = 0; attempt < 2; attempt++) {
           const conversations = await api("/api/messages/conversations");
@@ -421,10 +466,13 @@ async function start() {
           viewNote(e.message + " Retry unchanged text and image to safely retry this message.");
         }
       }
-      finally { operation.inFlight = false; sending = false; input.disabled = false; if (active()) updateControls(); }
+      finally { operation.inFlight = false; sending = false; input.disabled = false;
+        sendButton.disabled = false; sendButton.textContent = pendingSends.has(peer) ? "Retry send" : "Send";
+        if (active()) updateControls(); }
     };
     input.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); } });
-    footEl.appendChild(el("div", { class: "row" }, input, el("button", { type: "button", text: "Send", on: { click: send } })));
+    sendButton.addEventListener("click", send);
+    footEl.appendChild(el("div", { class: "row compose" }, menu, input, sendButton));
     state.seen = new Set();
     await loadThread(false);
     if (active()) { input.focus(); await view.refreshImages(); }

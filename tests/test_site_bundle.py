@@ -68,6 +68,15 @@ def test_prebuilt_program_uses_common_versioned_bundle_and_refreshes_gallery(tmp
     ).directory == bundle.directory
 
 
+def test_prebuilt_page_contract_is_part_of_version_identity(tmp_path):
+    args = dict(destination=tmp_path, slug="arena", title="Arena", entrypoint="run",
+                html="<!doctype html><title>Arena</title>", source_filename="arena.py", source="pass")
+    legacy = publish_prebuilt_program_bundle(**args)
+    described = publish_prebuilt_program_bundle(**args, page_contract={"schema": "meowdoku.page.v1"})
+    assert described.directory != legacy.directory
+    assert described.manifest["page_contract"] == {"schema": "meowdoku.page.v1"}
+
+
 def test_only_published_browser_shader_graduates_a_bundle_page():
     desktop_only = [{
         "language": "glsl",

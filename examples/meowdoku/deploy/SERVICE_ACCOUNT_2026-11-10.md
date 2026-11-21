@@ -20,6 +20,21 @@ Because children inherit the token, the supervisor and both instances run as tha
   - No grant touches `C:/Users/alber`.
   - M, inherited: `C:/Apache24/logs`, `turing/build` (Meowdoku state, logs, accounts.db, tls), `nodus/out`.
   - R on `build/meowdoku/admin_token*.txt` and `tls/key.pem` (explicit; the service is added, alber's access is unchanged).
+  - State layout: RX on `secrets/` itself, this folder only (2026-11-13). Apache resolves each folder of a path by name, so
+    without listing `secrets/` it is refused `tls-public/fullchain.cer` although the file grants read.
+- Service `ConfigArgs` = `-E C:/Apache24/logs/startup-errors.log` (2026-11-13): errors httpd hits before it opens `error.log`
+  go there; `Apache-Service.ps1 -Start` prints the file when a start fails.
+
+## First switch, 2026-11-13 (receipt)
+
+The first service start failed three times with only "Incorrect function" in the System log and nothing in `error.log`:
+1. The vhost loaded the certificate from the operator's profile (Posh-ACME). Fixed: `apache/meowdoku-proxy.conf` uses the
+   `secrets/tls-public` copies.
+2. With `-E` set, httpd reported `SSLCertificateFile: Invalid file path .../tls-public/fullchain.cer`: the service could not list
+   `secrets/`. Fixed by the folder grant above (`(RD)` alone is not enough; it lacks Synchronize).
+3. `httpd -k install` had exited non-zero while the console Apache held the ports; the script now judges by the service.
+Still open after the switch: the supervisor writes Nodus console tokens into `secrets/operator_credentials`, which the service
+cannot write, so `nodus-messenger`, `nodus-training` and `nodus-ui-mirror` do not start under the service.
 
 ## Private interpreter (no operator profile, no machine-wide resource)
 

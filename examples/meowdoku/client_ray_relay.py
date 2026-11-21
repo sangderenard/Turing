@@ -162,7 +162,8 @@ class ClientRayRelay:
     def poll(self, job, owner, credential):
         with self.lock:
             e=self._auth(job,owner,credential)
-            if self.clock()-e['last_poll'] < .09:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and self.clock()-e['last_poll'] < .09:
                 raise RelayError('Poll rate exceeds ten per second',429)
             e['last_poll']=self.clock();self._expire(e)
             if e['state'] in ('waiting','expired','rejected','committed'):e['ready_credit']=True

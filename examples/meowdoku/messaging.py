@@ -15,7 +15,8 @@ refuses every non-conversation (unknown, self, not accepted, blocked) with the s
 only ever returned as a JSON string; nothing here produces HTML.
 
 SERVER-MEDIATED AND OPERATOR-READABLE.  Every message passes through and is stored by the server; there is no peer-to-peer channel and
-no address of one user is ever handed to another.  A user's responses expose about another user ONLY username and display_name (no id,
+no address of one user is ever handed to another.  A user's responses expose about another user only username, display_name and
+current verified operator/admin role (no id,
 presence, last-seen, typing, or read receipt: ``read_at`` only feeds the recipient's own unread count).  An admin (capability
 account_manage) may read any thread, soft-delete a message (removed_at/removed_by: participants then see body "" and removed true) and
 suspend an account (msg_suspended: it cannot send or request contacts); each admin action is a ``msg_audit`` row.
@@ -49,7 +50,7 @@ MAX_PER_MINUTE, MAX_PER_DAY = 30, 2000
 MAX_CONTACTS, MAX_PENDING = 200, 20
 MAX_WAITERS, MAX_WAITERS_PER_ACCOUNT = 64, 2
 MAX_WAIT_S = 25.0
-SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic", "control")   # control: ref is an instance_requests id
+SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic", "control", "review", "page", "room", "article")   # control: an instance_requests id; review: a branch_reviews id; page: an authored page id; room: a chat room (an @mention there); article: a newsletter article
 MSG_TYPES = ("note", "status", "question", "handoff", "approval_request", "answer")
 MAX_SUBJECT_REF = 200
 HANDLE_TTL = 60
@@ -137,7 +138,9 @@ class Hub:
 
     def enter(self, account_id: int) -> None:
         with self.cond:
-            if sum(self._waiters.values()) >= MAX_WAITERS or self._waiters.get(account_id, 0) >= MAX_WAITERS_PER_ACCOUNT:
+            from meowdoku import rate_limits
+            if rate_limits.enabled() and (sum(self._waiters.values()) >= MAX_WAITERS or
+                                          self._waiters.get(account_id, 0) >= MAX_WAITERS_PER_ACCOUNT):
                 raise MessagingError("too many open message polls", 429)
             self._waiters[account_id] = self._waiters.get(account_id, 0) + 1
 
@@ -184,11 +187,13 @@ def _mutual(db, a, b) -> bool:
     return _state(db, a, b) == "accepted" and _state(db, b, a) == "accepted"
 
 
-# ---- the system as a contact ------------------------------------------------------------------------------------------------------
+# ---- managed contacts -------------------------------------------------------------------------------------------------------------
+INTRODUCTION_AGENTS = ("codex", "gemini", "claude", "dot", "llama")
+
+
 def system_contact(db, system_id: int, user_id: int, now: float | None = None) -> bool:
-    """Make the system account and one account mutual contacts.  For system broadcasts only: the system is not a
-    person, so this is not a request the account answers and the contact limits do not apply to it.  An account that
-    has BLOCKED the system stays blocked and gets nothing.  True when the two are mutual afterwards."""
+    """Make a managed system or named agent account and one account mutual contacts. The operator provisions these
+    contacts without a request, outside contact limits. A block on either side still wins. True when mutual."""
     if system_id == user_id:
         return False
     now = time.time() if now is None else now
@@ -210,6 +215,21 @@ def system_contact(db, system_id: int, user_id: int, now: float | None = None) -
 def befriend_all(db, system_id: int, user_ids) -> int:
     """``system_contact`` for each given account; returns how many are mutual with the system afterwards."""
     return sum(1 for user_id in user_ids if system_contact(db, system_id, int(user_id)))
+
+
+def introduce_agents(db, user_id: int | None = None) -> int:
+    """Connect existing accounts to the five provisioned agent accounts. Never create identities or override blocks.
+
+    With a user id, reconcile that account; if it is a named agent, reconcile everyone. Without one, reconcile all
+    accounts at startup. Missing agent accounts are skipped until they are provisioned and an introduction runs again.
+    """
+    agents = {row["username"].lower(): row["id"] for row in db.execute(
+        "SELECT id, username FROM users WHERE username COLLATE NOCASE IN (?,?,?,?,?)", INTRODUCTION_AGENTS)}
+    if user_id is None or user_id in agents.values():
+        users = [row[0] for row in db.execute("SELECT id FROM users")]
+    else:
+        users = [user_id] if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() else []
+    return sum(1 for uid in users for aid in agents.values() if uid != aid and system_contact(db, aid, uid))
 
 
 # ---- contacts -------------------------------------------------------------------------------------------------------------------
@@ -295,12 +315,17 @@ def remove(db, me: int, peer_username) -> dict:
 
 def contacts(db, me: int) -> dict:
     """{contacts: [{username, display_name, unread, last}], requests: [...], outgoing: [...], blocked: [...]}.
-    Only ``me``'s own rows: contacts are mutual peers; no one else's list is ever visible."""
+    Only ``me``'s own rows: contacts are mutual peers; no one else's list is ever visible. Verified roles come from
+    current server permission groups, never from a peer's name or display name."""
+    from meowdoku import permission_groups
     mine = db.execute("SELECT c.peer_id, c.state, c.created, u.username, u.display_name FROM msg_contacts c "
                       "JOIN users u ON u.id = c.peer_id WHERE c.user_id = ? ORDER BY u.username COLLATE NOCASE", (me,)).fetchall()
     out = {"contacts": [], "requests": [], "outgoing": [], "blocked": []}
     for row in mine:
-        item = {"username": row["username"], "display_name": row["display_name"]}
+        role = permission_groups.authority(db, row["peer_id"])["highest"]
+        verified_role = role if role in ("operator", "admin") else None
+        item = {"username": row["username"], "display_name": row["display_name"],
+                "verified_role": verified_role}
         theirs = _state(db, row["peer_id"], me)
         if row["state"] == "blocked":
             out["blocked"].append({"username": row["username"]})
@@ -313,7 +338,7 @@ def contacts(db, me: int) -> dict:
                               "OR (sender_id = ? AND recipient_id = ?)", (me, row["peer_id"], row["peer_id"], me)).fetchone()[0]
             out["contacts"].append({**item, "unread": unread, "last": last})
         elif theirs == "requested":
-            out["outgoing"].append({"username": row["username"]})
+            out["outgoing"].append({"username": row["username"], "verified_role": verified_role})
     return out
 
 
@@ -565,9 +590,10 @@ def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | 
             raise MessagingError("enable images in this chat before sending an image", 403)
         minute = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 60)).fetchone()[0]
         day = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 86400)).fetchone()[0]
-        if minute >= MAX_PER_MINUTE:
+        from meowdoku import rate_limits
+        if rate_limits.enabled() and minute >= MAX_PER_MINUTE:
             raise MessagingError(f"at most {MAX_PER_MINUTE} messages per minute", 429)
-        if day >= MAX_PER_DAY:
+        if rate_limits.enabled() and day >= MAX_PER_DAY:
             raise MessagingError(f"at most {MAX_PER_DAY} messages per day", 429)
         if attachment:
             owned = db.execute("SELECT COALESCE(SUM(length(data)),0) FROM msg_images WHERE sender_id=?", (me,)).fetchone()[0]

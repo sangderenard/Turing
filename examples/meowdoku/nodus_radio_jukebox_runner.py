@@ -3,11 +3,13 @@
 Construction/GET never launches a source. Operator catalogue paths only; the
 producer is silent (SDL dummy), while its real NRAD and PCM outputs are retained.
 """
+from collections import deque
 import json
 import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -21,6 +23,7 @@ class NativeTrack:
         self.process = None
         self.error = None
         self.lines = queue.Queue(maxsize=64)
+        self.diagnostics = deque(maxlen=8)
         self.reader = None
         self.spectrum_peer = None
         self.on_pcm = None
@@ -32,9 +35,18 @@ class NativeTrack:
         argv = [c['executable'], c['scope_dll'], c['fft_dll'], '127.0.0.1',
                 str(c['spectrum_port']), '0', '5', '1024', self.song['path'],
                 '0', str(c['pcm_port']), '1']
+        environment = dict(os.environ, SDL_AUDIODRIVER='dummy')
+        dll_dirs = c.get('codec', {}).get('dll_dirs', [])
+        if dll_dirs:
+            environment['PATH'] = os.pathsep.join(dll_dirs) + os.pathsep + environment.get('PATH', '')
+        if c.get('hls_env'):
+            from meowdoku import nodus_radio_hls
+            nodus_radio_hls.clear_output(c['hls_state'])
+            environment.update(c['hls_env'])
+            argv.append('1')
         self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
-            env=dict(os.environ, SDL_AUDIODRIVER='dummy'),
+            env=environment,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         def read():
             for line in self.process.stdout:
@@ -42,6 +54,8 @@ class NativeTrack:
                 if line.startswith(('radio_pcm_source_port=', 'radio_waiting_for_start=', 'radio_udp_source_port=')):
                     try: self.lines.put_nowait(line)
                     except queue.Full: self.error = 'Native source readiness overflow'
+                elif line.strip() and not line.startswith('DEBUG:'):
+                    self.diagnostics.append(line.strip()[:240])
         self.reader = threading.Thread(target=read, daemon=True, name='radio-source-output')
         self.reader.start()
         deadline = time.perf_counter() + 10
@@ -49,8 +63,12 @@ class NativeTrack:
         ready = False
         while not (pin and ready):
             if cancel.is_set(): return
-            if self.process.poll() is not None or time.perf_counter() >= deadline:
-                raise RuntimeError('Native source did not announce a gated PCM stream')
+            code = self.process.poll()
+            if code is not None or time.perf_counter() >= deadline:
+                self.reader.join(timeout=.2)
+                detail = '; '.join(self.diagnostics)
+                raise RuntimeError('Native source did not announce a gated PCM stream'
+                                   f' (exit={code}, diagnostics={detail or "none"})')
             try: line = self.lines.get(timeout=.05)
             except queue.Empty: continue
             match = re.fullmatch(r'radio_pcm_source_port=(\d+) rtp_payload=96 encoding=L16 rate=48000 channels=2 ssrc=(\d+)\s*', line)
@@ -119,8 +137,9 @@ class PcmTap:
 
 
 class Runner:
-    def __init__(self, store, config_path, jobs, *, track=NativeTrack):
+    def __init__(self, store, config_path, jobs, *, track=NativeTrack, state=None):
         self.store, self.config_path, self.jobs, self.track = store, Path(config_path), jobs, track
+        self.state = state
         self.lock = threading.RLock()
         self.worker = None
         self.stop = threading.Event()
@@ -150,7 +169,8 @@ class Runner:
     def station(self):
         with self.lock:
             if self.current_track is None or self.current_track.spectrum_peer is None: return None
-            return {"peer": self.current_track.spectrum_peer, "title": self.current_song["title"]}
+            return {"peer": self.current_track.spectrum_peer, "title": self.current_song["title"],
+                    "song_id": self.current_song["id"]}
 
     def _config(self):
         try:
@@ -162,6 +182,14 @@ class Runner:
             for key in ('router_port', 'pcm_port', 'spectrum_port'):
                 if type(c[key]) is not int or not 0 < c[key] < 65536: raise ValueError()
             if c['pcm_port'] == c['spectrum_port']: raise ValueError()
+            hls = c.get('hls')
+            if hls is not None:
+                if not isinstance(hls, dict) or type(hls.get('enabled')) is not bool: raise ValueError()
+                if hls['enabled']:
+                    if self.state is None or self.state.radio_json != self.config_path: raise ValueError()
+                    from meowdoku import nodus_radio_hls
+                    c['hls_env'] = nodus_radio_hls.prepare(self.state, hls)
+                    c['hls_state'] = self.state
             return c
         except (OSError, ValueError, KeyError, TypeError):
             raise ControlError('Native jukebox source is not configured', 503)
@@ -205,7 +233,7 @@ class Runner:
 
     def _run(self, config):
         while not self.stop.is_set():
-            owned = None; claim = None; registered = False
+            owned = None; claim = None; registered = False; playback_wav = None
             try:
                 with self.lock:
                     if self.stop.is_set(): break
@@ -216,9 +244,22 @@ class Runner:
                 if not self.jobs.begin('radio_jukebox', claim['token'], owner=f"account:{claim['user_id']}", label='Radio requested track'):
                     raise RuntimeError('Could not register source ownership')
                 registered = True
-                song = self.store.catalogue()[claim['song_id']]
+                song = dict(self.store.catalogue()[claim['song_id']])
                 path = Path(song['path'])
                 if not path.is_absolute() or not path.is_file(): raise RuntimeError('Catalogue source unavailable')
+                if song.get('storage') in ('mp3', 'flac'):
+                    if self.state is None: raise RuntimeError('Account-owned audio state is unavailable')
+                    from meowdoku.suno_radio_assets import run_codec
+                    playback_wav = path.parent / ('.playback-' + secrets.token_hex(12) + '.wav')
+                    run_codec(self.state, path, playback_wav, song['storage'] + '_decode')
+                    if not song.get('analysis'):
+                        try:
+                            from meowdoku.radio_upload_assets import ensure_analysis
+                            if ensure_analysis(self.state, self.store.db_path, song, playback_wav):
+                                song['analysis'] = True
+                        except Exception as exc:
+                            print(f'[radio-jukebox] Levels unavailable for {song["id"]}: {exc}', flush=True)
+                    song['path'] = str(playback_wav)
                 owned = self.track(config, song)
                 owned.on_pcm = self._publish_pcm
                 with self.lock:
@@ -239,6 +280,11 @@ class Runner:
                 if owned is not None:
                     try: owned.close()
                     except Exception as exc: self.error = str(exc); status = 'failed'; self.stop.set()
+                if playback_wav is not None:
+                    try:
+                        playback_wav.unlink(missing_ok=True)
+                    except OSError as exc:
+                        self.error = str(exc); status = 'failed'; self.stop.set()
                 if claim is not None:
                     try:
                         if registered and not self.jobs.end('radio_jukebox', claim['token']):

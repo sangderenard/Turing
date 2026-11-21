@@ -8,13 +8,13 @@ await assert.rejects(badApi('/api/messages/send',{}),/Invalid JSON/);
 assert.equal(requestOptions.redirect,'error');
 const start=src.indexOf('    let sending = false;');
 const code=src.slice(start,src.indexOf('    input.addEventListener',start))+'\nreturn send;';
-const make=new Function('input','location','crypto','pendingSends','peer','api','viewNote','draft','image','updateControls','active','choosing','view',code);
+const make=new Function('input','location','crypto','pendingSends','peer','api','viewNote','draft','image','updateControls','active','choosing','uploading','fileAttachment','view','sendButton',code);
 const receipt={ok:true,id:1,created:1};
 let nextKey=0;
 function pane(map,api,value='hello',image=null) {
- const input={value,disabled:false}, notes=[];
- const send=make(input,{protocol:'https:'},{randomUUID:()=> 'op-'+(++nextKey)},map,'ben',api,m=>notes.push(m),{},image,()=>{},()=>true,false,{imageState:{enabled:true},toggling:false});
- return {input,send,notes};
+ const input={value,disabled:false}, sendButton={disabled:false,textContent:'Send'}, notes=[];
+ const send=make(input,{protocol:'https:'},{randomUUID:()=> 'op-'+(++nextKey)},map,'ben',api,m=>notes.push(m),{},image,()=>{},()=>true,false,false,null,{imageState:{enabled:true},toggling:false},sendButton);
+ return {input,sendButton,send,notes};
 }
 // First response lost: one operation, fresh handles, double-click suppressed.
 {
@@ -34,20 +34,47 @@ function pane(map,api,value='hello',image=null) {
 {
  const map=new Map();let release, sent=0;
  const api=async(p)=>p.endsWith('/conversations')?{contacts:[{username:'ben',conversation_handle:'h'}]}:(sent++,await new Promise(r=>release=r));
- const old=pane(map,api);const running=old.send();await new Promise(r=>setImmediate(r));
+ const old=pane(map,api);const running=old.send();
+ assert.equal(old.sendButton.disabled,true);assert.equal(old.sendButton.textContent,'Sending…');
+ await new Promise(r=>setImmediate(r));
  const reopened=pane(map,api,'');assert.equal(reopened.input.value,'hello');await reopened.send();assert.equal(sent,1);
- release(receipt);await running;await reopened.send();assert.equal(sent,1);assert.equal(reopened.input.value,'');
+ release(receipt);await running;
+ assert.equal(old.sendButton.disabled,false);assert.equal(old.sendButton.textContent,'Send');
+ await reopened.send();assert.equal(sent,1);assert.equal(reopened.input.value,'');
 }
 // Invalid receipts stay uncertain. Editing must not discard the original key.
 {
  const map=new Map();let sent=0;
  const api=async(p)=>p.endsWith('/conversations')?{contacts:[{username:'ben',conversation_handle:'h'}]}:(sent++,null);
  const ui=pane(map,api);await ui.send();assert.equal(sent,2);assert.equal(ui.input.value,'hello');
+ assert.equal(ui.sendButton.disabled,false);assert.equal(ui.sendButton.textContent,'Retry send');
  const key=map.get('ben').idempotency_key;ui.input.value='different';await ui.send();
  assert.equal(sent,2);assert.equal(map.get('ben').idempotency_key,key);assert.match(ui.notes.at(-1),/previous message/);
  const reopened=pane(map,api,'');assert.equal(reopened.input.value,'hello');
 }
 console.log('Widget regression checks passed (isolated send/API functions, not full browser DOM).');
+
+// The selected DM stays open while contacts refresh. Its name block must shed a badge after demotion
+// without rebuilding the thread (that would restart loadThread's render loop).
+{
+ const loadCode=src.slice(src.indexOf('  async function loadContacts()'),src.indexOf('  async function lightCheck()'));
+ const headerCode=src.slice(src.indexOf('  function label(p)'),src.indexOf('  async function act('));
+ const title={children:[],set textContent(value){this.text=value;this.children=[];},appendChild(child){this.children.push(child);}};
+ const state={open:true,peer:'operator-gpt',contacts:null};
+ let role='operator',renders=0;
+ const api=async()=>({contacts:[{username:'operator-gpt',display_name:'Operator GPT',verified_role:role}],requests:[]});
+ const el=(tag,props)=>({tag,...props});
+ const {loadContacts}=new Function('state','api','setUnread','countUnread','renderBody','titleEl','el','document',
+   loadCode+headerCode+';return {loadContacts};')(state,api,()=>{},()=>0,()=>{renders++;},title,el,{});
+ await loadContacts();
+ assert.equal(title.text,'Operator GPT (operator-gpt)');
+ assert.equal(title.children[0]?.text,'✓ Verified operator');
+ role=null;
+ await loadContacts();
+ assert.equal(title.text,'Operator GPT (operator-gpt)');
+ assert.equal(title.children.length,0);
+ assert.equal(renders,0,'an open DM must keep its thread view while its header updates');
+}
 
 // Definitive validation failure allows correction; uncertainty followed by a
 // definitive failure retains the original operation identity instead.

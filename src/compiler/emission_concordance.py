@@ -1027,7 +1027,14 @@ def post_api_contract(
     for index, value_id in enumerate(order):
         held = resident.get(value_id)
         shape_count = _declared_count(shapes[index]) or 1
-        itemsize = int(DTYPES[str(dtypes[index])].byte_size)
+        # Public host buffers spell pointer-word storage ``uintp`` (NumPy),
+        # while the compiler's physical layout remains the distinct ``ptr``
+        # kind. This is an API storage spelling, not a new numerical dtype
+        # or permission to treat an opaque handle as an integer value.
+        public_dtype = str(dtypes[index])
+        itemsize = int(DTYPES[
+            "ptr" if public_dtype == "uintp" else public_dtype
+        ].byte_size)
         if held is None:
             buffers.append(LayoutBuffer(
                 None, None, None, index, str(dtypes[index]), shape_count,

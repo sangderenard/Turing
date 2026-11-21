@@ -133,14 +133,28 @@ def server(tmp_path):
     sessions.lifecycle = SimpleNamespace(token=TOKEN)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    _sign_in(httpd.server_address[1])
     yield httpd.server_address[1], sessions
     httpd.shutdown()
     httpd.server_close()
 
 
+SIGNED_IN = {}       # port -> account cookie: a visitor with no account is a guest and never holds library_manage (owner, 2026-11-13)
+
+
+def _sign_in(port):
+    status, _, response = _req(port, "POST", "/api/account/signup",
+                               json.dumps({"username": "studio_cat", "password": "correcthorse1"}).encode(),
+                               {"Content-Type": "application/json", "Cookie": ""})
+    assert status == 201
+    SIGNED_IN[port] = next(c.split(";")[0] for c in response.msg.get_all("Set-Cookie") if c.startswith(srv.ACCOUNT_COOKIE))
+
+
 def _req(port, method, path, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
-    h = dict(headers or {})
+    h = {"Cookie": SIGNED_IN.get(port, ""), **(headers or {})}
+    if not h["Cookie"]:
+        del h["Cookie"]
     if body is not None and "Content-Length" not in h:
         h["Content-Length"] = str(len(body))
     conn.request(method, path, body=body, headers=h)
@@ -323,7 +337,8 @@ def test_the_stream_at_each_bit_depth(tmp_path):
 
 
 def test_a_local_visitor_needs_no_token_for_the_studio(server):
-    """LAN-origin visitors (the owner's own network) activate and delete without the token; the owner asked for the studio open to creative use."""
+    """Signed-in LAN-origin visitors (the owner's own network) activate and delete without the token; the owner asked for the studio
+    open to creative use.  A visitor with no account is a guest and must sign in first (owner, 2026-11-13)."""
     port, sessions = server
     sessions.access.decide = lambda ip, host: ("lan", "edit")
     _, r1 = _save(port, _raw(1))

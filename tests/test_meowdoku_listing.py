@@ -19,7 +19,7 @@ from meowdoku import listing  # noqa: E402
 from meowdoku import math_jobs  # noqa: E402
 from meowdoku import server as srv  # noqa: E402
 
-LOCAL = {"Host": "127.0.0.1"}                                  # a local direct caller: the edit tier (dev_ui), role guest
+LOCAL = {"Host": "127.0.0.1"}                                  # a local direct caller: the edit tier (dev_ui once signed in)
 PUBLIC = {"X-Forwarded-For": "8.8.8.8", "X-Forwarded-Proto": "https", "Host": "cats.example.org"}   # dns origin: shader tier
 JSON = {"Accept": "application/json"}
 API_YAML = ("schema: turing-compiled-program-api-v1\nmodule: demo_mod\nlanguage: wasm\nentry: demo_entry\n"
@@ -28,9 +28,13 @@ ABI = {"schema": "turing.mobile-wasm-abi.v1", "inputs": [{"name": "x"}, {"name":
 ABOUT = "# Demo assets\n\nThese are hand-made test files.\n\n- first item\n- second `code` item\n"
 
 
+SIGNED_IN = {}       # port -> the fixture's account: a visitor with no account is a guest and never holds dev_ui (owner, 2026-11-13)
+GUEST = {"Cookie": ""}
+
+
 def _call(port, path, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-    conn.request("GET", path, headers={**LOCAL, **(headers or {})})
+    conn.request("GET", path, headers={**LOCAL, **SIGNED_IN.get(port, {}), **(headers or {})})
     r = conn.getresponse()
     raw = r.read()
     out = SimpleNamespace(status=r.status, raw=raw, headers={k.lower(): v for k, v in r.getheaders()}, cookies=r.msg.get_all("Set-Cookie") or [])
@@ -72,6 +76,7 @@ def world(tmp_path):
     listing.LIMITER = listing.RateLimiter(rate=1000.0)        # the rate-limit test builds its own bucket
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    SIGNED_IN[httpd.server_address[1]] = _signup(httpd.server_address[1], "browse_cat")     # a LAN account: the edit tier gives it dev_ui
     yield SimpleNamespace(port=httpd.server_address[1], sessions=sessions, web=web)
     httpd.shutdown()
     httpd.server_close()
@@ -79,10 +84,11 @@ def world(tmp_path):
 
 def test_guest_and_shader_tier_get_403_for_every_root(world):
     for root in ("", "site/", "math/", "docs/"):
-        r = _call(world.port, f"/browse/{root}", PUBLIC)
+        r = _call(world.port, f"/browse/{root}", {**PUBLIC, **GUEST})
         assert r.status == 403, root
-    assert _call(world.port, "/browse/site/hello.txt", PUBLIC).status == 403
-    assert _call(world.port, "/browse/", PUBLIC).headers["content-type"] == "application/json"
+        assert _call(world.port, f"/browse/{root}", GUEST).status == 403, root                 # a guest on the LAN, too
+    assert _call(world.port, "/browse/site/hello.txt", {**PUBLIC, **GUEST}).status == 403
+    assert _call(world.port, "/browse/", {**PUBLIC, **GUEST}).headers["content-type"] == "application/json"
 
 
 def test_operator_lists_site_as_json_with_hashes_and_declared_descriptions(world):
@@ -196,7 +202,7 @@ def test_member_lists_only_their_own_math_jobs_and_native_files_stay_hidden(worl
         assert _call(world.port, f"/browse/math/{job_a}/{name}", a).status == 404, name
     assert _call(world.port, f"/browse/math/{job_b}/", {**JSON, **a}).status == 404            # another account's job
     assert _call(world.port, f"/browse/math/{job_b}/law.numpy.py", a).status == 404
-    assert _call(world.port, f"/browse/math/{job_a}/", JSON).status == 403                     # no login: no compile_submit
+    assert _call(world.port, f"/browse/math/{job_a}/", {**JSON, **GUEST}).status == 403          # no login: no compile_submit
 
 
 def test_docs_root_describes_each_markdown_file(world):
@@ -239,4 +245,4 @@ def test_static_directory_request_redirects_for_dev_ui_and_files_are_unchanged(w
     assert r.status == 302 and r.headers["location"] == "/browse/site/sub/"
     assert _call(world.port, "/hello.txt").raw == b"hello listing\n"
     assert _call(world.port, "/sub/inner.txt").raw == b"inner"
-    assert _call(world.port, "/sub/", PUBLIC).status != 200
+    assert _call(world.port, "/sub/", {**PUBLIC, **GUEST}).status != 200

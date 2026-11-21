@@ -17,6 +17,7 @@ truth.  Plain data: it serializes as JSON or YAML unchanged.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 SCHEMA = "turing-runtime-abi-v1"
@@ -259,27 +260,132 @@ def apply_native_result_extents(
     buffers.update(views)
 
 
+@dataclass(frozen=True)
+class OwnedGlyphSequenceCopy:
+    """Exact returned child-pool ports supplied by a validated compiler receipt.
+
+    The outer arena contains int64 row handles; the child arena contains int64
+    glyph tokens, NOT Unicode code points. Capacity is flattened glyph storage,
+    while stride is the per-row width. This is a low-level copy contract, not
+    permission to export a descriptor or a Python string decoder.
+    """
+
+    data_id: int
+    length_id: int
+    capacity_id: int
+    owner_id: int
+    glyph_data_id: int
+    glyph_lengths_id: int
+    glyph_capacity_id: int
+    glyph_stride_id: int
+
+    def __post_init__(self):
+        ids = tuple(vars(self).values())
+        if any(type(i) is not int or i < 0 for i in ids) or len(set(ids)) != len(ids):
+            raise ValueError("owned glyph ports must be distinct nonnegative identities")
+
+
+def _copy_owned_glyph_rows(spec, integer_cell, count, capacity, address, owner):
+    """Copy validated row payloads while the caller retains the native owner."""
+    import ctypes
+    import numpy as np
+
+    glyph_address = integer_cell(spec.glyph_data_id)
+    lengths_address = integer_cell(spec.glyph_lengths_id)
+    flattened = integer_cell(spec.glyph_capacity_id)
+    stride = integer_cell(spec.glyph_stride_id)
+    pointer_max, extent_max = int(np.iinfo(np.uintp).max), int(np.iinfo(np.intp).max)
+    itemsize = np.dtype("int64").itemsize
+
+    def arena(pointer, extent):
+        if not 0 <= extent <= extent_max // itemsize:
+            raise ValueError("owned glyph arena extent exceeds host address width")
+        if not 0 <= pointer <= pointer_max:
+            raise ValueError("owned glyph pointer exceeds native pointer width")
+        size = extent * itemsize
+        if size and (pointer == 0 or pointer > pointer_max - (size - 1)):
+            raise ValueError("owned glyph arena has null or overflowing address")
+        if pointer and pointer % ctypes.alignment(ctypes.c_int64):
+            raise ValueError("owned glyph arena is not int64 aligned")
+
+    if (not 0 <= stride <= extent_max // itemsize or capacity > extent_max // itemsize
+            or flattened < 0 or capacity * stride > flattened):
+        raise ValueError("owned glyph dimensions exceed flattened capacity")
+    # Every scalar and arena bound is checked before reading any native row.
+    arena(address, count)
+    # Existing allocation reserves the outer arena independently but creates
+    # child arenas at zero extent until the first append. An empty result
+    # therefore need not have a child-length arena even with outer capacity.
+    arena(lengths_address, capacity if count else 0)
+    arena(glyph_address, flattened)
+    if count and not owner:
+        raise ValueError("owned glyph rows have no live owner")
+    if not count:
+        return ()
+
+    handles = np.ctypeslib.as_array((ctypes.c_int64 * count).from_address(address)).copy()
+    if any(not 0 <= int(handle) < capacity for handle in handles):
+        raise ValueError("owned glyph handle exceeds child length arena")
+    lengths = []
+    for handle in handles:
+        length = ctypes.c_int64.from_address(lengths_address + int(handle) * itemsize).value
+        if not 0 <= length <= stride or int(handle) * stride + length > flattened:
+            raise ValueError("owned glyph row length exceeds its stride or arena")
+        lengths.append(length)
+    # No payload read occurs until every selected handle and length validates.
+    result = []
+    for handle, length in zip(handles, lengths):
+        if length:
+            row = (ctypes.c_int64 * length).from_address(
+                glyph_address + int(handle) * stride * itemsize)
+            result.append(np.ctypeslib.as_array(row).copy())
+        else:
+            result.append(np.empty((0,), dtype=np.int64))
+    return tuple(result)
+
+
 def copy_owned_sequence_results(
     buffers: Mapping[int, Any],
     sequences: Iterable[tuple[int, int, int, int, str]],
+    *, glyph_sequences: Iterable[OwnedGlyphSequenceCopy] = (),
 ) -> dict[int, Any]:
     """Read an incumbent owned-heap sequence before releasing its owner.
 
     Ports are data-pointer cell, length, capacity, owner and element dtype,
     derived from the returned sequence descriptor. The caller keeps the
     native owner alive through this copy and releases it even on failure.
+    Optional glyph specs replace only the selected data result with a tuple of
+    independent int64 glyph arrays, never decoded Python strings. Numeric
+    address/extent checks do not prove pointer validity: validated compiler
+    provenance and a live native allocation are caller prerequisites.
     """
     import ctypes
     import numpy as np
 
+    sequences = tuple(sequences)
+    glyphs = {}
+    for spec in glyph_sequences:
+        if not isinstance(spec, OwnedGlyphSequenceCopy):
+            raise ValueError("owned glyph copy requires typed ports")
+        if spec.data_id in glyphs:
+            raise ValueError("duplicate owned glyph result")
+        matches = [ports for ports in sequences if ports[:4] == (
+            spec.data_id, spec.length_id, spec.capacity_id, spec.owner_id)]
+        if len(matches) != 1 or np.dtype(matches[0][4]) != np.dtype("int64"):
+            raise ValueError("owned glyph ports do not match one int64 outer result")
+        output_ids = {spec.data_id, spec.length_id, spec.capacity_id}
+        if any(output_ids.intersection(ports[:3]) for ports in sequences if ports is not matches[0]):
+            raise ValueError("owned glyph result collides with another output")
+        glyphs[spec.data_id] = spec
+
+    def integer_cell(value_id):
+        cell = np.asarray(buffers[int(value_id)])
+        if cell.size != 1 or cell.dtype.kind not in {"i", "u"}:
+            raise ValueError("owned sequence metadata is not one integer cell")
+        return int(cell.reshape(-1)[0])
+
     copied = {}
     for data_id, length_id, capacity_id, owner_id, dtype in sequences:
-        def integer_cell(value_id):
-            cell = np.asarray(buffers[int(value_id)])
-            if cell.size != 1 or cell.dtype.kind not in {"i", "u"}:
-                raise ValueError("owned sequence metadata is not one integer cell")
-            return int(cell.reshape(-1)[0])
-
         count, capacity = integer_cell(length_id), integer_cell(capacity_id)
         address, owner = integer_cell(data_id), integer_cell(owner_id)
         element = np.dtype(dtype)
@@ -294,7 +400,10 @@ def copy_owned_sequence_results(
             raise ValueError("owned sequence byte count exceeds host address width")
         if count and (address == 0 or owner == 0):
             raise ValueError("nonempty owned sequence has no live arena and owner")
-        if count:
+        if data_id in glyphs:
+            copied[int(data_id)] = _copy_owned_glyph_rows(
+                glyphs[data_id], integer_cell, count, capacity, address, owner)
+        elif count:
             octets = (ctypes.c_ubyte * (count * element.itemsize)).from_address(address)
             copied[int(data_id)] = np.ctypeslib.as_array(octets).view(element).copy()
         else:
