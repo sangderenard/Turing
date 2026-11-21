@@ -95,7 +95,10 @@ def _run_records(days: Path, now: float, agents: dict | None = None) -> dict[str
     agents = AGENTS if agents is None else agents
     found: dict[str, list[dict]] = {name: [] for name in agents}
     directory = days / "running"
-    if not directory.is_dir():
+    try:
+        if not directory.is_dir():
+            return found
+    except OSError:
         return found
     for file in directory.glob("*.json"):
         try:
@@ -163,7 +166,10 @@ def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | Non
     days = Path(agent_days) if agent_days is not None else Path.home() / "AgentDays"
     known = known_agents(accounts_db)
     records = _run_records(days, now, known)
-    records_available = (days / "running").is_dir()
+    try:
+        records_available = (days / "running").is_dir()
+    except OSError:
+        records_available = False
     agents = []
     for name, (account, minute) in known.items():
         runs = records[name]
