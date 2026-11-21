@@ -431,7 +431,19 @@ def export_assets(out: Path) -> dict:
 EMOJI_ATLAS_CELL = 128         # texels per cell edge
 EMOJI_ATLAS_COLS = 4
 EMOJI_ATLAS_INK = 0.875        # the glyph's longer side as a share of the cell (the rest is a margin that mip levels do not bleed across)
-EMOJI_FONT = "C:/Windows/Fonts/seguiemj.ttf"
+# ---- [PLATFORM] the colour emoji font the atlas is baked from -------------------------------------------------------
+# Program: web_export.py on the Oracle A1 host (Ubuntu 24.04, 2026-11-21).  Wrong record: the font was the Windows path
+# alone, so the export stopped at "OSError: cannot open resource".  Rule: each platform names its own colour emoji font
+# here and nowhere else.  Noto Color Emoji (package fonts-noto-color-emoji) is a bitmap (CBDT) font that opens only at
+# its fixed 109 px strike; bake_emoji_atlas crops each glyph to its ink and scales it to the cell, so the strike only
+# bounds the source resolution.  The atlas is the same layout on every platform; the glyph art is the platform font's.
+if sys.platform == "win32":
+    EMOJI_FONT, EMOJI_FONT_STRIKE = "C:/Windows/Fonts/seguiemj.ttf", None
+elif sys.platform.startswith("linux"):
+    EMOJI_FONT, EMOJI_FONT_STRIKE = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 109
+else:
+    raise RuntimeError(f"web_export.py: name this platform's colour emoji font ({sys.platform})")
+# ---- end [PLATFORM] --------------------------------------------------------------------------------------------------
 
 
 def emoji_kinds() -> list[dict]:
@@ -464,7 +476,8 @@ def bake_emoji_atlas(kinds: list[dict], cell: int = EMOJI_ATLAS_CELL, cols: int 
     rows = -(-len(kinds) // cols)
     atlas = np.zeros((rows * cell, cols * cell, 4), np.uint8)
     big = 4 * cell
-    font = ImageFont.truetype(font_path, int(big * 0.85))
+    strike = EMOJI_FONT_STRIKE if font_path == EMOJI_FONT else None   # a bitmap font opens only at its own strike
+    font = ImageFont.truetype(font_path, strike or int(big * 0.85))
     for index, kind in enumerate(kinds):
         canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
         ImageDraw.Draw(canvas).text((big // 2, big // 2), kind["glyph"], font=font, embedded_color=True, anchor="mm")

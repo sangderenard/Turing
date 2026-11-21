@@ -237,13 +237,17 @@ def test_unnamed_build_target_is_this_host(monkeypatch):
     import sys
 
     from src.compiler.native_code_retention import (
-        LINUX_AMD64_NATIVE_LINKER, host_build_target,
+        LINUX_AMD64_NATIVE_LINKER, LINUX_ARM64_NATIVE_LINKER, host_build_target,
     )
 
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(sys, "platform", "linux")
     assert host_build_target() is LINUX_AMD64_NATIVE_LINKER
     assert LINUX_AMD64_NATIVE_LINKER.llvm_triple == "x86_64-linux-gnu"
+    # The Oracle A1 host: an arm64 Linux build is an aarch64 ELF, not a PE DLL.
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+    assert host_build_target() is LINUX_ARM64_NATIVE_LINKER
+    assert LINUX_ARM64_NATIVE_LINKER.llvm_triple == "aarch64-linux-gnu"
     monkeypatch.setattr(platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(sys, "platform", "win32")
     assert host_build_target() is WINDOWS_AMD64_NATIVE_LINKER
