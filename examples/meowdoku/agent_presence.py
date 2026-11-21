@@ -16,12 +16,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 AGENTS = {"claude": ("agents", 0), "codex": ("agents-codex", 20), "gemini": ("agents-gemini", 40)}
-# Accounts with no Start-AgentDay slot: hosted Llama and the two app operators.
-UNSCHEDULED_AGENTS = ("llama", "operator-claude", "operator-codex")
+# Accounts with no Start-AgentDay slot: hosted Llama, gemma (the resident Hermes agent on its own sleep cycle, task
+# "SpeakToMe gemma") and the two app operators.
+UNSCHEDULED_AGENTS = ("llama", "gemma", "operator-claude", "operator-codex")
 # Installed external API agents (external_agents.py, case 989e507e), read beside the accounts database at each snapshot.
 _external: dict[str, tuple[str, int]] = {}
 RECENT_SECONDS = 30
 REQUEST_CHANNELS = ("api_in", "mcp_in")
+OUTBOUND_CHANNELS = ("api_out", "mcp_out")
 _lock = threading.Lock()
 _recent: dict[tuple[str, str], float] = {}
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9_./-]{1,400}$")
@@ -44,19 +46,38 @@ def known_agents(accounts_db: Path | None = None) -> dict[str, tuple[str, int]]:
     return {**AGENTS, **_external}
 
 
+def _agent_name(username: str) -> str | None:
+    """Map the signed-in account to the badge name shown by snapshot()."""
+    if username in AGENTS or username in _external or username in UNSCHEDULED_AGENTS:
+        return username
+    return next((name for name, (account, _) in {**AGENTS, **_external}.items() if username == account), None)
+
+
 def note_inbound(username: str, *, mcp: bool, now: float | None = None) -> None:
     """Record an authenticated API request; a call is only 'recent', not 'running'."""
-    if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
+    name = _agent_name(username)
+    if name is None:
         return
     with _lock:
-        _recent[(username, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
+        _recent[(name, "mcp_in" if mcp else "api_in")] = time.time() if now is None else now
+
+
+def note_outbound(username: str, channel: str, *, now: float | None = None) -> bool:
+    """Record a bounded observation from an authenticated agent's real client call site."""
+    name = _agent_name(username)
+    if channel not in OUTBOUND_CHANNELS or name is None:
+        return False
+    with _lock:
+        _recent[(name, channel)] = time.time() if now is None else now
+    return True
 
 
 def _observed(username: str, now: float) -> dict:
     with _lock:
-        recent = {channel: _recent.get((username, channel)) for channel in REQUEST_CHANNELS}
-    return {channel: {"state": "recent" if at is not None and 0 <= now - at <= RECENT_SECONDS else "unobserved",
-                      "at": at} for channel, at in recent.items()}
+        recent = {channel: _recent.get((username, channel)) for channel in (*REQUEST_CHANNELS, *OUTBOUND_CHANNELS)}
+    return {channel: {"state": "recent" if at is not None and 0 <= now - at <= RECENT_SECONDS else
+                      "unknown" if at is None and channel in OUTBOUND_CHANNELS else "unobserved", "at": at}
+            for channel, at in recent.items()}
 
 
 def _stamp(value) -> float | None:
@@ -151,14 +172,15 @@ def checkout_locations(accounts_db: Path, now: float) -> list[dict]:
         return []
     seen, out = set(), []
     for username, repository, path, at in rows:
-        if username not in AGENTS and username not in _external and username not in UNSCHEDULED_AGENTS:
+        name = _agent_name(username)
+        if name is None:
             continue
-        if username in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
+        if name in seen or not isinstance(path, str) or not _SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
             continue
         if not isinstance(at, (int, float)) or not 0 <= now - at <= RECENT_SECONDS:
             continue
-        seen.add(username)
-        out.append({"username": username, "repository": repository, "path": path.replace("\\", "/"), "at": at,
+        seen.add(name)
+        out.append({"username": name, "repository": repository, "path": path.replace("\\", "/"), "at": at,
                     "age_seconds": max(0, now - at)})
     return out
 
@@ -175,13 +197,11 @@ def snapshot(accounts_db: Path, agent_days: Path | None = None, now: float | Non
     agents = []
     for name, (account, minute) in known.items():
         runs = records[name]
-        channels = {"api_in": _observed(name, now)["api_in"], "mcp_in": _observed(name, now)["mcp_in"],
-                    "api_out": {"state": "unknown"}, "mcp_out": {"state": "unknown"},
+        channels = {**_observed(name, now),
                     "local": {"state": "active" if runs else "unobserved" if records_available else "unknown", "since": min((r["started"] for r in runs), default=None)}}
         agents.append({"username": name, "account": account, "runs": runs, "schedule": _schedule(days, name, minute, now), "channels": channels})
     for name in UNSCHEDULED_AGENTS:
         agents.append({"username": name, "account": None, "runs": [], "schedule": None,
-                       "channels": {**_observed(name, now), "api_out": {"state": "unknown"},
-                                    "mcp_out": {"state": "unknown"}, "local": {"state": "unknown"}}})
+                       "channels": {**_observed(name, now), "local": {"state": "unknown"}}})
     return {"as_of": now, "agents": agents, "locations": checkout_locations(accounts_db, now),
-            "note": "Repository locations require a file access observed in the last 30 seconds. Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound channels have no shared observation source."}
+            "note": "Repository locations require a file access observed in the last 30 seconds. Recent means an authenticated call observed by this server process in the last 30 seconds. MCP in requires the internal OAuth/preview bridge; other API calls are API in. Unobserved does not mean offline. Outbound lights come only from instrumented agent call sites; unknown means this server has no such observation."}

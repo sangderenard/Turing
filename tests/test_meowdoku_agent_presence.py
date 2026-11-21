@@ -54,12 +54,14 @@ def test_non_object_records_do_not_hide_a_valid_run(tmp_path, monkeypatch):
 
 def test_checkout_location_requires_recent_observation_and_outbound_unknown(tmp_path):
     now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
+    with presence._lock:
+        presence._recent.clear()
     db = tmp_path / "accounts.db"
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE checkout_calls (id INTEGER PRIMARY KEY, at REAL, username TEXT, repository TEXT, path TEXT, operation TEXT, ok INTEGER)")
         conn.executemany("INSERT INTO checkout_calls(at,username,repository,path,operation,ok) VALUES (?,?,?,?,?,?)", [
             (now - 60, "codex", "turing", "examples/meowdoku/server.py", "read", 1),
-            (now - 10, "codex", "turing", "examples/meowdoku/worldmap.py", "write", 1),
+            (now - 10, "agents-codex", "turing", "examples/meowdoku/worldmap.py", "write", 1),
             (30, "claude", "turing", "../secret", "read", 1),
             (40, "gemini", "turing", "src/compiler/fortran_c_shell.py", "read", 0),
         ])
@@ -77,11 +79,25 @@ def test_hosted_and_app_agents_have_truthful_unscheduled_badges(tmp_path):
     now = datetime(2026, 11, 17, 21, 25, tzinfo=timezone.utc).timestamp()
     result = presence.snapshot(tmp_path / "missing.db", tmp_path, now=now)
     by_name = {agent["username"]: agent for agent in result["agents"]}
-    for name in ("llama", "operator-claude", "operator-codex"):
+    for name in ("llama", "gemma", "operator-claude", "operator-codex"):
         assert name in by_name
         assert by_name[name]["schedule"] is None
         assert by_name[name]["channels"]["local"]["state"] == "unknown"
         assert by_name[name]["channels"]["api_out"]["state"] == "unknown"
+
+
+def test_outbound_requires_known_agent_and_real_channel():
+    with presence._lock:
+        presence._recent.clear()
+    assert presence._observed("codex", 100)["api_out"]["state"] == "unknown"
+    assert not presence.note_outbound("random-user", "api_out", now=100)
+    assert not presence.note_outbound("codex", "api_in", now=100)
+    assert presence.note_outbound("agents-codex", "api_out", now=100)
+    presence.note_inbound("agents-codex", mcp=True, now=100)
+    assert presence._observed("codex", 129)["api_out"] == {"state": "recent", "at": 100}
+    assert presence._observed("codex", 129)["mcp_in"] == {"state": "recent", "at": 100}
+    assert presence._observed("codex", 131)["api_out"]["state"] == "unobserved"
+    assert presence._observed("codex", 100)["mcp_out"]["state"] == "unknown"
 
 
 def test_inbound_is_recent_only(monkeypatch):
