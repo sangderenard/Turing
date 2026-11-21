@@ -414,8 +414,10 @@ class Instance:
         out = open(self.logfile, "ab")
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
+            # Off Windows each instance leads its own session and process group, so its whole tree -- the compiles a
+            # server starts (zig cc / clang) as well as the server -- can be ended together (end_process_group).
             self.proc = subprocess.Popen(self.command(), cwd=str(self.code_root), env=self.env(), stdin=subprocess.DEVNULL, stdout=out,
-                                         stderr=subprocess.STDOUT, creationflags=flags)
+                                         stderr=subprocess.STDOUT, creationflags=flags, start_new_session=(os.name != "nt"))
         finally:
             out.close()
         self.deadline = time.monotonic() + START_TIMEOUT.get(self.kind, 30.0)
@@ -554,6 +556,7 @@ class Instance:
             return
         code = self.proc.poll()
         if code is not None:
+            self.end_process_group()                        # what the exited instance started must not outlive it
             if code == EXIT_RESTART and self.kind == "meowdoku":
                 self.sup.log(f"{self.name}: scheduled exit ({code}); relaunching")
                 self.launch()
@@ -584,6 +587,33 @@ class Instance:
             self.renew_leases()
 
     # ---- stop
+    def end_process_group(self, grace=5.0):
+        """Off Windows: end what is left of this instance's process group once the instance itself has stopped or
+        exited. Program: the Oracle A1 host, 2026-11-21. Wrong record: stopping a server ended the server only; its
+        wasm compile (zig cc, then zig clang at ~22 GB) was re-parented to init and kept running, one more per restart,
+        until the kernel's OOM killer fired twice. Rule: the instance's group is its tree (launch starts it in its own
+        session); SIGTERM the group, wait `grace`, SIGKILL what remains. Windows has the job object for this
+        (tie_children_to_this_process)."""
+        if os.name == "nt" or self.proc is None:
+            return
+        group = self.proc.pid
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return                                          # the group is already empty
+        end = time.monotonic() + grace
+        while time.monotonic() < end:
+            try:
+                os.killpg(group, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.2)
+        try:
+            os.killpg(group, signal.SIGKILL)
+            self.sup.log(f"{self.name}: process group {group} did not end in {grace:.0f}s; killed")
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def request_stop(self):
         if self.proc is None or self.proc.poll() is not None:
             return
@@ -644,6 +674,7 @@ class Instance:
                 self.proc.wait(10)
             except subprocess.TimeoutExpired:
                 pass
+        self.end_process_group()
         self.remove_console_token()
         self.return_leases()
         self.state = "stopped"
@@ -669,6 +700,7 @@ class Instance:
                 self.proc.wait(5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        self.end_process_group()
         self.remove_console_token()
         if self.uid is not None and self.state not in ("skipped", "external"):
             self.return_leases()
