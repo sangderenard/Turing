@@ -213,6 +213,18 @@ def test_rest_wakes_early_on_new_message_and_survives_check_failure():
     assert A.rest(40, 15, lambda: (1, 5), sleep, lambda: now[0], logged.append) == "rested" and now[0] == 40
 
 
+def test_a_message_that_arrived_during_the_wake_ends_the_rest_at_the_first_poll():
+    """2026-11-20: a second @mention sent while gemma was awake was taken as already seen and waited a whole rest."""
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+    # baseline (1, 5) was waiting when the wake began; (2, 6) arrived during the wake
+    assert A.rest(1000, 15, lambda: (2, 6), sleep, lambda: now[0], [].append, baseline=(1, 5)) == "early"
+    assert now[0] == 0.0  # no sleep before noticing it
+    assert A.rest(30, 15, lambda: (1, 5), sleep, lambda: now[0], [].append, baseline=(1, 5)) == "rested"
+
+
 def test_cycle_ends_rest_early_when_pending_reports_message(tmp_path):
     _prepare(tmp_path)
     fake, log = _fake_hermes(tmp_path)

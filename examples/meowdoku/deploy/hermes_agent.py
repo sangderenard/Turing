@@ -273,11 +273,13 @@ def _newer(now, baseline):
     return count > base_count
 
 
-def rest(seconds, poll_seconds, check, sleep, clock, log):
-    """Rest for `seconds`; every poll ask `check` (message count, top id) whether something new has arrived since the rest
-    began. Returns "early" or "rested". A failing check is logged and the rest goes on at the same pace."""
+def rest(seconds, poll_seconds, check, sleep, clock, log, baseline=None):
+    """Rest for `seconds`; every poll ask `check` (message count, top id) whether something new has arrived since
+    `baseline` — what was waiting when the WAKE began (the agent read its messages then), so a message that arrived
+    during the wake ends the rest at the first poll instead of being taken as already seen (2026-11-20: a second @mention
+    sent mid-wake went unanswered for a whole rest). Without a baseline, the first poll sets it. Returns "early" or
+    "rested". A failing check is logged and the rest goes on at the same pace."""
     end = clock() + seconds
-    baseline = None
     while True:
         try:
             now = check()
@@ -351,6 +353,11 @@ def cycle(args, pending_check=None, session_probe=None, sleep=time.sleep, clock=
             before_tools = int(state.get("tool_total") or 0)
             wake_wall = time.time()
             started = time.monotonic()
+            try:  # what is waiting as the agent wakes: anything newer during the wake or rest ends the next rest
+                wake_baseline = check()
+            except Exception as error:  # noqa: BLE001
+                log(f"pending check failed: {type(error).__name__}: {error}")
+                wake_baseline = None
             log(f"wake cycle={int(state.get('cycles') or 0) + 1} session={session or 'new'}")
             work_code = run_turn(home, LATER_WAKE if session else FIRST_WAKE, args.work_seconds - args.wind_down_seconds,
                                  exe, session)
@@ -383,7 +390,7 @@ def cycle(args, pending_check=None, session_probe=None, sleep=time.sleep, clock=
             log(f"rest planned seconds={wait:.0f} work_seconds={work:.0f} tool_calls={tools} session={session}")
             if args.cycles and done >= args.cycles:
                 break
-            outcome = rest(wait, args.poll_seconds, check, sleep, clock, log)
+            outcome = rest(wait, args.poll_seconds, check, sleep, clock, log, baseline=wake_baseline)
             log("woke early: something is waiting" if outcome == "early" else "rested the full time")
         return 0
     except KeyboardInterrupt:
