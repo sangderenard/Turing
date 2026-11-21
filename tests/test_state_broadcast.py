@@ -77,8 +77,16 @@ def test_enrolled_reader_accepts_and_takes_over(regions):
         assert conn.execute("SELECT count(*) FROM notes").fetchone()[0] == 200
         assert conn.execute("SELECT region FROM region_enrollment ORDER BY region").fetchall() == [
             ("oracle",), ("owner-recovery",)]
-    # The writer's own keys never travel.
-    assert not (target / "secrets" / "region").exists()
+    # The clear manifest names nothing private: no file names, no recipient regions (key fingerprints only).
+    header = (Path(accepted["held"]) / "000000.rec").read_bytes()
+    for private in (b"page.txt", b"link.key", b"accounts.db", b"oracle", b"owner-recovery"):
+        assert private not in header, private
+    # The writer's own keys never travel: what the regrown root holds is the taking-over region's identity, and it is a
+    # working writer that continues the numbering.
+    assert sb.Region(target).name == "oracle"
+    assert sb.Region(target).key_id == sb.Region(regions["reader"]).key_id
+    successor = sb.pack(target, target / "sql" / "accounts.db", regions["tmp"] / "work-next", regions["tmp"] / "out-next")
+    assert successor["writer"] == "oracle" and successor["generation"] == 2
 
 
 def test_refusals(regions):

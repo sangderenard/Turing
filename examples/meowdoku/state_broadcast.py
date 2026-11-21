@@ -127,6 +127,10 @@ class Region:
         self.sign = Ed25519PrivateKey.from_private_bytes((self.dir / "sign.key").read_bytes())
         self.box = X25519PrivateKey.from_private_bytes((self.dir / "box.key").read_bytes())
 
+    @property
+    def key_id(self) -> str:
+        return key_id(_b64(self.box.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)))
+
     def public(self) -> dict:
         return {"region": self.name, "sign_pub": _b64(self.sign.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)),
                 "box_pub": _b64(self.box.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw))}
@@ -200,8 +204,13 @@ def recipients(accounts_db) -> list[dict]:
 
 # ---- sealing ----------------------------------------------------------------------------------------------------------
 
-def _kek(shared: bytes, generation: int, region: str) -> bytes:
-    info = f"{FORMAT} key-wrap generation={generation} region={region}".encode("utf-8")
+def key_id(box_pub: str) -> str:
+    """A recipient's name in the clear manifest: a fingerprint of its box key, never its region name (review 371d4fb9)."""
+    return hashlib.sha256(_unb64(box_pub, 32, "box_pub")).hexdigest()[:32]
+
+
+def _kek(shared: bytes, generation: int, kid: str) -> bytes:
+    info = f"{FORMAT} key-wrap generation={generation} kid={kid}".encode("utf-8")
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(shared)
 
 
@@ -350,14 +359,17 @@ def pack(state_dir, accounts_db, work_dir, out_dir, repos=None, exclude=(), emit
             ephemeral = X25519PrivateKey.generate()
             shared = ephemeral.exchange(X25519PublicKey.from_public_bytes(_unb64(target["box_pub"], 32, "box_pub")))
             nonce = os.urandom(12)
-            wrapped.append({"region": target["region"], "kind": target["kind"],
+            kid = key_id(target["box_pub"])
+            wrapped.append({"kid": kid,
                             "epk": _b64(ephemeral.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)),
                             "nonce": _b64(nonce),
-                            "key": _b64(ChaCha20Poly1305(_kek(shared, generation, target["region"])).encrypt(nonce, key, None))})
+                            "key": _b64(ChaCha20Poly1305(_kek(shared, generation, kid)).encrypt(nonce, key, None))})
+        wrapped.sort(key=lambda w: w["kid"])
+        # The manifest travels and rests in the clear, so it names nothing private: no file names (they are in the
+        # sealed archive's own manifest.json), no recipient regions (key fingerprints only). review 371d4fb9.
         manifest = {"format": FORMAT, "generation": generation, "writer": region.name,
                     "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "tools": _tool_commits(repos), "files": [{"rel": f["rel"], "kind": f["kind"], "size": f["size"]} for f in files],
-                    "skipped": skipped, "chunk_bytes": CHUNK_BYTES, "nonce_prefix": _b64(prefix),
+                    "tools": _tool_commits(repos), "chunk_bytes": CHUNK_BYTES, "nonce_prefix": _b64(prefix),
                     "chunks": len(sink.hashes), "chunk_sha256": sink.hashes, "recipients": wrapped}
         body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
         write_record(0, MAGIC + struct.pack(">I", len(body)) + body + region.sign.sign(body))
@@ -433,16 +445,18 @@ def _check_chunks(paths: list[Path], manifest: dict) -> None:
             raise BroadcastError(f"chunk {index} does not match its hash")
 
 
-def _unseal_to(paths: list[Path], box: X25519PrivateKey, me: str, manifest: dict, archive: Path) -> None:
-    """Open the content key with this region's box key, then unseal the chunks one at a time into ``archive``."""
-    entry = next((r for r in manifest["recipients"] if r["region"] == me), None)
+def _unseal_to(paths: list[Path], region: "Region", manifest: dict, archive: Path) -> None:
+    """Open the content key with this region's box key (its entry found by key fingerprint), then unseal the chunks one
+    at a time into ``archive``."""
+    me, kid, box = region.name, region.key_id, region.box
+    entry = next((r for r in manifest["recipients"] if r.get("kid") == kid), None)
     if entry is None:
         raise BroadcastError(f"generation {manifest['generation']} is not sealed to {me}")
     shared = box.exchange(X25519PublicKey.from_public_bytes(_unb64(entry["epk"], 32, "epk")))
     generation, writer = int(manifest["generation"]), str(manifest["writer"])
     chunks = paths[1:]
     try:
-        key = ChaCha20Poly1305(_kek(shared, generation, me)).decrypt(_unb64(entry["nonce"], 12, "nonce"),
+        key = ChaCha20Poly1305(_kek(shared, generation, kid)).decrypt(_unb64(entry["nonce"], 12, "nonce"),
                                                                     base64.b64decode(entry["key"]), None)
         prefix = _unb64(manifest["nonce_prefix"], 4, "nonce_prefix")
         aead = ChaCha20Poly1305(key)
@@ -491,7 +505,7 @@ def accept(state_dir, incoming_generation_dir, held_dir) -> dict:
     _check_chunks(paths, manifest)
     with tempfile.TemporaryDirectory(dir=region.dir) as private:
         archive = Path(private) / "generation.tar.gz"
-        _unseal_to(paths, region.box, region.name, manifest, archive)
+        _unseal_to(paths, region, manifest, archive)
         result = state_backup.verify(_extract(archive, Path(private)))
     if not result["ok"]:
         raise BroadcastError(f"generation {generation} unseals but does not verify: {result['bad'][:3]}")
@@ -526,10 +540,16 @@ def take_over(state_dir, held_generation_dir, target_state_dir, writer_stopped: 
     _check_chunks(paths, manifest)
     with tempfile.TemporaryDirectory(dir=region.dir) as private:
         archive = Path(private) / "generation.tar.gz"
-        _unseal_to(paths, region.box, region.name, manifest, archive)
+        _unseal_to(paths, region, manifest, archive)
         restored = state_backup.restore(_extract(archive, Path(private)), target_state_dir, into_empty=True)
     if not restored.get("ok"):
         raise BroadcastError(f"restore did not verify: {restored.get('bad')}")
-    # The new writer continues the numbering, so every reader keeps seeing a rising generation.
-    (region.dir / "generation").write_text(str(generation))
+    # The regrown root is a working writer (review 371d4fb9): it carries this region's identity (keys, pins, accepted
+    # counter), which never travels in a generation, and continues the numbering, so every reader keeps seeing a rising
+    # generation. The old root keeps its own copy; it is a reader that has stopped.
+    target_region = Path(target_state_dir) / REGION_DIR
+    for name in ("self.json", "sign.key", "box.key", "pins.json", "accepted.json"):
+        if (region.dir / name).is_file():
+            _write_private(target_region / name, (region.dir / name).read_bytes())
+    _write_private(target_region / "generation", str(generation).encode("ascii"))
     return {"took_over_from": writer, "generation": generation, "restored": restored["count"], "into": str(target_state_dir)}
