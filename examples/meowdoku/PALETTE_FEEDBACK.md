@@ -1,11 +1,15 @@
 # Personal color preference game
 
-`/palette.html` lets any visitor order the ten existing Meowdoku
-colour-blind-safe swatches. `POST /api/palette/rank` stores that ordering and
-selects a personal site accent. The page and the home feed show it for that
-participant. `POST /api/palette/feedback` accepts `good` or `bad` with the
-current candidate nonce, stores the outcome, and selects the next candidate.
-The nonce prevents a stale page from rating a different design. The browser's
+`/palette.html` lets any visitor choose among the ten existing Meowdoku
+colour-blind-safe swatches in the moment, in the style of a classic colour
+test: a mid-alpha black overlay covers and disables the site while ten
+borderless one-inch squares hang in space with ample margin, and each square
+disappears when chosen. The order of choices is that participant's ranking.
+`POST /api/palette/rank` stores it and selects a personal site accent. The
+page and the home feed show it for that participant.
+`POST /api/palette/feedback` accepts `good` or `bad` with the current
+candidate nonce, stores the outcome, and selects the next candidate. The
+nonce prevents a stale page from rating a different design. The browser's
 existing player token or an account's existing identity is the owner key.
 Other visitors' palettes never change.
 

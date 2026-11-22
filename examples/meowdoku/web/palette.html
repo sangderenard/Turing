@@ -11,34 +11,39 @@
   a, .accent { color: var(--palette-accent); }
   h1 { line-height: 1.12; }
   .panel { border: 1px solid color-mix(in srgb, var(--palette-accent) 45%, #384d67); border-radius: 1rem; padding: 1.2rem; margin: 1.4rem 0; background: #1b2839; }
-  .swatch { display: flex; align-items: center; gap: .7rem; padding: .35rem 0; }
-  .sample { width: 2rem; height: 2rem; border-radius: .4rem; border: 1px solid #fff8; flex: none; }
-  .swatch span:nth-child(2) { flex: 1; }
   button { font: inherit; border-radius: .5rem; border: 1px solid #6984a5; padding: .42rem .7rem; color: #edf2fb; background: #263953; cursor: pointer; }
   button:hover, button:focus-visible { border-color: var(--palette-accent); outline-color: var(--palette-accent); }
   button:disabled { opacity: .45; cursor: default; }
   .preview { border-left: .5rem solid var(--palette-accent); background: color-mix(in srgb, var(--palette-secondary) 10%, #1b2839); }
   .muted { color: #c2cddd; }
   #notice { min-height: 1.5rem; }
+  /* The choice field: a mid-alpha black layer that covers and disables the site beneath. */
+  #overlay { position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.55); }
+  #overlay[hidden] { display: none; }
+  #field { position: relative; width: 100%; height: 100%; }
+  .chip { position: absolute; width: 1in; height: 1in; border: none; border-radius: 0; padding: 0;
+          cursor: pointer; transform: translate(-50%, -50%); }
+  .chip:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .hint { position: absolute; top: 1rem; left: 0; right: 0; text-align: center; color: #e6e6e6;
+          font: .95rem/1.4 system-ui, sans-serif; pointer-events: none; }
 </style>
 </head>
 <body>
-<main>
+<div id="overlay" hidden>
+  <p class="hint">Choose the color that appeals to you right now. It will disappear.</p>
+  <div id="field"></div>
+</div>
+<main id="page">
   <p><a href="/">← Site home</a></p>
   <h1>Play the color preference game</h1>
-  <p>People and agents can order the same swatches. SpeakToMe tries a palette on your own site view, then learns from your good or bad response. Your choice does not change anyone else's view.</p>
-  <section class="panel" aria-labelledby="rank-title">
-    <h2 id="rank-title">Put the colors in your preferred order</h2>
-    <p class="muted">Use the up and down buttons, then apply your order.</p>
-    <div id="swatches"></div>
-    <button id="rank" type="button">Apply my order</button>
-  </section>
+  <p>People and agents can choose from the same swatches. Pick the colors in the moment, favorite first: each square hangs in space and disappears when chosen. When every color is chosen, SpeakToMe tries that palette on your own site view and learns from your good or bad response. Your choice does not change anyone else's view.</p>
   <section class="panel preview" aria-labelledby="preview-title">
     <h2 id="preview-title">Your site design</h2>
-    <p id="candidate" class="accent">Rank the colors to begin.</p>
+    <p id="candidate" class="accent">Choose the colors to begin.</p>
     <p>This card and the site home page use your current color. Visit <a href="/">the home page</a> and return to rate it.</p>
     <button id="good" type="button" disabled>Good</button>
     <button id="bad" type="button" disabled>Bad</button>
+    <button id="again" type="button">Choose colors again</button>
   </section>
   <p id="notice" role="status"></p>
 </main>
