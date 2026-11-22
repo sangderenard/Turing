@@ -1124,6 +1124,18 @@ def test_reviews_put_together_land_only_together(world):
     assert actions(done) == {"set-a": "landed", "set-b": "landed"}, "asking for one lands its whole set"
 
 
+def test_a_ready_sets_member_passes_the_push_check_alone(world):
+    """Landing together is the lander's coordination: once every member is ready, the push check (one repository, one
+    push) accepts each member's head by itself. This is the documented limit, held here so it cannot change unseen."""
+    db, policy = world["db"], world["policy"]
+    a, b = branch(world, "solo-a"), branch(world, "solo-b")
+    one = submit(world, "solo-a", a, timeout_s=0)
+    two = submit_with(world, "solo-b", b, [one["id"]], timeout_s=0)
+    assert branch_review.get(db, one["id"], 1000.0)["together_ready"] and two["together_ready"]
+    line = f"refs/heads/main {a} refs/heads/main {remote_has(world, 'main')}"
+    assert branch_gate.check_push(policy, db, "work", [line], 1000.0) == [], "a ready member's head is accepted alone"
+
+
 def test_a_set_holds_whole_when_one_member_would_not_land(world):
     work, db, policy = world["work"], world["db"], world["policy"]
     good = branch(world, "good")

@@ -415,7 +415,8 @@ async function show(id) {
     ...(review.held_at ? [["Held for review", `by ${review.held_by}, ${when(review.held_at)}: ${review.held_reason}`]] : []),
     ...(review.landed_at ? [["Landed", `${when(review.landed_at)} ${review.landed_detail || ""}`]] : []),
     ...(review.together?.length ? [["Lands together with", review.together.map(t => `${t.repository} ${t.branch} (${t.standing})`).join("; ")
-      + (review.together_ready ? "" : " — waits until every one is accepted or approved")]] : []),
+      + (review.together_ready ? "" : " — waits until every one is accepted or approved")
+      + ". The lander lands a ready set in one run; a push by hand can still move one alone."]] : []),
   ]) { facts.append(el("dt", term)); const dd = el("dd"); dd.append(el(term === "Commit" || term === "Review ID" ? "code" : "span", value)); facts.append(dd); }
   detail.replaceChildren(heading, facts);
   detail.append(el("p", "Reviewer remarks are formal agree or object votes. Discussion comments are in Threads.", "muted"));

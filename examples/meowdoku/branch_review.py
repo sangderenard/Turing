@@ -7,7 +7,7 @@ change and removes branches, and it does only what these rows allow. The one Git
 review names, for any reviewer (GET /api/reviews/diff), through ``branch_gate.git``.
 
     submit(db, user_id=, username=, repository=, branch=, base=, head=, timeout_s=, delete_branch=, known=[...],
-           together_with=[review ids])                                              lands only with those reviews
+           together_with=[review ids])                     the lander lands it only with those reviews
     remark(db, review_id, user_id=, username=, verdict="agree" | "object", note="")     a peer; never the author
     decide(db, review_id, user_id=, username=, head=, decision="approved" | "rejected", note="")   an admin
     withdraw(db, review_id, user_id=)                                                   the author
@@ -40,6 +40,12 @@ still its own review, decided on its own; ``submit(..., together_with=[review id
 (``branch_review_sets``). A member is ready only when every companion is approved, accepted or landed (``together``):
 until then the lander leaves all of them in the queue and the push check accepts none of their heads. A companion its
 author withdrew leaves the set; a resubmitted branch takes its old review's place in it.
+
+Landing together is the lander's coordination, not a guarantee the push check can give. Once a set is ready, the push
+check accepts each member's head alone: each repository's push is checked by itself, and the lander's own pushes come
+one member at a time. The lander lands every member of a ready set in one run, and checks them all before pushing any.
+A push made by hand can still move one member alone, and a failed push after another member's leaves the set partly
+landed; each member's record says what happened.
 
 ``advice`` is the one text that says how a change is made here. The lock prints it, in mock and in earnest.
 
@@ -504,7 +510,8 @@ def landable(db, now=None) -> list:
 
 def accepted_head(db, repository, base, head, now=None) -> bool:
     """True when ``head`` may be the tip of ``base``: a change at that commit is already landed, or is accepted or
-    approved and every companion in its set is too."""
+    approved and every companion in its set is too. It does not ask that the companions land in the same push: a set
+    can span repositories, and the lander pushes its members one at a time (see the module's note on sets)."""
     now = time.time() if now is None else now
     ensure(db)
     rows = db.execute(f"SELECT {', '.join(_COLUMNS)} FROM branch_reviews WHERE repository = ? AND base = ? AND head = ?",
