@@ -83,7 +83,15 @@ class OAuthMCP:
                 token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS oauth_mcp_pending (
                 nonce TEXT PRIMARY KEY, query_json TEXT NOT NULL, cookie_user INTEGER, expires REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS oauth_mcp_delegations (
+                id INTEGER PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, client_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL, resource TEXT NOT NULL, challenge TEXT NOT NULL,
+                user_id INTEGER NOT NULL, approved_by INTEGER NOT NULL, tools_json TEXT NOT NULL,
+                approved REAL NOT NULL, expires REAL NOT NULL, revoked REAL);
         """)
+        for table in ("oauth_mcp_codes", "oauth_mcp_tokens"):
+            if "delegation_id" not in {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN delegation_id INTEGER")
         self.db.commit()
         self.servers = {}
         self.register_hits = {}
@@ -93,12 +101,72 @@ class OAuthMCP:
         if not isinstance(token, str) or not 20 <= len(token) <= 256 or not token.isascii():
             return None
         with self.lock:
-            row = self.db.execute("SELECT users.id, users.username, users.display_name, oauth_mcp_tokens.expires "
+            row = self.db.execute("SELECT users.id, users.username, users.display_name, oauth_mcp_tokens.expires, "
+                                  "oauth_mcp_tokens.delegation_id, d.id, d.expires, d.revoked, d.tools_json "
                                   "FROM oauth_mcp_tokens JOIN users ON users.id = oauth_mcp_tokens.user_id "
+                                  "LEFT JOIN oauth_mcp_delegations d ON d.id=oauth_mcp_tokens.delegation_id "
                                   "WHERE oauth_mcp_tokens.token_hash = ?", (_digest(token),)).fetchone()
-        if not row or row[3] <= time.time():
+        if (not row or row[3] <= time.time() or
+            (row[4] is not None and (row[5] != row[4] or row[6] <= time.time() or row[7] is not None))):
             return None
-        return {"id": row[0], "username": row[1], "display_name": row[2]}
+        if row[4] is not None:
+            from meowdoku import authz
+            if authz.role_of(self.accounts.path, row[0]) != "member":
+                return None
+        return {"id": row[0], "username": row[1], "display_name": row[2],
+                "delegation_id": row[4], "allowed_tools": json.loads(row[8]) if row[4] is not None else None}
+
+    def pending_connections(self):
+        """Admin display of exact, unexpired OAuth requests; no bearer secret is returned."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT p.nonce,p.query_json,p.expires,c.name FROM oauth_mcp_pending p "
+                "JOIN oauth_mcp_clients c ON c.client_id=json_extract(p.query_json,'$.client_id') "
+                "LEFT JOIN oauth_mcp_delegations d ON d.nonce=p.nonce "
+                "WHERE p.expires>? AND d.id IS NULL ORDER BY p.expires", (time.time(),)).fetchall()
+        return [{"nonce": row[0], "client_name": row[3], "client_id": json.loads(row[1])["client_id"],
+                 "redirect_uri": json.loads(row[1])["redirect_uri"], "resource": json.loads(row[1])["resource"],
+                 "challenge_sha256": _digest(json.loads(row[1])["code_challenge"]),
+                 "expires": row[2]} for row in rows]
+
+    def approve_inbound(self, nonce, user_id, approved_by, tools, seconds):
+        if (not isinstance(nonce, str) or not isinstance(user_id, int) or not isinstance(approved_by, int) or
+            type(seconds) is not int or not 60 <= seconds <= TOKEN_LIFETIME or
+            not isinstance(tools, list) or not 1 <= len(tools) <= 40 or "whoami" not in tools or
+            any(not isinstance(t, str) or not t or len(t) > 64 or not t.replace("_", "").isalnum() for t in tools)):
+            raise ValueError("invalid inbound authorization")
+        now = time.time()
+        with self.lock:
+            if not self.db.execute("SELECT 1 FROM inbound_agent_accounts WHERE user_id=?", (user_id,)).fetchone():
+                raise ValueError("inbound identity not found")
+            from meowdoku import authz
+            if authz.role_of(self.accounts.path, user_id) != "member":
+                raise ValueError("privileged inbound delegation is not supported")
+            row = self.db.execute("SELECT query_json,expires FROM oauth_mcp_pending WHERE nonce=?", (nonce,)).fetchone()
+            if row is None or row[1] <= now:
+                raise ValueError("pending OAuth request expired")
+            q = json.loads(row[0])
+            cursor = self.db.execute(
+                "INSERT INTO oauth_mcp_delegations(nonce,client_id,redirect_uri,resource,challenge,user_id,approved_by,tools_json,approved,expires) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (nonce, q["client_id"], q["redirect_uri"], q["resource"], q["code_challenge"],
+                 user_id, approved_by, json.dumps(sorted(set(tools))), now, now + seconds))
+            self.db.commit()
+            return {"id": cursor.lastrowid, "expires": now + seconds}
+
+    def revoke_inbound(self, delegation_id):
+        with self.lock:
+            cursor = self.db.execute("UPDATE oauth_mcp_delegations SET revoked=? WHERE id=? AND revoked IS NULL",
+                                     (time.time(), delegation_id))
+            self.db.commit()
+            return cursor.rowcount == 1
+
+    def inbound_sessions(self):
+        with self.lock:
+            rows = self.db.execute("SELECT d.id,u.username,d.client_id,d.approved_by,d.tools_json,d.approved,d.expires,d.revoked "
+                                   "FROM oauth_mcp_delegations d JOIN users u ON u.id=d.user_id ORDER BY d.id DESC LIMIT 100").fetchall()
+        return [{"id": r[0], "username": r[1], "client_id": r[2], "approved_by": r[3],
+                 "tools": json.loads(r[4]), "approved": r[5], "expires": r[6], "revoked": r[7]} for r in rows]
 
     def metadata(self, handler, path):
         if path == "/.well-known/oauth-protected-resource/mcp":
@@ -178,11 +246,14 @@ class OAuthMCP:
             user = html.escape(account["username"]) if account else ""
             credentials = "" if account else '<label>Username <input name="username" autocomplete="username" required></label><label>Password <input name="password" type="password" autocomplete="current-password" required></label>'
             page = (f'<!doctype html><meta charset="utf-8"><title>Connect to SpeakToMe</title>'
-                    f'<h1>Connect {title} to SpeakToMe?</h1><p>{"Signed in as " + user if account else "Sign in to authorize this client."}</p>'
-                    f'<p>This client will use your account’s existing permissions.</p><form method="post" action="/oauth/authorize">'
+                    f'<h1>Connect {title} to SpeakToMe?</h1><p>{"Signed in as " + user if account else "Sign in to connect your own account, or wait for an approved agent identity."}</p>'
+                    f'<p>For an agent, have an admin authorize request <code>{nonce}</code> in Operator control, then choose Connect approved agent. '
+                    'The agent connection uses only its approved tools until expiry.</p>'
+                    f'<form method="post" action="/oauth/authorize">'
                     f'<input type="hidden" name="nonce" value="{nonce}">{credentials}'
-                    '<button type="submit" name="decision" value="allow">Allow</button>'
-                    '<button type="submit" name="decision" value="deny">Deny</button></form>').encode()
+                    '<button type="submit" name="decision" value="agent" formnovalidate>Connect approved agent</button>'
+                    '<button type="submit" name="decision" value="allow">Connect my own account</button>'
+                    '<button type="submit" name="decision" value="deny" formnovalidate>Deny</button></form>').encode()
             return _response(handler, 200, page, "text/html; charset=utf-8",
                              [("Set-Cookie", f"oauth_mcp_nonce={nonce}; Path=/oauth/authorize; Max-Age={CODE_LIFETIME}; HttpOnly; Secure; SameSite=Lax"),
                               ("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'"),
@@ -199,41 +270,58 @@ class OAuthMCP:
                 raise ValueError()
             with self.lock:
                 item = self.db.execute("SELECT query_json, cookie_user, expires FROM oauth_mcp_pending WHERE nonce = ?", (nonce,)).fetchone()
-                self.db.execute("DELETE FROM oauth_mcp_pending WHERE nonce = ?", (nonce,))
-                self.db.commit()
             if item is None or item[2] <= time.time():
                 raise ValueError()
             q, cookie_user = json.loads(item[0]), item[1]
             redirect = q["redirect_uri"]
             if form.get("decision") == "deny":
+                with self.lock:
+                    self.db.execute("DELETE FROM oauth_mcp_pending WHERE nonce=?", (nonce,))
+                    self.db.commit()
                 return self._redirect(handler, redirect, {"error": "access_denied", "state": q.get("state", "")})
-            if form.get("decision") != "allow":
+            if form.get("decision") not in ("allow", "agent"):
                 raise ValueError()
-            account = handler._account()
-            if cookie_user is not None:
-                if account is None or account["id"] != cookie_user:
-                    raise ValueError()
-                user_id = account["id"]
+            delegation_id = None
+            if form["decision"] == "agent":
+                with self.lock:
+                    delegated = self.db.execute(
+                        "SELECT id,user_id,client_id,redirect_uri,resource,challenge,expires,revoked "
+                        "FROM oauth_mcp_delegations WHERE nonce=?", (nonce,)).fetchone()
+                if (delegated is None or delegated[6] <= time.time() or delegated[7] is not None or
+                    (delegated[2], delegated[3], delegated[4], delegated[5]) !=
+                    (q["client_id"], redirect, q["resource"], q["code_challenge"])):
+                    return _json(handler, 403, {"error": "this OAuth request has no active agent approval"})
+                delegation_id, user_id = delegated[0], delegated[1]
             else:
-                # The existing login guard is applied to password submissions, including malformed names.
-                from meowdoku import login_guard, accounts as accounts_mod
-                username = form.get("username", "")
-                db = login_guard.connect(self.accounts.path)
-                try:
-                    if login_guard.check(db, handler._client_ip, username):
-                        return _json(handler, 429, {"error": "too_many_attempts"})
+                account = handler._account()
+                if cookie_user is not None:
+                    if account is None or account["id"] != cookie_user:
+                        raise ValueError()
+                    user_id = account["id"]
+                else:
+                    # The existing login guard is applied to password submissions, including malformed names.
+                    from meowdoku import login_guard, accounts as accounts_mod
+                    username = form.get("username", "")
+                    db = login_guard.connect(self.accounts.path)
                     try:
-                        user_id = self.accounts.login(username, form.get("password", ""))["id"]
-                    except accounts_mod.AccountError:
-                        login_guard.record(db, handler._client_ip, username, False)
-                        return _json(handler, 401, {"error": "invalid_credentials"})
-                    login_guard.record(db, handler._client_ip, username, True)
-                finally:
-                    db.close()
+                        if login_guard.check(db, handler._client_ip, username):
+                            return _json(handler, 429, {"error": "too_many_attempts"})
+                        try:
+                            user_id = self.accounts.login(username, form.get("password", ""))["id"]
+                        except accounts_mod.AccountError:
+                            login_guard.record(db, handler._client_ip, username, False)
+                            return _json(handler, 401, {"error": "invalid_credentials"})
+                        login_guard.record(db, handler._client_ip, username, True)
+                    finally:
+                        db.close()
             code = secrets.token_urlsafe(32)
             with self.lock:
-                self.db.execute("INSERT INTO oauth_mcp_codes VALUES (?, ?, ?, ?, ?, ?)",
-                                (_digest(code), q["client_id"], user_id, redirect, q["code_challenge"], time.time() + CODE_LIFETIME))
+                if self.db.execute("DELETE FROM oauth_mcp_pending WHERE nonce=? AND expires>?", (nonce, time.time())).rowcount != 1:
+                    raise ValueError()
+                self.db.execute("INSERT INTO oauth_mcp_codes(code_hash,client_id,user_id,redirect_uri,challenge,expires,delegation_id) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                (_digest(code), q["client_id"], user_id, redirect, q["code_challenge"], time.time() + CODE_LIFETIME,
+                                 delegation_id))
                 self.db.commit()
             return self._redirect(handler, redirect, {"code": code, "state": q.get("state", "")})
         except (ValueError, KeyError, TypeError):
@@ -256,17 +344,29 @@ class OAuthMCP:
                 raise ValueError()
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
             with self.lock:
-                row = self.db.execute("SELECT client_id, user_id, redirect_uri, challenge, expires FROM oauth_mcp_codes WHERE code_hash = ?",
+                row = self.db.execute("SELECT client_id, user_id, redirect_uri, challenge, expires, delegation_id "
+                                      "FROM oauth_mcp_codes WHERE code_hash = ?",
                                       (_digest(form["code"]),)).fetchone()
                 if not row or row[4] <= time.time() or row[0] != form.get("client_id") or row[2] != form.get("redirect_uri") or not secrets.compare_digest(row[3], challenge):
                     raise ValueError()
+                delegation_expires = None
+                if row[5] is not None:
+                    d = self.db.execute("SELECT user_id,client_id,redirect_uri,resource,challenge,expires,revoked "
+                                        "FROM oauth_mcp_delegations WHERE id=?", (row[5],)).fetchone()
+                    if (d is None or d[5] <= time.time() or d[6] is not None or
+                        (d[0], d[1], d[2], d[3], d[4]) != (row[1], row[0], row[2], self.resource, row[3])):
+                        raise ValueError()
+                    delegation_expires = d[5]
                 self.db.execute("DELETE FROM oauth_mcp_codes WHERE code_hash = ?", (_digest(form["code"]),))
                 token = secrets.token_urlsafe(32)
-                self.db.execute("INSERT INTO oauth_mcp_tokens VALUES (?, ?, ?)", (_digest(token), row[1], time.time() + TOKEN_LIFETIME))
+                expires = min(time.time() + TOKEN_LIFETIME, delegation_expires) if delegation_expires else time.time() + TOKEN_LIFETIME
+                self.db.execute("INSERT INTO oauth_mcp_tokens(token_hash,user_id,expires,delegation_id) VALUES(?,?,?,?)",
+                                (_digest(token), row[1], expires, row[5]))
                 self.db.execute("DELETE FROM oauth_mcp_codes WHERE expires <= ?", (time.time(),))
                 self.db.execute("DELETE FROM oauth_mcp_tokens WHERE expires <= ?", (time.time(),))
                 self.db.commit()
-            return _json(handler, 200, {"access_token": token, "token_type": "Bearer", "expires_in": TOKEN_LIFETIME, "scope": "mcp"})
+            return _json(handler, 200, {"access_token": token, "token_type": "Bearer",
+                                        "expires_in": max(1, int(expires - time.time())), "scope": "mcp"})
         except (ValueError, KeyError, TypeError):
             return _json(handler, 400, {"error": "invalid_grant"})
 
@@ -352,7 +452,9 @@ class OAuthMCP:
                     rest = BearerRest(f"https://127.0.0.1:{handler.server.server_port}", token,
                                       handler._origin, handler._tier, ca_file=self.loopback_ca)
                 session_id = secrets.token_urlsafe(32)
-                entry = (identity, handler._origin, handler._tier, threading.Lock(), ApiServer(rest))
+                entry = (identity, handler._origin, handler._tier, threading.Lock(),
+                         ApiServer(rest, allowed_tools=user["allowed_tools"] if not guest else None,
+                                   oauth_resource=self.resource if not guest else None))
                 self.servers[session_id] = entry
                 self.server_used[session_id] = now
         else:

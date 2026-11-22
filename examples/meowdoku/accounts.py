@@ -68,7 +68,7 @@ PRIVATE_TABLES = (
     "relay_addresses", "user_file_keys", "research_affirmations",
     "research_ballots", "research_eligible", "research_surveys",
     "radio_requests", "radio_turns", "radio_votes",
-    "owned_assets", "sessions", "preview_recovery", "temporary_accounts",
+    "owned_assets", "sessions", "preview_recovery", "temporary_accounts", "inbound_agent_accounts",
 )
 
 
@@ -145,6 +145,11 @@ class Accounts:
                 created_at REAL NOT NULL,
                 frozen_at REAL
             );
+            CREATE TABLE IF NOT EXISTS inbound_agent_accounts (
+                user_id INTEGER PRIMARY KEY,
+                created_by INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            );
         """)
         _schema_version.declare(self._conn, "accounts", 4)
         self._conn.commit()
@@ -209,6 +214,33 @@ class Accounts:
                 raise
         return {"id": cursor.lastrowid, "username": username, "temporary": True, "expires_at": expires,
                 "recovery_cookie": recovery_cookie, "recovery_code": recovery_code}
+
+    def create_inbound_agent(self, username: str, created_by: int) -> dict:
+        """Create a permanent identity that can authenticate only through an approved OAuth delegation."""
+        username = self._clean_username(username)
+        with self.lock:
+            if self._conn.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone():
+                raise AccountError("that username is taken", 409)
+            try:
+                cursor = self._conn.execute(
+                    "INSERT INTO users(username,password_hash,display_name,created_at) VALUES(?,?,?,?)",
+                    (username, "!inbound-agent", username, time.time()))
+                self._conn.execute("INSERT INTO inbound_agent_accounts(user_id,created_by,created_at) VALUES(?,?,?)",
+                                   (cursor.lastrowid, created_by, time.time()))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return {"id": cursor.lastrowid, "username": username}
+
+    def inbound_agents(self) -> list[dict]:
+        with self.lock:
+            rows = self._conn.execute(
+                "SELECT users.id, users.username, users.display_name, inbound_agent_accounts.created_by, "
+                "inbound_agent_accounts.created_at FROM inbound_agent_accounts "
+                "JOIN users ON users.id=inbound_agent_accounts.user_id ORDER BY users.username").fetchall()
+        return [{"id": row[0], "username": row[1], "display_name": row[2],
+                 "created_by": row[3], "created_at": row[4]} for row in rows]
 
     def _freeze_expired_locked(self, now: float) -> int:
         """Move expired previews out of active sessions, retaining their recovery record."""
@@ -432,6 +464,8 @@ class Accounts:
             row = self._conn.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (str(username),)).fetchone()
             if row is None:
                 raise AccountError("no such account", 404)
+            if self._conn.execute("SELECT 1 FROM inbound_agent_accounts WHERE user_id=?", (row[0],)).fetchone():
+                raise AccountError("inbound agent accounts do not accept passwords", 403)
             self._conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, row[0]))
             self._conn.commit()
             return row[0]
@@ -440,11 +474,12 @@ class Accounts:
         username = self._clean_username(username)
         with self.lock:
             row = self._conn.execute(
-                "SELECT users.id, users.username, users.password_hash, temporary_accounts.user_id "
+                "SELECT users.id, users.username, users.password_hash, temporary_accounts.user_id, inbound_agent_accounts.user_id "
                 "FROM users LEFT JOIN temporary_accounts ON temporary_accounts.user_id = users.id "
+                "LEFT JOIN inbound_agent_accounts ON inbound_agent_accounts.user_id = users.id "
                 "WHERE users.username = ? COLLATE NOCASE",
                 (username,)).fetchone()
-        if row is None or row[3] is not None or not _verify_password(str(password), row[2]):
+        if row is None or row[3] is not None or row[4] is not None or not _verify_password(str(password), row[2]):
             raise AccountError("wrong username or password", 401)
         return {"id": row[0], "username": row[1]}
 

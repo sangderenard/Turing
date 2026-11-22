@@ -152,7 +152,7 @@ def _granted(db, user_id, preset_id, now):
                       (user_id, preset_id, now)).fetchone() is not None
 
 
-def list_state(db, user_id, admin):
+def list_state(db, user_id, admin, accounts=None, oauth=None):
     presets = []
     for row in db.execute("SELECT id,label,script,argv,timeout FROM control_presets WHERE disabled IS NULL ORDER BY label"):
         if admin or _granted(db, user_id, row["id"], time.time()):
@@ -177,10 +177,13 @@ def list_state(db, user_id, admin):
             "agents": external_agents.agents(external_agents.ensure(db)) if admin else [],
             "providers": external_agents.PROVIDERS if admin else (),
             "apis": external_agents.APIS if admin else (),
-            "agent_tools": external_agents.DAY_TOOLS if admin else ()}
+            "agent_tools": external_agents.DAY_TOOLS if admin else (),
+            "inbound_agents": accounts.inbound_agents() if admin and accounts else [],
+            "inbound_pending": oauth.pending_connections() if admin and oauth else [],
+            "inbound_sessions": oauth.inbound_sessions() if admin and oauth else []}
 
 
-def command(db, accounts_db, user_id, admin, body):
+def command(db, accounts_db, user_id, admin, body, accounts=None, oauth=None):
     if not isinstance(body, dict) or not isinstance(body.get("action"), str):
         raise ControlError("expected an action")
     action = body["action"]
@@ -188,6 +191,32 @@ def command(db, accounts_db, user_id, admin, body):
         audit(db, user_id, action, "", False, "password verification failed")
         raise ControlError("password verification failed", 403)
     now = time.time()
+    if action in ("inbound_create", "inbound_authorize", "inbound_revoke"):
+        if not admin:
+            raise ControlError("admin account required", 403)
+        if accounts is None or oauth is None:
+            raise ControlError("inbound agent service unavailable", 503)
+        from meowdoku import accounts as accounts_mod
+        try:
+            if action == "inbound_create":
+                identity = accounts.create_inbound_agent(body.get("username", ""), user_id)
+                audit(db, user_id, action, identity["username"], True)
+                return {"identity": identity}
+            if action == "inbound_authorize":
+                user = body.get("user_id")
+                if type(user) is not int:
+                    raise ValueError("select an inbound identity")
+                grant = oauth.approve_inbound(body.get("nonce"), user, user_id,
+                                              body.get("tools"), body.get("seconds"))
+                audit(db, user_id, action, grant["id"], True)
+                return {"delegation": grant}
+            delegation_id = body.get("delegation_id")
+            if type(delegation_id) is not int or not oauth.revoke_inbound(delegation_id):
+                raise ValueError("active delegation not found")
+            audit(db, user_id, action, delegation_id, True)
+            return {"revoked": delegation_id}
+        except (ValueError, accounts_mod.AccountError) as error:
+            raise ControlError(str(error), getattr(error, "status", 400)) from None
     if action == "preset":
         if not admin:
             raise ControlError("admin account required", 403)
@@ -291,7 +320,7 @@ def route(handler, sessions, method):
     db = connect(sessions.state.root)
     try:
         if method == "GET":
-            value = list_state(db, user_id, admin)
+            value = list_state(db, user_id, admin, sessions.accounts, sessions.oauth_mcp)
             value["csrf"] = csrf_issue(db, token)
             value["admin"] = admin
             db.commit()
@@ -306,7 +335,7 @@ def route(handler, sessions, method):
             return
         try:
             db.execute("BEGIN IMMEDIATE")
-            result = command(db, sessions.accounts_db, user_id, admin, body)
+            result = command(db, sessions.accounts_db, user_id, admin, body, sessions.accounts, sessions.oauth_mcp)
             db.commit()
             return handler._json(result, 202 if body["action"] == "run" else 200)
         except (ControlError, ValueError, TypeError) as error:

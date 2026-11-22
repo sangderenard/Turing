@@ -1,5 +1,6 @@
 const byId = id => document.getElementById(id);
 let state;
+let selectedInboundRequest=null;
 function show(message, bad=false) {
   const box=byId("notice"); box.textContent=message; box.style.color=bad?"#b00020":"";
 }
@@ -67,6 +68,7 @@ function render() {
     grantBox.append(row);
   }
   renderAgents();
+  renderInbound();
   const jobs=byId("jobs"); jobs.replaceChildren();
   for(const item of state.jobs) jobs.append(node("div",
     "Run "+item.id+" · action "+item.preset_id+" · "+item.status+
@@ -129,6 +131,53 @@ function renderAgents() {
   }
   if(!state.agents.length) box.append(node("p","No external agents declared."));
 }
+function renderInbound() {
+  byId("inbound-section").hidden=!state.admin;
+  if(!state.admin) return;
+  const agents=state.inbound_agents||[], pending=state.inbound_pending||[], sessions=state.inbound_sessions||[];
+  const people=byId("inbound-agents"); people.replaceChildren();
+  const identities=byId("inbound-identity"), prior=identities.value; identities.replaceChildren();
+  for(const item of agents) {
+    people.append(node("div",item.username+" · account "+item.id,{class:"card"}));
+    identities.append(node("option",item.username,{value:String(item.id)}));
+  }
+  if(agents.some(item=>String(item.id)===prior)) identities.value=prior;
+  if(!agents.length) people.append(node("p","No inbound identities yet."));
+  const requests=byId("inbound-pending"); requests.replaceChildren();
+  if(!pending.some(item=>item.nonce===selectedInboundRequest)) selectedInboundRequest=null;
+  for(const item of pending) {
+    const card=node("div","",{class:"card"});
+    const choose=node("input","",{type:"radio",name:"inbound-request",value:item.nonce});
+    choose.checked=item.nonce===selectedInboundRequest;
+    choose.addEventListener("change",()=>{selectedInboundRequest=item.nonce;});
+    card.append(choose,node("strong",item.client_name+" "),node("small",
+      "client "+item.client_id+" · redirect "+item.redirect_uri+" · resource "+item.resource+
+      " · challenge SHA-256 "+item.challenge_sha256+
+      " · expires "+new Date(item.expires*1000).toLocaleTimeString()));
+    requests.append(card);
+  }
+  if(!pending.length) requests.append(node("p","No pending MCP connections."));
+  const history=byId("inbound-sessions"); history.replaceChildren();
+  for(const item of sessions) {
+    const card=node("div",item.username+" · client "+item.client_id+" · tools "+item.tools.join(", ")+
+      " · expires "+new Date(item.expires*1000).toLocaleString()+
+      (item.revoked?" · revoked":""),{class:"card"});
+    if(!item.revoked&&item.expires>Date.now()/1000) {
+      const revoke=node("button","Revoke now",{type:"button"});
+      revoke.addEventListener("click",()=>{if(confirm("Revoke this agent connection now?")) act({action:"inbound_revoke",delegation_id:item.id});});
+      card.append(revoke);
+    }
+    history.append(card);
+  }
+  if(!sessions.length) history.append(node("p","No authorized sessions."));
+}
+byId("inbound-create").addEventListener("click",()=>act({action:"inbound_create",username:byId("inbound-username").value.trim()}));
+byId("inbound-authorize").addEventListener("click",()=>{
+  if(!selectedInboundRequest) { show("Select the exact pending MCP request.",true); return; }
+  const minutes=Number(byId("inbound-minutes").value);
+  act({action:"inbound_authorize",nonce:selectedInboundRequest,user_id:Number(byId("inbound-identity").value),
+    tools:byId("inbound-tools").value.split(",").map(t=>t.trim()).filter(Boolean),seconds:minutes*60});
+});
 byId("agent-provider").addEventListener("change",providerChanged);
 byId("agent-declare").addEventListener("click",()=>{
   const minute=byId("agent-minute").value;

@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import pytest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples"), str(ROOT / "tests")]
 
 from meowdoku import server as srv  # noqa: E402
-from meowdoku import authz, oauth_mcp  # noqa: E402
+from meowdoku import authz, oauth_mcp, admin_script_control  # noqa: E402
 from test_meowdoku_access import _web  # noqa: E402
 
 
@@ -125,6 +126,107 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
         assert response.status == 204
         response, _ = call("POST", "/mcp", request, accept)
         assert response.status == 404
+
+        # An admin approves this precise pending OAuth request for a permanent
+        # passwordless agent. The browser's own account must never become the delegate.
+        administrator = sessions.accounts.ensure_user("adminowner", "admin-secret-1")
+        controls = admin_script_control.connect(tmp_path)
+        with pytest.raises(admin_script_control.ControlError):
+            admin_script_control.command(controls, sessions.accounts_db, administrator, False,
+                {"action": "inbound_create", "password": "admin-secret-1", "username": "chatgpt-research"},
+                sessions.accounts, sessions.oauth_mcp)
+        inbound = admin_script_control.command(controls, sessions.accounts_db, administrator, True,
+            {"action": "inbound_create", "password": "admin-secret-1", "username": "chatgpt-research"},
+            sessions.accounts, sessions.oauth_mcp)["identity"]
+        with pytest.raises(srv.accounts_mod.AccountError):
+            sessions.accounts.login("chatgpt-research", "anything")
+        with pytest.raises(srv.accounts_mod.AccountError):
+            sessions.accounts.set_password("chatgpt-research", "new-password")
+        response, body = call("GET", "/oauth/authorize?" + query)
+        assert response.status == 200, body
+        agent_cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        agent_nonce = agent_cookie.split("=", 1)[1]
+        waiting = sessions.oauth_mcp.pending_connections()
+        assert any(p["nonce"] == agent_nonce and p["client_id"] == client for p in waiting)
+        # A different pending request cannot inherit this agent's eventual approval.
+        response, body = call("GET", "/oauth/authorize?" + query.replace("state-1", "state-2"))
+        assert response.status == 200, body
+        other_cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        other_nonce = other_cookie.split("=", 1)[1]
+        response, _ = call("POST", "/oauth/authorize",
+                           urllib.parse.urlencode({"nonce": other_nonce, "decision": "agent"}),
+                           {"Content-Type": "application/x-www-form-urlencoded", "Cookie": other_cookie})
+        assert response.status == 403
+        delegation = admin_script_control.command(controls, sessions.accounts_db, administrator, True,
+            {"action": "inbound_authorize", "password": "admin-secret-1", "nonce": agent_nonce,
+             "user_id": inbound["id"], "tools": ["whoami", "memory_files"], "seconds": 60},
+            sessions.accounts, sessions.oauth_mcp)["delegation"]
+        agent_form = urllib.parse.urlencode({"nonce": agent_nonce, "decision": "agent"})
+        response, body = call("POST", "/oauth/authorize", agent_form,
+                              {"Content-Type": "application/x-www-form-urlencoded", "Cookie": agent_cookie})
+        assert response.status == 302, body
+        agent_code = urllib.parse.parse_qs(urllib.parse.urlsplit(response.getheader("Location")).query)["code"][0]
+        agent_exchange = urllib.parse.urlencode({"grant_type": "authorization_code", "client_id": client,
+            "code": agent_code, "redirect_uri": "http://127.0.0.1:9876/callback",
+            "resource": sessions.oauth_mcp.resource, "code_verifier": verifier})
+        response, body = call("POST", "/oauth/token", agent_exchange,
+                              {"Content-Type": "application/x-www-form-urlencoded"})
+        assert response.status == 200, body
+        delegated_token = json.loads(body)["access_token"]
+        scoped = {**accept, "Authorization": "Bearer " + delegated_token}
+        scoped.pop("MCP-Session-Id", None)
+        response, body = call("POST", "/mcp", json.dumps({
+            "jsonrpc": "2.0", "id": 30, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}), scoped)
+        assert response.status == 200, body
+        scoped["MCP-Session-Id"] = response.getheader("MCP-Session-Id")
+        for rid in range(31, 41):
+            response, body = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": rid,
+                "method": "tools/call", "params": {"name": "whoami", "arguments": {}}}), scoped)
+            assert response.status == 200, body
+            assert json.loads(json.loads(body)["result"]["content"][0]["text"])["username"] == "chatgpt-research"
+        response, body = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 41,
+            "method": "tools/list"}), scoped)
+        assert response.status == 200, body
+        listed = json.loads(body)["result"]["tools"]
+        assert {tool["name"] for tool in listed} == {"whoami", "memory_files"}
+        assert all(tool["securitySchemes"][0]["type"] == "oauth2" for tool in listed)
+        response, body = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 43,
+            "method": "tools/call", "params": {"name": "newsletter_submit", "arguments": {}}}), scoped)
+        assert response.status == 200 and "error" in json.loads(body)
+        # A new MCP conversation with the same access token resolves the same identity.
+        fresh = {key: value for key, value in scoped.items() if key != "MCP-Session-Id"}
+        response, body = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 44,
+            "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "fresh", "version": "1"}}}), fresh)
+        assert response.status == 200, body
+        fresh["MCP-Session-Id"] = response.getheader("MCP-Session-Id")
+        response, body = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 45,
+            "method": "tools/call", "params": {"name": "whoami", "arguments": {}}}), fresh)
+        assert json.loads(json.loads(body)["result"]["content"][0]["text"])["username"] == "chatgpt-research"
+        # A role promotion cuts off an already issued delegated token, and
+        # privileged inbound accounts cannot receive a new delegation.
+        authz.grant_role(sessions.accounts_db, "chatgpt-research", "operator", "test")
+        response, _ = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 47,
+            "method": "tools/list"}), fresh)
+        assert response.status == 401
+        with pytest.raises(ValueError, match="privileged inbound"):
+            sessions.oauth_mcp.approve_inbound(other_nonce, inbound["id"], administrator,
+                                               ["whoami"], 60)
+        authz.grant_role(sessions.accounts_db, "chatgpt-research", "member", "test")
+        assert admin_script_control.command(controls, sessions.accounts_db, administrator, True,
+            {"action": "inbound_revoke", "password": "admin-secret-1", "delegation_id": delegation["id"]},
+            sessions.accounts, sessions.oauth_mcp)["revoked"] == delegation["id"]
+        response, _ = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 42,
+            "method": "tools/list"}), scoped)
+        assert response.status == 401
+        with sessions.oauth_mcp.lock:
+            sessions.oauth_mcp.db.execute("UPDATE oauth_mcp_delegations SET revoked=NULL, expires=? WHERE id=?",
+                                          (time.time()-1, delegation["id"]))
+            sessions.oauth_mcp.db.commit()
+        response, _ = call("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 46,
+            "method": "tools/list"}), fresh)
+        assert response.status == 401
 
         # The public MCP URL creates a temporary identity without exposing its
         # internal session credential. Tests and opinions remain unpublished.
