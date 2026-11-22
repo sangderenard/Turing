@@ -127,7 +127,8 @@ function render() {
     const row = el("button", null, "row"); row.type = "button";
     const title = el("strong", `${review.repository} · ${review.branch}`);
     row.append(title, badge(review.standing),
-      el("small", `${review.owner_name} · commit ${review.head.slice(0, 12)} · review ${review.id.slice(0, 12)} · submitted ${when(review.created_at)}`));
+      el("small", `${review.owner_name} · commit ${review.head.slice(0, 12)} · review ${review.id.slice(0, 12)} · submitted ${when(review.created_at)}`
+        + (review.together?.length ? ` · with ${review.together.map(t => `${t.repository} ${t.branch}`).join(", ")}` : "")));
     row.setAttribute("aria-current", String(review.id === selected));
     row.onclick = () => show(review.id);
     list.append(row);
@@ -413,6 +414,9 @@ async function show(id) {
     ...(review.revoked_at ? [["Approval revoked", `by ${review.revoked_by}, ${when(review.revoked_at)}: ${review.revoke_reason}`]] : []),
     ...(review.held_at ? [["Held for review", `by ${review.held_by}, ${when(review.held_at)}: ${review.held_reason}`]] : []),
     ...(review.landed_at ? [["Landed", `${when(review.landed_at)} ${review.landed_detail || ""}`]] : []),
+    ...(review.together?.length ? [["Lands together with", review.together.map(t => `${t.repository} ${t.branch} (${t.standing})`).join("; ")
+      + (review.together_ready ? "" : " — waits until every one is accepted or approved")
+      + ". The lander lands a ready set in one run; a push by hand can still move one alone."]] : []),
   ]) { facts.append(el("dt", term)); const dd = el("dd"); dd.append(el(term === "Commit" || term === "Review ID" ? "code" : "span", value)); facts.append(dd); }
   detail.replaceChildren(heading, facts);
   detail.append(el("p", "Reviewer remarks are formal agree or object votes. Discussion comments are in Threads.", "muted"));

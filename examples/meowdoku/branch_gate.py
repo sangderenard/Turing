@@ -609,17 +609,73 @@ def landing_merge(path, base, head):
     return tree, None
 
 
+def _precheck(policy, review, fetched) -> str | None:
+    """Why this change could not land now, without changing anything (None when it could): the checks _land makes
+    before it pushes. Used to hold every member of a set when one of them would hold."""
+    declared = policy["repositories"].get(review["repository"])
+    if declared is None:
+        return "the policy no longer names this repository"
+    path, remote = declared["path"], policy["remote"]
+    if review["base"] != declared["default"]:
+        return "the review's base is not the repository's default branch"
+    try:
+        if (path, remote) not in fetched:
+            git(path, "fetch", "--quiet", remote)
+            fetched.add((path, remote))
+        base = f"refs/remotes/{remote}/{review['base']}"
+        if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", review["head"], base],
+                          capture_output=True).returncode == 0:
+            return None                          # already contained
+        if (git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{review['branch']}", check=False) != review["head"]
+                and git(path, "rev-parse", "-q", "--verify", f"refs/heads/{review['branch']}", check=False) != review["head"]):
+            return "the branch is not at the reviewed commit, here or on the remote"
+        if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
+                          capture_output=True).returncode != 0:
+            tree, why = landing_merge(path, base, review["head"])
+            if tree is None:
+                return f"not a fast-forward of {review['base']}, and {why}"
+    except GateError as error:
+        return str(error)
+    return None
+
+
+def _set_holds(policy, landable, wanted, fetched) -> dict:
+    """review id -> why it holds because a member of its set would hold. Every member of a set is checked before any
+    is pushed, so a set lands whole unless a push itself fails (landing across repositories is not atomic)."""
+    holds, seen = {}, set()
+    for review in landable:
+        if not review["together"] or review["id"] in seen or (wanted is not None and review["id"] not in wanted):
+            continue
+        members = [review] + [other for other in landable if other["id"] in {c["id"] for c in review["together"]}]
+        seen.update(member["id"] for member in members)
+        for member in members:
+            why = _precheck(policy, member, fetched)
+            if why is not None:
+                reason = f"held with its set: {member['repository']} {member['branch']} would not land ({why})"
+                holds.update({other["id"]: reason for other in members})
+                break
+    return holds
+
+
 def _land(policy, db, *, apply, now=None, log=print, gh=run_gh, only=None) -> list:
     now = time.time() if now is None else now
     wanted = None if only is None else {str(review_id) for review_id in only}
     results = []
     fetched = set()                                # one fetch per repository per run, not one per change
-    for review in branch_review.landable(db, now):
+    landable = branch_review.landable(db, now)
+    if wanted is not None:                         # a member asked for brings its whole set
+        for review in landable:
+            if review["id"] in wanted:
+                wanted |= {other["id"] for other in review["together"]}
+    holds = _set_holds(policy, landable, wanted, fetched)
+    for review in landable:
         if wanted is not None and review["id"] not in wanted:
             continue
         entry = {"review": review["id"], "repository": review["repository"], "branch": review["branch"], "head": review["head"]}
         declared = policy["repositories"].get(review["repository"])
         try:
+            if review["id"] in holds:
+                raise GateError(holds[review["id"]])
             if declared is None:
                 raise GateError("the policy no longer names this repository")
             path, remote = declared["path"], policy["remote"]

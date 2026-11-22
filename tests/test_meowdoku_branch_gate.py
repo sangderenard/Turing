@@ -1100,3 +1100,72 @@ def test_the_push_check_accepts_the_landers_merge_and_nothing_dressed_as_one(wor
     unreviewed = run(work, "commit-tree", run(work, "rev-parse", f"{stray}^{{tree}}"), "-p", merged, "-p", stray, "-m", "x")
     assert branch_gate.check_push(policy, db, "work", lines(unreviewed), 1000.0, path=work), "a second parent nobody accepted"
     branch_gate.install_hooks(policy, world["policy_file"], world["db_file"], remove=True, log=lambda line: None)
+
+
+def submit_with(world, name, head, together, *, user=ANN, username="ann", timeout_s=DAY, now=1000.0):
+    return branch_review.submit(world["db"], user_id=user, username=username, repository="work", branch=name, base="main",
+                                head=head, timeout_s=timeout_s, delete_branch=True, known=["work"], now=now,
+                                together_with=together)
+
+
+def test_reviews_put_together_land_only_together(world):
+    db, policy = world["db"], world["policy"]
+    a, b = branch(world, "set-a"), branch(world, "set-b")
+    one = submit(world, "set-a", a, timeout_s=0)
+    two = submit_with(world, "set-b", b, [one["id"]])
+    assert [t["id"] for t in two["together"]] == [one["id"]] and two["together_ready"], "its companion is accepted"
+    first = branch_review.get(db, one["id"], 1000.0)
+    assert [t["id"] for t in first["together"]] == [two["id"]] and not first["together_ready"], "it waits for set-b"
+    assert branch_review.queue(db, now=1000.0) == [], "one is accepted, but its companion still waits"
+    line = f"refs/heads/main {a} refs/heads/main {remote_has(world, 'main')}"
+    assert branch_gate.check_push(policy, db, "work", [line], 1000.0), "its head is not accepted alone"
+    assert branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None) == []
+    done = branch_gate.land(policy, db, apply=True, now=1000.0 + DAY, log=lambda line: None, only=[one["id"]])
+    assert actions(done) == {"set-a": "landed", "set-b": "landed"}, "asking for one lands its whole set"
+
+
+def test_a_ready_sets_member_passes_the_push_check_alone(world):
+    """Landing together is the lander's coordination: once every member is ready, the push check (one repository, one
+    push) accepts each member's head by itself. This is the documented limit, held here so it cannot change unseen."""
+    db, policy = world["db"], world["policy"]
+    a, b = branch(world, "solo-a"), branch(world, "solo-b")
+    one = submit(world, "solo-a", a, timeout_s=0)
+    two = submit_with(world, "solo-b", b, [one["id"]], timeout_s=0)
+    assert branch_review.get(db, one["id"], 1000.0)["together_ready"] and two["together_ready"]
+    line = f"refs/heads/main {a} refs/heads/main {remote_has(world, 'main')}"
+    assert branch_gate.check_push(policy, db, "work", [line], 1000.0) == [], "a ready member's head is accepted alone"
+
+
+def test_a_set_holds_whole_when_one_member_would_not_land(world):
+    work, db, policy = world["work"], world["db"], world["policy"]
+    good = branch(world, "good")
+    clash = branch(world, "clash", file="shared.txt")
+    commit(work, "shared.txt", "main's own text")
+    run(work, "push", "-q", "origin", "main")
+    tip = remote_has(world, "main")
+    one = submit(world, "good", good, timeout_s=0)
+    submit_with(world, "clash", clash, [one["id"]], timeout_s=0)
+    done = {e["branch"]: e for e in branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)}
+    assert done["good"]["action"] == "held" and "held with its set: work clash" in done["good"]["reason"]
+    assert done["clash"]["action"] == "held" and remote_has(world, "main") == tip, "nothing of the set landed"
+
+
+def test_a_resubmitted_branch_keeps_its_place_and_a_withdrawn_one_leaves(world):
+    work, db = world["work"], world["db"]
+    x, y = branch(world, "x"), branch(world, "y")
+    one = submit(world, "x", x)
+    submit_with(world, "y", y, [one["id"]])
+    run(work, "checkout", "-q", "y")
+    moved = commit(work, "y2.txt")
+    run(work, "push", "-q", "origin", "y")
+    run(work, "checkout", "-q", "main")
+    again = submit(world, "y", moved, now=1001.0)
+    assert [t["id"] for t in again["together"]] == [one["id"]], "the new review takes the old one's place"
+    assert [t["id"] for t in branch_review.get(db, one["id"], 1001.0)["together"]] == [again["id"]]
+    branch_review.withdraw(db, again["id"], user_id=ANN)
+    assert branch_review.get(db, one["id"], 1001.0)["together"] == [] and branch_review.get(db, one["id"], 1001.0)["together_ready"]
+    bobs = submit(world, "z", branch(world, "z"), user=BOB, username="bob")
+    with pytest.raises(branch_review.ReviewError):
+        submit_with(world, "w", "e" * 40, [bobs["id"]])
+    with pytest.raises(branch_review.ReviewError):
+        submit_with(world, "w", "e" * 40, ["no-such-review"])
