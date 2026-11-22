@@ -94,7 +94,7 @@ RULES = {
     # ---- development record and system state: kept
     "branch_reviews": {"note": "text", "landed_detail": "text", "land_result": "text", "revoke_reason": "text"},
     "branch_review_remarks": {"note": "text"}, "branch_review_read": KEEP, "branch_owners": KEEP, "branch_removed": KEEP,
-    "branch_merged_seen": KEEP, "checkouts": KEEP, "worktree_verdicts": KEEP,
+    "branch_merged_seen": KEEP, "branch_review_sets": KEEP, "checkouts": KEEP, "worktree_verdicts": KEEP,
     "divider_jobs": KEEP, "divider_pieces": KEEP, "divider_attempts": {"error": "text"},
     "lowering_blobs": KEEP, "lowering_cores": KEEP, "lowering_leases": KEEP, "lowerings": KEEP,
     "hosted_agent_last_word": KEEP, "hosted_dispatch_cursor": KEEP,

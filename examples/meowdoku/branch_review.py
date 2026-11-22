@@ -6,7 +6,8 @@ answered and what was done. Nothing here changes Git: ``branch_gate.py`` is the 
 change and removes branches, and it does only what these rows allow. The one Git read here is ``diff``: the change a
 review names, for any reviewer (GET /api/reviews/diff), through ``branch_gate.git``.
 
-    submit(db, user_id=, username=, repository=, branch=, base=, head=, timeout_s=, delete_branch=, known=[...])
+    submit(db, user_id=, username=, repository=, branch=, base=, head=, timeout_s=, delete_branch=, known=[...],
+           together_with=[review ids])                                              lands only with those reviews
     remark(db, review_id, user_id=, username=, verdict="agree" | "object", note="")     a peer; never the author
     decide(db, review_id, user_id=, username=, head=, decision="approved" | "rejected", note="")   an admin
     withdraw(db, review_id, user_id=)                                                   the author
@@ -33,6 +34,12 @@ it was at, so a removal can be undone while Git still holds the commit.
 A revoked change is hidden from the default listing a week after its revoke, or as soon as its author or an admin marks
 it read (``mark_read``; the ``branch_review_read`` table). Nothing is deleted: ``listing`` marks each record ``hidden``
 and GET /api/reviews?all=1 still returns every record.
+
+A change may span several branches, in one repository or several (ticket d6f30e0a, case ece4dcf1). Each branch is
+still its own review, decided on its own; ``submit(..., together_with=[review ids])`` puts them in one set
+(``branch_review_sets``). A member is ready only when every companion is approved, accepted or landed (``together``):
+until then the lander leaves all of them in the queue and the push check accepts none of their heads. A companion its
+author withdrew leaves the set; a resubmitted branch takes its old review's place in it.
 
 ``advice`` is the one text that says how a change is made here. The lock prints it, in mock and in earnest.
 
@@ -84,7 +91,11 @@ DDL = (
     "CREATE TABLE IF NOT EXISTS branch_review_read (review_id TEXT PRIMARY KEY, read_by TEXT NOT NULL, read_at REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS branch_review_hold_events (review_id TEXT NOT NULL, at REAL NOT NULL, "
     "actor TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('hold','release')), reason TEXT NOT NULL)",
+    # Reviews that land together: one row per member (together(), submit(together_with=)).
+    "CREATE TABLE IF NOT EXISTS branch_review_sets (review_id TEXT PRIMARY KEY, set_id TEXT NOT NULL)",
 )
+READY = ("approved", "accepted", "landed")     # a companion in one of these lets its set land
+MAX_TOGETHER = 20
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
             "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail",
             "land_tried_at", "land_result", "revoked_at", "revoked_by", "revoke_reason",
@@ -193,8 +204,33 @@ def get(db, review_id, now=None) -> dict:
     row = db.execute(f"SELECT {', '.join(_COLUMNS)} FROM branch_reviews WHERE id = ?", (str(review_id),)).fetchone()
     if row is None:
         raise ReviewError("review not found", 404)
+    now = time.time() if now is None else now
     record = _record(db, row)
-    record["standing"] = standing(record, time.time() if now is None else now)
+    record["standing"] = standing(record, now)
+    _with_set(db, record, now)
+    return record
+
+
+def together(db, review_id, now) -> list:
+    """The other members of this review's set, each with its standing; a member its author withdrew has left the set."""
+    row = db.execute("SELECT set_id FROM branch_review_sets WHERE review_id = ?", (str(review_id),)).fetchone()
+    if row is None:
+        return []
+    out = []
+    for other in db.execute(f"SELECT {', '.join(_COLUMNS)} FROM branch_reviews WHERE id IN "
+                            "(SELECT review_id FROM branch_review_sets WHERE set_id = ? AND review_id <> ?) ORDER BY created_at",
+                            (row[0], str(review_id))).fetchall():
+        record = _record(db, other)
+        state = standing(record, now)
+        if state != "withdrawn":
+            out.append({"id": record["id"], "repository": record["repository"], "branch": record["branch"],
+                        "head": record["head"], "standing": state})
+    return out
+
+
+def _with_set(db, record, now) -> dict:
+    record["together"] = together(db, record["id"], now)
+    record["together_ready"] = all(other["standing"] in READY for other in record["together"])
     return record
 
 
@@ -210,6 +246,7 @@ def listing(db, now=None, *, limit: int = 100) -> list:
     for row in rows:
         record = _record(db, row)
         record["standing"] = standing(record, now)
+        _with_set(db, record, now)
         record["hidden"] = record["standing"] == "revoked" and (
             record["id"] in read or now - record["revoked_at"] >= REVOKED_SHOWN_S)
         out.append(record)
@@ -276,7 +313,26 @@ def standing(record: dict, now: float) -> str:
     return "accepted" if now >= record["accept_after"] else "waiting"
 
 
-def submit(db, *, user_id, username, repository, branch, base, head, timeout_s, delete_branch, known, now=None) -> dict:
+def _join(db, review_id, companions, superseded) -> None:
+    """Puts ``review_id`` and ``companions`` in one set, merging any sets they were already in, and gives a resubmitted
+    branch its superseded review's place. Inside submit's transaction."""
+    looked = [review_id, *companions, *superseded]
+    marks = ",".join("?" * len(looked))
+    sets = [row[0] for row in db.execute(f"SELECT DISTINCT set_id FROM branch_review_sets WHERE review_id IN ({marks})", looked)]
+    if not sets and not companions:
+        return                                   # a branch in no set, submitted alone
+    set_id = sets[0] if sets else uuid.uuid4().hex
+    for other in sets[1:]:
+        db.execute("UPDATE branch_review_sets SET set_id = ? WHERE set_id = ?", (set_id, other))
+    for old in superseded:
+        db.execute("DELETE FROM branch_review_sets WHERE review_id = ?", (old,))
+    for member in (review_id, *companions):
+        db.execute("INSERT INTO branch_review_sets (review_id, set_id) VALUES (?,?) "
+                   "ON CONFLICT(review_id) DO UPDATE SET set_id = excluded.set_id", (member, set_id))
+
+
+def submit(db, *, user_id, username, repository, branch, base, head, timeout_s, delete_branch, known, now=None,
+           together_with=None) -> dict:
     ensure(db)
     _account(user_id)
     if repository not in known:
@@ -292,24 +348,42 @@ def submit(db, *, user_id, username, repository, branch, base, head, timeout_s, 
         raise ReviewError(f"timeout must be between 0 and {int(MAX_TIMEOUT_S)} seconds")
     if not isinstance(delete_branch, bool):
         raise ReviewError("delete_branch must be true or false")
+    if together_with is None:
+        together_with = []
+    if (not isinstance(together_with, list) or len(together_with) > MAX_TOGETHER
+            or not all(isinstance(other, str) for other in together_with)):
+        raise ReviewError(f"together_with must be a list of at most {MAX_TOGETHER} review ids")
     now = time.time() if now is None else now
+    companions = list(dict.fromkeys(together_with))
+    for other_id in companions:
+        other = get(db, other_id, now)
+        if other["owner_id"] != user_id and not is_admin(db, user_id):
+            raise ReviewError("a change is put together only with its author's own reviews", 403)
+        if other["standing"] in ("landed", "withdrawn", "rejected"):
+            raise ReviewError(f"review {other_id[:8]} is {other['standing']}; only a review still in play joins a set", 409)
+        if other["repository"] == repository and other["branch"] == branch:
+            raise ReviewError("a branch is not put together with its own earlier review")
     db.execute("BEGIN IMMEDIATE")
     try:
         old = db.execute("SELECT id, owner_id FROM branch_reviews WHERE repository = ? AND branch = ? AND head = ?",
                          (repository, branch, head)).fetchone()
         if old is not None:                      # the same change again: the same row, whoever asks
+            _join(db, old[0], companions, [])
             db.execute("COMMIT")
             return get(db, old[0], now)
         if db.execute("SELECT 1 FROM branch_reviews WHERE repository = ? AND branch = ? "
                       "AND held_at IS NOT NULL AND landed_at IS NULL", (repository, branch)).fetchone():
             raise ReviewError("an admin has held this branch for further review", 409)
         review_id = uuid.uuid4().hex
+        superseded = [row[0] for row in db.execute("SELECT id FROM branch_reviews WHERE repository = ? AND branch = ? "
+                                                   "AND status = 'open' AND landed_at IS NULL", (repository, branch))]
         db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = ? WHERE repository = ? AND branch = ? "
                    "AND status = 'open' AND landed_at IS NULL", (now, f"superseded by {review_id}", repository, branch))
         db.execute("INSERT INTO branch_reviews (id, repository, branch, base, head, owner_id, owner_name, created_at, "
                    "accept_after, delete_branch) VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (review_id, repository, branch, base, head, user_id, username, now, now + float(timeout_s), int(delete_branch)))
         db.execute("INSERT OR IGNORE INTO branch_owners VALUES (?,?,?,?,?)", (repository, branch, user_id, username, now))
+        _join(db, review_id, companions, superseded)
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -424,16 +498,23 @@ def withdraw(db, review_id, *, user_id, now=None) -> dict:
 
 def landable(db, now=None) -> list:
     now = time.time() if now is None else now
-    return [record for record in listing(db, now, limit=1000) if record["standing"] in ("approved", "accepted")]
+    return [record for record in listing(db, now, limit=1000)
+            if record["standing"] in ("approved", "accepted") and record["together_ready"]]
 
 
 def accepted_head(db, repository, base, head, now=None) -> bool:
-    """True when ``head`` may be the tip of ``base``: a change at that commit is accepted, approved or already landed."""
+    """True when ``head`` may be the tip of ``base``: a change at that commit is already landed, or is accepted or
+    approved and every companion in its set is too."""
     now = time.time() if now is None else now
     ensure(db)
     rows = db.execute(f"SELECT {', '.join(_COLUMNS)} FROM branch_reviews WHERE repository = ? AND base = ? AND head = ?",
                       (repository, base, head)).fetchall()
-    return any(standing(_record(db, row), now) in ("approved", "accepted", "landed") for row in rows)
+    for row in rows:
+        record = _record(db, row)
+        state = standing(record, now)
+        if state == "landed" or (state in ("approved", "accepted") and _with_set(db, record, now)["together_ready"]):
+            return True
+    return False
 
 
 def mark_landed(db, review_id, detail, now=None) -> dict:
@@ -894,7 +975,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
                 raise ReviewError("keep must be true or false")
             base = known[repository]["default"] if isinstance(repository, str) and repository in known else ""
             made = submit(db, **who, repository=repository, branch=body.get("branch"), base=base, head=body.get("head"),
-                          timeout_s=hours * 3600.0, delete_branch=not keep, known=list(known))
+                          timeout_s=hours * 3600.0, delete_branch=not keep, known=list(known),
+                          together_with=body.get("together_with"))
         elif path == "/api/reviews/identity":
             return self._json({"identity": set_identity(db, user_id=principal.user_id, name=body.get("name"),
                                                         email=body.get("email"))})
