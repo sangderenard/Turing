@@ -172,13 +172,14 @@ def list_state(db, user_id, admin, accounts=None, oauth=None):
         "FROM control_jobs " + ("" if admin else "WHERE requested_by=? ") + "ORDER BY id DESC LIMIT 50",
         () if admin else (user_id,))]
     # [EXTERNAL AGENTS] declarations only (external_agents.py); the install is the owner's Install-ExternalAgent.ps1 -Name <name>.
-    from meowdoku import external_agents
+    from meowdoku import external_agents, guest_review
     return {"scripts": SCRIPTS if admin else (), "presets": presets, "grants": grants, "jobs": jobs,
             "agents": external_agents.agents(external_agents.ensure(db)) if admin else [],
             "providers": external_agents.PROVIDERS if admin else (),
             "apis": external_agents.APIS if admin else (),
             "agent_tools": external_agents.DAY_TOOLS if admin else (),
             "inbound_agents": accounts.inbound_agents() if admin and accounts else [],
+            "inbound_requests": guest_review.inbound_request_queue(accounts.path) if admin and accounts else [],
             "inbound_pending": oauth.pending_connections() if admin and oauth else [],
             "inbound_sessions": oauth.inbound_sessions() if admin and oauth else []}
 

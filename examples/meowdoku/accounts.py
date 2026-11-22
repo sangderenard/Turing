@@ -68,7 +68,7 @@ PRIVATE_TABLES = (
     "relay_addresses", "user_file_keys", "research_affirmations",
     "research_ballots", "research_eligible", "research_surveys",
     "radio_requests", "radio_turns", "radio_votes",
-    "owned_assets", "sessions", "preview_recovery", "temporary_accounts", "inbound_agent_accounts",
+    "owned_assets", "sessions", "preview_recovery", "temporary_accounts", "inbound_agent_accounts", "guest_inbound_requests",
 )
 
 

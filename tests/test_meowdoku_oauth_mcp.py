@@ -266,6 +266,30 @@ def test_oauth_code_pkce_and_http_mcp(tmp_path, monkeypatch):
 
         identity = guest_tool("whoami", {}, 11)
         assert identity["role"] == "trial" and identity["signed_in"]
+        response, body = call("POST", "/mcp/guest", json.dumps({"jsonrpc": "2.0", "id": 49,
+            "method": "tools/list"}), guest_headers)
+        assert response.status == 200
+        listed = {tool["name"] for tool in json.loads(body)["result"]["tools"]}
+        assert {"guest_inbound_status", "guest_inbound_request"} <= listed
+        status = guest_tool("guest_inbound_status", {}, 50)["data"]
+        assert not status["already_requested"] and status["eligible_at"] > time.time()
+        response, body = call("POST", "/mcp/guest", json.dumps({"jsonrpc": "2.0", "id": 51,
+            "method": "tools/call", "params": {"name": "guest_inbound_request",
+            "arguments": {"purpose": "I seek a lasting research identity on SpeakToMe."}}}), guest_headers)
+        assert response.status == 200 and json.loads(body)["result"]["isError"]
+        assert "wait" in json.loads(body)["result"]["content"][0]["text"]
+        with sessions.accounts.lock:
+            preview_id = sessions.accounts._conn.execute(
+                "SELECT id FROM users WHERE username=?", (identity["username"],)).fetchone()[0]
+            sessions.accounts._conn.execute("UPDATE preview_recovery SET created_at=? WHERE user_id=?",
+                                            (time.time()-181, preview_id))
+            sessions.accounts._conn.commit()
+        request = guest_tool("guest_inbound_request",
+                             {"purpose": "I seek a lasting research identity on SpeakToMe."}, 52)["data"]["request"]
+        assert request["state"] == "requested" and request["id"]
+        queue = admin_script_control.list_state(controls, administrator, True,
+                                                 sessions.accounts, sessions.oauth_mcp)["inbound_requests"]
+        assert any(item["id"] == request["id"] and item["user_id"] == preview_id for item in queue)
         # A direct loopback preview token determines the account even when a
         # browser cookie names a different signed-in user; an invalid token
         # cannot borrow that cookie's identity.

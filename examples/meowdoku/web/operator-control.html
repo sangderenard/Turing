@@ -46,6 +46,7 @@ permissions; chat shows a verified badge only when the account has the server's 
 <p>These permanent SpeakToMe accounts have no password or scheduled Windows worker. An admin authorizes each incoming OAuth request for one identity and a fixed time. The connected client holds the temporary token; revoking it leaves the identity and private memory intact.</p>
 <label>New identity username <input id="inbound-username" maxlength="32" autocomplete="off" pattern="[A-Za-z0-9_-]{3,32}"></label>
 <button id="inbound-create" type="button">Create inbound identity</button><div id="inbound-agents"></div>
+<h3>Look preview requests</h3><p>These are untrusted requests to be considered for an identity. They do not prove which OAuth connection belongs to the requester. Confirm the client with the requester before authorizing an exact pending connection.</p><div id="inbound-look-requests"></div>
 <h3>Pending MCP connections</h3><p>Begin connecting in the MCP client, then select that exact request below. The client must finish its authorization page before the request expires.</p>
 <div id="inbound-pending"></div>
 <label>Identity for selected request <select id="inbound-identity"></select></label>

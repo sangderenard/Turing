@@ -25,6 +25,9 @@ POLICY = ("Reject hate speech and overtly sexual content. Ordinary swear words a
           "Assess context, targeting, and quoted material. Never publish a pending guest post automatically.")
 MAX_PENDING = 10
 MAX_DAILY = 20
+INBOUND_WAIT = 180
+INBOUND_DAILY = 12
+INBOUND_VISIBLE = 172800
 
 
 class GuestReviewError(Exception):
@@ -53,6 +56,10 @@ def _connect(path):
             state TEXT NOT NULL DEFAULT 'pending', reviewer_id INTEGER, reason TEXT NOT NULL DEFAULT '',
             published_id INTEGER);
         CREATE INDEX IF NOT EXISTS guest_post_by_writer ON guest_post_queue(user_id, id);
+        CREATE TABLE IF NOT EXISTS guest_inbound_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE,
+            purpose TEXT NOT NULL, created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS guest_inbound_requests_created ON guest_inbound_requests(created);
     """)
     return db
 
@@ -75,6 +82,57 @@ def _writer(handler):
     if principal.role not in ("trial", "intern"):
         raise GuestReviewError("this route is for trial and intern contributors", 403)
     return principal
+
+
+def _inbound_status(db, principal):
+    if principal.role != "trial":
+        raise GuestReviewError("inbound requests start from a look preview", 403)
+    row = db.execute("SELECT p.created_at,t.expires_at FROM preview_recovery p "
+                     "JOIN temporary_accounts t ON t.user_id=p.user_id WHERE p.user_id=? AND p.frozen_at IS NULL",
+                     (principal.user_id,)).fetchone()
+    if row is None or row[1] <= time.time():
+        raise GuestReviewError("active preview required", 403)
+    submitted = db.execute("SELECT id,created FROM guest_inbound_requests WHERE user_id=?",
+                           (principal.user_id,)).fetchone()
+    return {"eligible_at": row[0] + INBOUND_WAIT, "already_requested": submitted is not None,
+            "request_id": submitted[0] if submitted else None,
+            "request_at": submitted[1] if submitted else None,
+            "next": "After requesting, start OAuth against /mcp; an admin must approve that exact connection."}
+
+
+def _inbound_request(db, principal, body):
+    purpose = body.get("purpose")
+    if not isinstance(purpose, str) or not 20 <= len(purpose.strip()) <= 500:
+        raise GuestReviewError("purpose must be 20 to 500 characters")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        status = _inbound_status(db, principal)
+        now = time.time()
+        if status["already_requested"]:
+            raise GuestReviewError("this preview already requested an inbound identity", 409)
+        if now < status["eligible_at"]:
+            raise GuestReviewError(f"wait {int(status['eligible_at'] - now) + 1} seconds before requesting", 429)
+        if db.execute("SELECT COUNT(*) FROM guest_inbound_requests WHERE created>?", (now - 86400,)).fetchone()[0] >= INBOUND_DAILY:
+            raise GuestReviewError("inbound request queue is full for today", 429)
+        cursor = db.execute("INSERT INTO guest_inbound_requests(user_id,purpose,created) VALUES(?,?,?)",
+                            (principal.user_id, purpose.strip(), now))
+        db.commit()
+        return {"id": cursor.lastrowid, "state": "requested", "next": status["next"]}
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def inbound_request_queue(accounts_db):
+    db = _connect(accounts_db)
+    try:
+        rows = db.execute("SELECT r.id,r.user_id,u.username,r.purpose,r.created FROM guest_inbound_requests r "
+                          "JOIN users u ON u.id=r.user_id WHERE r.created>? ORDER BY r.id DESC LIMIT 50",
+                          (time.time() - INBOUND_VISIBLE,)).fetchall()
+        return [{"id": row[0], "user_id": row[1], "username": row[2], "created": row[4],
+                 "untrusted": {"purpose": row[3]}} for row in rows]
+    finally:
+        db.close()
 
 
 def _moderator(handler):
@@ -249,6 +307,8 @@ def http_route(handler, path, method, *, accounts_db, kinds, caps_for):
                                   "posting": "Qualified preview guests and interns submit text for private review before publication."})
         if method == "GET" and path == "/api/guest/status":
             return handler._json(_own_status(db, _writer(handler)))
+        if method == "GET" and path == "/api/guest/inbound-request":
+            return handler._json(_inbound_status(db, _writer(handler)))
         if method == "GET" and path == "/api/guest/review":
             _moderator(handler)
             return handler._json(_review_queue(db))
@@ -257,6 +317,8 @@ def http_route(handler, path, method, *, accounts_db, kinds, caps_for):
         body = _body(handler)
         if body is None:
             return
+        if path == "/api/guest/inbound-request":
+            return handler._json({"request": _inbound_request(db, _writer(handler), body)}, 202)
         if path == "/api/guest/tests":
             principal = _writer(handler)
             if principal.role != "trial":

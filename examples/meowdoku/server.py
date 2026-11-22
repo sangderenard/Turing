@@ -4351,7 +4351,7 @@ def make_handler(sessions: Sessions):
                     return sessions.oauth_mcp.mcp(self, "POST", guest=True)
             if self._principal().role == "trial" and path0 not in (
                     "/api/account/keep", "/api/account/recover", "/api/account/logout", "/api/account/login", "/api/account/signup",
-                    "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback", "/api/palette/select", "/api/scratch"):
+                    "/api/guest/tests", "/api/guest/submissions", "/api/guest/inbound-request", "/api/palette/rank", "/api/palette/feedback", "/api/palette/select", "/api/scratch"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
                 return

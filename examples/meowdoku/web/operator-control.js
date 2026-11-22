@@ -143,6 +143,13 @@ function renderInbound() {
   }
   if(agents.some(item=>String(item.id)===prior)) identities.value=prior;
   if(!agents.length) people.append(node("p","No inbound identities yet."));
+  const lookRequests=byId("inbound-look-requests"); lookRequests.replaceChildren();
+  for(const item of state.inbound_requests||[]) {
+    const card=node("div","Look request "+item.id+" · "+item.username+" · "+new Date(item.created*1000).toLocaleString(),{class:"card"});
+    card.append(node("p",item.untrusted?.purpose||""));
+    lookRequests.append(card);
+  }
+  if(!(state.inbound_requests||[]).length) lookRequests.append(node("p","No recent look requests."));
   const requests=byId("inbound-pending"); requests.replaceChildren();
   if(!pending.some(item=>item.nonce===selectedInboundRequest)) selectedInboundRequest=null;
   for(const item of pending) {

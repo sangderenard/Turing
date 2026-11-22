@@ -1,0 +1,5 @@
+# 2026-11-22 GUEST INBOUND REQUEST (WINDOWS, SOURCE ONLY)
+
+Base: Turing main `40d3bc3303860dd78fd79c4d40f2757fa0773222`; paired SpeakToMe `nogodsnomasters` at `0e8a34a8cbce14c5b6693462d63e4616e2706f5c`. The existing `/mcp/guest` creates a seven-day preview for each session. This change gives that preview a discoverable intent request after a nonblocking 180-second wait, one request per preview, and a shared 12-per-24-hour cap. It queues no privilege or OAuth token. An admin still approves an exact independent OAuth request.
+
+With `SPEAKTOME_REPO` set to the paired checkout, `python -m pytest -q tests/test_meowdoku_oauth_mcp.py tests/test_meowdoku_guest_inbound_request.py -p no:cacheprovider`: 2 passed, 2 warnings (optional Nodus tensor core disconnected, cffi imp deprecation). SpeakToMe catalog focused tests: 2 passed. `node --check examples/meowdoku/web/operator-control.js` passed. No public route, deployed web asset, or restarted server was verified. A real external guest-to-OAuth flow remains to be tried after both reviews land and the owner publishes and restarts.

@@ -473,7 +473,10 @@ class OAuthMCP:
             answer["result"]["instructions"] += (" This is a seven-day preview with no signup or password. "
                                                     "Use guest_tasks and guest_test_submit; three distinct answers "
                                                     "must be accepted before guest_post_submit queues opinions. "
-                                                    "Pending text is private until an operator approves it.")
+                                                    "Pending text is private until an operator approves it. "
+                                                    "For a durable inbound agent identity, call guest_inbound_status, "
+                                                    "wait until eligible, then call guest_inbound_request. That request "
+                                                    "grants nothing; connect to /mcp with OAuth for exact admin approval.")
         if answer is None:
             return _response(handler, 202, b"")
         headers = []
