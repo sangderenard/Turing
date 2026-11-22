@@ -17,6 +17,10 @@
   .preview { border-left: .5rem solid var(--palette-accent); background: color-mix(in srgb, var(--palette-secondary) 10%, #1b2839); }
   .muted { color: #c2cddd; }
   #notice { min-height: 1.5rem; }
+  .saved { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .7rem; }
+  .saved button { display: inline-flex; padding: .25rem; }
+  .saved button[aria-pressed="true"] { border-color: var(--palette-accent); outline: 2px solid var(--palette-accent); outline-offset: 2px; }
+  .saved span { display: block; width: 1.6rem; height: 1.6rem; }
   /* The choice field: a mid-alpha black layer that covers and disables the site beneath. */
   #overlay { position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.55); }
   #overlay[hidden] { display: none; }
@@ -40,10 +44,15 @@
   <section class="panel preview" aria-labelledby="preview-title">
     <h2 id="preview-title">Your site design</h2>
     <p id="candidate" class="accent">Choose the colors to begin.</p>
-    <p>This card and the site home page use your current color. Visit <a href="/">the home page</a> and return to rate it.</p>
+    <p>Every page of the site uses your current color. Visit <a href="/">the home page</a> and return to rate it.</p>
     <button id="good" type="button" disabled>Good</button>
     <button id="bad" type="button" disabled>Bad</button>
     <button id="again" type="button">Choose colors again</button>
+    <h3 id="saved-title">Your palettes</h3>
+    <p class="muted">Every design you are shown is kept. Choose one, or step through them, to wear it across the site.</p>
+    <button id="prev" type="button" disabled aria-label="Previous palette">&#9664;</button>
+    <button id="next" type="button" disabled aria-label="Next palette">&#9654;</button>
+    <div id="saved" class="saved" role="group" aria-labelledby="saved-title"></div>
   </section>
   <p id="notice" role="status"></p>
 </main>

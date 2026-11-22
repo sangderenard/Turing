@@ -44,3 +44,42 @@ def test_ranking_feedback_and_browser_isolation(tiered):
                              {"rating": "good", "nonce": second["candidate"]["nonce"]}, b)
     assert status == 200 and second["candidate"]["id"] == same, "good feedback should keep a satisfying design"
     assert call("POST", "/api/palette/rank", {"ranking": [0] * len(order)}, a)[0] == 400
+
+
+def test_saved_palettes_are_kept_and_selectable(tiered):
+    port, _, sessions = tiered
+
+    def call(method, path, body=None, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        headers = {"Content-Type": "application/json"}
+        if cookie:
+            headers["Cookie"] = cookie
+        conn.request(method, path, json.dumps(body) if body is not None else None, headers)
+        response = conn.getresponse()
+        payload = json.loads(response.read())
+        issued = response.getheader("Set-Cookie")
+        conn.close()
+        return response.status, payload, issued.split(";", 1)[0] if issued else None
+
+    status, state, a = call("GET", "/api/palette")
+    assert status == 200 and state["saved"] == [] and state["active"] is None
+    order = [s["id"] for s in state["swatches"]]
+    status, state, _ = call("POST", "/api/palette/rank", {"ranking": order}, a)
+    assert status == 200 and len(state["saved"]) == 1 and state["active"] == state["saved"][0]["id"]
+    first = state["saved"][0]
+    assert state["candidate"]["color"] == first["color"] and state["candidate"]["saved"] == first["id"]
+    status, state, _ = call("POST", "/api/palette/feedback", {"rating": "bad", "nonce": state["candidate"]["nonce"]}, a)
+    assert status == 200 and len(state["saved"]) == 2, "each design shown is kept"
+    second = state["saved"][1]
+    assert all(p["color"] != p["secondary"] for p in state["saved"]), "a design has two different colors"
+    assert state["active"] == second["id"] and state["candidate"]["color"] == second["color"]
+    status, state, _ = call("POST", "/api/palette/select", {"id": first["id"]}, a)
+    assert status == 200 and state["active"] == first["id"]
+    assert state["candidate"]["color"] == first["color"] and state["candidate"]["secondary"] == first["secondary"]
+    status, again, _ = call("GET", "/api/palette", cookie=a)
+    assert again["active"] == first["id"] and again["candidate"]["color"] == first["color"], "the choice is kept"
+    status, rated, _ = call("POST", "/api/palette/feedback", {"rating": "good", "nonce": state["candidate"]["nonce"]}, a)
+    assert status == 200, "the selected palette is the one feedback rates"
+    status, other, b = call("GET", "/api/palette")
+    assert other["saved"] == [] and call("POST", "/api/palette/select", {"id": first["id"]}, b)[0] == 404
+    assert call("POST", "/api/palette/select", {"id": "1"}, a)[0] == 400

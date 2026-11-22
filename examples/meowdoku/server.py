@@ -4351,7 +4351,7 @@ def make_handler(sessions: Sessions):
                     return sessions.oauth_mcp.mcp(self, "POST", guest=True)
             if self._principal().role == "trial" and path0 not in (
                     "/api/account/keep", "/api/account/recover", "/api/account/logout", "/api/account/login", "/api/account/signup",
-                    "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback", "/api/scratch"):
+                    "/api/guest/tests", "/api/guest/submissions", "/api/palette/rank", "/api/palette/feedback", "/api/palette/select", "/api/scratch"):
                 return self._json({"error": "preview accounts are read-only; keep this account to participate"}, HTTPStatus.FORBIDDEN)
             if self._kiosk_gate(path0, "POST"):
                 return
@@ -4359,7 +4359,7 @@ def make_handler(sessions: Sessions):
                 return
             if path0.startswith("/api/guest/"):
                 return self._guest_route(path0, "POST")
-            if path0 in ("/api/palette/rank", "/api/palette/feedback"):
+            if path0 in ("/api/palette/rank", "/api/palette/feedback", "/api/palette/select"):
                 from meowdoku import palette_feedback
                 return palette_feedback.route(self, path0, "POST", accounts_db=sessions.accounts_db)
             if path0.startswith("/api/hosted-agents/") and path0.endswith(("/last-word", "/controls")):

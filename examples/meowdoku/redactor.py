@@ -98,7 +98,7 @@ RULES = {
     "divider_jobs": KEEP, "divider_pieces": KEEP, "divider_attempts": {"error": "text"},
     "lowering_blobs": KEEP, "lowering_cores": KEEP, "lowering_leases": KEEP, "lowerings": KEEP,
     "hosted_agent_last_word": KEEP, "hosted_dispatch_cursor": KEEP,
-    "palette_feedback": KEEP, "palette_participants": KEEP,
+    "palette_feedback": KEEP, "palette_participants": KEEP, "palette_saved": KEEP, "palette_active": KEEP,
     "radio_actions": KEEP, "radio_channel": KEEP, "radio_requests": KEEP, "radio_turns": KEEP, "radio_votes": KEEP,
     "suno_radio_assets": KEEP, "relay_addresses": KEEP,
     "schema_version": KEEP, "sqlite_sequence": KEEP,

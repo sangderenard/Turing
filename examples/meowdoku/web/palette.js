@@ -1,4 +1,4 @@
-import {applyPalette} from "./palette-theme.js";
+import {applyPalette, sharePalette} from "./palette-theme.js";
 
 const $ = (id) => document.getElementById(id);
 let state = null;
@@ -88,8 +88,45 @@ function openField() {
 function render() {
   const current = state.candidate;
   applyPalette(current);
+  sharePalette(current);
   $("candidate").textContent = current ? `Current accent: ${current.color}` : "Choose the colors to begin.";
   $("good").disabled = $("bad").disabled = !current;
+  renderSaved();
+}
+
+// The participant's saved palettes, oldest first; the active one is pressed.
+function renderSaved() {
+  const list = state.saved || [];
+  $("saved").replaceChildren(...list.map((palette, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(palette.id === state.active));
+    button.setAttribute("aria-label", `Palette ${index + 1}: ${palette.color} and ${palette.secondary}`);
+    button.title = `${palette.color} · ${palette.secondary}`;
+    for (const color of [palette.color, palette.secondary]) {
+      const swatch = document.createElement("span");
+      swatch.style.background = color;
+      button.append(swatch);
+    }
+    button.addEventListener("click", () => select(palette.id));
+    return button;
+  }));
+  $("prev").disabled = $("next").disabled = list.length < 2;
+}
+
+async function select(id) {
+  try {
+    state = await request("/api/palette/select", {id});
+    render();
+    $("notice").textContent = "Palette applied across the site.";
+  } catch (error) { $("notice").textContent = error.message; }
+}
+
+function step(by) {
+  const list = state.saved || [];
+  if (list.length < 2) return;
+  const at = list.findIndex((palette) => palette.id === state.active);
+  select(list[(at + by + list.length) % list.length].id);
 }
 
 async function update(path, body) {
@@ -103,6 +140,8 @@ async function update(path, body) {
 $("good").addEventListener("click", () => update("/api/palette/feedback", {nonce: state.candidate.nonce, rating: "good"}));
 $("bad").addEventListener("click", () => update("/api/palette/feedback", {nonce: state.candidate.nonce, rating: "bad"}));
 $("again").addEventListener("click", () => openField());
+$("prev").addEventListener("click", () => step(-1));
+$("next").addEventListener("click", () => step(1));
 
 try {
   state = await request("/api/palette");

@@ -5,6 +5,8 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
+import {loadPersonalPalette} from "./palette-theme.js";
+
 const VERSION = 12;
 
 function allowed() {
@@ -735,6 +737,7 @@ async function showSiteNotice(header, headerBottom) {
 
 async function main() {
   if (!allowed()) { console.info("[site-nav] not loaded: this page's script tag lacks data-site-nav=\"allow\""); return; }
+  loadPersonalPalette();      // the participant's color game palette, on every page that carries the site controls
 
   const host = document.createElement("div");
   host.style.cssText = "all:initial !important;display:block !important;flex:0 0 auto !important;grid-column:1 / -1 !important";
