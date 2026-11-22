@@ -17,6 +17,9 @@ export function applyPalette(candidate) {
   if (typeof color !== "string" || !HEX.test(color)) return;
   const root = document.documentElement;
   root.style.setProperty("--palette-accent", color);
+  // Derived shades the shared stylesheet (pages.css) reads: a dark tint for backgrounds, a mid edge for borders.
+  root.style.setProperty("--palette-tint", `color-mix(in srgb, ${color} 35%, #101722)`);
+  root.style.setProperty("--palette-edge", `color-mix(in srgb, ${color} 55%, #384d67)`);
   if (typeof candidate.secondary === "string" && HEX.test(candidate.secondary))
     root.style.setProperty("--palette-secondary", candidate.secondary);
   if (!document.getElementById("palette-theme")) {
