@@ -29648,8 +29648,10 @@ def _class_surface_ssa_program(
         )
         # A copy minted for ``one: 'uint32' = 1`` and one minted for a bare
         # ``1`` compute in different dtypes: two contracts, two symbols.
-        literal_dtype_specialization = (
-            graph_obj.graph.get("planner_specialization_dtypes") or {}
+        from .planner_concordance_posts import planner_specialization_dtypes
+
+        literal_dtype_specialization = planner_specialization_dtypes(
+            graph_obj.graph,
         )
         if literal_dtype_specialization:
             specialization_contract = (
@@ -30757,12 +30759,11 @@ def _class_surface_ssa_program(
             **dict(graph_obj.graph.get("parameter_defaults") or {}),
             **dict(graph_obj.graph.get("planner_specializations") or {}),
         }
-        declared_literal_dtypes = {
-            str(name): str(dtype)
-            for name, dtype in dict(
-                graph_obj.graph.get("planner_specialization_dtypes") or {}
-            ).items()
-        }
+        from .planner_concordance_posts import planner_specialization_dtypes
+
+        declared_literal_dtypes = planner_specialization_dtypes(
+            graph_obj.graph,
+        )
         parameter_value_dtypes = {value_id: 'opaque_ref' for value_id in native_handle_ids}
         parameter_value_dtypes.update((value_id, 'bool') for value_id in native_identity_reductions)
         parameter_value_shapes = {}
@@ -64843,7 +64844,21 @@ def _lower_ast_source_to_ssa_impl(
     glsl_source_receipt = None
     if str(source_language).casefold() == "glsl":
         from .glsl_ast_ingestion import lower_glsl_source_to_ast, retain_glsl_source_evidence
-        glsl_result = lower_glsl_source_to_ast(source, function_name=entrypoint)
+        from .extraction_contract import binding_names_function
+        # A sampler's texel format is not GLSL source; it is the caller's
+        # declared program_abi field for that parameter.
+        glsl_texture_fields = {
+            str(value.parameter): value.field
+            for value in getattr(
+                getattr(extraction_policy, "program_abi", None), "values", (),
+            ) or ()
+            if entrypoint is None
+            or binding_names_function(str(value.function), str(entrypoint))
+        }
+        glsl_result = lower_glsl_source_to_ast(
+            source, function_name=entrypoint,
+            texture_fields=glsl_texture_fields,
+        )
         if not glsl_result.complete:
             raise ValueError(glsl_result.shortfall_report())
         glsl_tree = retain_glsl_source_evidence(glsl_result.module, source)

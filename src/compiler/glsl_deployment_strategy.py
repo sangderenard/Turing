@@ -233,6 +233,7 @@ from .planner_concordance_posts import (
     _post_control_specialization as _post_control_specialization,
     _post_pruned_return_sites as _post_pruned_return_sites,
     _fold_literal_source_cells as _fold_literal_source_cells,
+    declared_specialization_dtype as declared_specialization_dtype,
     _post_identity_table_mutation as _post_identity_table_mutation,
     _post_copy_planner_specializations as _post_copy_planner_specializations,
     _materialize_planner_specializations as _materialize_planner_specializations,
@@ -3784,7 +3785,7 @@ def _planned_scalar_dtypes_from_graph(
                 )
                 settle(
                     scalar, node_id,
-                    attributes.get("declared_literal_dtype")
+                    declared_specialization_dtype(graph, node_id)
                     or literal_dtype(literal),
                 )
                 # Program: ``for x in [1, 5, 9]: ... r += x`` (corpus c156).
@@ -3951,11 +3952,11 @@ def _planned_scalar_dtypes_from_graph(
                 # (``one: 'uint32' = 1``) has that dtype, before its class
                 # (``builtins.int``) proposes the Python default int64
                 # (``SpecializationFact.dtype``).
-                declared_literal_dtype = dict(
-                    G.graph.get("planner_specialization_dtypes") or {}
-                ).get(str(attributes.get("binding_name") or ""))
+                declared_literal_dtype = declared_specialization_dtype(
+                    graph, node_id,
+                )
                 if declared_literal_dtype is not None:
-                    settle(scalar, node_id, str(declared_literal_dtype))
+                    settle(scalar, node_id, declared_literal_dtype)
                 from .process_graph_facts import captured_input_contract
                 capture_fact, capture_cell = captured_input_contract(graph, node_id)
                 if capture_cell is not None:
@@ -7779,15 +7780,8 @@ def _build_shell_hierarchy_plan(
                 # (``SpecializationFact.dtype``).  The formal's tensor
                 # descriptor is its class default (``builtins.int`` ->
                 # int64), which is no declaration and must not outrank one.
-                declared_literal_dtype = attributes.get(
-                    "declared_literal_dtype"
-                ) or (
-                    dict(
-                        graph.G.graph.get("planner_specialization_dtypes")
-                        or {}
-                    ).get(str(binding_name))
-                    if binding_name is not None
-                    and node.get("type") == "Input" else None
+                declared_literal_dtype = declared_specialization_dtype(
+                    graph, int(current),
                 )
                 dtype = (
                     declared_literal_dtype
@@ -7913,8 +7907,8 @@ def _build_shell_hierarchy_plan(
 
                         # A literal folded from a DECLARED argument keeps
                         # that dtype (``SpecializationFact.dtype``).
-                        dtype = attributes.get(
-                            "declared_literal_dtype"
+                        dtype = declared_specialization_dtype(
+                            graph, int(current),
                         ) or python_int_literal_dtype(literal)
                     elif isinstance(literal, float):
                         dtype = "float64"
@@ -34482,17 +34476,6 @@ def _fold_callsite_structural_values(
             "value": copy.deepcopy(value),
             "structural_specialization": True,
         })
-        # A formal folded from a DECLARED literal argument keeps that
-        # dtype (``SpecializationFact.dtype``); the Python class of the
-        # bare value would retype ``one: 'uint32' = 1`` as int64.
-        if str(data.get("type") or "").casefold() == "input":
-            declared_literal_dtype = dict(
-                graph.G.graph.get("planner_specialization_dtypes") or {}
-            ).get(str(source_attributes.get("binding_name") or ""))
-            if declared_literal_dtype is not None:
-                attributes["declared_literal_dtype"] = str(
-                    declared_literal_dtype
-                )
         data.update({
             "type": "Constant", "op": "const", "label": repr(value),
             "attributes": attributes,
@@ -34506,13 +34489,6 @@ def _fold_callsite_structural_values(
         if isinstance(tensor, Mapping) and "shape" in tensor:
             if isinstance(value, (bool, int, float)):
                 data["tensor"] = {**tensor, "shape": ()}
-                # Its dtype is the declared argument's, not the formal's
-                # class default (``SpecializationFact.dtype``): the int64
-                # left here promoted ``old + one`` to int64 in atomic_add.
-                if attributes.get("declared_literal_dtype") is not None:
-                    data["tensor"]["dtype"] = str(
-                        attributes["declared_literal_dtype"]
-                    )
             elif isinstance(value, (list, tuple)) and all(
                 isinstance(item, (bool, int, float)) for item in value
             ):

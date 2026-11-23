@@ -11078,10 +11078,17 @@ class CorrelationTable:
             # the Python int default (int64).  Rule: that canonical identity
             # keys the value's own ``value_type_abi`` row (the same row key);
             # a single scalar arm citing an ANNOTATION_DECLARATION is the
-            # authored domain, width-checked exactly as above.
+            # authored domain, width-checked exactly as above.  Only for a
+            # receipt that cites neither direct cause: one citing just one
+            # of the two is a broken receipt and stays refused.
             from .concordance_declarations import CANONICAL_VALUE as _CANONICAL
+            cites_direct_width_cause = any(
+                cell.page in (VALUE_TYPE_ABI, ANNOTATION_DECLARATION)
+                for cell in materialization_sources
+            )
             for canonical in materialization_sources:
-                if (authored_domains or canonical.page != _CANONICAL
+                if (authored_domains or cites_direct_width_cause
+                        or canonical.page != _CANONICAL
                         or not isinstance(canonical.row, tuple)
                         or len(canonical.row) != 2
                         or int(canonical.row[1]) != int(value_id)):

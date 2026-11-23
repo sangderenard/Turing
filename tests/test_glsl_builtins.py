@@ -43,6 +43,40 @@ void main(){ y = pick(i) + B[1].x; }'''
     assert _run(source, 1) == 1.5
 
 
+_SAMPLER = '''layout(local_size_x=1) in;
+layout(binding=0) uniform usampler2D t;
+layout(std430, binding=1) buffer O { uint o[]; };
+void main(){ o[0] = texelFetch(t, ivec2(1, 2), 0).%s; }'''
+
+
+def test_sampler_format_is_the_callers_declaration_not_an_assumption():
+    # GLSL states no texel format for a sampler: without the caller's
+    # declared field it is a shortfall, never a guessed channel count.
+    undeclared = lower_glsl_source_to_ast(_SAMPLER % "r")
+    assert any("has no texel format" in s.message for s in undeclared.shortfalls)
+    wider = lower_glsl_source_to_ast(
+        _SAMPLER % "r", texture_fields={"t": {"dtype": "uint32", "rank": 3}})
+    assert any("multi-channel" in s.message for s in wider.shortfalls)
+    declared = lower_glsl_source_to_ast(
+        _SAMPLER % "r", texture_fields={"t": {"dtype": "uint32", "rank": 2}})
+    assert declared.complete, declared.shortfall_report()
+    assert declared.textures == (("t", "uint32", 2),)
+    # The read is the stored lane itself: no constructed gvec4 lanes.
+    text = ast.unparse(declared.module)
+    read = next(node for node in ast.walk(declared.module)
+                if isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name) and node.value.id == "t")
+    assert [ast.unparse(axis) for axis in read.slice.elts] == [
+        "__glsl_value_0.y", "__glsl_value_0.x"]
+    assert "uvec4" not in text
+
+
+def test_texel_lanes_the_format_does_not_store_are_refused():
+    result = lower_glsl_source_to_ast(
+        _SAMPLER % "g", texture_fields={"t": {"dtype": "uint32", "rank": 2}})
+    assert any("does not store" in s.message for s in result.shortfalls)
+
+
 def test_store_through_a_runtime_vector_index_writes_that_component():
     source = '''uniform int k; out int y; void main(){
   ivec3 q = ivec3(1, 2, 3); q[k] = 10; q[k] += 5; y = q.x*100 + q.y*10 + q.z; }'''

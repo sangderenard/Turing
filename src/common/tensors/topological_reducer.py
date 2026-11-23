@@ -1032,6 +1032,9 @@ def specialize_python_precision_widths(
     target = getattr(graph, "G", graph)
     metadata = getattr(target, "graph", {})
     specializations = dict(metadata.get("planner_specializations") or {})
+    from ...compiler.planner_concordance_posts import (
+        planner_specialization_dtypes as _planner_specialization_dtypes,
+    )
 
     def stable(value: Any) -> Any:
         if isinstance(value, Mapping):
@@ -1122,9 +1125,9 @@ def specialize_python_precision_widths(
         # with no declaration computes as its Python class.  Two numeric
         # identities (``SpecializationFact.dtype``).
         (f"literal_dtype:{name}", str(dtype))
-        for name, dtype in sorted(dict(
-            metadata.get("planner_specialization_dtypes") or {}
-        ).items())
+        for name, dtype in sorted(
+            _planner_specialization_dtypes(metadata).items()
+        )
     ) + tuple(
         (f"class:{name}", stable(value))
         for name, value in sorted(parameter_classes.items())

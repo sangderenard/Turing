@@ -22,7 +22,7 @@ import ast
 import copy
 from dataclasses import dataclass
 import re
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from .glsl_source_ingestion import (
     GLSLSourceShortfall,
@@ -716,6 +716,22 @@ class _ASTExpressionParser:
         return _typed(ast.Subscript(value=value, slice=index, ctx=ast.Load()), element)
 
     def _field(self, value: ast.expr, field: _Token) -> ast.expr:
+        texel = getattr(value, "_glsl_texel", None)
+        if texel is not None:
+            # A swizzle of a texel read names only the lanes its declared
+            # format stores (``_texture_call``).
+            component, channels = texel
+            indices = [_SWIZZLE.get(letter) for letter in field.text]
+            if (any(i is None or i >= channels for i in indices) or len(indices) > 4
+                    or len({_family(letter) for letter in field.text}) != 1):
+                raise _ExpressionError(
+                    field, f"swizzle .{field.text} names lanes a {channels}-channel "
+                           f"texel does not store")
+            if len(indices) == 1:
+                return _typed(value, component)
+            stable = self._stable(_typed(value, component), field)
+            return self._construct(_vector_type(component, len(indices)), [
+                _typed(self._reuse(stable), component) for _ in indices])
         glsl_type = _type_of(value)
         shape = _vector_shape(glsl_type)
         struct_row = getattr(value, "_glsl_buffer_struct", None)
@@ -818,8 +834,8 @@ class _ASTExpressionParser:
         order; coordinate ``q`` addresses texel ``(q.z, q.y, q.x)``.
         ``imageAtomicAdd``/``imageAtomicOr`` are AbstractTensor's declared
         atomic updates on that texel; ``imageLoad`` and ``texelFetch`` (mip
-        0 only) return GLSL's one-channel texel ``gvec4(v, 0, 0, 1)``;
-        ``imageStore`` writes the value's first component.
+        0 only) read the one stored channel, through a swizzle that names
+        only it; ``imageStore`` writes the value's first component.
         """
 
         name = token.text
@@ -853,15 +869,18 @@ class _ASTExpressionParser:
             lod = args[2]
             if not (isinstance(lod, ast.Constant) and lod.value == 0):
                 raise _ExpressionError(token, "texelFetch reads mip level 0 only")
+        # The texel holds the one channel its declared format stores.  GLSL
+        # types the read ``gvec4``; the lanes the format does not store are
+        # not in caller memory, so only a swizzle of the stored lane is
+        # lowered (``_field``), and the read is not used whole.
+        if self._peek(".") is None:
+            raise _ExpressionError(
+                token, f"{name} of a one-channel texture is lowered through a "
+                       f"swizzle of its stored lane (.r/.x)")
         read = _typed(ast.Subscript(value=_name(texture.id), slice=texel,
                                     ctx=ast.Load()), component)
-        zero = ast.Constant(value=0.0 if component == "float" else 0)
-        one = ast.Constant(value=1.0 if component == "float" else 1)
-        for literal in (zero, one):
-            literal._glsl_scalar_dtype = _BUFFER_ELEMENT_DTYPES[component]
-        return self._construct(_vector_type(component, 4), [
-            read, _typed(zero, component), _typed(copy.deepcopy(zero), component),
-            _typed(one, component)])
+        read._glsl_texel = (component, 1)
+        return read
 
     def _bit_reinterpretation(self, token: _Token, args: Sequence[ast.expr]) -> ast.expr:
         """``floatBitsToUint(x)``: the same bits typed as the other scalar.
@@ -1860,32 +1879,57 @@ _TEXTURE_COMPONENTS = {"": "float", "i": "int", "u": "uint"}
 _IMAGE_FORMATS = {"r32f": "float", "r32i": "int", "r32ui": "uint"}
 
 
-def _source_textures(cleaned, shortfalls):
+def _source_textures(cleaned, shortfalls, texture_fields=None):
     """Read image and sampler uniforms as caller-owned texel memory.
 
     A one-channel 32-bit texture is a rank-``dims`` tensor of its component
     type in ``[z, y, x]`` order (x fastest, as GLSL stores texels).  An
     image's channel count is its declared ``layout`` format, which must be
-    ``r32f``/``r32i``/``r32ui``; a sampler states none in GLSL, so it is
-    declared single-channel here and the caller's contract must match.
+    ``r32f``/``r32i``/``r32ui``.  A sampler states none in GLSL: its texel
+    format is the caller's declared field in ``texture_fields`` (the
+    ``program_abi`` value of that parameter), whose rank is ``dims`` for one
+    channel.  An undeclared sampler, or one declared with more channels, is
+    a shortfall; no channel count is assumed.
     Returns ``name -> (kind, component, dims)``.
     """
 
+    fields = dict(texture_fields or {})
     textures: dict[str, tuple[str, str, int]] = {}
     for match in _TEXTURE.finditer(cleaned):
         line = cleaned.count("\n", 0, match.start()) + 1
+        name = match.group("name")
         component = _TEXTURE_COMPONENTS[match.group("prefix")]
+        dims = int(match.group("dims"))
         if match.group("kind") == "image":
             formats = {item.strip() for item in (match.group("layout") or "").split(",")}
             declared = {_IMAGE_FORMATS[f] for f in formats if f in _IMAGE_FORMATS}
             if declared != {component}:
                 shortfalls.append(GLSLSourceShortfall(
                     "GLSL_TEXTURE", line, 1,
-                    f"image {match.group('name')} needs a one-channel 32-bit "
+                    f"image {name} needs a one-channel 32-bit "
                     f"layout format matching its {component} texels"))
                 continue
-        textures[match.group("name")] = (
-            match.group("kind"), component, int(match.group("dims")))
+        else:
+            field = fields.get(name)
+            if field is None:
+                shortfalls.append(GLSLSourceShortfall(
+                    "GLSL_TEXTURE", line, 1,
+                    f"sampler {name} has no texel format in GLSL; the caller's "
+                    f"program_abi must declare its dtype and rank"))
+                continue
+            dtype = str(getattr(field, "dtype", None) if not isinstance(field, Mapping)
+                        else field.get("dtype"))
+            rank = getattr(field, "rank", None) if not isinstance(field, Mapping) \
+                else field.get("rank")
+            if dtype != _BUFFER_ELEMENT_DTYPES[component] or rank is None or int(rank) != dims:
+                shortfalls.append(GLSLSourceShortfall(
+                    "GLSL_TEXTURE", line, 1,
+                    f"sampler {name} is declared {dtype} rank {rank}; a "
+                    f"{component} {dims}D one-channel texture is "
+                    f"{_BUFFER_ELEMENT_DTYPES[component]} rank {dims} "
+                    f"(multi-channel texel reads are not lowered)"))
+                continue
+        textures[name] = (match.group("kind"), component, dims)
     return textures
 
 
@@ -1944,8 +1988,15 @@ def lower_glsl_source_to_ast(
     source: str,
     *,
     function_name: str | None = None,
+    texture_fields: Mapping[str, Any] | None = None,
 ) -> GLSLASTLoweringResult:
-    """Parse the supported GLSL slice into an ordinary Python ``ast.Module``."""
+    """Parse the supported GLSL slice into an ordinary Python ``ast.Module``.
+
+    ``texture_fields`` is the caller's declared ABI field (``dtype``,
+    ``rank``, ``shape``) of each sampler uniform, by name: GLSL states no
+    texel format for a sampler, so the caller that allocated the texture
+    declares it (``_source_textures``).
+    """
 
     shortfalls: list[GLSLSourceShortfall] = []
     cleaned = _inline_global_scalar_constants(_without_comments(_expand_object_macros(
@@ -2000,7 +2051,7 @@ def lower_glsl_source_to_ast(
     arguments: list[str] = []
     output_names: list[str] = []
     argument_types = {}
-    textures = _source_textures(cleaned, shortfalls)
+    textures = _source_textures(cleaned, shortfalls, texture_fields)
     for match in _GLOBAL.finditer(prefix):
         storage, name = match.group("storage"), match.group("name")
         if name in textures:
