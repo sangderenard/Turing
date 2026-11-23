@@ -562,6 +562,40 @@ def annotate_types(tree: ast.AST) -> dict:
     return annotator.annotations
 
 
+def function_type_annotations(metadata) -> dict:
+    """The annotated declarations one graph's function can see, from the book.
+
+    Read from ``annotation_declaration`` (module, owner qualname, name), the
+    concordance row ingestion posts for every annotated assignment: the
+    module-scope rows (owner ``""``) and the graph's own function's
+    (``authored_function_identity``), the function's shadowing the module's.
+    The bare-name ``type_annotations`` table merges every function under one
+    name: GLSL ``main`` and ``splat`` each declaring ``__glsl_literal_0`` with
+    different widths had one typed by the other's declaration.  A graph with
+    no authored function identity (the whole-program graph) keeps that table.
+    """
+
+    identity = metadata.get("authored_function_identity")
+    if not isinstance(identity, (tuple, list)) or len(identity) != 2:
+        return dict(metadata.get("type_annotations") or {})
+    from ...compiler.concordance_declarations import ANNOTATION_DECLARATION
+    from ...compiler.identity_concordance import current_identity_book
+
+    page = current_identity_book().pages.get(ANNOTATION_DECLARATION.name)
+    if page is None:
+        return {}
+    module, owner = str(identity[0]), str(identity[1])
+    scope, own = {}, {}
+    for row in page.rows():
+        if not (isinstance(row, tuple) and len(row) == 3 and row[0] == module):
+            continue
+        if row[1] == "":
+            scope[str(row[2])] = page.latest(row).annotation
+        elif row[1] == owner:
+            own[str(row[2])] = page.latest(row).annotation
+    return {**scope, **own}
+
+
 class _DeclaredAttributeCollector(ast.NodeVisitor):
     """Every attribute name the source declares: a class's methods/properties,
     its annotated or assigned class-level fields, and any ``obj.name = ...``

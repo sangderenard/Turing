@@ -82,9 +82,11 @@ class _ExpressionError(ValueError):
 
 _TOKEN = re.compile(
     r"(?P<space>\s+)"
-    r"|(?P<number>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[fFuU]?)"
+    r"|(?P<number>0[xX][0-9a-fA-F]+[uU]?"
+    r"|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[fFuU]?)"
     r"|(?P<name>[A-Za-z_]\w*)"
-    r"|(?P<operator>\+\+|--|==|!=|<=|>=|&&|\|\||<<|>>|\+=|-=|\*=|/=|%=|"
+    r"|(?P<operator><<=|>>=|\+\+|--|==|!=|<=|>=|&&|\|\||<<|>>|\+=|-=|\*=|/=|%=|"
+    r"&=|\|=|\^=|"
     r"[{};+\-*/%<>&|^!~?:=(),.\[\]])"
 )
 
@@ -116,7 +118,14 @@ _QUALIFIERS = {
 _SCALAR_TYPES = frozenset(GLSL_CASTS)
 
 
-def _without_comments(source: str) -> str:
+def _without_comments(source: str, *, keep_directives: bool = False) -> str:
+    """Blank comments (and, unless kept, preprocessor lines) in place.
+
+    ``keep_directives`` leaves ``#define`` and the other directive lines for
+    a reader that expands them (``glsl_ast_ingestion._expand_object_macros``);
+    a macro body's trailing ``// comment`` is still removed first.
+    """
+
     source = re.sub(
         r"/\*.*?\*/",
         lambda match: re.sub(r"[^\n]", " ", match.group(0)),
@@ -124,6 +133,8 @@ def _without_comments(source: str) -> str:
         flags=re.DOTALL,
     )
     source = re.sub(r"//[^\n]*", lambda m: " " * len(m.group()), source)
+    if keep_directives:
+        return source
     return re.sub(r"^[ \t]*#[^\n]*", lambda m: " " * len(m.group()), source, flags=re.MULTILINE)
 
 
@@ -148,6 +159,26 @@ def _tokenize(text: str, *, start_line: int = 1) -> list[_Token]:
             column += len(spelling)
         position = match.end()
     return tokens
+
+
+def glsl_number_literal(spelling: str) -> tuple[int | float, str]:
+    """The value and SSA dtype of one GLSL numeric literal spelling.
+
+    Hexadecimal digits include ``e`` and ``f``, so a ``0x`` literal is never
+    read as a float exponent or suffix; only ``u``/``U`` may follow it.
+    """
+
+    if spelling[:2] in {"0x", "0X"}:
+        unsigned = spelling[-1:] in {"u", "U"}
+        value = int(spelling[:-1] if unsigned else spelling, 16)
+        return value, "u32" if unsigned else "i32"
+    suffix = spelling[-1:] if spelling[-1:] in "fFuU" else ""
+    number = spelling[:-1] if suffix else spelling
+    if suffix.lower() == "u":
+        return int(number, 10), "u32"
+    if any(character in number for character in ".eE") or suffix.lower() == "f":
+        return float(number), "float32"
+    return int(number, 10), "i32"
 
 
 def _dtype(glsl_type: str | None) -> str | None:
@@ -212,14 +243,7 @@ class _SSABuilder:
         if spelling in {"true", "false"}:
             value, dtype = spelling == "true", "bool"
         else:
-            suffix = spelling[-1:] if spelling[-1:] in "fFuU" else ""
-            number = spelling[:-1] if suffix else spelling
-            if suffix.lower() == "u":
-                value, dtype = int(number, 10), "u32"
-            elif any(character in number for character in ".eE"):
-                value, dtype = float(number), "float32"
-            else:
-                value, dtype = int(number, 10), "i32"
+            value, dtype = glsl_number_literal(spelling)
         return self.emit(
             Handler.Const,
             dtype=dtype,

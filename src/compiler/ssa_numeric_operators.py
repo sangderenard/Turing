@@ -112,6 +112,7 @@ _DIRECT_TENSOR_HANDLERS: Mapping[str, Handler] = MappingProxyType({
     "fptoui": Handler.FpToUi,
     "sitofp": Handler.SiToFp,
     "uitofp": Handler.UiToFp,
+    "bitcast": Handler.BitCast,
     "tensor_from_list": Handler.Const,
 })
 

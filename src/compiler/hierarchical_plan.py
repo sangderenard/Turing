@@ -709,6 +709,9 @@ def plan_region_to_ssa_instrs(
                 inferred = "int64"
             elif opcode in scalar_cast_dtypes:
                 inferred = scalar_cast_dtypes[opcode]
+            elif opcode == "bitcast":
+                # A bit reinterpretation's result is its declared type.
+                inferred = str(dict(item.attributes)["target_dtype"])
             elif opcode in {"truediv", "div"}:
                 # True division is floating: the operands' widest declared
                 # float width; over integral operands, Python's float.
@@ -762,6 +765,10 @@ def plan_region_to_ssa_instrs(
             dtype_of[int(item.outputs[0])] = "int64"
         elif item.outputs and opcode in scalar_cast_dtypes:
             dtype_of[int(item.outputs[0])] = scalar_cast_dtypes[opcode]
+        elif item.outputs and opcode == "bitcast":
+            dtype_of[int(item.outputs[0])] = str(
+                dict(item.attributes)["target_dtype"]
+            )
         if opcode == "getelementptr":
             # Only repository address arithmetic requires integer indices.
             # High-level Indexed/IndexedStore may be a dictionary lookup whose
@@ -1075,6 +1082,11 @@ def plan_region_to_ssa_instrs(
                 "target_dtype", scalar_cast_dtypes[opcode.casefold()]
             )
             opcode = "Cast"
+        elif opcode.casefold() == "bitcast":
+            # Same-width reinterpretation: the repository ``BitCast``, which
+            # each backend emits natively (LLVM ``bitcast``, C ``memcpy``,
+            # GLSL ``floatBitsToUint``); never a value ``Cast``.
+            opcode = "BitCast"
         elif opcode.casefold() == "tensor":
             # AbstractTensor.tensor(x) is the general ensure-type idiom.  Once
             # x reaches typed repository SSA, normalization is represented by

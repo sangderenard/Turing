@@ -1547,6 +1547,39 @@ def _exact_source_literal_values(graph_obj: Any) -> dict[int, Any]:
     return literals
 
 
+def _local_scalar_literal_evidence(
+    book: Any, graph: Any, value_id: int, attributes: Mapping[str, Any],
+) -> tuple:
+    """The declaration cells of a literal bound to an annotated local.
+
+    ``a: 'int32' = 1`` gives the literal node ``local_scalar_annotation =
+    (dtype, ANNOTATION_DECLARATION cell)``.  Its declared width is proved by
+    that cell together with the value's own ``value_type_abi`` row when that
+    row has one scalar arm of the same dtype citing the same declaration;
+    both cells are then the width causes a materialization of the literal
+    cites.  Otherwise there is no declared width and ``()`` is returned.
+    """
+
+    local_scalar = attributes.get("local_scalar_annotation")
+    if local_scalar is None:
+        return ()
+    from .concordance_declarations import VALUE_TYPE_ABI
+
+    dtype, annotation_cell = local_scalar
+    scope = getattr(graph, "G", graph).graph.get("lexical_read_scope")
+    abi_cell = book.latest_ref(VALUE_TYPE_ABI, (scope, int(value_id)))
+    abi_fact = (
+        None if abi_cell is None
+        else book.pages[abi_cell.page.name].cell(abi_cell.row, abi_cell.column)
+    )
+    arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
+    if (len(arms) == 1 and arms[0].storage == "scalar"
+            and arms[0].dtype == dtype
+            and annotation_cell in arms[0].source_cells):
+        return (annotation_cell, abi_cell)
+    return ()
+
+
 def _recover_late_source_literals(
     function: Any,
     graph_obj: Any | None = None,
@@ -6255,6 +6288,21 @@ def _prove_tensor_value_dtypes(contracts: dict) -> None:
             contracts[(owner, field)] = {**receipt, "dtype": proven[0]}
 
 
+def _graph_type_annotations(graph_metadata) -> dict:
+    """One graph's own annotated declarations (``function_type_annotations``).
+
+    The merged ``type_annotations`` table keys every function's locals by
+    bare name, so two functions declaring one name with different types
+    overwrote each other; this reads the declaring function's own table.
+    """
+
+    from ..transmogrifier.graph.node_special_cases import (
+        function_type_annotations,
+    )
+
+    return function_type_annotations(graph_metadata)
+
+
 def _authored_annotation_field_receipt(
     annotation: ast.AST,
     python_bindings: Mapping[str, Any] | None = None,
@@ -6364,9 +6412,18 @@ def _authored_annotation_field_receipt(
         )
         if authored_scalar is not None:
             return dict(authored_scalar)
-        scalar = {
-            "int": "int64", "float": "float64", "bool": "bool",
-        }.get(annotation.id)
+        # One width authority for parameters and record fields.  The private
+        # int/float/bool table here returned None for every fixed-width
+        # spelling: ``x: 'float32'`` on an authored dataclass (the GLSL
+        # reader's vec3/struct records) lost its field receipt, and
+        # ``V(a, b).x`` then failed with missing_source_value_class while
+        # the parameter ``a: 'float32'`` resolved through
+        # source_annotation_dtype.  Builtin spellings keep their widths.
+        from ..transmogrifier.dtype_layout import source_annotation_dtype
+        scalar = (
+            None if annotation.id in {"Any", "object"}
+            else source_annotation_dtype(annotation.id)
+        )
         if scalar is not None:
             return {
                 "storage": "scalar", "dtype": scalar, "rank": 0,
@@ -8160,7 +8217,7 @@ def _graph_sequence_record_abi(graph_obj: Any) -> dict[object, Mapping[str, Any]
                 "program_abi_table_row": True,
             }
     for binding_name, annotation in dict(
-        graph_obj.graph.get("type_annotations") or {}
+        _graph_type_annotations(graph_obj.graph)
     ).items():
         if str(binding_name) in resolved or not isinstance(annotation, str):
             continue
@@ -11421,7 +11478,7 @@ def _field_slot_ops(
 
     annotated_row_widths: dict[int, int] = {}
     for binding_name, annotation in (
-        *dict(graph_obj.graph.get("type_annotations") or {}).items(),
+        *dict(_graph_type_annotations(graph_obj.graph)).items(),
         # A parameter's authored annotation declares its row exactly as a
         # local annotation does; ``failures: list[tuple[float, Metrics,
         # tuple[str, ...]]] | None`` is the physical row of ``failures``.
@@ -19492,7 +19549,7 @@ def _sequence_column_dtype_contracts(
                 ),
             )
     for binding_name, annotation in dict(
-        graph_obj.graph.get("type_annotations") or {}
+        _graph_type_annotations(graph_obj.graph)
     ).items():
         if not isinstance(annotation, str) or not annotation.strip():
             continue
@@ -29622,6 +29679,17 @@ def _class_surface_ssa_program(
             graph_obj.graph.get("planner_specializations") or {},
             graph_obj.graph.get("planner_tensor_descriptors") or {},
         )
+        # A copy minted for ``one: 'uint32' = 1`` and one minted for a bare
+        # ``1`` compute in different dtypes: two contracts, two symbols.
+        from .planner_concordance_posts import planner_specialization_dtypes
+
+        literal_dtype_specialization = planner_specialization_dtypes(
+            graph_obj.graph,
+        )
+        if literal_dtype_specialization:
+            specialization_contract = (
+                *specialization_contract, literal_dtype_specialization,
+            )
         # Program: ``head(xs0); xs2.append(0); head(xs2)`` (scratch s28
         # c_g).  Wrong record: the first callsite's copy bound ``xs`` by its
         # display members, the second bound it whole as grown storage; both
@@ -30724,6 +30792,11 @@ def _class_surface_ssa_program(
             **dict(graph_obj.graph.get("parameter_defaults") or {}),
             **dict(graph_obj.graph.get("planner_specializations") or {}),
         }
+        from .planner_concordance_posts import planner_specialization_dtypes
+
+        declared_literal_dtypes = planner_specialization_dtypes(
+            graph_obj.graph,
+        )
         parameter_value_dtypes = {value_id: 'opaque_ref' for value_id in native_handle_ids}
         parameter_value_dtypes.update((value_id, 'bool') for value_id in native_identity_reductions)
         parameter_value_shapes = {}
@@ -30959,7 +31032,12 @@ def _class_surface_ssa_program(
                 parameter_value_shapes[int(history[0])] = tuple(
                     map(int, value_abi["shape"])
                 )
-            fact_dtype = scalar_fact_dtype(
+            # A declared literal argument keeps its declared dtype
+            # (``SpecializationFact.dtype``); the bare value's Python class
+            # is the fallback for an undeclared literal.
+            fact_dtype = declared_literal_dtypes.get(
+                str(parameter_name)
+            ) or scalar_fact_dtype(
                 parameter_facts.get(str(parameter_name))
             )
             if history and fact_dtype is not None:
@@ -30973,7 +31051,7 @@ def _class_surface_ssa_program(
         # including loop-target projections, so the compiler-frame formal
         # is typed from the retained source declaration.
         for binding_name, annotation in dict(
-            graph_obj.graph.get("type_annotations") or {}
+            _graph_type_annotations(graph_obj.graph)
         ).items():
             # The tuple row handle is not a numeric scalar annotation.
             dtype = ("int64" if str(annotation).strip() == "tuple"
@@ -31065,19 +31143,10 @@ def _class_surface_ssa_program(
                                     )
                                     if literal_cell in source_edge_targets:
                                         evidence.append(literal_cell)
-                local_scalar = attributes.get("local_scalar_annotation")
-                if local_scalar is not None:
-                    from .concordance_declarations import VALUE_TYPE_ABI
-                    dtype, annotation_cell = local_scalar
-                    abi_cell = shape_identity_book.latest_ref(
-                        VALUE_TYPE_ABI, (graph_obj.graph.get("lexical_read_scope"), materialized_value_id),
-                    )
-                    abi_fact = None if abi_cell is None else _cell_fact(abi_cell)
-                    arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
-                    if (len(arms) == 1 and arms[0].storage == "scalar"
-                            and arms[0].dtype == dtype
-                            and annotation_cell in arms[0].source_cells):
-                        evidence.extend((annotation_cell, abi_cell))
+                evidence.extend(_local_scalar_literal_evidence(
+                    shape_identity_book, graph_obj, materialized_value_id,
+                    attributes,
+                ))
                 if source_identity is not None or evidence:
                     constant_source_cells[materialized_value_id] = tuple(
                         dict.fromkeys((
@@ -31094,7 +31163,9 @@ def _class_surface_ssa_program(
                 (data.get("attributes") or {}).get("binding_name") or ""
             )
             fact = parameter_facts.get(parameter_name)
-            fact_dtype = scalar_fact_dtype(fact)
+            fact_dtype = declared_literal_dtypes.get(
+                parameter_name
+            ) or scalar_fact_dtype(fact)
             if fact_dtype is not None:
                 parameter_value_dtypes[int(value_id)] = fact_dtype
 
@@ -34583,8 +34654,26 @@ def _class_surface_ssa_program(
             for instruction in block.instrs
             for argument in instruction.args
         }
+        # A canonical literal is owned by the control function
+        # (``control_owned_literals``): a region that uses it keeps a
+        # private copy, which is never that region's output.  Program:
+        # ``q = V(1, 0, 2); use(q, out); out[1] = fwd[q.z, q.y, q.x]``.
+        # Wrong record: the folded field reads made region 0 copy the
+        # constructor literals, and this pass published those copies as
+        # region outputs, so ``use``'s field arguments were loaded after
+        # region 0 ran -- after the call that reads them -- and typed by
+        # the private copy (int64), not the declared field (int32).  Rule:
+        # an authored constant of this function is left to the control
+        # materialization of its consumer (the record-literal and late
+        # literal passes), never adopted from a region.
+        authored_literal_ids = {
+            int(value_id)
+            for value_id, _literal in caller.metadata.get(
+                "authored_constant_values", (),
+            )
+        }
         for desired_id in desired_ids:
-            if desired_id in available:
+            if desired_id in available or desired_id in authored_literal_ids:
                 continue
             producer = None
             for block in caller.blocks.values():
@@ -43961,6 +44050,10 @@ def _class_surface_ssa_program(
         values = function_values(function)
         constants = []
         table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
+        # A constructor literal bound to an annotated local cites that
+        # declaration as its width cause (``_local_scalar_literal_evidence``),
+        # as the ordinary control-constant materialization does.
+        constant_declaration_cells: dict[int, tuple] = {}
         layouts = []
         storage_aliases = _concordant_function_aliases(function)
         source_nodes_by_value_id = {
@@ -44249,6 +44342,12 @@ def _class_surface_ssa_program(
                             [], value,
                             attributes={} if literal is None else {"value": literal},
                         ))
+                        constant_declaration_cells[int(physical_value_id)] = (
+                            _local_scalar_literal_evidence(
+                                book, graph, int(physical_value_id),
+                                source_attributes,
+                            )
+                        )
                         source_cell = _frame_graph_cell(
                             graph, int(physical_value_id),
                         )
@@ -44863,6 +44962,7 @@ def _class_surface_ssa_program(
                         sources = tuple(dict.fromkeys(cell for cell in (
                             _frame_value_cell(function, value_id),
                             prior_geometry,
+                            *constant_declaration_cells.get(value_id, ()),
                         ) if cell is not None))
                         if not sources:
                             raise ConcordanceRefusal(
@@ -64797,7 +64897,21 @@ def _lower_ast_source_to_ssa_impl(
     glsl_source_receipt = None
     if str(source_language).casefold() == "glsl":
         from .glsl_ast_ingestion import lower_glsl_source_to_ast, retain_glsl_source_evidence
-        glsl_result = lower_glsl_source_to_ast(source, function_name=entrypoint)
+        from .extraction_contract import binding_names_function
+        # A sampler's texel format is not GLSL source; it is the caller's
+        # declared program_abi field for that parameter.
+        glsl_texture_fields = {
+            str(value.parameter): value.field
+            for value in getattr(
+                getattr(extraction_policy, "program_abi", None), "values", (),
+            ) or ()
+            if entrypoint is None
+            or binding_names_function(str(value.function), str(entrypoint))
+        }
+        glsl_result = lower_glsl_source_to_ast(
+            source, function_name=entrypoint,
+            texture_fields=glsl_texture_fields,
+        )
         if not glsl_result.complete:
             raise ValueError(glsl_result.shortfall_report())
         glsl_tree = retain_glsl_source_evidence(glsl_result.module, source)
@@ -68096,18 +68210,13 @@ def _lower_ast_source_to_ssa_impl(
         # Source catalogue graphs have finished supplying every extraction,
         # call, and shell-boundary fact above.  A native-only module must not
         # retain their live ``python_bindings`` heaps (including imported
-        # module objects) after that point.  Use the repository's established
-        # finalization transaction; deterministic FunctionReference addresses
-        # and all lowered repository SSA remain intact.
-        from .project_compilation_product import (
-            detach_repository_ssa_frontend,
-        )
-
-        compile_substage("detach completed source representations")
-        detach_repository_ssa_frontend(module)
-        gate = dict(module.metadata.get("full_native_link_gate") or {})
-        gate["frontend_representations_detached"] = True
-        module.metadata["full_native_link_gate"] = gate
+        # module objects) once it is accepted.  The detach itself waits for
+        # the final concordance in ``_run_source_lowering``: that audit reads
+        # the function table's graphs (``_source_parameter_memory_contract_
+        # findings``: a record parameter's Input and installed contract), and
+        # detaching here refused every program passing a dataclass to a
+        # helper ("parameter 'd' lost selected contract ... formal binding").
+        module.metadata["frontend_detach_pending"] = True
     return module, outputs, exports
 
 
@@ -68558,6 +68667,20 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             if module is not None:
                 refusal.rejected_source_result = result
             raise refusal
+        if module is not None and module.metadata.pop("frontend_detach_pending", False):
+            # The accepted native-only module releases its source
+            # representations by the repository's established finalization
+            # transaction; FunctionReference addresses and all lowered
+            # repository SSA remain intact.
+            from .project_compilation_product import (
+                detach_repository_ssa_frontend,
+            )
+
+            _bars.substage("detach completed source representations")
+            detach_repository_ssa_frontend(module)
+            gate = dict(module.metadata.get("full_native_link_gate") or {})
+            gate["frontend_representations_detached"] = True
+            module.metadata["full_native_link_gate"] = gate
         ok = True
         if module is not None and _regulator.live_arena is not None:
             _bars.substage("publish live storage receipts")

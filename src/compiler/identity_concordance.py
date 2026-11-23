@@ -11070,6 +11070,82 @@ class CorrelationTable:
                         upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
                         if lower <= literal <= upper:
                             authored_domains.append(width)
+            # Program: ``AbstractTensor.atomic_add(words, i, one)`` with
+            # ``one: 'uint32' = 1``.  The callee copy's formal is folded to
+            # the declared literal (``SpecializationFact.dtype``) and
+            # materialized uint32, but the materialization cites the value's
+            # ``canonical_value`` identity, not its ABI row, so the audit read
+            # the Python int default (int64).  Rule: that canonical identity
+            # keys the value's own ``value_type_abi`` row (the same row key);
+            # a single scalar arm citing an ANNOTATION_DECLARATION is the
+            # authored domain, width-checked exactly as above.  Only for a
+            # receipt that cites neither direct cause: one citing just one
+            # of the two is a broken receipt and stays refused.
+            from .concordance_declarations import CANONICAL_VALUE as _CANONICAL
+            cites_direct_width_cause = any(
+                cell.page in (VALUE_TYPE_ABI, ANNOTATION_DECLARATION)
+                for cell in materialization_sources
+            )
+            for canonical in materialization_sources:
+                if (authored_domains or cites_direct_width_cause
+                        or canonical.page != _CANONICAL
+                        or not isinstance(canonical.row, tuple)
+                        or len(canonical.row) != 2
+                        or int(canonical.row[1]) != int(value_id)):
+                    continue
+                abi_ref = book.latest_ref(VALUE_TYPE_ABI, canonical.row)
+                if abi_ref is None:
+                    continue
+                abi = book.page(VALUE_TYPE_ABI).cell(abi_ref.row, abi_ref.column)
+                arms = tuple(getattr(abi, "physical_alternatives", ()))
+                if len(arms) != 1 or arms[0].storage != "scalar" or arms[0].rank != 0 or arms[0].shape:
+                    continue
+                arm = arms[0]
+                for annotation_cell in arm.source_cells:
+                    if annotation_cell.page != ANNOTATION_DECLARATION:
+                        continue
+                    annotation = book.page(ANNOTATION_DECLARATION).cell(annotation_cell.row, annotation_cell.column)
+                    width = source_annotation_dtype(annotation.annotation)
+                    layout = resolve(width) if width is not None else None
+                    if width == arm.dtype and layout is not None and layout.kind in {"int", "uint"}:
+                        bits = layout.byte_size * 8
+                        lower = -(1 << (bits - 1)) if layout.kind == "int" else 0
+                        upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
+                        if lower <= literal <= upper:
+                            authored_domains.append(width)
+            # Program: GLSL ``ivec3 q = ivec3(3, 0, 2);`` (an authored
+            # dataclass whose fields are declared ``'int32'``).  Wrong record:
+            # ``materialize_program_abi_record_literals`` materialized each
+            # field literal at its field's declared width, citing the value's
+            # ``ssa_value`` cell, which that field declaration revised; the
+            # audit read only local annotations and called it int64.  Rule:
+            # a CLASS_FIELD_DECLARATION that directly causes this value's own
+            # ``ssa_value`` cell declares its domain, width-checked as above.
+            from .concordance_declarations import (
+                CLASS_FIELD_DECLARATION as _FIELD_DECLARATION,
+                SSA_VALUE as _SSA_VALUE,
+            )
+            for value_cell in materialization_sources:
+                if (authored_domains or value_cell.page != _SSA_VALUE
+                        or not isinstance(value_cell.row, tuple)
+                        or len(value_cell.row) != 2
+                        or int(value_cell.row[1]) != int(value_id)):
+                    continue
+                field_widths = set()
+                for cause, _stage in book.edges_into(value_cell):
+                    if cause.page != _FIELD_DECLARATION:
+                        continue
+                    field = book.page(_FIELD_DECLARATION).cell(cause.row, cause.column)
+                    field_widths.add(source_annotation_dtype(getattr(field, "annotation", None)))
+                width = next(iter(field_widths)) if len(field_widths) == 1 else None
+                layout = resolve(width) if width is not None else None
+                if (width == str(dtype) and layout is not None
+                        and layout.kind in {"int", "uint"}):
+                    bits = layout.byte_size * 8
+                    lower = -(1 << (bits - 1)) if layout.kind == "int" else 0
+                    upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
+                    if lower <= literal <= upper:
+                        authored_domains.append(width)
             if len(set(authored_domains)) == 1:
                 expected_dtype = authored_domains[0]
             discrepancies = []

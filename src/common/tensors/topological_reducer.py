@@ -445,7 +445,11 @@ def _record_numeric_annotation_descriptors(graph: Any) -> dict[str, Any]:
     metadata["function_parameter_numeric_descriptors"] = normalized
 
     local = {}
-    for name, annotation in (metadata.get("type_annotations") or {}).items():
+    from ...transmogrifier.graph.node_special_cases import (
+        function_type_annotations as _function_type_annotations,
+    )
+
+    for name, annotation in _function_type_annotations(metadata).items():
         descriptor = numeric_feature_descriptor(annotation)
         if descriptor is not None:
             local[str(name)] = descriptor.receipt()
@@ -1028,6 +1032,9 @@ def specialize_python_precision_widths(
     target = getattr(graph, "G", graph)
     metadata = getattr(target, "graph", {})
     specializations = dict(metadata.get("planner_specializations") or {})
+    from ...compiler.planner_concordance_posts import (
+        planner_specialization_dtypes as _planner_specialization_dtypes,
+    )
 
     def stable(value: Any) -> Any:
         if isinstance(value, Mapping):
@@ -1114,6 +1121,14 @@ def specialize_python_precision_widths(
         (str(name), stable(value))
         for name, value in specializations.items()
     )) + tuple(
+        # A literal declared uint32 at its callsite computes in uint32; one
+        # with no declaration computes as its Python class.  Two numeric
+        # identities (``SpecializationFact.dtype``).
+        (f"literal_dtype:{name}", str(dtype))
+        for name, dtype in sorted(
+            _planner_specialization_dtypes(metadata).items()
+        )
+    ) + tuple(
         (f"class:{name}", stable(value))
         for name, value in sorted(parameter_classes.items())
     ) + tuple(
@@ -3121,7 +3136,11 @@ def _operand_numeric_descriptor(
     if not isinstance(node, ast.Name):
         return None
     try:
-        annotations = graph.G.graph.get("type_annotations") or {}
+        from ...transmogrifier.graph.node_special_cases import (
+            function_type_annotations as _function_type_annotations,
+        )
+
+        annotations = _function_type_annotations(graph.G.graph)
     except AttributeError:
         return None
     declared = annotations.get(node.id) or _parameter_declaration(

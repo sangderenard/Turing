@@ -377,7 +377,11 @@ def test_every_advertised_op_emits():
     integer_ops = {"invert", "bitand", "bitor", "bitxor", "shl", "shr"}
     for op in sorted(GLSL_OPS):
         dtype = np.int32 if op in integer_ops else np.float32
-        src = emit_op_source(op, left_dtype=dtype, right_dtype=dtype)
+        # A bitcast's result is its declared target type; it has no default.
+        src = emit_op_source(
+            op, left_dtype=dtype, right_dtype=dtype,
+            output_dtype=np.uint32 if op == "bitcast" else None,
+        )
         assert src.startswith("#version 430")
         assert "arena[u_slot[" in src
         assert " + (gid)]" in src

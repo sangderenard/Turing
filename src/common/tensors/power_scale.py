@@ -128,6 +128,8 @@ _declare("materialize",
          # rounding, integer arithmetic, bit patterns, integer and boolean casts
          "floor", "ceil", "round", "trunc", "int_trunc", "floordiv", "mod",
          "bitand", "bitor", "bitxor", "shl", "shr", "invert",
+         # a bit reinterpretation reads the logical value's stored bits
+         "bitcast",
          "fptosi", "fptoui", "sitofp", "uitofp", "sext", "zext",
          "int", "long", "long_cast", "bool", "nan_to_num",
          # results a scale cannot describe: (values, indices) and eigen pairs

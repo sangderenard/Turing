@@ -1112,6 +1112,7 @@ def _post_identity_table_mutation(
 def _post_copy_planner_specializations(
     specialized: Any, specializations: Mapping[str, Any],
     specialization_cells: Mapping[str, tuple],
+    specialization_dtypes: Mapping[str, str] | None = None,
 ) -> None:
     """The rows of one callee COPY: a literal argument of its callsite
     (``SpecializationFact(value, LITERAL)`` from the argument cells the
@@ -1139,9 +1140,16 @@ def _post_copy_planner_specializations(
                         cell.row, cell.column,
                     ).value
                     break
+        # A declared argument's dtype is part of its literal (see
+        # ``SpecializationFact.dtype``); a default has no callsite
+        # declaration, so it carries none.
+        dtype = (
+            dict(specialization_dtypes or {}).get(str(parameter))
+            if source is SpecializationSource.LITERAL else None
+        )
         _post_planner_specialization(
-            specialized, str(parameter), SpecializationFact(value, source),
-            cells,
+            specialized, str(parameter),
+            SpecializationFact(value, source, dtype), cells,
         )
     _materialize_planner_specializations(specialized)
 
@@ -1169,6 +1177,97 @@ def _materialize_planner_specializations(graph: Any) -> None:
         if isinstance(fact, SpecializationFact):
             view[str(row[1])] = fact.value
     graph.G.graph["planner_specializations"] = view
+
+
+def planner_specialization_dtypes(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """The declared dtype of each formal of this copy that a DECLARED
+    literal argument specialized (``SpecializationFact.dtype``), read from
+    the copy's ``planner_specialization`` rows.  A formal whose latest fact
+    declares no dtype has no entry."""
+
+    from .concordance_declarations import (
+        PLANNER_SPECIALIZATION_PAGE, SpecializationFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    scope = metadata.get("lexical_read_scope")
+    page = current_identity_book().pages.get(PLANNER_SPECIALIZATION_PAGE.name)
+    if scope is None or page is None:
+        return {}
+    dtypes: dict[str, str] = {}
+    for row in page.scope_rows(tuple(scope)):
+        fact = page.latest(row)
+        if isinstance(fact, SpecializationFact) and fact.dtype is not None:
+            dtypes[str(row[1])] = str(fact.dtype)
+    return dtypes
+
+
+def declared_specialization_dtype(graph: Any, node_id: int) -> str | None:
+    """The dtype a DECLARED literal argument gave ``node_id``.
+
+    A planner-fed Input reads its own ``planner_specialization`` row.  The
+    structural fold turns that Input into a constant in place, so the
+    constant is still the value the formal's first ``name_binding``
+    version names in this copy's scope; it reads that formal's row, when
+    the fact is the same literal.  (``proven_literal`` is keyed by function
+    name, shared by every copy, so its causes do not name this copy's
+    specialization.)"""
+
+    from .concordance_declarations import (
+        NAME_BINDING, PLANNER_SPECIALIZATION_PAGE, BindingFact,
+        SpecializationFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    node_id = int(node_id)
+    if node_id not in graph.G:
+        return None
+    book = current_identity_book()
+    data = graph.G.nodes[node_id]
+    scope = graph.G.graph.get("lexical_read_scope")
+    binding = (data.get("attributes") or {}).get("binding_name")
+    if str(data.get("type") or "").casefold() == "input":
+        if scope is None or binding is None:
+            return None
+        page = book.pages.get(PLANNER_SPECIALIZATION_PAGE.name)
+        fact = (
+            page.latest((tuple(scope), str(binding)))
+            if page is not None
+            and book.latest_ref(
+                PLANNER_SPECIALIZATION_PAGE, (tuple(scope), str(binding)),
+            ) is not None
+            else None
+        )
+        return (
+            str(fact.dtype)
+            if isinstance(fact, SpecializationFact) and fact.dtype is not None
+            else None
+        )
+    attributes = data.get("attributes") or {}
+    if scope is None or not attributes.get("structural_specialization"):
+        return None
+    literal = attributes.get("value")
+    page = book.pages.get(PLANNER_SPECIALIZATION_PAGE.name)
+    if page is None:
+        return None
+    value_ids = {node_id, int(data.get("value_id", node_id))}
+    dtypes = set()
+    for row in page.scope_rows(tuple(scope)):
+        fact = page.latest(row)
+        if not (
+            isinstance(fact, SpecializationFact)
+            and fact.dtype is not None
+            and type(fact.value) is type(literal)
+            and fact.value == literal
+        ):
+            continue
+        binding_row = (row[0], row[1], 0)
+        if book.latest_ref(NAME_BINDING, binding_row) is None:
+            continue
+        binding = book.page(NAME_BINDING).latest(binding_row)
+        if isinstance(binding, BindingFact) and int(binding.value_id) in value_ids:
+            dtypes.add(str(fact.dtype))
+    return next(iter(dtypes)) if len(dtypes) == 1 else None
 
 
 def _callsite_descriptor_receipt(descriptor: Any) -> Any:

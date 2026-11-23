@@ -172,6 +172,11 @@ _INTENTIONALLY_NONDIFFERENTIABLE = {
     # ``trunc`` is. The widening direction (``sitofp``/``uitofp``) is a genuine
     # identity on the value and gets a real reverse instead.
     "long", "int", "fptosi", "fptoui", "int_trunc",
+    # A bit reinterpretation keeps the bits and changes their type: 1.0 and
+    # 1065353216 are not related by any slope.  Its exact inverse is the
+    # opposite reinterpretation (``bit_reinterpretation``), which reverses
+    # the value; a gradient through it is a category error, like an index's.
+    "bitcast",
 }
 
 # Operations that manufacture values rather than transform them. Their output

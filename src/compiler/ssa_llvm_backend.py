@@ -1849,6 +1849,17 @@ def _public_numpy_dtype(value: _Any) -> str:
     return _llvm_abi_numpy_table()[llvm_type]
 
 
+def _llvm_bit_width(llvm_type: str) -> int | None:
+    """Bits in a scalar LLVM type (``bitcast`` requires equal widths)."""
+
+    floats = {"half": 16, "bfloat": 16, "float": 32, "double": 64, "fp128": 128}
+    if llvm_type in floats:
+        return floats[llvm_type]
+    if llvm_type.startswith("i") and llvm_type[1:].isdigit():
+        return int(llvm_type[1:])
+    return None
+
+
 def _value_llvm_type(value: _Any) -> str:
     accounting = getattr(value, "accounting", {}) or {}
     # Existing structural carriers are address tables, not scalar dtype
@@ -5349,6 +5360,40 @@ def _emit_repository_call_module(
                 ))
                 if active_block is not None:
                     block_exit_label[active_block] = done
+                register_cache.clear()
+                continue
+
+            if operation == "BitCast" and result is not None and len(instruction.args) == 1:
+                # Same-width reinterpretation.  The bits are the DTYPE's: a
+                # float32 scalar lives in a double slot, so the operand is
+                # loaded at its dtype's own width (exact, it was a float32),
+                # retyped by LLVM's ``bitcast``, and the result converted
+                # into its slot (an fpext for a float32 result, also exact).
+                source_type = _llvm_type_for_dtype(instruction.args[0].dtype)
+                bits_type = _llvm_type_for_dtype(result.dtype)
+                result_type = _value_llvm_type(result)
+                if (_llvm_bit_width(source_type) is None
+                        or _llvm_bit_width(source_type) != _llvm_bit_width(bits_type)):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"bitcast {instruction.args[0].dtype} to {result.dtype} "
+                        "changes width",
+                    ))
+                    continue
+                operand = load_as(
+                    instruction.args[0], source_type, f"bitcast.{tag}",
+                )
+                register = f"%bitcast.{tag}"
+                body.append(
+                    f"  {register} = bitcast {source_type} {operand} to {bits_type}"
+                )
+                stored = convert_loaded(
+                    register, bits_type, result_type, f"bitcast.store.{tag}",
+                )
+                body.append(
+                    f"  store {result_type} {stored}, ptr {pointer(result)}, "
+                    f"align {_align(result_type)}"
+                )
                 register_cache.clear()
                 continue
 
@@ -9440,6 +9485,31 @@ def emit_ssa_function_to_llvm(
                         f"  store {returns} {register}, ptr {destination}, "
                         f"align {_align(returns)}"
                     )
+                continue
+
+            if operation == "BitCast" and instruction.res is not None and len(instruction.args) == 1:
+                # Same-width reinterpretation at the dtypes' own widths (see
+                # the module lane above); the register carries that type and
+                # consumers convert from it.
+                source_type = _llvm_type_for_dtype(instruction.args[0].dtype)
+                target_type = _llvm_type_for_dtype(instruction.res.dtype)
+                own = as_type(
+                    int(instruction.args[0].id), source_type,
+                    f"bitcast.src.{result_id}",
+                )
+                if (own is None or _llvm_bit_width(source_type) is None
+                        or _llvm_bit_width(source_type) != _llvm_bit_width(target_type)):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, str(operation),
+                        f"bitcast {source_type} to {target_type} is not a same-width "
+                        f"reinterpretation of %t{int(instruction.args[0].id)}",
+                    ))
+                    continue
+                register = f"%bitcast.{result_id}"
+                lines.append(
+                    f"  {register} = bitcast {source_type} {own} to {target_type}"
+                )
+                scalars[result_id] = (register, target_type)
                 continue
 
             if operation in {"Cast", "CastLike", "cast_like"} and instruction.res is not None and instruction.args:

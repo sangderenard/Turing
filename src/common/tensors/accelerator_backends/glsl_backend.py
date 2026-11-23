@@ -247,7 +247,19 @@ _UNARY: dict[str, str] = {
     "uitofp": "float($a)",
 }
 
-GLSL_OPS: frozenset[str] = frozenset(_BINARY) | frozenset(_UNARY)
+# Same-width bit reinterpretation (``BitCast``), spelled by its operand and
+# declared result types: (operand GLSL type, result GLSL type) -> built-in.
+# Its result type is the step's declared ``target_dtype``, never inferred
+# from the operation name, so it is not a ``_UNARY`` template.
+_GLSL_BIT_REINTERPRETATIONS = {
+    ("float", "uint"): "floatBitsToUint",
+    ("float", "int"): "floatBitsToInt",
+    ("uint", "float"): "uintBitsToFloat",
+    ("int", "float"): "intBitsToFloat",
+}
+_UNARY_OPS: frozenset[str] = frozenset(_UNARY) | {"bitcast"}
+
+GLSL_OPS: frozenset[str] = frozenset(_BINARY) | _UNARY_OPS
 
 # WebGL 2 has the GLSL ES scalar math used by these entries, but it does not
 # share the desktop compute backend's typed SSBO ABI.  Keep the reusable
@@ -257,7 +269,7 @@ _NON_FLOAT_SCALAR_OPS = frozenset(
     {
         "bitand", "bitor", "bitxor", "shl", "shr", "invert",
         "int_trunc", "zext", "sext", "fptosi", "fptoui", "sitofp",
-        "uitofp",
+        "uitofp", "bitcast",
     }
 )
 GLSL_FLOAT_SCALAR_OPS: frozenset[str] = GLSL_OPS - _NON_FLOAT_SCALAR_OPS
@@ -3950,16 +3962,25 @@ def _validate_program_outputs(
                 f"fused GLSL program does not support typed primitive {op!r}"
             )
         scalar = step.attrs.get("right_scalar")
-        unknown = set(step.attrs) - {"right_scalar", "reverse"}
+        # A bitcast declares the types it reinterprets between; its result
+        # type is that declaration, not an inference from the op name.
+        allowed = {"right_scalar", "reverse"} | (
+            {"source_dtype", "target_dtype"} if op == "bitcast" else set()
+        )
+        unknown = set(step.attrs) - allowed
         if unknown:
             raise ValueError(
                 f"step {step.step_id} has unsupported attrs: {sorted(unknown)}"
+            )
+        if op == "bitcast" and "target_dtype" not in step.attrs:
+            raise ValueError(
+                f"step {step.step_id} bitcast declares no target_dtype"
             )
         if any(value_id not in defined for value_id in step.input_ids):
             raise ValueError(
                 f"step {step.step_id} reads a value before it is written"
             )
-        if op in _UNARY:
+        if op in _UNARY_OPS:
             valid = len(step.input_ids) == 1 and scalar is None
         else:
             valid = (
@@ -4077,7 +4098,7 @@ def program_snippet(
         reverse = reverse ^ bool(step.attrs.get("reverse", False))
         a = value_names[step.input_ids[0]]
         left_dtype = value_dtypes[step.input_ids[0]]
-        if op in _UNARY:
+        if op in _UNARY_OPS:
             b = None
             right_dtype = None
         elif len(step.input_ids) == 2:
@@ -4091,7 +4112,10 @@ def program_snippet(
             raise ValueError(
                 f"binary op {step.op_name!r} has no right operand"
             )
-        inferred_dtype = _result_dtype(op, left_dtype, right_dtype)
+        inferred_dtype = (
+            _normalize_dtype(step.attrs["target_dtype"]) if op == "bitcast"
+            else _result_dtype(op, left_dtype, right_dtype)
+        )
         result_dtype = metadata_dtype(step.result_id, inferred_dtype)
         helper, expression = _typed_expr(
             op, a, b, reverse, left_dtype, right_dtype, result_dtype,
@@ -4253,6 +4277,11 @@ def _promote_dtype(left: Any, right: Any | None = None) -> np.dtype:
 
 
 def _result_dtype(op: str, left: Any, right: Any | None = None) -> np.dtype:
+    if op == "bitcast":
+        raise GLSLUnsupportedOp(
+            "bitcast's result is its declared target_dtype; this path was "
+            "given only the operation name"
+        )
     if op in _BOOL_RESULTS:
         return np.dtype(np.bool_)
     if op in _CAST_RESULTS:
@@ -4298,6 +4327,14 @@ def _typed_expr(
 
     if op in _CAST_RESULTS:
         return "", _expr(op, a, None, False, out_type=out_type)
+
+    if op == "bitcast":
+        function = _GLSL_BIT_REINTERPRETATIONS.get((left_type, out_type))
+        if function is None:
+            raise GLSLUnsupportedOp(
+                f"no GLSL bit reinterpretation of {left_type} as {out_type}"
+            )
+        return "", f"{function}({a})"
 
     if op in _FLOAT_MATH:
         return "", _expr(
@@ -4614,7 +4651,7 @@ def emit_op_source(
     """Lower one canonical primitive to a standalone typed compute shader."""
     name, reverse = canonical_op(op)
     left_dtype = _normalize_dtype(left_dtype)
-    if name in _UNARY:
+    if name in _UNARY_OPS:
         if scalar is not None:
             raise ValueError(f"unary op {op!r} given a scalar right operand")
         right_dtype = None
@@ -9701,7 +9738,7 @@ def _defer_elementwise(
         return primary_output_id(deferred.program)
 
     attrs: dict[str, Any] = {}
-    if name in _UNARY:
+    if name in _UNARY_OPS:
         assert lhs is not None
         input_ids = [operand_id(lhs)]
     elif lhs is None:
@@ -9771,7 +9808,7 @@ def run_op(op: str, left: Any, right: Any = None) -> GLChunk:
     """
     require_gl_context()
     name, reverse = canonical_op(op)
-    unary = name in _UNARY
+    unary = name in _UNARY_OPS
     if unary and right is not None:
         raise ValueError(f"unary op {op!r} given a right operand")
     if not unary and right is None:

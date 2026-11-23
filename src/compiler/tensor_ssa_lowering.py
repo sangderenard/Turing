@@ -10701,6 +10701,81 @@ def lower_tensor_calls_to_repository_ssa(
                         )
                         if operation == "basic_index_store" and len(args) >= 2:
                             value = args[-1]
+                            # ``index_assign_double`` is exact for a float64
+                            # span (test_indexed_store_versions_the_same_
+                            # resident_arena_in_place); only an element dtype
+                            # that kernel does not represent takes the
+                            # scalar address below.
+                            scalar_store = (
+                                str(instruction.op) == "IndexedStore"
+                                and str(source.dtype or "") not in {
+                                    "", "unknown", "float64", "double",
+                                }
+                                and len(axes) == len(source_shape)
+                                and all(
+                                    bool(drop_axis) and len(indices) == 1
+                                    for indices, drop_axis in axes
+                                )
+                            )
+                            if scalar_store:
+                                # Program: ``words[1] = i`` on a uint32
+                                # span (a GLSL ``atomicOr(words[1], ..)``
+                                # through ``AbstractTensor.atomic_or``).
+                                # Wrong record: a literal scalar index took
+                                # ``index_assign_double``; its in-place output
+                                # formal then revised the span's ssa_value to
+                                # physical float64 beside its uint32 dtype,
+                                # and ir_indexing refused the disagreement.
+                                # Rule: the store's every axis is removed by
+                                # one integer, so it addresses one element,
+                                # exactly as the ``basic_index`` load's
+                                # scalar_selection below.  It is the same
+                                # address + Store that ir_indexing gives a
+                                # runtime scalar index, in the element's own
+                                # dtype, and its version aliases the base.
+                                linear_index = 0
+                                for axis, (indices, _drop_axis) in enumerate(
+                                    axes
+                                ):
+                                    linear_index = (
+                                        linear_index * source_shape[axis]
+                                        + int(indices[0])
+                                    )
+                                index_value, index_definition = constant(
+                                    linear_index, "int64"
+                                )
+                                address = fresh(dtype="ptr")
+                                result.shape = source_shape
+                                register_tensor(
+                                    result,
+                                    storage="view",
+                                    alias_of=int(source_descriptor.tensor_id),
+                                    data_value_id=int(
+                                        source_descriptor.data_value_id
+                                    ),
+                                )
+                                aliases[int(result.id)] = source
+                                store_attributes = {
+                                    "basic_index_linearized": True,
+                                    "lowered_from": "IndexedStore",
+                                    "source_effect_value_id": int(result.id),
+                                }
+                                rewritten.extend((
+                                    index_definition,
+                                    Instr(
+                                        "GetElementPtr",
+                                        [source, index_value],
+                                        address,
+                                        attributes=dict(store_attributes),
+                                        source_span=instruction.source_span,
+                                    ),
+                                    Instr(
+                                        "Store", [value, address], None,
+                                        attributes=dict(store_attributes),
+                                        source_span=instruction.source_span,
+                                    ),
+                                ))
+                                continue
                             register_tensor(
                                 value,
                                 storage=(
