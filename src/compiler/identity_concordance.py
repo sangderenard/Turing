@@ -11106,6 +11106,39 @@ class CorrelationTable:
                         upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
                         if lower <= literal <= upper:
                             authored_domains.append(width)
+            # Program: GLSL ``ivec3 q = ivec3(3, 0, 2);`` (an authored
+            # dataclass whose fields are declared ``'int32'``).  Wrong record:
+            # ``materialize_program_abi_record_literals`` materialized each
+            # field literal at its field's declared width, citing the value's
+            # ``ssa_value`` cell, which that field declaration revised; the
+            # audit read only local annotations and called it int64.  Rule:
+            # a CLASS_FIELD_DECLARATION that directly causes this value's own
+            # ``ssa_value`` cell declares its domain, width-checked as above.
+            from .concordance_declarations import (
+                CLASS_FIELD_DECLARATION as _FIELD_DECLARATION,
+                SSA_VALUE as _SSA_VALUE,
+            )
+            for value_cell in materialization_sources:
+                if (authored_domains or value_cell.page != _SSA_VALUE
+                        or not isinstance(value_cell.row, tuple)
+                        or len(value_cell.row) != 2
+                        or int(value_cell.row[1]) != int(value_id)):
+                    continue
+                field_widths = set()
+                for cause, _stage in book.edges_into(value_cell):
+                    if cause.page != _FIELD_DECLARATION:
+                        continue
+                    field = book.page(_FIELD_DECLARATION).cell(cause.row, cause.column)
+                    field_widths.add(source_annotation_dtype(getattr(field, "annotation", None)))
+                width = next(iter(field_widths)) if len(field_widths) == 1 else None
+                layout = resolve(width) if width is not None else None
+                if (width == str(dtype) and layout is not None
+                        and layout.kind in {"int", "uint"}):
+                    bits = layout.byte_size * 8
+                    lower = -(1 << (bits - 1)) if layout.kind == "int" else 0
+                    upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
+                    if lower <= literal <= upper:
+                        authored_domains.append(width)
             if len(set(authored_domains)) == 1:
                 expected_dtype = authored_domains[0]
             discrepancies = []

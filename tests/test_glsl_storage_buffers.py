@@ -236,6 +236,24 @@ void main(){ vec3 d = vec3(outv[0], outv[1], 0.5); outv[1] = weigh(d, 2.0); }
     assert outv.tolist() == [1.0, (1.0 + 2.0 * 2.0 + 0.5 * 3.0) * 2.0]
 
 
+def test_integer_vector_literal_record_keeps_its_declared_field_width():
+    # ``ivec3(3, 0, 2)``: each field literal is materialized at the record
+    # field's declared int32, which the final audit now accepts from the
+    # field declaration; the record is then passed to a helper and read again.
+    from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+
+    result = lower_glsl_source_to_ast('''#version 430
+layout(local_size_x=1) in;
+layout(std430, binding=0) buffer Out { float outv[]; };
+void put(ivec3 q){ outv[0] = float(q.x * 10 + q.z); }
+void main(){ ivec3 q = ivec3(3, 0, 2); put(q); outv[1] = float(q.z * 100 + q.y * 10 + q.x); }
+''')
+    artifact, names = _compile(result, {"outv": 2})
+    outv = np.zeros(2, dtype=np.float32)
+    prepare_artifact_execution(artifact, {names["outv"]: outv}).run()
+    assert outv.tolist() == [32.0, 203.0]
+
+
 def test_compute_shader_with_buffer_atomics_runs_on_caller_storage():
     from src.compiler.ssa_llvm_backend import prepare_artifact_execution
 
