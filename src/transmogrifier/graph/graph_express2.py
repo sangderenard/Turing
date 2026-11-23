@@ -24,6 +24,7 @@ from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
 from .node_special_cases import (
     annotate_types,
+    annotate_types_scoped,
     inline_context_managers,
     expand_ellipsis_subscripts,
     fold_constant_getattr,
@@ -7363,10 +7364,22 @@ class ProcessGraph(TiledObject):
         # dependency on ``obj.ndim`` (known deterministically before it fires)
         # instead of an opaque literal.
         tree = expand_ellipsis_subscripts(tree)
+        merged_annotations, scoped_annotations = annotate_types_scoped(tree)
         self.G.graph["type_annotations"] = {
             **(self.G.graph.get("type_annotations") or {}),
-            **annotate_types(tree),
+            **merged_annotations,
         }
+        # The exact per-function table (``function_type_annotations`` reads
+        # it); the merged bare-name view above is kept for whole-program use.
+        scoped_table = {
+            owner: dict(table)
+            for owner, table in dict(
+                self.G.graph.get("scoped_type_annotations") or {}
+            ).items()
+        }
+        for owner, table in scoped_annotations.items():
+            scoped_table.setdefault(owner, {}).update(table)
+        self.G.graph["scoped_type_annotations"] = scoped_table
         tree = ast.fix_missing_locations(tree)
         # Re-stamp after the walrus/getattr/ellipsis rewrites: ``ensure_node``
         # posts each node's ``ingestion_value`` row from the final tree.

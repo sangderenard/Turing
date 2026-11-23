@@ -22,8 +22,8 @@ def test_contract_contains_every_repository_and_tensor_operator():
     # 225, not the 223 this line was born with: the assertion was written in
     # the same commit that added ``cast_like`` and never counted it, and
     # ``sigmoid`` joined ELEMENTWISE_UNARY afterwards.  Both are real
-    # vocabulary, so the number moved to meet them.
-    assert len(TENSOR_SSA_OPERATORS) == len(CANONICAL_ABSTRACT_TENSOR_OPERATORS) == 225
+    # vocabulary, so the number moved to meet them.  226: ``bitcast``.
+    assert len(TENSOR_SSA_OPERATORS) == len(CANONICAL_ABSTRACT_TENSOR_OPERATORS) == 226
     assert CANONICAL_TENSOR_SSA_OPERATORS == CANONICAL_ABSTRACT_TENSOR_OPERATORS
 
 

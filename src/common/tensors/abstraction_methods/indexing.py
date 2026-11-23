@@ -363,3 +363,51 @@ def scatter(x: Any, index: Any, src: Any, dim: int = 0, *, reduce: str = "sum"):
             result[tuple(indexer)] / divisor.reshape(tuple(spread)))
     return finalize(result)
 
+
+def atomic_add(self, index, value):
+    """Add ``value`` to the one element ``x[index]`` in place; return the old value.
+
+    This is a GLSL/C11 atomic fetch-add written as the read, combine and
+    store the compiler already has (``Indexed``, ``add``, ``IndexedStore``):
+    ``x`` is caller-owned state written in place, as ``__setitem__`` writes
+    it, and the old element is returned.  Only operations in the catalogue
+    appear here, so this method owns no lowering and is pursued as authored
+    source (``aot_compile``'s catalogue boundary).
+
+    The three steps are one atomic site.  Run one invocation at a time
+    (NumPy, Torch, a serial native lane) they are already the exact
+    semantics.  A target that runs invocations concurrently reads the
+    site's concordance row and emits them as one atomic read-modify-write.
+    ``index`` names one element; a slice would make the "old value" a
+    view, which is not what the atomic returns.
+    """
+
+    old = self[index]
+    self[index] = old + value
+    return old
+
+
+def atomic_or(self, index, value):
+    """Bitwise-or ``value`` into the one element ``x[index]``; return the old value.
+
+    The same declared read, combine and store as :func:`atomic_add`, with
+    the combine step a bitwise or.  Integer elements only, as in GLSL.
+    """
+
+    old = self[index]
+    self[index] = old | value
+    return old
+
+
+#: The declared atomic updates: each method's authored identity, as source
+#: pursuit records it (``authored_function_identity``), mapped to its
+#: combine step.  The planner reserves the pursued body of one of these as
+#: one indivisible region and posts it as a ``source_atomic_site`` row; a
+#: target that runs invocations concurrently emits that region as one
+#: atomic read-modify-write.  The keys come from the functions themselves,
+#: so a rename cannot leave a stale spelling here.
+ATOMIC_UPDATE_OPERATIONS = {
+    (atomic_add.__module__, atomic_add.__qualname__): "add",
+    (atomic_or.__module__, atomic_or.__qualname__): "or",
+}
+

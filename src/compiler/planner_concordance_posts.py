@@ -1112,6 +1112,7 @@ def _post_identity_table_mutation(
 def _post_copy_planner_specializations(
     specialized: Any, specializations: Mapping[str, Any],
     specialization_cells: Mapping[str, tuple],
+    specialization_dtypes: Mapping[str, str] | None = None,
 ) -> None:
     """The rows of one callee COPY: a literal argument of its callsite
     (``SpecializationFact(value, LITERAL)`` from the argument cells the
@@ -1139,9 +1140,16 @@ def _post_copy_planner_specializations(
                         cell.row, cell.column,
                     ).value
                     break
+        # A declared argument's dtype is part of its literal (see
+        # ``SpecializationFact.dtype``); a default has no callsite
+        # declaration, so it carries none.
+        dtype = (
+            dict(specialization_dtypes or {}).get(str(parameter))
+            if source is SpecializationSource.LITERAL else None
+        )
         _post_planner_specialization(
-            specialized, str(parameter), SpecializationFact(value, source),
-            cells,
+            specialized, str(parameter),
+            SpecializationFact(value, source, dtype), cells,
         )
     _materialize_planner_specializations(specialized)
 
@@ -1164,11 +1172,19 @@ def _materialize_planner_specializations(graph: Any) -> None:
     if page is None:
         return
     view = dict(graph.G.graph.get("planner_specializations") or {})
+    # The declared dtypes are the same rows' second fact; a formal whose
+    # latest fact declares none has no entry, so a stale one is dropped.
+    dtypes = dict(graph.G.graph.get("planner_specialization_dtypes") or {})
     for row in page.scope_rows(tuple(scope)):
         fact = page.latest(row)
         if isinstance(fact, SpecializationFact):
             view[str(row[1])] = fact.value
+            if fact.dtype is not None:
+                dtypes[str(row[1])] = str(fact.dtype)
+            else:
+                dtypes.pop(str(row[1]), None)
     graph.G.graph["planner_specializations"] = view
+    graph.G.graph["planner_specialization_dtypes"] = dtypes
 
 
 def _callsite_descriptor_receipt(descriptor: Any) -> Any:

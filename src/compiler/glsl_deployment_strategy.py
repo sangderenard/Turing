@@ -1844,6 +1844,98 @@ def _precision_indivisible_node_groups(
     return tuple(groups)
 
 
+def _atomic_indivisible_node_groups(
+    graph: Any,
+    executable_node_ids: Iterable[int],
+) -> tuple[tuple[int, ...], ...]:
+    """Reserve a declared atomic update's pursued body as one region.
+
+    Program: ``AbstractTensor.atomic_add(words, i, 1)`` (the GLSL reader's
+    ``atomicAdd(words[i], 1u)``).  Wrong record: the read, the add and the
+    store were three planned regions, so no target could emit them as one
+    read-modify-write and a concurrent target would lose updates.  Rule:
+    the pursued body of an ``indexing.ATOMIC_UPDATE_OPERATIONS`` method,
+    selected by its ``authored_function_identity``, is one non-separable
+    region, posted as its ``source_atomic_site`` row.  The body must be
+    exactly one store and the read it returns; anything else is refused,
+    never guessed into a site.
+    """
+
+    from ..common.tensors.abstraction_methods.indexing import (
+        ATOMIC_UPDATE_OPERATIONS,
+    )
+
+    identity = graph.G.graph.get("authored_function_identity")
+    operation = (
+        ATOMIC_UPDATE_OPERATIONS.get(tuple(map(str, identity)))
+        if isinstance(identity, (tuple, list)) else None
+    )
+    if operation is None:
+        return ()
+    executable = {
+        int(node_id) for node_id in executable_node_ids
+        if int(node_id) in graph.G
+    }
+    order = {
+        int(node_id): index
+        for index, node_id in enumerate(_dependency_order(graph))
+    }
+    members = tuple(sorted(executable, key=order.__getitem__))
+    stores = tuple(
+        node_id for node_id in members
+        if graph.G.nodes[node_id].get("type") == "IndexedStore"
+    )
+    outputs = tuple(graph.G.graph.get("function_outputs") or ())
+    versions = dict(graph.G.graph.get("identity_table") or {})
+    observed = (
+        int(tuple(versions[outputs[0]])[-1])
+        if len(outputs) == 1 and versions.get(outputs[0]) else None
+    )
+    if len(stores) != 1 or observed not in members:
+        raise ValueError(
+            "declared atomic update is not one store and its returned read: "
+            f"identity={tuple(identity)!r}, members={members!r}, "
+            f"stores={stores!r}, observed={observed!r}"
+        )
+
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        PLANNER_REGION_CARVE, SOURCE_ATOMIC_SITE,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    book = current_identity_book()
+    scope = _source_numeric_scope(graph.G)
+    row = (scope, stores[0])
+    # GLSL buffer atomics and C11 ``__atomic_*`` default to sequential
+    # consistency; the site states it rather than leaving it to a target.
+    proposed = (
+        str(operation), members, int(observed), int(stores[0]),
+        "sequentially-consistent",
+    )
+    incumbent = book.page(SOURCE_ATOMIC_SITE).latest(row)
+    if incumbent is not None and tuple(incumbent) != proposed:
+        raise ValueError(
+            "source atomic site concordance disagreement for "
+            f"{row!r}: recorded={incumbent!r}, proposed={proposed!r}"
+        )
+    book.post(
+        SOURCE_ATOMIC_SITE, row, proposed,
+        stage=PLANNER_REGION_CARVE,
+        provenance=Derived(tuple(dict.fromkeys(
+            node_identity_cell(graph, node_id) for node_id in members
+        ))),
+        mode=Mode.CONCORD,
+    )
+    for node_id in members:
+        graph.G.nodes[node_id].setdefault("attributes", {})[
+            "source_atomic_site"
+        ] = row
+    return (members,)
+
+
 def _concord_consumer_operands(
     graph: Any, consumer_nodes: Any, values: Any,
 ) -> None:
@@ -3589,6 +3681,10 @@ def _planned_scalar_dtypes_from_graph(
             node_id = int(node_id)
             op = operation(data)
             attributes = data.get("attributes") or {}
+            if op == "bitcast":
+                # A bit reinterpretation is its declared type; its operand's
+                # class says nothing about it (``bit_reinterpretation``).
+                settle(scalar, node_id, attributes.get("target_dtype"))
             from .process_graph_facts import operation as process_operation
             process_fact, _process_cell = process_operation(graph, node_id)
             process_dtype = None if process_fact is None else process_fact[2]
@@ -3686,7 +3782,11 @@ def _planned_scalar_dtypes_from_graph(
                     getattr(expression, "value", None)
                     if isinstance(expression, ast.Constant) else None,
                 )
-                settle(scalar, node_id, literal_dtype(literal))
+                settle(
+                    scalar, node_id,
+                    attributes.get("declared_literal_dtype")
+                    or literal_dtype(literal),
+                )
                 # Program: ``for x in [1, 5, 9]: ... r += x`` (corpus c156).
                 # Wrong record: the folded display is a constant whose
                 # element type nobody read, so ``x`` had no proven class and
@@ -3847,6 +3947,15 @@ def _planned_scalar_dtypes_from_graph(
                 if op == "generatorexp":
                     continue
             if op == "input":
+                # A formal specialized to a DECLARED literal argument
+                # (``one: 'uint32' = 1``) has that dtype, before its class
+                # (``builtins.int``) proposes the Python default int64
+                # (``SpecializationFact.dtype``).
+                declared_literal_dtype = dict(
+                    G.graph.get("planner_specialization_dtypes") or {}
+                ).get(str(attributes.get("binding_name") or ""))
+                if declared_literal_dtype is not None:
+                    settle(scalar, node_id, str(declared_literal_dtype))
                 from .process_graph_facts import captured_input_contract
                 capture_fact, capture_cell = captured_input_contract(graph, node_id)
                 if capture_cell is not None:
@@ -7665,8 +7774,24 @@ def _build_shell_hierarchy_plan(
                     precision_dtype = limb_element_name(
                         attributes.get("precision_element")
                     )
+                # A formal specialized to a DECLARED literal argument, or
+                # the constant it was folded to, has the declared dtype
+                # (``SpecializationFact.dtype``).  The formal's tensor
+                # descriptor is its class default (``builtins.int`` ->
+                # int64), which is no declaration and must not outrank one.
+                declared_literal_dtype = attributes.get(
+                    "declared_literal_dtype"
+                ) or (
+                    dict(
+                        graph.G.graph.get("planner_specialization_dtypes")
+                        or {}
+                    ).get(str(binding_name))
+                    if binding_name is not None
+                    and node.get("type") == "Input" else None
+                )
                 dtype = (
-                    (
+                    declared_literal_dtype
+                    or (
                         None if tensor_dtype_unsettled
                         else local_tensor_dtype
                     )
@@ -7786,7 +7911,11 @@ def _build_shell_hierarchy_plan(
                             python_int_literal_dtype,
                         )
 
-                        dtype = python_int_literal_dtype(literal)
+                        # A literal folded from a DECLARED argument keeps
+                        # that dtype (``SpecializationFact.dtype``).
+                        dtype = attributes.get(
+                            "declared_literal_dtype"
+                        ) or python_int_literal_dtype(literal)
                     elif isinstance(literal, float):
                         dtype = "float64"
                 if dtype is None and operation in {"getattr", "indexed"}:
@@ -22934,6 +23063,51 @@ def _source_static_literal(
     raise ValueError("value is not source-static")
 
 
+def _source_declared_scalar_dtype(graph: Any, node_id: int) -> str | None:
+    """The scalar dtype a source-static argument was DECLARED with, or None.
+
+    A literal argument read from an annotated binding (``one: 'uint32' =
+    1``) is two facts about one value, its literal and its declared dtype,
+    and both cross the call (``SpecializationFact.dtype``).  The declaration
+    is the caller's own ``annotation_declaration`` row, keyed by its
+    authored function and binding name; the binding is the one whose
+    identity history holds ``node_id``.  ``G.graph["type_annotations"]`` is
+    not read: it is keyed by bare binding name across the program, so the
+    GLSL reader's per-function ``__glsl_literal_0`` in ``main`` overwrote
+    the same name in ``claim`` and typed ``claim``'s int32 index uint32.
+    Several bindings that disagree about one version declare nothing exact.
+    """
+
+    from .concordance_declarations import ANNOTATION_DECLARATION
+    from .identity_concordance import current_identity_book
+    from ..transmogrifier.dtype_layout import source_annotation_dtype
+
+    owner = graph.G.graph.get("authored_function_identity")
+    if not isinstance(owner, (tuple, list)) or len(owner) != 2:
+        return None
+    page = current_identity_book().pages.get(ANNOTATION_DECLARATION.name)
+    if page is None:
+        return None
+    declared = set()
+    for binding, history in dict(
+        graph.G.graph.get("identity_table") or {}
+    ).items():
+        try:
+            versions = {int(version) for version in history}
+        except (TypeError, ValueError):
+            continue
+        if int(node_id) not in versions:
+            continue
+        fact = page.latest((str(owner[0]), str(owner[1]), str(binding)))
+        dtype = (
+            None if fact is None
+            else source_annotation_dtype(getattr(fact, "annotation", None))
+        )
+        if dtype is not None:
+            declared.add(str(dtype))
+    return next(iter(declared)) if len(declared) == 1 else None
+
+
 def _canonical_planner_specialization_cells(contributions: Any) -> tuple:
     """The set of cells proving one aggregate specialization, in one order."""
 
@@ -22963,6 +23137,10 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
 
     # Per candidate: (value, the cells that prove it, omitted-argument?).
     candidates: dict[tuple[int, str], list[tuple[Any, tuple, bool]]] = {}
+    #: Per candidate, aligned with ``candidates``: each contribution's
+    #: declared argument dtype (None for an undeclared literal, a default or
+    #: a non-literal), so the agreed fact carries it.
+    declared_dtypes: dict[tuple[int, str], list[str | None]] = {}
     dynamic_argument = object()
     not_source_static = object()
     tensor_argument = object()
@@ -23052,6 +23230,13 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     (*_argument_identity_cells(caller, int(parent)), *role_cells),
                     False,
                 ))
+                declared_dtypes.setdefault(
+                    (int(reference), parameter), []
+                ).append(
+                    None if any(value is sentinel for sentinel in (
+                        dynamic_argument, not_source_static, tensor_argument,
+                    )) else _source_declared_scalar_dtype(caller, int(parent))
+                )
             # Omitted arguments are just as exact as authored literal
             # arguments: Python binds them to the signature default before
             # the body starts. Include them in the same consistency proof so
@@ -23069,6 +23254,9 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                         copy.deepcopy(default),
                         _formal_identity_cells(callee, parameter), True,
                     ))
+                    declared_dtypes.setdefault(
+                        (int(reference), parameter), []
+                    ).append(None)
     # Every candidate is a row on ``planner_specialization`` (callee scope,
     # parameter): the agreed literal / default as a ``SpecializationFact``,
     # or the reason no literal exists -- a dynamic argument, an argument that
@@ -23123,7 +23311,11 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )
         except (TypeError, ValueError):
             consistent = False
-        if not consistent:
+        # The same literal declared uint32 at one callsite and undeclared
+        # (or int32) at another is not one argument: the callee's copy
+        # would have to compute in two dtypes.
+        dtypes = set(declared_dtypes.get((reference, parameter), ()))
+        if not consistent or len(dtypes) > 1:
             _post_planner_specialization(callee, parameter, Unresolved(
                 SPECIALIZATION_CALLSITES_DISAGREE, read=cells,
             ), cells)
@@ -23134,7 +23326,9 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             else SpecializationSource.LITERAL
         )
         _post_planner_specialization(
-            callee, parameter, SpecializationFact(first, source), cells,
+            callee, parameter,
+            SpecializationFact(first, source, next(iter(dtypes), None)),
+            cells,
         )
         callee.G.graph.setdefault(
             "planner_specializations", {}
@@ -24988,6 +25182,7 @@ def _propagate_callsite_tensor_specializations(
         record_descriptor_sources: dict[str, tuple[Any, ...]] = {}
         specializations: dict[str, Any] = {}
         specialization_cells: dict[str, tuple] = {}
+        specialization_dtypes: dict[str, str] = {}
         bound_parameters: set[str] = set()
         for parent, role_value in _expanded_callsite_argument_edges(
             caller, int(node_id),
@@ -25066,6 +25261,11 @@ def _propagate_callsite_tensor_specializations(
                     specialization_cells[parameter] = (
                         _argument_identity_cells(caller, int(parent))
                     )
+                    declared_dtype = _source_declared_scalar_dtype(
+                        caller, int(parent),
+                    )
+                    if declared_dtype is not None:
+                        specialization_dtypes[parameter] = declared_dtype
         for parameter, default in (
             callee.G.graph.get("parameter_defaults") or {}
         ).items():
@@ -25240,6 +25440,7 @@ def _propagate_callsite_tensor_specializations(
             _stable_signature_value(aggregate_descriptors),
             _stable_signature_value(specializations),
             _stable_signature_value(record_descriptors),
+            _stable_signature_value(specialization_dtypes),
         )
         reuse_key = (id(callee.G), signature)
         signature_digest = hashlib.sha256(
@@ -25274,6 +25475,7 @@ def _propagate_callsite_tensor_specializations(
         # This propagation copy's own rows, under its forked scope (7.1).
         _post_copy_planner_specializations(
             specialized, specializations, specialization_cells,
+            specialization_dtypes,
         )
         specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
             descriptors
@@ -34280,6 +34482,17 @@ def _fold_callsite_structural_values(
             "value": copy.deepcopy(value),
             "structural_specialization": True,
         })
+        # A formal folded from a DECLARED literal argument keeps that
+        # dtype (``SpecializationFact.dtype``); the Python class of the
+        # bare value would retype ``one: 'uint32' = 1`` as int64.
+        if str(data.get("type") or "").casefold() == "input":
+            declared_literal_dtype = dict(
+                graph.G.graph.get("planner_specialization_dtypes") or {}
+            ).get(str(source_attributes.get("binding_name") or ""))
+            if declared_literal_dtype is not None:
+                attributes["declared_literal_dtype"] = str(
+                    declared_literal_dtype
+                )
         data.update({
             "type": "Constant", "op": "const", "label": repr(value),
             "attributes": attributes,
@@ -34293,6 +34506,13 @@ def _fold_callsite_structural_values(
         if isinstance(tensor, Mapping) and "shape" in tensor:
             if isinstance(value, (bool, int, float)):
                 data["tensor"] = {**tensor, "shape": ()}
+                # Its dtype is the declared argument's, not the formal's
+                # class default (``SpecializationFact.dtype``): the int64
+                # left here promoted ``old + one`` to int64 in atomic_add.
+                if attributes.get("declared_literal_dtype") is not None:
+                    data["tensor"]["dtype"] = str(
+                        attributes["declared_literal_dtype"]
+                    )
             elif isinstance(value, (list, tuple)) and all(
                 isinstance(item, (bool, int, float)) for item in value
             ):
@@ -38459,6 +38679,9 @@ def _callsite_specialized_shell_type(
     #: Per literal parameter: the caller argument cells that proved it; the
     #: copy's ``planner_specialization`` rows derive from them.
     specialization_cells: dict[str, tuple] = {}
+    #: Per literal parameter the caller DECLARED (``one: 'uint32' = 1``):
+    #: that dtype, which is part of the literal and of this copy's contract.
+    specialization_dtypes: dict[str, str] = {}
     #: Per int parameter: the interval this callsite's actual is proven in,
     #: when it is narrower than the authored formal's (the join over every
     #: caller), and the cell proving it.  The copy is minted for it.
@@ -38725,6 +38948,11 @@ def _callsite_specialized_shell_type(
                 specialization_cells[parameter] = _argument_identity_cells(
                     caller, int(parent),
                 )
+                declared_dtype = _source_declared_scalar_dtype(
+                    caller, int(parent),
+                )
+                if declared_dtype is not None:
+                    specialization_dtypes[parameter] = declared_dtype
                 _publish_formal_literal(
                     str(original.G.graph.get("function_name")),
                     parameter,
@@ -38896,6 +39124,7 @@ def _callsite_specialized_shell_type(
             (name, stable(value))
             for name, value in receiver_field_specializations.items()
         )),
+        tuple(sorted(specialization_dtypes.items())),
     )
     key = (
         tuple(policy.items()), generation,
@@ -39036,6 +39265,7 @@ def _callsite_specialized_shell_type(
     # argument cells, each default from the formal it binds (design 7.1).
     _post_copy_planner_specializations(
         specialized, specializations, specialization_cells,
+        specialization_dtypes,
     )
     specialized.G.graph["planner_receiver_field_specializations"] = dict(
         receiver_field_specializations
@@ -43608,8 +43838,13 @@ def strategize_shell_deployment(
             fusible_node_ids=_shader_fusible_node_ids(
                 graph, executable_nodes,
             ),
-            indivisible_node_groups=_precision_indivisible_node_groups(
-                graph, executable_nodes,
+            indivisible_node_groups=(
+                *_precision_indivisible_node_groups(
+                    graph, executable_nodes,
+                ),
+                *_atomic_indivisible_node_groups(
+                    graph, executable_nodes,
+                ),
             ),
             control_node_ids=recursion_control_nodes,
             _progress=lambda facts: selection_event(

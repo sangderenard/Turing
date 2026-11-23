@@ -5019,9 +5019,13 @@ class LoopComposer:
                 for name, history in identities.items()
                 if row_sequence_id in set(map(int, history))
             ), None)
+            from ..transmogrifier.graph.node_special_cases import (
+                function_type_annotations,
+            )
+
             annotation = (
                 None if binding is None
-                else (graph.G.graph.get("type_annotations") or {}).get(binding)
+                else function_type_annotations(graph.G.graph).get(binding)
             )
             try:
                 authored = ast.parse(str(annotation), mode="eval").body

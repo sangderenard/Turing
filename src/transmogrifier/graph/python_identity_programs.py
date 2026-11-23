@@ -176,6 +176,23 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
         operator="minimum", inputs=("$receiver", "$arg0"),
         description="AbstractTensor elementwise minimum",
     ),
+    *(
+        _operator(
+            f"src.common.tensors.abstraction_methods.bit_reinterpretation.{name}",
+            operator="bitcast",
+            attributes={"source_dtype": source, "target_dtype": target},
+            description=(
+                f"same-width reinterpretation of {source} bits as {target}; "
+                "every backend emits its native bitcast"
+            ),
+        )
+        for name, (source, target) in (
+            ("float_bits_to_uint", ("float32", "uint32")),
+            ("float_bits_to_int", ("float32", "int32")),
+            ("uint_bits_to_float", ("uint32", "float32")),
+            ("int_bits_to_float", ("int32", "float32")),
+        )
+    ),
     _operator("builtins.float", operator="float", description="scalar extraction/cast"),
     _operator("builtins.int", operator="int", description="integer cast"),
     _operator("builtins.bool", operator="bool", description="truth-value cast"),

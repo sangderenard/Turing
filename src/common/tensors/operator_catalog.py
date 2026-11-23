@@ -181,6 +181,8 @@ SPECTRAL_OPERATORS = frozenset(
 TYPE_AND_DEVICE_OPERATORS = frozenset(
     {
         "astype",
+        # Same-width bit reinterpretation (``bit_reinterpretation``).
+        "bitcast",
         "bool",
         "cast_like",
         "cpu",

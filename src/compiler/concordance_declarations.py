@@ -1215,6 +1215,15 @@ class SpecializationFact:
 
     value: Any
     source: SpecializationSource
+    #: The scalar dtype the argument was DECLARED with at its callsite
+    #: (``one: 'uint32' = 1``), or None when the argument is an undeclared
+    #: Python literal.  Program: ``AbstractTensor.atomic_add(words, i, one)``
+    #: with ``one: 'uint32' = 1``.  Wrong record: the fact held the value 1
+    #: alone, so the callee's folded formal was typed by its Python class
+    #: (int64), ``old`` was widened to int64 before the add, and the uint32
+    #: store of 0xffffffff + 1 faulted instead of wrapping to 0.  Rule: a
+    #: declared literal is two facts about one value; both cross the call.
+    dtype: str | None = None
 
     def __eq__(self, other: object) -> bool:
         # A bound tensor literal (an array, an AbstractTensor) answers ``==``
@@ -1224,12 +1233,12 @@ class SpecializationFact:
         # element bytes agree.
         if not isinstance(other, SpecializationFact):
             return NotImplemented
-        return self.source == other.source and (
+        return self.source == other.source and self.dtype == other.dtype and (
             literal_identity(self.value) == literal_identity(other.value)
         )
 
     def __hash__(self) -> int:
-        return hash((self.source, literal_identity(self.value)))
+        return hash((self.source, self.dtype, literal_identity(self.value)))
 
 
 def is_array_literal(value: Any) -> bool:
@@ -5331,6 +5340,17 @@ SOURCE_PRECISION_OPERATOR = declare_page(
 #: boundary cells they were grouped from).
 SOURCE_PRECISION_REGION = declare_page(
     "source_precision_region_concordance", (
+        RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+    ), tuple,
+)
+#: ``_atomic_indivisible_node_groups``: one declared atomic update (the
+#: pursued body of an ``indexing.ATOMIC_UPDATE_OPERATIONS`` method),
+#: ``(numeric scope, store value)`` -> ``(operation, members, observed,
+#: store, ordering)``, CONCORD, DERIVED(the members' node identity cells).
+#: The read, combine and store it names are one non-separable region; a
+#: concurrent target emits them as one atomic read-modify-write.
+SOURCE_ATOMIC_SITE = declare_page(
+    "source_atomic_site_concordance", (
         RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
     ), tuple,
 )

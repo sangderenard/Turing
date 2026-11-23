@@ -3303,6 +3303,8 @@ from .abstraction_methods.indexing import (
     unravel_index as indexing_unravel_index,
     gather,
     scatter,
+    atomic_add,
+    atomic_or,
 )
 
 
@@ -3451,6 +3453,8 @@ AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 AbstractTensor.gather = gather
 AbstractTensor.scatter = scatter
 AbstractTensor.scatter_row = scatter_row
+AbstractTensor.atomic_add = atomic_add
+AbstractTensor.atomic_or = atomic_or
 AbstractTensor.random_tensor = staticmethod(random_tensor)
 
 # --- Creation helpers: tape + requires_grad + record ------------------------

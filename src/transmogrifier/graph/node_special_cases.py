@@ -525,22 +525,61 @@ class _TypeAnnotator(ast.NodeTransformer):
 
     def __init__(self) -> None:
         self.annotations: dict[str, str] = {}
+        # The same declarations keyed by their owning function's qualified
+        # name (``""`` for module scope).  ``annotations`` merges every
+        # function under one bare name, so two functions declaring the same
+        # local with different types overwrote each other (the GLSL reader's
+        # per-function ``__glsl_literal_0``); this is the exact table.
+        self.scoped: dict[str, dict[str, str]] = {}
+        # Enclosing definitions: (is a function, qualified name).
+        self._owners: list[tuple[bool, str]] = []
+
+    def _owner(self) -> str:
+        return self._owners[-1][1] if self._owners else ""
 
     def _record(self, target, annotation) -> None:
         if isinstance(target, ast.Name) and annotation is not None:
             try:
-                self.annotations[target.id] = ast.unparse(annotation)
+                text = ast.unparse(annotation)
             except Exception:  # noqa: BLE001 -- metadata only, never fatal
-                pass
+                return
+            self.annotations[target.id] = text
+            self.scoped.setdefault(self._owner(), {})[target.id] = text
+
+    def _enter(self, node, visit):
+        # Python's qualified name: a definition inside a function is
+        # ``outer.<locals>.name``; a member of a class is ``Class.member``.
+        if not self._owners:
+            qualname = node.name
+        elif self._owners[-1][0]:
+            qualname = f"{self._owners[-1][1]}.<locals>.{node.name}"
+        else:
+            qualname = f"{self._owners[-1][1]}.{node.name}"
+        self._owners.append((
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)), qualname,
+        ))
+        try:
+            return visit(node)
+        finally:
+            self._owners.pop()
+
+    def visit_FunctionDef(self, node):  # noqa: N802
+        return self._enter(node, self.generic_visit)
+
+    def visit_AsyncFunctionDef(self, node):  # noqa: N802
+        return self._enter(node, self.generic_visit)
 
     def visit_ClassDef(self, node):  # noqa: N802
-        node.body = [
-            self.visit(member)
-            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-            else member
-            for member in node.body
-        ]
-        return node
+        def members(definition):
+            definition.body = [
+                self.visit(member)
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else member
+                for member in definition.body
+            ]
+            return definition
+
+        return self._enter(node, members)
 
     def visit_AnnAssign(self, node):  # noqa: N802
         node = self.generic_visit(node)
@@ -556,10 +595,44 @@ def annotate_types(tree: ast.AST) -> dict:
     """Rewrite annotated assignments in ``tree`` (in place) to ordinary
     assignments and return the captured ``name -> annotation`` type metadata."""
 
+    return annotate_types_scoped(tree)[0]
+
+
+def annotate_types_scoped(tree: ast.AST) -> tuple[dict, dict]:
+    """``annotate_types`` plus the same declarations by owning function.
+
+    Returns ``(merged, scoped)``: ``merged`` is the historical bare-name table;
+    ``scoped`` maps each owner's qualified name (``""`` for module scope) to
+    its own ``name -> annotation`` table.  Read one graph's declarations with
+    :func:`function_type_annotations`, never ``merged``.
+    """
+
     annotator = _TypeAnnotator()
     annotator.visit(tree)
     ast.fix_missing_locations(tree)
-    return annotator.annotations
+    return annotator.annotations, annotator.scoped
+
+
+def function_type_annotations(metadata) -> dict:
+    """The annotated-assignment declarations one graph's function can see.
+
+    Module-scope declarations plus the graph's own function's
+    (``authored_function_identity``), the function's shadowing the module's.
+    A graph with no authored function identity (the whole-program graph)
+    keeps the merged table.  Program: GLSL ``main`` and ``splat`` each
+    declaring ``__glsl_literal_0`` with different widths; the merged table
+    typed one function's literal by the other's declaration.
+    """
+
+    merged = dict(metadata.get("type_annotations") or {})
+    scoped = metadata.get("scoped_type_annotations")
+    identity = metadata.get("authored_function_identity")
+    if not scoped or not isinstance(identity, (tuple, list)) or len(identity) != 2:
+        return merged
+    return {
+        **dict(scoped.get("", {})),
+        **dict(scoped.get(str(identity[1]), {})),
+    }
 
 
 class _DeclaredAttributeCollector(ast.NodeVisitor):

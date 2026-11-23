@@ -200,6 +200,9 @@ class Handler(Enum):
     FpToUi        = "FpToUi"
     SiToFp        = "SiToFp"
     UiToFp        = "UiToFp"
+    # Same-width bit reinterpretation (LLVM ``bitcast``, GLSL
+    # ``floatBitsToUint``): the operand's bits, typed as ``target_dtype``.
+    BitCast       = "BitCast"
 
     # Control Flow
     Phi           = "Phi"
@@ -394,6 +397,7 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'fptoui':              Handler.FpToUi,
     'sitofp':              Handler.SiToFp,
     'uitofp':              Handler.UiToFp,
+    'bitcast':             Handler.BitCast,
 
     # Selection / Piecewise
     'select':              Handler.Select,
@@ -718,6 +722,7 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
     Handler.FpToUi: ('call:fptoui',),
     Handler.SiToFp: ('call:sitofp',),
     Handler.UiToFp: ('call:uitofp',),
+    Handler.BitCast: ('call:bitcast',),
 
     # Control and calls.
     Handler.Phi: (

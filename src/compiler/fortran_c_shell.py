@@ -6255,6 +6255,21 @@ def _prove_tensor_value_dtypes(contracts: dict) -> None:
             contracts[(owner, field)] = {**receipt, "dtype": proven[0]}
 
 
+def _graph_type_annotations(graph_metadata) -> dict:
+    """One graph's own annotated declarations (``function_type_annotations``).
+
+    The merged ``type_annotations`` table keys every function's locals by
+    bare name, so two functions declaring one name with different types
+    overwrote each other; this reads the declaring function's own table.
+    """
+
+    from ..transmogrifier.graph.node_special_cases import (
+        function_type_annotations,
+    )
+
+    return function_type_annotations(graph_metadata)
+
+
 def _authored_annotation_field_receipt(
     annotation: ast.AST,
     python_bindings: Mapping[str, Any] | None = None,
@@ -6364,9 +6379,18 @@ def _authored_annotation_field_receipt(
         )
         if authored_scalar is not None:
             return dict(authored_scalar)
-        scalar = {
-            "int": "int64", "float": "float64", "bool": "bool",
-        }.get(annotation.id)
+        # One width authority for parameters and record fields.  The private
+        # int/float/bool table here returned None for every fixed-width
+        # spelling: ``x: 'float32'`` on an authored dataclass (the GLSL
+        # reader's vec3/struct records) lost its field receipt, and
+        # ``V(a, b).x`` then failed with missing_source_value_class while
+        # the parameter ``a: 'float32'`` resolved through
+        # source_annotation_dtype.  Builtin spellings keep their widths.
+        from ..transmogrifier.dtype_layout import source_annotation_dtype
+        scalar = (
+            None if annotation.id in {"Any", "object"}
+            else source_annotation_dtype(annotation.id)
+        )
         if scalar is not None:
             return {
                 "storage": "scalar", "dtype": scalar, "rank": 0,
@@ -8160,7 +8184,7 @@ def _graph_sequence_record_abi(graph_obj: Any) -> dict[object, Mapping[str, Any]
                 "program_abi_table_row": True,
             }
     for binding_name, annotation in dict(
-        graph_obj.graph.get("type_annotations") or {}
+        _graph_type_annotations(graph_obj.graph)
     ).items():
         if str(binding_name) in resolved or not isinstance(annotation, str):
             continue
@@ -11421,7 +11445,7 @@ def _field_slot_ops(
 
     annotated_row_widths: dict[int, int] = {}
     for binding_name, annotation in (
-        *dict(graph_obj.graph.get("type_annotations") or {}).items(),
+        *dict(_graph_type_annotations(graph_obj.graph)).items(),
         # A parameter's authored annotation declares its row exactly as a
         # local annotation does; ``failures: list[tuple[float, Metrics,
         # tuple[str, ...]]] | None`` is the physical row of ``failures``.
@@ -19492,7 +19516,7 @@ def _sequence_column_dtype_contracts(
                 ),
             )
     for binding_name, annotation in dict(
-        graph_obj.graph.get("type_annotations") or {}
+        _graph_type_annotations(graph_obj.graph)
     ).items():
         if not isinstance(annotation, str) or not annotation.strip():
             continue
@@ -29622,6 +29646,15 @@ def _class_surface_ssa_program(
             graph_obj.graph.get("planner_specializations") or {},
             graph_obj.graph.get("planner_tensor_descriptors") or {},
         )
+        # A copy minted for ``one: 'uint32' = 1`` and one minted for a bare
+        # ``1`` compute in different dtypes: two contracts, two symbols.
+        literal_dtype_specialization = (
+            graph_obj.graph.get("planner_specialization_dtypes") or {}
+        )
+        if literal_dtype_specialization:
+            specialization_contract = (
+                *specialization_contract, literal_dtype_specialization,
+            )
         # Program: ``head(xs0); xs2.append(0); head(xs2)`` (scratch s28
         # c_g).  Wrong record: the first callsite's copy bound ``xs`` by its
         # display members, the second bound it whole as grown storage; both
@@ -30724,6 +30757,12 @@ def _class_surface_ssa_program(
             **dict(graph_obj.graph.get("parameter_defaults") or {}),
             **dict(graph_obj.graph.get("planner_specializations") or {}),
         }
+        declared_literal_dtypes = {
+            str(name): str(dtype)
+            for name, dtype in dict(
+                graph_obj.graph.get("planner_specialization_dtypes") or {}
+            ).items()
+        }
         parameter_value_dtypes = {value_id: 'opaque_ref' for value_id in native_handle_ids}
         parameter_value_dtypes.update((value_id, 'bool') for value_id in native_identity_reductions)
         parameter_value_shapes = {}
@@ -30959,7 +30998,12 @@ def _class_surface_ssa_program(
                 parameter_value_shapes[int(history[0])] = tuple(
                     map(int, value_abi["shape"])
                 )
-            fact_dtype = scalar_fact_dtype(
+            # A declared literal argument keeps its declared dtype
+            # (``SpecializationFact.dtype``); the bare value's Python class
+            # is the fallback for an undeclared literal.
+            fact_dtype = declared_literal_dtypes.get(
+                str(parameter_name)
+            ) or scalar_fact_dtype(
                 parameter_facts.get(str(parameter_name))
             )
             if history and fact_dtype is not None:
@@ -30973,7 +31017,7 @@ def _class_surface_ssa_program(
         # including loop-target projections, so the compiler-frame formal
         # is typed from the retained source declaration.
         for binding_name, annotation in dict(
-            graph_obj.graph.get("type_annotations") or {}
+            _graph_type_annotations(graph_obj.graph)
         ).items():
             # The tuple row handle is not a numeric scalar annotation.
             dtype = ("int64" if str(annotation).strip() == "tuple"
@@ -31094,7 +31138,9 @@ def _class_surface_ssa_program(
                 (data.get("attributes") or {}).get("binding_name") or ""
             )
             fact = parameter_facts.get(parameter_name)
-            fact_dtype = scalar_fact_dtype(fact)
+            fact_dtype = declared_literal_dtypes.get(
+                parameter_name
+            ) or scalar_fact_dtype(fact)
             if fact_dtype is not None:
                 parameter_value_dtypes[int(value_id)] = fact_dtype
 
@@ -68096,18 +68142,13 @@ def _lower_ast_source_to_ssa_impl(
         # Source catalogue graphs have finished supplying every extraction,
         # call, and shell-boundary fact above.  A native-only module must not
         # retain their live ``python_bindings`` heaps (including imported
-        # module objects) after that point.  Use the repository's established
-        # finalization transaction; deterministic FunctionReference addresses
-        # and all lowered repository SSA remain intact.
-        from .project_compilation_product import (
-            detach_repository_ssa_frontend,
-        )
-
-        compile_substage("detach completed source representations")
-        detach_repository_ssa_frontend(module)
-        gate = dict(module.metadata.get("full_native_link_gate") or {})
-        gate["frontend_representations_detached"] = True
-        module.metadata["full_native_link_gate"] = gate
+        # module objects) once it is accepted.  The detach itself waits for
+        # the final concordance in ``_run_source_lowering``: that audit reads
+        # the function table's graphs (``_source_parameter_memory_contract_
+        # findings``: a record parameter's Input and installed contract), and
+        # detaching here refused every program passing a dataclass to a
+        # helper ("parameter 'd' lost selected contract ... formal binding").
+        module.metadata["frontend_detach_pending"] = True
     return module, outputs, exports
 
 
@@ -68558,6 +68599,20 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             if module is not None:
                 refusal.rejected_source_result = result
             raise refusal
+        if module is not None and module.metadata.pop("frontend_detach_pending", False):
+            # The accepted native-only module releases its source
+            # representations by the repository's established finalization
+            # transaction; FunctionReference addresses and all lowered
+            # repository SSA remain intact.
+            from .project_compilation_product import (
+                detach_repository_ssa_frontend,
+            )
+
+            _bars.substage("detach completed source representations")
+            detach_repository_ssa_frontend(module)
+            gate = dict(module.metadata.get("full_native_link_gate") or {})
+            gate["frontend_representations_detached"] = True
+            module.metadata["full_native_link_gate"] = gate
         ok = True
         if module is not None and _regulator.live_arena is not None:
             _bars.substage("publish live storage receipts")

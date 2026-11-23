@@ -1055,7 +1055,7 @@ def supported_scalar_operations() -> frozenset[str]:
         | set(_TERNARY)
         | {
             "Cast", "CastLike", "cast_like", "Select", "Not", "LNot",
-            "SExt", "ZExt", "Trunc", "UiToFp", "SiToFp", "FpToSi",
+            "SExt", "ZExt", "Trunc", "UiToFp", "SiToFp", "FpToSi", "BitCast",
             "SIToFP", "FPToSI", "FpToUi", "ULt", "ULe", "UGt", "UGe", "Invert", "Max",
             "Min", "Pow", "Exp", "Log", "Sin", "Cos",
         }
@@ -8237,6 +8237,31 @@ def emit_ssa_module_to_c(
                     declared = (
                         f"const {result_type} t{result_id} = "
                         f"({result_type})(({unsigned_type})({args[0]}));"
+                    )
+                elif op == "BitCast" and len(args) == 1:
+                    # Same-width reinterpretation.  The operand is held at its
+                    # dtype's own width (a float32 scalar's double register
+                    # narrows exactly) and its bytes are copied into the
+                    # target type, which is C's defined spelling of a bitcast
+                    # (``memcpy``, never pointer punning).
+                    source_layout = dtype_layout(str(instruction.args[0].dtype).casefold())
+                    bits_layout = dtype_layout(str(instruction.res.dtype).casefold())
+                    if source_layout.byte_size != bits_layout.byte_size:
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"bitcast {instruction.args[0].dtype} to "
+                            f"{instruction.res.dtype} changes width in {fn}"))
+                        continue
+                    result_type = _scalar_c_type(instruction.res.dtype)
+                    if _is_integer_dtype(instruction.res.dtype):
+                        integer_ids.add(result_id)
+                    held, bits = source_layout.c_storage_type, bits_layout.c_storage_type
+                    declared = (
+                        f"{held} t{result_id}_held = ({held})({args[0]}); "
+                        f"{bits} t{result_id}_bits; "
+                        f"(void)memcpy(&t{result_id}_bits, &t{result_id}_held, "
+                        f"sizeof t{result_id}_bits); "
+                        f"const {result_type} t{result_id} = "
+                        f"({result_type})t{result_id}_bits;"
                     )
                 elif op in {
                     "UiToFp", "SiToFp", "SIToFP", "FpToSi", "FPToSI",
