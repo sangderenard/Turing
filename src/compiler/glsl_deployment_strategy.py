@@ -23070,12 +23070,20 @@ def _source_declared_scalar_dtype(graph: Any, node_id: int) -> str | None:
     GLSL reader's per-function ``__glsl_literal_0`` in ``main`` overwrote
     the same name in ``claim`` and typed ``claim``'s int32 index uint32.
     Several bindings that disagree about one version declare nothing exact.
+
+    A formal of this copy that was itself specialized to a declared literal
+    (GLSL ``splat(q, 5u)`` forwarding ``v`` on to ``atomic_add``) carries
+    its declaration in its own ``planner_specialization`` row
+    (``declared_specialization_dtype``); that row is read first.
     """
 
     from .concordance_declarations import ANNOTATION_DECLARATION
     from .identity_concordance import current_identity_book
     from ..transmogrifier.dtype_layout import source_annotation_dtype
 
+    forwarded = declared_specialization_dtype(graph, int(node_id))
+    if forwarded is not None:
+        return forwarded
     owner = graph.G.graph.get("authored_function_identity")
     if not isinstance(owner, (tuple, list)) or len(owner) != 2:
         return None
@@ -33545,6 +33553,44 @@ def _fold_callsite_structural_values(
                 source_rank, result_rank = symbolic_basic_index_ranks(
                     expression.slice, base_fact.rank
                 )
+                # Program: ``old = self[index]`` in an ``atomic_add`` copy
+                # whose ``index`` is bound to ``(q.z, q.y, q.x)``.  Wrong
+                # record: the selector is the bare name ``index``, read as
+                # one axis, so a rank-3 texture's element read was posted a
+                # rank-2 span.  Rule: an index operand that is a fixed tuple
+                # aggregate (``_apply_callsite_aggregate_descriptors``: a
+                # ``Tuple`` node with its N scalar leaves) consumes N axes,
+                # as ``x[t]`` is ``x[t[0], ..., t[N-1]]``.
+                index_parents = tuple(
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) == "index"
+                )
+                if (
+                    not isinstance(expression.slice, ast.Tuple)
+                    and len(index_parents) == 1
+                    and index_parents[0] in graph.G
+                ):
+                    index_attributes = (
+                        graph.G.nodes[index_parents[0]].get("attributes") or {}
+                    )
+                    leaves = tuple(
+                        index_attributes.get("aggregate_leaf_value_ids") or ()
+                    )
+                    if (
+                        index_attributes.get("aggregate_kind") == "tuple"
+                        and leaves
+                        and not any(
+                            isinstance(known.get(int(leaf)), slice)
+                            or known.get(int(leaf), unresolved) is None
+                            or known.get(int(leaf)) is Ellipsis
+                            or isinstance(known.get(int(leaf)), _ProgramABIValueFact)
+                            and known[int(leaf)].storage != "scalar"
+                            for leaf in leaves
+                        )
+                    ):
+                        source_rank = max(int(base_fact.rank or 0), len(leaves))
+                        result_rank = max(0, source_rank - len(leaves))
                 if base is not None and int(base) in graph.G:
                     base_data = graph.G.nodes[int(base)]
                     base_attributes = dict(base_data.get("attributes") or {})

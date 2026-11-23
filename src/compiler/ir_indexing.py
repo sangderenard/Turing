@@ -91,6 +91,35 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                 for selector in selectors
             )
 
+        # Program: ``AbstractTensor.atomic_add(layer, (q.z, q.y, q.x), v)``,
+        # whose body reads ``self[index]``.  Wrong record: the fixed tuple
+        # formal arrives as its scalar members re-packed by one ``Tuple``,
+        # and the address was ``GetElementPtr(self, <tuple>)`` -- one opaque
+        # index -- so the element read became a span and the Tuple had no
+        # emission.  Rule: ``x[t]`` with ``t`` a fixed tuple is
+        # ``x[t[0], ..., t[n-1]]``; the Tuple's own operands are those
+        # members, so they are the address's indices.
+        tuple_members = {
+            int(instruction.res.id): tuple(instruction.args)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Tuple" and instruction.res is not None
+            and instruction.args
+            and all(
+                not tuple(argument.shape or ())
+                and not isinstance(constants.get(int(argument.id)), slice)
+                and constants.get(int(argument.id)) is not Ellipsis
+                for argument in instruction.args
+            )
+        }
+        expanded_tuples: set[int] = set()
+
+        def address_indices(indices):
+            if len(indices) == 1 and int(indices[0].id) in tuple_members:
+                expanded_tuples.add(int(indices[0].id))
+                return list(tuple_members[int(indices[0].id)])
+            return list(indices)
+
         # base value each store's result aliases, so later uses read the same
         # storage the store mutated in place.
         aliases: dict[int, SSAValue] = {}
@@ -112,6 +141,7 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     rewritten.append(instruction)
                 elif canonical_op in _GATHER and len(instruction.args) >= 2:
                     base, *indices = instruction.args
+                    indices = address_indices(indices)
                     # The energy audit's four raw GEP ids had no mint edge.
                     # This address is made from the exact indexing operands,
                     # not an unrelated global-counter identity.
@@ -139,7 +169,7 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                 elif canonical_op in _SCATTER and len(instruction.args) >= 3:
                     base = instruction.args[0]
                     value = instruction.args[-1]
-                    indices = instruction.args[1:-1]
+                    indices = address_indices(instruction.args[1:-1])
                     address = SSAValue(mint_ssa_value(
                         function, ADDRESS, (base, *indices, instruction.res),
                         dtype="ptr", stage=CONTROL_SSA_FINISH,
@@ -173,6 +203,24 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                 else:
                     rewritten.append(instruction)
             block.instrs = rewritten
+
+        # A Tuple whose only readers were the addresses it now spells is
+        # spent: nothing reads the aggregate itself.
+        still_read = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
+        spent = expanded_tuples - still_read
+        if spent:
+            for block in function.blocks.values():
+                block.instrs = [
+                    instruction for instruction in block.instrs
+                    if not (instruction.op == "Tuple"
+                            and instruction.res is not None
+                            and int(instruction.res.id) in spent)
+                ]
 
         if not aliases:
             continue

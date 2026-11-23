@@ -264,6 +264,23 @@ def validated_sequence_lifetime(module, function_name, sequence_id):
     return cell,fact
 
 
+def _descriptor_retired(table, sequence_id):
+    """Whether the owning pass retired this table's descriptor.
+
+    A retirement is the descriptor row's ``None`` revision DERIVED from that
+    same row's prior descriptor cell (``_BookRows.remove``): the sequence no
+    longer exists, so the lifetime it was born with ended there.  Program:
+    ``atomic_add(layer, (q.z, q.y, q.x), 5)`` -- the tuple formal's
+    descriptor is retired once its members are scalar formals.
+    """
+    row = (table.owner, int(sequence_id))
+    cell = table.book.latest_ref(SEQUENCE_DESCRIPTOR, row)
+    if cell is None or table.book.page(SEQUENCE_DESCRIPTOR).cell(cell.row, cell.column) is not None:
+        return False
+    return any(parent.page == SEQUENCE_DESCRIPTOR and parent.row == row
+               for parent, _ in table.book.edges_into(cell))
+
+
 def sequence_lifetime_findings(module):
     from .identity_concordance import Finding
     book = dict(getattr(module,'metadata',{}) or {}).get('identity_book')
@@ -275,9 +292,12 @@ def sequence_lifetime_findings(module):
             _validate(book,book.latest_ref(SEQUENCE_STORAGE_LIFETIME,row))
             from .ssa_record_return_state import function_scope_of
             tables = getattr(module, 'sequence_tables', {})
-            matches = [name for name, function in module.functions.items()
-                       if function_scope_of(function) == row[0]
-                       and name in tables and int(row[1]) in tables[name].sequences]
+            owners = [name for name, function in module.functions.items()
+                      if function_scope_of(function) == row[0] and name in tables]
+            matches = [name for name in owners if int(row[1]) in tables[name].sequences]
+            if not matches and [name for name in owners
+                                if _descriptor_retired(tables[name], row[1])]:
+                continue
             if len(matches) != 1:
                 raise ValueError('lifetime has no unique current descriptor owner')
             validated_sequence_lifetime(module, matches[0], row[1])

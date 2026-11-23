@@ -1547,6 +1547,39 @@ def _exact_source_literal_values(graph_obj: Any) -> dict[int, Any]:
     return literals
 
 
+def _local_scalar_literal_evidence(
+    book: Any, graph: Any, value_id: int, attributes: Mapping[str, Any],
+) -> tuple:
+    """The declaration cells of a literal bound to an annotated local.
+
+    ``a: 'int32' = 1`` gives the literal node ``local_scalar_annotation =
+    (dtype, ANNOTATION_DECLARATION cell)``.  Its declared width is proved by
+    that cell together with the value's own ``value_type_abi`` row when that
+    row has one scalar arm of the same dtype citing the same declaration;
+    both cells are then the width causes a materialization of the literal
+    cites.  Otherwise there is no declared width and ``()`` is returned.
+    """
+
+    local_scalar = attributes.get("local_scalar_annotation")
+    if local_scalar is None:
+        return ()
+    from .concordance_declarations import VALUE_TYPE_ABI
+
+    dtype, annotation_cell = local_scalar
+    scope = getattr(graph, "G", graph).graph.get("lexical_read_scope")
+    abi_cell = book.latest_ref(VALUE_TYPE_ABI, (scope, int(value_id)))
+    abi_fact = (
+        None if abi_cell is None
+        else book.pages[abi_cell.page.name].cell(abi_cell.row, abi_cell.column)
+    )
+    arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
+    if (len(arms) == 1 and arms[0].storage == "scalar"
+            and arms[0].dtype == dtype
+            and annotation_cell in arms[0].source_cells):
+        return (annotation_cell, abi_cell)
+    return ()
+
+
 def _recover_late_source_literals(
     function: Any,
     graph_obj: Any | None = None,
@@ -31110,19 +31143,10 @@ def _class_surface_ssa_program(
                                     )
                                     if literal_cell in source_edge_targets:
                                         evidence.append(literal_cell)
-                local_scalar = attributes.get("local_scalar_annotation")
-                if local_scalar is not None:
-                    from .concordance_declarations import VALUE_TYPE_ABI
-                    dtype, annotation_cell = local_scalar
-                    abi_cell = shape_identity_book.latest_ref(
-                        VALUE_TYPE_ABI, (graph_obj.graph.get("lexical_read_scope"), materialized_value_id),
-                    )
-                    abi_fact = None if abi_cell is None else _cell_fact(abi_cell)
-                    arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
-                    if (len(arms) == 1 and arms[0].storage == "scalar"
-                            and arms[0].dtype == dtype
-                            and annotation_cell in arms[0].source_cells):
-                        evidence.extend((annotation_cell, abi_cell))
+                evidence.extend(_local_scalar_literal_evidence(
+                    shape_identity_book, graph_obj, materialized_value_id,
+                    attributes,
+                ))
                 if source_identity is not None or evidence:
                     constant_source_cells[materialized_value_id] = tuple(
                         dict.fromkeys((
@@ -34630,8 +34654,26 @@ def _class_surface_ssa_program(
             for instruction in block.instrs
             for argument in instruction.args
         }
+        # A canonical literal is owned by the control function
+        # (``control_owned_literals``): a region that uses it keeps a
+        # private copy, which is never that region's output.  Program:
+        # ``q = V(1, 0, 2); use(q, out); out[1] = fwd[q.z, q.y, q.x]``.
+        # Wrong record: the folded field reads made region 0 copy the
+        # constructor literals, and this pass published those copies as
+        # region outputs, so ``use``'s field arguments were loaded after
+        # region 0 ran -- after the call that reads them -- and typed by
+        # the private copy (int64), not the declared field (int32).  Rule:
+        # an authored constant of this function is left to the control
+        # materialization of its consumer (the record-literal and late
+        # literal passes), never adopted from a region.
+        authored_literal_ids = {
+            int(value_id)
+            for value_id, _literal in caller.metadata.get(
+                "authored_constant_values", (),
+            )
+        }
         for desired_id in desired_ids:
-            if desired_id in available:
+            if desired_id in available or desired_id in authored_literal_ids:
                 continue
             producer = None
             for block in caller.blocks.values():
@@ -44008,6 +44050,10 @@ def _class_surface_ssa_program(
         values = function_values(function)
         constants = []
         table = all_record_tables.setdefault(symbol, SSARecordTable(owner=symbol))
+        # A constructor literal bound to an annotated local cites that
+        # declaration as its width cause (``_local_scalar_literal_evidence``),
+        # as the ordinary control-constant materialization does.
+        constant_declaration_cells: dict[int, tuple] = {}
         layouts = []
         storage_aliases = _concordant_function_aliases(function)
         source_nodes_by_value_id = {
@@ -44296,6 +44342,12 @@ def _class_surface_ssa_program(
                             [], value,
                             attributes={} if literal is None else {"value": literal},
                         ))
+                        constant_declaration_cells[int(physical_value_id)] = (
+                            _local_scalar_literal_evidence(
+                                book, graph, int(physical_value_id),
+                                source_attributes,
+                            )
+                        )
                         source_cell = _frame_graph_cell(
                             graph, int(physical_value_id),
                         )
@@ -44910,6 +44962,7 @@ def _class_surface_ssa_program(
                         sources = tuple(dict.fromkeys(cell for cell in (
                             _frame_value_cell(function, value_id),
                             prior_geometry,
+                            *constant_declaration_cells.get(value_id, ()),
                         ) if cell is not None))
                         if not sources:
                             raise ConcordanceRefusal(
