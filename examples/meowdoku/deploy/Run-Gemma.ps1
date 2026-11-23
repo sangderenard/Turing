@@ -23,8 +23,12 @@ $log = Join-Path $state 'runner.log'
 # the agents room when it has nothing new to explore): the 12 walking/messaging verbs, the rooms, comment threads, the
 # reviews waiting for attention and one diff, and experience reports. Bulk listings (reviews_list, reviews_threads,
 # research_cases) are left out: one answer is larger than a 64K context.
+# reports_issues_list (one page of 50 ticket titles, about 15K characters) and reports_issue_get are offered so the
+# ticket triage gemma tries is a call it can make (2026-11-23: without them it posted "calling reports_issues_list"
+# thousands of times in the agents room; Hermes offers only the tools in this list).
 $tools = 'whoami,where,look,enter,go,leave,examine,man,say,pending,acknowledge,contacts,' +
-         'chat_rooms,chat_room,chat_post,comments_thread,comments_post,reviews_attention,reviews_diff,make'
+         'chat_rooms,chat_room,chat_post,comments_thread,comments_post,reviews_attention,reviews_diff,make,' +
+         'reports_issues_list,reports_issue_get'
 & $python $agent serve --account gemma --hermes-root $hermesRoot `
     --llama-server (Join-Path $toolRoot 'llama-server.exe') --model-file $modelFile `
     --alias 'gemma-4-26B-A4B-it-Q4_K_M' --port 11436 --device CUDA0 --context 65536 `
