@@ -14470,6 +14470,46 @@ def _normalize_lexical_values(
                             _Derived(call_sources) if call_sources else None
                         ),
                     )
+                native_contract = call_attributes.get("extraction_contract")
+                native_contract = (
+                    dict(native_contract)
+                    if isinstance(native_contract, Mapping) else {}
+                )
+                if (
+                    call_attributes.get("extraction_action") == "use_native"
+                    and native_contract.get("action") == "use_native"
+                    and dict(native_contract.get("parameters") or {}).get(
+                        "result_dtype"
+                    ) == "float64"
+                ):
+                    # Program: ``t = time.time(); return t + 1.0`` (ticket
+                    # b043a7c9, case 6b7d429f; also ``time.perf_counter()``
+                    # minus a reading).  Wrong record: the use_native
+                    # boundary's contract states ``result_dtype: float64``,
+                    # but no SOURCE_VALUE_CLASS row was published for the
+                    # call, so the terminal freeze
+                    # (``_refuse_unsettled_host_scalars``) refused value 0
+                    # (the call) as ``missing_source_value_class`` once it
+                    # was consumed as a host scalar.  A direct ``return
+                    # time.time()`` passed only because the native callsite
+                    # supplies the return dtype itself.  Rule: the contract
+                    # is the authority for a native boundary's result; a
+                    # float64 result is a Python float, published here like
+                    # the ``builtins.len`` intrinsic above.  Only float64 is
+                    # read as a class: the contract's int64 also transports
+                    # handles (``lzma.open``), which are not Python ints.
+                    call_sources = tuple(filter(None, (
+                        node_identity_cell(graph, int(node_id)),
+                    )))
+                    _concord_source_value_class(
+                        value_class_scope,
+                        int(node_id),
+                        "builtins.float",
+                        source="use_native float64 result",
+                        provenance=(
+                            _Derived(call_sources) if call_sources else None
+                        ),
+                    )
                 page_declaration_cell = None
                 if isinstance(expression.func, ast.Attribute):
                     if (

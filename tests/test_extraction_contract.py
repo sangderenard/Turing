@@ -375,6 +375,42 @@ def test_wall_clock_return_is_supplied_by_the_native_callsite_as_float64():
     assert [value.id for value in ret.args] == [returned.id]
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import time\ndef entry():\n    t = time.time()\n    return t + 1.0\n",
+        "import time\ndef entry():\n"
+        "    t0 = time.perf_counter()\n    return time.perf_counter() - t0\n",
+    ),
+    ids=("wall_clock_plus_constant", "performance_counter_difference"),
+)
+def test_clock_reading_used_in_arithmetic_is_a_float64_host_scalar(source):
+    # Ticket b043a7c9 / case 6b7d429f: a use_native float64 result consumed
+    # by arithmetic was refused by _refuse_unsettled_host_scalars as
+    # missing_source_value_class.  The contract's result_dtype now publishes
+    # the call's class, so the arithmetic lowers to a float64 return.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, outputs, exports = lower_ast_source_to_ssa(
+            source, "entry", name="clock_arithmetic",
+            extraction_contract=ExtractionContract(CONTRACT),
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+    assert exports == ("clock_arithmetic__entry",)
+    returned, = outputs["clock_arithmetic__entry"]
+    assert returned.dtype == "float64"
+    natives = tuple(
+        instruction
+        for block in module.functions["clock_arithmetic__entry"].blocks.values()
+        for instruction in block.instrs
+        if (instruction.attributes or {}).get("external_reference")
+    )
+    assert natives
+    assert all(native.res.dtype == "float64" for native in natives)
+
+
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
     contract = ExtractionContract(CONTRACT)
     graph = ProcessGraph(materialize_memory=False)
