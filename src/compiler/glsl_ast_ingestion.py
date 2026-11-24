@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import keyword
 from dataclasses import dataclass
 import re
 from typing import Any, Mapping, Sequence
@@ -2205,22 +2206,50 @@ def lower_glsl_source_to_ast(
         prelude.append(ast.ImportFrom(
             module="src.common.tensors.abstraction_methods.bit_reinterpretation",
             names=[ast.alias(name=name) for name in sorted(context.imports)], level=0))
-    module = ast.fix_missing_locations(ast.Module(
+    module = _python_identifiers(ast.fix_missing_locations(ast.Module(
         body=prelude + records + [_retain_literal_widths(fn) for fn in helper_definitions+[function]],
         type_ignores=[]
-    ))
+    )))
     def buffer_abi(name):
         element, extent, _scalar, layout = buffers[name]
         if layout is None:
-            return name, _BUFFER_ELEMENT_DTYPES[element], extent, None
+            return _python_identifier(name), _BUFFER_ELEMENT_DTYPES[element], extent, None
         stride, _fields, component = layout
-        return name, _BUFFER_ELEMENT_DTYPES[component], extent, stride
+        return _python_identifier(name), _BUFFER_ELEMENT_DTYPES[component], extent, stride
 
     return GLSLASTLoweringResult(
         module, tuple(shortfalls),
         tuple(buffer_abi(name) for name in main_buffers if name in buffers),
-        tuple((name, _BUFFER_ELEMENT_DTYPES[textures[name][1]], textures[name][2])
+        tuple((_python_identifier(name), _BUFFER_ELEMENT_DTYPES[textures[name][1]],
+               textures[name][2])
               for name in main_buffers if name in textures))
+
+
+def _python_identifier(name):
+    """A GLSL identifier as a Python one.
+
+    GLSL allows Python's keywords as names (the Studio tracer's ``uint
+    from``).  Such a name gets the suffix ``__glsl_keyword``; GLSL reserves
+    every identifier containing ``__``, so no source name can collide.
+    """
+    return f"{name}__glsl_keyword" if keyword.iskeyword(name) else name
+
+
+def _python_identifiers(module):
+    """Apply ``_python_identifier`` to every name the AST binds or reads:
+    variables, parameters, functions, record fields and attributes."""
+    for node in ast.walk(module):
+        if isinstance(node, ast.Name):
+            node.id = _python_identifier(node.id)
+        elif isinstance(node, ast.arg):
+            node.arg = _python_identifier(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            node.name = _python_identifier(node.name)
+        elif isinstance(node, ast.Attribute):
+            node.attr = _python_identifier(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            node.arg = _python_identifier(node.arg)
+    return module
 
 
 def _helper_definition(context, name, signature, statements, token):

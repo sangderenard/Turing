@@ -11320,12 +11320,22 @@ def _field_slot_ops(
 
     class_table = dict(graph_obj.graph.get("class_table") or {})
     owner = graph_obj.graph.get("method_owner")
+    receiver = _graph_receiver_formal(graph_obj)
+    # Program: free ``inner(b: vec2)`` reading ``b.x``, its program's only
+    # dataclass ``vec2``.  Wrong record: with one class in the table it was
+    # taken as this graph's receiver class, so ``b.x`` (a record PARAMETER's
+    # field, passed fields-only) became a receiver slot read of record None
+    # ("record scalar slot ABI lacks dtype").  Rule: only a method graph has
+    # a receiver arena; the one-class fallback names a method's owner.
     record = (
         class_table.get(owner)
         if owner in class_table
-        else (next(iter(class_table.values())) if len(class_table) == 1 else None)
+        else (
+            next(iter(class_table.values()))
+            if len(class_table) == 1 and receiver is not None
+            else None
+        )
     )
-    receiver = _graph_receiver_formal(graph_obj)
     declared_self_record = dict(
         (graph_obj.graph.get("parameter_record_abi") or {}).get(receiver) or {}
         if receiver is not None else {}

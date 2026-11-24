@@ -7945,6 +7945,46 @@ def _normalize_lexical_values(
                 stores = True
                 break
             attribute = parents.get(id(node))
+            # Program: Studio ``splat_segment_multiscale(a, b, ...)`` hands
+            # ``b`` straight on to ``splat_segment_spectral(a, b, ...)``,
+            # which only reads its fields.  Wrong record: a bare name passed
+            # to a call was an escape, so ``b`` (and every caller's record
+            # passed through it) "may store", and the tracer's later
+            # ``hp.x`` refused (record_stored_by_call).  Rule: a bare
+            # argument may store exactly when the callee's own parameter at
+            # that position or keyword may (``callee_may_store``; an
+            # unknown callee still may).
+            call = parents.get(id(attribute)) if isinstance(
+                attribute, ast.keyword,
+            ) else attribute
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(node.ctx, ast.Load)
+                and call.func is not node
+            ):
+                callee = (
+                    call.func.id if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute) else None
+                )
+                if isinstance(attribute, ast.keyword):
+                    forwarded_store = (
+                        callee is None or attribute.arg is None
+                        or callee_may_store(callee, keyword=attribute.arg)
+                    )
+                else:
+                    position = next((
+                        index for index, argument in enumerate(call.args)
+                        if argument is node
+                    ), None)
+                    forwarded_store = (
+                        callee is None or position is None
+                        or callee_may_store(callee, position=position)
+                    )
+                if forwarded_store:
+                    stores = True
+                    break
+                continue
             if not (
                 isinstance(attribute, ast.Attribute)
                 and attribute.value is node
@@ -12331,8 +12371,44 @@ def _normalize_lexical_values(
                         position = field_names.index(expression.attr)
                         if position < len(receiver_expression.args):
                             field_expression = receiver_expression.args[position]
+                    # Program: ``u = vec2(u.x * k, u.y * k)`` then ``u.x``.
+                    # Wrong record: the field's value was found by resolving
+                    # the constructor's argument AST again, in the CURRENT
+                    # environment, where ``u`` already names this
+                    # constructor, so ``u.x`` resolved through itself
+                    # without end (and a rebound argument name would have
+                    # been read at its later value).  Rule: the argument the
+                    # constructor was built from is its own operand edge
+                    # (``kw:<field>`` or the field's position), already the
+                    # producer resolved at construction.
+                    from ...transmogrifier.graph.edge_roles import (
+                        keyword_arguments as _keyword_arguments,
+                        ordered_arguments as _ordered_arguments,
+                    )
+
+                    constructor_parents = tuple(
+                        receiver_data.get("parents") or ()
+                    )
+                    constructed_operand = _keyword_arguments(
+                        constructor_parents,
+                    ).get(expression.attr)
+                    if (
+                        constructed_operand is None
+                        and expression.attr in field_names
+                    ):
+                        positional_operands = _ordered_arguments(
+                            constructor_parents,
+                        )
+                        position = field_names.index(expression.attr)
+                        if position < len(positional_operands):
+                            constructed_operand = positional_operands[position]
                     if field_expression is not None:
-                        field_value = resolve_expression(field_expression)
+                        field_value = (
+                            int(constructed_operand)
+                            if isinstance(constructed_operand, int)
+                            and int(constructed_operand) in graph.G
+                            else resolve_expression(field_expression)
+                        )
                         if isinstance(field_value, int) and (
                             constructed_state is None
                             or _cell_node_id(constructed_state.value)
