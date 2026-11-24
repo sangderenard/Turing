@@ -135,11 +135,14 @@
         "--compile-python",
         "C:/dev/Powershell/srv/python/python.exe",
         "--cron",
-        "cron:7201:C:/dev/Powershell/srv/state/jobs/cron"
+        "cron:7201:C:/dev/Powershell/srv/state/jobs/cron",
+        "--nodus-root",
+        "C:/dev/Powershell/nodus"
       ],
       "leases": [],
       "nodus": {
-        "tool": "C:/dev/Powershell/nodus/tools/run_canvas.py",
+        "tool": "C:/dev/Powershell/srv/state/products/nodus-native/66dcbb5a/frontend_shell.exe",
+        "native": true,
         "canvas": "build/meowdoku/canvas/messenger.canvas",
         "acquire": [
           "gui.proof:4:54000",
