@@ -38,6 +38,20 @@ export function sharePalette(candidate) {
   channel.close();
 }
 
+// One request for the page's first palette state, shared by every module that loads it (this module is loaded once
+// per page). A first visit has no identity cookie yet; two concurrent requests would each be issued their own.
+let firstState = null;
+export function pageState() {
+  if (!firstState) {
+    firstState = fetch("/api/palette", {credentials: "same-origin", cache: "no-store"}).then(async (response) => {
+      const data = await response.json();
+      if (!response.ok) throw Object.assign(new Error(data.error || `Request failed: ${response.status}`), {status: response.status});
+      return data;
+    });
+  }
+  return firstState;
+}
+
 let listening = false;
 export async function loadPersonalPalette() {
   if (!listening && typeof BroadcastChannel === "function") {
@@ -45,7 +59,6 @@ export async function loadPersonalPalette() {
     new BroadcastChannel(CHANNEL).onmessage = (event) => applyPalette(event.data);
   }
   try {
-    const response = await fetch("/api/palette", {credentials: "same-origin", cache: "no-store"});
-    if (response.ok) applyPalette((await response.json()).candidate);
+    applyPalette((await pageState()).candidate);
   } catch (_) { /* The site's default design remains usable offline. */ }
 }

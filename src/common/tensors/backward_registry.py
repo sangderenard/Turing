@@ -127,6 +127,17 @@ helpers_spec: Dict[str, str] = {
         "T(X): transpose last two dims of X (matrix transpose); vectors are treated as row matrices.",
 }
 
+#: Helper formals whose value decides the helper's result type.  In
+#: ``unbroadcast`` the length of ``target_shape`` is the result rank and its
+#: entries decide which axes are summed, so the helper has no single
+#: fixed-rank signature: the compiler lowers it only at a callsite that
+#: supplies ``target_shape`` as a literal, and refuses a callsite that cannot.
+#: ``expand_to``'s ``shape`` is not declared: its dynamic-extent case has not
+#: been measured.
+HELPER_STATIC_SHAPE_PARAMETERS: Dict[str, tuple[str, ...]] = {
+    "unbroadcast": ("target_shape",),
+}
+
 def unbroadcast(G, target_shape: tuple[int, ...]):
     g_shape = list(getattr(G, "shape", ()))
     t_shape = list(target_shape)

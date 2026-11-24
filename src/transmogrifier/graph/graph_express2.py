@@ -1600,6 +1600,40 @@ def resolve_source_definition(item):
     )
 
 
+def stamp_generated_source_cells(tree, source_cells):
+    """Stamp generated source with the declarations it was generated from.
+
+    ``source_cells``: top-level definition name -> its ``SourceDefinition``.
+    Every node of that definition carries its declaration, the module all of
+    them, and ``post_source_span`` derives the spans from them.  ``None`` or
+    empty: authored source, whose spans are roots.
+
+    Program: ``_build_backward_rule_process_graph`` ran
+    ``ingest_exception_syntax`` before ``build_from_ast`` stamped these, and
+    that pass posts every definition's own span.  Wrong record: the
+    ``unbroadcast`` definition span ``('<string:...>', 'unbroadcast', ())``
+    was minted NOVEL(INGEST_SOURCE) while its body spans derived from the
+    ``backward_rule_definition`` root, so the definition's declaration was
+    unreachable from its identity.  Rule: a caller that posts spans before
+    ``build_from_ast`` stamps the tree first, with this one function.
+    """
+
+    if source_cells:
+        for statement in getattr(tree, "body", ()):
+            cell = source_cells.get(getattr(statement, "name", None))
+            if cell is None:
+                continue
+            for descendant in ast.walk(statement):
+                descendant._turing_source_cells = (cell,)
+        tree._turing_source_cells = tuple(dict.fromkeys(
+            source_cells.values()
+        ))
+        tree._turing_source_cells_by_name = dict(source_cells)
+    else:
+        tree._turing_source_cells = ()
+        tree._turing_source_cells_by_name = None
+
+
 def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
     """Post ``node``'s ``source_span`` root and return its cell (plan 60, 1.5).
 
@@ -6748,20 +6782,7 @@ class ProcessGraph(TiledObject):
         # them, and ``post_source_span`` derives the spans from them.
         # The values are ``SourceDefinition`` identities, never book cells:
         # the stamps outlive this book (see ``SourceDefinition``).
-        if source_cells:
-            for statement in getattr(tree, "body", ()):
-                cell = source_cells.get(getattr(statement, "name", None))
-                if cell is None:
-                    continue
-                for descendant in ast.walk(statement):
-                    descendant._turing_source_cells = (cell,)
-            tree._turing_source_cells = tuple(dict.fromkeys(
-                source_cells.values()
-            ))
-            tree._turing_source_cells_by_name = dict(source_cells)
-        else:
-            tree._turing_source_cells = ()
-            tree._turing_source_cells_by_name = None
+        stamp_generated_source_cells(tree, source_cells)
 
         retained = () if retain is None else (
             (retain,) if inspect.isclass(retain) else tuple(retain)

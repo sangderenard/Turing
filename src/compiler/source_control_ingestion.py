@@ -271,6 +271,56 @@ def ingest_control_activity(graph, definition, scope):
             bind_activity(identity, scope, occurrences[0])
 
 
+def ingest_graph_activity(graph, scope, *, stage):
+    """The activity graph of a ProcessGraph body that has no source text.
+
+    ``ingest_control_activity`` reads evaluation order from the AST.  A graph
+    built without source (a SymPy law, a spliced graph reverse, a training
+    graph) states it in its own operand edges: a value is evaluated after
+    every operand it reads.  Each node is its own occurrence -- its identity
+    cell -- with an ``enter`` and an ``exit`` point (kind: its operation,
+    owners: none, since such a body has no authored control), one ``flow``
+    edge from enter to exit, and one ``flow`` edge from each operand's exit to
+    the consumer's enter.  Each node then binds its two points, exactly as
+    ``bind_activity`` binds an AST occurrence.  Every row derives from the
+    cells it joins.
+    """
+
+    import networkx as nx
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    book = current_identity_book()
+    scope = tuple(scope)
+    if not nx.is_directed_acyclic_graph(graph.G):
+        raise UnadmittedSourceControlTopology(
+            'ProcessGraph', 'graph_native_activity_recurrence',
+        )
+    identities, points = {}, {}
+    for node in nx.topological_sort(graph.G):
+        node = int(node)
+        data = graph.G.nodes[node]
+        identity = node_identity_cell(graph, node)
+        kind = str(data.get('type') or data.get('op') or '')
+        enter, leave = (
+            book.post(SOURCE_ACTIVITY_NODE, (scope, identity, phase), (kind, ()),
+                      stage=stage, provenance=Derived((identity,)), mode=Mode.CONCORD)
+            for phase in ('enter', 'exit')
+        )
+        identities[node], points[node] = identity, (enter, leave)
+        book.post(SOURCE_ACTIVITY_EDGE, (scope, enter, leave, 'flow'), True,
+                  stage=stage, provenance=Derived((enter, leave)), mode=Mode.CONCORD)
+        for parent, _role in data.get('parents') or ():
+            before = points[int(parent)][1]
+            book.post(SOURCE_ACTIVITY_EDGE, (scope, before, enter, 'flow'), True,
+                      stage=stage, provenance=Derived((before, enter)), mode=Mode.CONCORD)
+    for node, identity in identities.items():
+        enter, leave = points[node]
+        book.post(SOURCE_ACTIVITY_BINDING, (scope, identity), (enter, leave),
+                  stage=stage, provenance=Derived((identity, enter, leave)), mode=Mode.CONCORD)
+    return scope
+
+
 def bind_activity(identity, scope, occurrence):
     book = current_identity_book()
     enter = book.latest_ref(SOURCE_ACTIVITY_NODE, (scope, occurrence, 'enter'))

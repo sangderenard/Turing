@@ -2176,7 +2176,16 @@ class _FunctionEmitter:
             return f"{args[0]}({', '.join(subscripts)})"
 
         if operation == "permute":
-            dims = list(attributes.get("dims") or ())
+            # The permutation's record is AbstractTensor's own: the tape writes
+            # params={"perm": ...} (abstraction_methods/reshape.py), and
+            # precompile_to_ssa copies a FusedProgram step's attrs onto the
+            # instruction unchanged. Reading only "dims" refused every
+            # transpose of a captured backward graph (the matmul VJP of the
+            # palette scorer, perm=[1, 0]: "no Fortran intrinsic or expression
+            # is registered"). "dims" is still what c_primitive_program
+            # renames it to; both name the one value, as fortran_jit_backend
+            # and c_backend_llvm_ssa already read it.
+            dims = list(attributes.get("perm", attributes.get("dims")) or ())
             if len(dims) != rank or sorted(dims) != list(range(rank)):
                 return None
             # RESHAPE fills the result so that its dimension ORDER(k) takes

@@ -374,7 +374,16 @@ def capture_forward_reverse_cycle(
         bound = dict(feeds)
         for name, value in bound.items():
             value._tape = tape
-            value.requires_grad_(name in solve_names)
+            # Every feed is recorded, not only the solved ones; which feeds are
+            # solved is ``wrt_feed_ids`` below. The tape records an operation
+            # only when an input requires grad, so with requires_grad on the
+            # solved feeds alone, a backward rule's work on a data feed (the
+            # palette scorer's T(cx), T(pa), the activations made from them)
+            # ran eagerly and entered the cycle as capture-time constants: feeds
+            # 119 (11, 64), 256 (11, 128) ... with the zero data of the capture.
+            # The native cycle then took any new data through its forward half
+            # and the old data through its reverse half, and learned nothing.
+            value.requires_grad_(True)
             tape.create_tensor_node(value)
         raw_outputs = forward(bound)
         declared = (

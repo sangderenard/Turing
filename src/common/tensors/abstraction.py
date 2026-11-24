@@ -427,7 +427,7 @@ class AbstractTensor:
     def sign(self):
         return self._apply_operator("sign", self, None)
 
-    def abs(self):
+    def abs(self) -> "AbstractTensor":
         return self._apply_operator("abs", self, None)
 
     def __abs__(self):

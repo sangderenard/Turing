@@ -1484,6 +1484,10 @@ def _build_backward_rule_process_graph() -> ProcessGraph:
         "flat_index_ids": flat_index_ids,
     }
     tree = ast.parse(source, filename="<abstract-tensor-backward-rules>")
+    # The exception conversion below posts each definition's span; the spans
+    # are generated from the rule/helper declarations, so stamp them first.
+    from ..transmogrifier.graph.graph_express2 import stamp_generated_source_cells
+    stamp_generated_source_cells(tree, source_cells)
     # This registry build does not run source pursuit, so build_from_ast's
     # source-control normalizers do not run. Apply the same authored exception
     # conversion as the public source compiler before graph ingestion.
@@ -2359,6 +2363,33 @@ def _annotate_numeric_metadata(graph: ProcessGraph) -> None:
     for node_id in nx.topological_sort(graph.G):
         data = graph.G.nodes[node_id]
         tensor = dict(data.get("tensor") or {})
+        # Program: ``(residual * residual).mean()`` differentiated, whose
+        # backward call is ``bw_mean(seed, x, axis=None, keepdim=False)``.
+        # Wrong record: the generated ``None`` and ``False`` actuals took the
+        # default ``float64`` below, so callsite specialization bound
+        # ``axis``/``keepdim`` as float64 rank-0 tensors and the call result
+        # had no tensor contract (host-scalar freeze refused ``bw_mean``'s
+        # ``expand_reduction`` call; tests/test_llvm_training_runtime,
+        # 2026-11-22, case 9f272724).  Rule: a generated constant's
+        # descriptor is its literal's: int/float/bool scalars state their own
+        # dtype, and a literal that is no number (``None``, a string) has no
+        # numeric descriptor.
+        if _operation(data) == "const" and not tensor:
+            literal = data.get(
+                "constant", (data.get("attributes") or {}).get("values"),
+            )
+            if literal is None or isinstance(literal, (str, bytes)):
+                continue
+            if isinstance(literal, (bool, int, float)):
+                data["tensor"] = {
+                    "shape": (),
+                    "dtype": (
+                        "bool" if isinstance(literal, bool)
+                        else "int64" if isinstance(literal, int)
+                        else "float64"
+                    ),
+                }
+                continue
         parents = _parents(graph, int(node_id))
         parent_tensors = [graph.G.nodes[parent].get("tensor") or {} for parent in parents]
         parent_shapes = [tuple(item.get("shape") or ()) for item in parent_tensors]
@@ -2438,6 +2469,159 @@ def _annotate_numeric_metadata(graph: ProcessGraph) -> None:
             "shape": tuple(shape),
             "dtype": dtype,
         }
+    _post_graph_tensor_descriptors(graph)
+
+
+def _program_value_cells(book: Any, identity: Any) -> tuple[Any, ...]:
+    """The ``abstract_tensor_program_value`` cells a node's ingestion lineage
+    reaches: its own forward bridge cell, or -- for an adjoint or fused node
+    -- the forward node's, through the ``ingestion_value`` cells it derives
+    from."""
+
+    from .concordance_declarations import (
+        ABSTRACT_TENSOR_PROGRAM_VALUE, INGESTION_VALUE,
+    )
+
+    found: list[Any] = []
+    pending, seen = [identity], set()
+    while pending:
+        cell = pending.pop()
+        if cell in seen:
+            continue
+        seen.add(cell)
+        # An adjoint node is minted NOVEL(ADJOINT_OF, (forward cell,)): its
+        # forward cell is a mint operand, not a derivation edge.
+        minted = book.mint_of(cell)
+        causes = (
+            *(cause for cause, _stage in book.edges_into(cell)),
+            *(() if minted is None else tuple(minted[1])),
+        )
+        for cause in causes:
+            if cause.page == ABSTRACT_TENSOR_PROGRAM_VALUE:
+                found.append(cause)
+            elif cause.page == INGESTION_VALUE:
+                pending.append(cause)
+    return tuple(dict.fromkeys(found))
+
+
+def _lineage_descriptor_cells(book: Any, identity: Any) -> tuple[Any, ...]:
+    """The ``graph_tensor_descriptor`` rows of the values a node's ingestion
+    lineage derives from (not its own): an adjoint node's forward value, a
+    fused node's adjoint or forward value."""
+
+    from .concordance_declarations import GRAPH_TENSOR_DESCRIPTOR, INGESTION_VALUE
+
+    found: list[Any] = []
+    pending, seen = [identity], set()
+    while pending:
+        cell = pending.pop()
+        if cell in seen:
+            continue
+        seen.add(cell)
+        minted = book.mint_of(cell)
+        for cause in (
+            *(cause for cause, _stage in book.edges_into(cell)),
+            *(() if minted is None else tuple(minted[1])),
+        ):
+            if cause.page != INGESTION_VALUE:
+                continue
+            descriptor = book.latest_ref(
+                GRAPH_TENSOR_DESCRIPTOR, (cause.row[0], cause.row[1]),
+            )
+            if descriptor is not None:
+                found.append(descriptor)
+            pending.append(cause)
+    return tuple(dict.fromkeys(found))
+
+
+def post_graph_tensor_descriptors(graph: ProcessGraph, *, declared_by: str) -> None:
+    """Post a graph's declared descriptors (the SymPy equation compiler's
+    scalar model types): roots with no program value or ancestor descriptor
+    stand on ``declared_by`` and their ``constant_role`` row, if any."""
+
+    _post_graph_tensor_descriptors(graph, declared_by=declared_by)
+
+
+def _post_graph_tensor_descriptors(graph: ProcessGraph, *, declared_by: str | None = None) -> None:
+    """Post every descriptor ``_annotate_numeric_metadata`` stated.
+
+    Program: linear-MSE training linked into ``lower_ast_source_to_ssa``.
+    Wrong record: the forward bridge put each program value on the book
+    (``abstract_tensor_program_value``) but the adjoint and fused graphs'
+    descriptors -- copied from forward nodes or inferred from parents here
+    -- lived only in node metadata, so nothing on the book said which
+    training values were tensors or of what shape, and the class and ABI
+    rows read from them had no provenance.  Rule: each descriptor is a
+    ``graph_tensor_descriptor`` row DERIVED from the value's identity cell,
+    the program value cells its lineage reaches, its ancestors' and parents'
+    rows.  The fact's third element is its basis: ``program`` (a recorded
+    AbstractTensor program value), ``lineage`` (descriptor rows only), or
+    ``declared_by`` for a root the graph's own compiler declared (a SymPy
+    model value, citing its ``constant_role`` row when one decides it).  A
+    descriptor with none of these has no evidence and is refused.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        CONSTANT_ROLE, GRAPH_TENSOR_DESCRIPTOR, GRAPH_TENSOR_DESCRIPTOR_STAGE,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    scope = graph.G.graph.get("ingestion_value_scope")
+    if scope is None:
+        raise ProcessGraphAutogradError(
+            "a stamped graph has no ingestion scope for its tensor descriptors"
+        )
+    scope = tuple(scope)
+    book = current_identity_book()
+    for node_id in nx.topological_sort(graph.G):
+        data = graph.G.nodes[node_id]
+        tensor = data.get("tensor") or {}
+        if not tensor.get("dtype"):
+            continue
+        value_id = int(data.get("value_id", node_id))
+        identity = node_identity_cell(graph, int(node_id))
+        if identity is None:
+            raise ProcessGraphAutogradError(
+                f"stamped value {value_id} has no identity cell to derive "
+                "its tensor descriptor from"
+            )
+        parent_rows = tuple(
+            cell for cell in (
+                book.latest_ref(GRAPH_TENSOR_DESCRIPTOR, (
+                    scope, int(graph.G.nodes[parent].get("value_id", parent)),
+                ))
+                for parent in _parents(graph, int(node_id))
+            )
+            if cell is not None
+        )
+        row = (scope, value_id)
+        program = _program_value_cells(book, identity)
+        lineage = (*_lineage_descriptor_cells(book, identity), *parent_rows)
+        role = book.latest_ref(CONSTANT_ROLE, row)
+        basis = ("program" if program else "lineage" if lineage
+                 else declared_by)
+        if basis is None:
+            raise ProcessGraphAutogradError(
+                f"stamped value {value_id} has no program value, ancestor "
+                "descriptor or declaring compiler behind its descriptor"
+            )
+        fact = (tuple(map(int, tensor.get("shape") or ())), str(tensor["dtype"]), basis)
+        incumbent = book.latest_ref(GRAPH_TENSOR_DESCRIPTOR, row)
+        if incumbent is not None and book.page(
+            GRAPH_TENSOR_DESCRIPTOR,
+        ).latest(row) == fact:
+            continue
+        book.post(
+            GRAPH_TENSOR_DESCRIPTOR, row, fact,
+            stage=GRAPH_TENSOR_DESCRIPTOR_STAGE,
+            provenance=Derived(tuple(dict.fromkeys((
+                identity, *program, *lineage,
+                *((role,) if role is not None else ()),
+                *((incumbent,) if incumbent is not None else ()),
+            )))),
+            mode=Mode.CONCORD if incumbent is None else Mode.REVISE,
+        )
 
 
 def differentiate_process_graph(
@@ -2851,21 +3035,13 @@ def fuse_forward_loss_backward(
         motion.G.graph["execution_contract"] = copy.deepcopy(
             dict(execution_contract)
         )
-    # This fused motion is a numeric DAG with calls into separately owned
-    # backward-rule functions; it has no authored branch of its own. Unlike
-    # an AST-reduced function, it has no source-control ingestion writer to
-    # declare that empty activity graph. Publish the declaration from the
-    # exact motion roots so scope forks can read it without inventing
-    # conditional ownership from syntax or node names.
-    from .concordance_declarations import SOURCE_ACTIVITY_SCOPE
-    from .identity_concordance import Derived, Mode
-    book.post(
-        SOURCE_ACTIVITY_SCOPE, (motion_scope,), motion_scope,
-        stage=FORWARD_LOSS_BACKWARD_FUSION,
-        provenance=Derived(tuple(dict.fromkeys(
-            _graph_node_cell(motion, int(root)) for root in motion.roots
-        ))), mode=Mode.CONCORD,
-    )
+    # The motion's activity graph is its own operand order; it is ingested
+    # when the motion is admitted as a function
+    # (``admit_process_graph_function``), once its outputs are declared.
+    # Program: compile_native_graph_reverse(left * right).  Wrong record: an
+    # EMPTY activity scope posted here; every installer position then raised
+    # "process node 2 lacks an ingested evaluation point", and the final
+    # audit refuses a read scope that names no ingested activity graph.
     _annotate_numeric_metadata(motion)
     return ForwardLossBackwardMotion(
         graph=motion,
@@ -3019,45 +3195,144 @@ def obtain_graph_reverse(
     )
 
 
-def lower_training_motion_to_repository_ssa(
-    motion: ForwardLossBackwardMotion,
-    *,
-    function_name: str = "forward_loss_backward",
-    tensor_ssa_reference: Any | None = None,
-    observed_outputs: Mapping[str, int] | None = None,
-) -> TrainingMotionSSALowering:
-    """Lower the complete semantic training motion through repository SSA.
+@dataclass(frozen=True)
+class GraphReverseSplice:
+    """Gradients of one host graph's value, spliced back into that host."""
 
-    The motion remains a ``ProcessGraph`` program.  Its graph-backed calls to
-    the authored ``BACKWARD_RULES`` closure therefore pass through the same
-    control, call-linking, operator-region, and repository-SSA machinery as
-    any other ingested program; this boundary neither projects a
-    ``FusedProgram`` nor manufactures a second instruction language.
+    adjoint: ProcessGraphAdjoint
+    gradient_value_ids: Mapping[int, int]
+    splice: Any
+
+
+def splice_graph_reverse(
+    host: ProcessGraph,
+    *,
+    output: int,
+    wrt: Iterable[int],
+    context_cells: Iterable[Any],
+    cotangent: int | None = None,
+) -> GraphReverseSplice:
+    """Differentiate ``output`` w.r.t. ``wrt`` and splice the reverse into ``host``.
+
+    The reverse is the canonical one: :func:`obtain_graph_reverse` isolates
+    the ancestors of ``output`` and builds their parametric backward graph
+    from ``BACKWARD_RULES``.  Its saved-forward inputs become the host values
+    they stand for, its seed becomes the constant one (or the host value
+    ``cotangent``), and every other backward node is copied into the host by
+    :func:`process_graph_function_linking.splice_process_graph`, which also
+    moves the backward-rule functions into the host's function table.
+
+    The host must already carry every tensor descriptor the reverse reads:
+    call this once the graph is complete and annotated, before it is
+    reduced or lowered.  ``context_cells`` names the one identity the splice
+    resolves (the Derivative, the training request).
     """
 
-    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
-        c_backend_repository_ssa_reference,
+    from .process_graph_function_linking import splice_process_graph
+
+    output_id = int(output)
+    wrt_ids = tuple(int(value) for value in wrt)
+    product = obtain_graph_reverse(host, outputs=(output_id,), wrt=wrt_ids)
+    adjoint = product.adjoint
+    if tuple(adjoint.output_value_ids) != (output_id,):
+        raise ProcessGraphAutogradError(
+            f"graph reverse of {output_id} differentiated "
+            f"{tuple(adjoint.output_value_ids)!r}"
+        )
+    seed = int(adjoint.seed_value_ids[output_id])
+    operands = {
+        int(backward_id): int(forward_id)
+        for forward_id, backward_id in adjoint.saved_value_ids.items()
+    }
+    constants: dict[int, Any] = {}
+    if cotangent is None:
+        constants[seed] = 1.0
+    else:
+        if int(cotangent) not in host.G:
+            raise ProcessGraphAutogradError(
+                f"cotangent {int(cotangent)} is not a host value"
+            )
+        operands[seed] = int(cotangent)
+    gradients = {
+        int(forward_id): int(backward_id)
+        for forward_id, backward_id in adjoint.gradient_value_ids.items()
+    }
+    passthrough = {
+        forward_id: backward_id for forward_id, backward_id in gradients.items()
+        if backward_id in operands
+    }
+    splice = splice_process_graph(
+        host,
+        adjoint.backward,
+        operands=operands,
+        outputs=tuple(
+            backward_id for forward_id, backward_id in gradients.items()
+            if forward_id not in passthrough
+        ),
+        context_cells=context_cells,
+        constants=constants,
     )
-    from .fortran_c_shell import _lower_resolved_process_graph_deployment
-    from .process_graph_fusion import extract_clean_process_subgraph
-    from .shell_reference_tables import build_map_dependency_regions
+    return GraphReverseSplice(
+        adjoint=adjoint,
+        gradient_value_ids={
+            forward_id: int(splice.value_ids[backward_id])
+            for forward_id, backward_id in gradients.items()
+        },
+        splice=splice,
+    )
+
+
+def training_motion_function(
+    motion: ForwardLossBackwardMotion,
+    *,
+    function_name: str,
+    observed_outputs: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Declare a training motion's function signature on its own graph.
+
+    Formals are the motion's input nodes in dependency order, named by their
+    binding names.  Outputs are the observations, then ``loss_<i>`` for each
+    loss and ``grad_<forward id>`` for each gradient, in that order.  The
+    function's definition cells are its roots' ingestion cells: the motion
+    is generated, so its roots are what defines it.  Returns the outputs.
+    """
 
     graph = motion.graph
     _annotate_numeric_metadata(graph)
-
     observations = {
         str(name): int(value_id)
         for name, value_id in dict(observed_outputs or {}).items()
     }
+    # Program: the palette scorer observed ``_score(rated)`` computed beside
+    # the loss but not used by it.  Wrong record: the check was ``value_id in
+    # graph.G``; the motion is built from the loss's reachable graph and its
+    # adjoint nodes are numbered after the forward's, so the program value
+    # 242 named an unrelated scalar node and the observation silently read
+    # it.  Rule: a node is an observed program value only when its ingestion
+    # lineage reaches that value's ``abstract_tensor_program_value`` row.
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+
+    def observes(value_id: int) -> bool:
+        if value_id not in graph.G:
+            return False
+        identity = node_identity_cell(graph, int(value_id))
+        return identity is not None and any(
+            int(cell.row[1]) == int(value_id)
+            for cell in _program_value_cells(book, identity)
+        )
+
     missing_observations = {
         name: value_id
         for name, value_id in observations.items()
-        if value_id not in graph.G
+        if not observes(value_id)
     }
     if missing_observations:
         raise ProcessGraphAutogradError(
-            "training-motion observations are not graph values: "
-            f"{missing_observations!r}"
+            "training-motion observations are not values of the loss graph "
+            f"(observe values the loss uses): {missing_observations!r}"
         )
     reserved_output_names = {
         *(f"loss_{index}" for index in range(len(motion.loss_value_ids))),
@@ -3076,7 +3351,6 @@ def lower_training_motion_to_repository_ssa(
         **{f"grad_{forward_id}": int(value_id)
            for forward_id, value_id in motion.gradient_value_ids.items()},
     }
-
     used_names: set[str] = set()
     parameter_names: list[str] = []
     identity_table: dict[str, tuple[int, ...]] = {}
@@ -3101,49 +3375,112 @@ def lower_training_motion_to_repository_ssa(
         parameter_names.append(name)
         identity_table[name] = (node_id,)
     identity_table.update({name: (node_id,) for name, node_id in outputs.items()})
-
-    # The AST reducer normally posts version-zero formal bindings.  This
-    # motion has no AST: each formal is an existing AbstractTensor input
-    # copied into the motion, so its binding derives from that input cell.
-    from .concordance_declarations import (
-        BindingFact, FORWARD_LOSS_BACKWARD_FUSION, NAME_BINDING,
-    )
-    from .identity_concordance import Derived, Mode, current_identity_book
-
-    motion_scope = graph.G.graph["ingestion_value_scope"]
-    graph.G.graph["lexical_read_scope"] = motion_scope
-    for parameter_name in parameter_names:
-        value_id = int(identity_table[parameter_name][0])
-        current_identity_book().post(
-            NAME_BINDING, (motion_scope, parameter_name, 0),
-            BindingFact(value_id, False, (None,) * 4, ""),
-            stage=FORWARD_LOSS_BACKWARD_FUSION,
-            provenance=Derived((_graph_node_cell(graph, value_id),)),
-            mode=Mode.CONCORD,
-        )
-
-    # The generated VJP is defined by the fused motion's roots.  Their
-    # ingestion cells derive from the exact forward/backward producers, so
-    # they are the definition cells for its FunctionTable address.
-    definition_cells = tuple(dict.fromkeys(
-        _graph_node_cell(graph, int(root)) for root in graph.roots
-    ))
-    function_reference = graph.function_table.declare(
-        function_name,
-        qualified_name=function_name,
-        source=definition_cells,
-    )
-    graph.function_table.resolve_graph(function_reference, graph)
     graph.G.graph.update({
-        "function_ref": int(function_reference.address),
         "function_name": str(function_name),
         "function_parameters": tuple(parameter_names),
         "positional_parameters": tuple(parameter_names),
         "function_outputs": tuple(outputs),
         "identity_table": identity_table,
-        "compile_targets": (str(function_name),),
+        "function_definition_cells": tuple(dict.fromkeys(
+            _graph_node_cell(graph, int(root)) for root in graph.roots
+        )),
         "semantic_authority": "ProcessGraph",
     })
+    return outputs
+
+
+def training_function_recipe(
+    output: Any,
+    *,
+    bindings: Mapping[str, Any],
+    wrt: Iterable[int],
+    function_name: str,
+    observed_outputs: Mapping[str, int] | None = None,
+):
+    """A ``linked_process_graphs`` entry that builds one training function.
+
+    ``output`` is the loss of an ``SSATensorProgram`` AbstractTensor run and
+    ``bindings`` names its caller-owned inputs, as for
+    :func:`obtain_graph_reverse`.  The returned recipe is called by
+    ``lower_ast_source_to_ssa`` inside the compile's identity book: there it
+    ingests the program, takes the combined graph reverse w.r.t. ``wrt`` and
+    declares the motion as a function (:func:`training_motion_function`).
+    The source compiler then reduces its caller and reaches the motion and
+    its backward rules through ordinary call linking.
+    """
+
+    wrt_ids = tuple(int(value) for value in wrt)
+    built: list[tuple[Any, ProcessGraph]] = []
+
+    def build() -> ProcessGraph:
+        # One graph per identity book: the source compiler links before and
+        # again after reduction, and both passes must see the same graph.
+        from .identity_concordance import current_identity_book
+
+        book = current_identity_book()
+        if built and built[0][0] is book:
+            return built[0][1]
+        product = obtain_graph_reverse(
+            output, bindings=bindings, wrt=wrt_ids, packaging="combined",
+        )
+        if product.motion is None:
+            raise ProcessGraphAutogradError(
+                "combined graph reverse produced no training motion"
+            )
+        training_motion_function(
+            product.motion, function_name=function_name,
+            observed_outputs=observed_outputs,
+        )
+        built[:] = [(book, product.motion.graph)]
+        return product.motion.graph
+
+    build.process_graph_recipe = str(function_name)
+    return build
+
+
+def lower_training_motion_to_repository_ssa(
+    motion: ForwardLossBackwardMotion,
+    *,
+    function_name: str = "forward_loss_backward",
+    tensor_ssa_reference: Any | None = None,
+    observed_outputs: Mapping[str, int] | None = None,
+) -> TrainingMotionSSALowering:
+    """Lower the complete semantic training motion through repository SSA.
+
+    The motion remains a ``ProcessGraph`` program.  Its graph-backed calls to
+    the authored ``BACKWARD_RULES`` closure therefore pass through the same
+    control, call-linking, operator-region, and repository-SSA machinery as
+    any other ingested program; this boundary neither projects a
+    ``FusedProgram`` nor manufactures a second instruction language.
+    """
+
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from .fortran_c_shell import _lower_resolved_process_graph_deployment
+    from .process_graph_fusion import extract_clean_process_subgraph
+    from .shell_reference_tables import build_map_dependency_regions
+
+    from .concordance_declarations import FORWARD_LOSS_BACKWARD_FUSION
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .process_graph_function_linking import admit_process_graph_function
+
+    graph = motion.graph
+    outputs = training_motion_function(
+        motion, function_name=function_name, observed_outputs=observed_outputs,
+    )
+    motion_scope = graph.G.graph["ingestion_value_scope"]
+    function_reference = graph.function_table.declare(
+        function_name,
+        qualified_name=function_name,
+        source=graph.G.graph["function_definition_cells"],
+    )
+    graph.function_table.resolve_graph(function_reference, graph)
+    graph.G.graph.update({
+        "function_ref": int(function_reference.address),
+        "compile_targets": (str(function_name),),
+    })
+    admit_process_graph_function(graph, stage=FORWARD_LOSS_BACKWARD_FUSION)
 
     original_roots = list(graph.roots)
     original_function_outputs = tuple(
@@ -3316,4 +3653,8 @@ __all__ = [
     "lower_training_motion_to_repository_ssa",
     "obtain_graph_reverse",
     "reverse_compile_book",
+    "GraphReverseSplice",
+    "splice_graph_reverse",
+    "training_function_recipe",
+    "training_motion_function",
 ]
