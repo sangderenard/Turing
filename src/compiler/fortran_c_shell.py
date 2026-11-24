@@ -1281,6 +1281,7 @@ def _retained_parameter_identity(
     wrapper and leave the real scalar formal backed by zeroed scratch storage.
     """
 
+    retained_parameters = tuple(retained_parameters)
     retained = tuple(
         int(value_id)
         for name, value_id in retained_parameters
@@ -1289,6 +1290,18 @@ def _retained_parameter_identity(
     if len(set(retained)) == 1:
         return retained[0]
     history = tuple(map(int, identity_history))
+    # Program: GLSL ``put(vec3 d)`` writing the global ``recorded``:
+    # ``def put(d, recorded): recorded = d; return recorded``.  ``recorded``
+    # is dead on entry and retains no formal; its first identity version is
+    # ``d``'s formal, which ``d`` retains.  Wrong record: the fallback bound
+    # the caller's ``recorded`` into ``d``'s slot.  Rule: a formal another
+    # parameter retains is not this parameter's.
+    claimed = {
+        int(value_id) for name, value_id in retained_parameters
+        if str(name) != str(parameter_name)
+    }
+    if history and history[0] in claimed:
+        return None
     return history[0] if history else None
 
 
@@ -4650,14 +4663,6 @@ def _prune_unused_callee_formals_once(
             if str(name) in record_parameter_names
         }
 
-        # The record parameters whose fields cross as field formals of their
-        # own (``program_abi_parameter`` + ``program_abi_field``).
-        fielded_record_parameters = {
-            str((formal.accounting or {}).get("program_abi_parameter"))
-            for formal in callee.args
-            if (formal.accounting or {}).get("program_abi_parameter") is not None
-            and (formal.accounting or {}).get("program_abi_field") is not None
-        }
         record_parameter_name_of = {
             int(value_id): str(name)
             for name, value_id in metadata.get("parameter_names", ())
@@ -4676,10 +4681,12 @@ def _prune_unused_callee_formals_once(
             # caller had no handle to pass.  Rule: a record parameter whose
             # fields cross as field formals of their own is correlation
             # whether its container view is ``record`` or ``reference``.
+            # A dead one (GLSL ``r = d`` before any read of ``r``) has no
+            # field formals at all and crosses nothing; removal still
+            # requires the formal to be unreferenced.
             fielded_reference = (
                 storage == "reference"
-                and record_parameter_name_of.get(int(formal.id))
-                in fielded_record_parameters
+                and int(formal.id) in record_parameter_name_of
             )
             # A record container (declared ``storage: record`` with no field of
             # its own) is correlation: only its leaves cross the native ABI.
@@ -20194,6 +20201,24 @@ def _propagate_record_field_demand(
             {int(value.id) for value in caller.args},
             callee_cell=_frame_value_cell(callee, formal.id),
         )
+        if member_id is None:
+            # Program: GLSL ``begin(d)`` writes the global ``recorded``,
+            # then ``row()`` reads ``recorded.y``: main's ``recorded`` is
+            # begin's returned record, whose ``y`` the call record already
+            # binds (frame binding caller_storage -> the constant 2.5).
+            # Wrong record: the member walk found no caller member, so a
+            # fresh formal was minted on ``main`` -- an input no caller can
+            # supply -- and the frame-aliased result disagreed with the
+            # recorded storage.  Rule: the call record's exact frame binding
+            # for this callee formal names the caller value to pass.
+            recorded = tuple(
+                int(source) for callee_id, kind, source in record.frame_bindings
+                if int(callee_id) == int(formal.id)
+                and str(kind) in {"caller_value", "caller_alias", "caller_storage"}
+                and isinstance(source, int)
+            )
+            if len(recorded) == 1 and recorded[0] in caller_values:
+                member_id = recorded[0]
         return None if member_id is None else caller_values.get(int(member_id))
 
     grew = True
@@ -33079,10 +33104,35 @@ def _class_surface_ssa_program(
                         } if (data.get("attributes") or {}).get(
                             "program_abi_optional_presence_value_id"
                         ) is not None else {}),
+                        # The parameter an Input is the entry value of, as
+                        # the graph declares it (``_is_parameter_entry``).
+                        **({
+                            "input_binding": str(
+                                (data.get("attributes") or {})["binding_name"]
+                            ),
+                        } if str(data.get("type") or "") == "Input"
+                        and (data.get("attributes") or {}).get(
+                            "binding_name"
+                        ) is not None else {}),
                     }
                     for node_id, data in graph_obj.nodes(data=True)
                     for expression in (data.get("expr_obj"),)
                     if isinstance(expression, ast.AST)
+                    and int(data.get("value_id", node_id)) == int(node_id)
+                } | {
+                    # A parameter Input has no expression of its own; the
+                    # graph still declares which parameter it enters.
+                    int(node_id): {
+                        "node_id": int(node_id),
+                        "input_binding": str(
+                            (data.get("attributes") or {})["binding_name"]
+                        ),
+                    }
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("type") or "") == "Input"
+                    and not isinstance(data.get("expr_obj"), ast.AST)
+                    and (data.get("attributes") or {}).get("binding_name")
+                    is not None
                     and int(data.get("value_id", node_id)) == int(node_id)
                 },
                 shape_scope=shape_scope_of(graph_obj),
@@ -61414,12 +61464,15 @@ def _class_surface_ssa_program(
                     == callee_symbol
                 ), None)
                 if linked_call is not None:
-                    caller_values = {
-                        int(value.id): value
-                        for value in all_functions[
-                            str(caller_symbol)
-                        ].args
-                    }
+                    # Every value the caller defines, not only its formals:
+                    # GLSL ``begin(d)`` then ``row()`` reads the global
+                    # ``recorded.y`` -- the rebound storage is main's own
+                    # constant 2.5 (``d.y``), a body value.  Looking only at
+                    # formals left the call on the storage leased from
+                    # absence while the record named the constant.
+                    caller_values = dict(function_values(
+                        all_functions[str(caller_symbol)]
+                    ))
                     rebound_positions = []
                     for position, callee_id in enumerate(
                         map(int, linked_call.attributes.get(
@@ -61470,10 +61523,37 @@ def _class_surface_ssa_program(
                                 )),
                             )
                             value.dtype = field_dtype
+                        stale = linked_call.args[position]
                         linked_call.args[position] = value
                         rebound_positions.append((
                             position, callee_id, int(caller_id),
                         ))
+                        # Program: GLSL ``begin(d)`` then ``row()`` reading
+                        # the global ``recorded.y``.  The operand was storage
+                        # leased from absence for exactly this binding, and
+                        # ``row``'s frame-aliased result had already been
+                        # read through it downstream (main fed it to its
+                        # region: an input no caller supplies, read as 0).
+                        # Rule: once the binding is proven, the leased
+                        # placeholder is that value everywhere in the caller.
+                        if (
+                            int(stale.id) != int(value.id)
+                            and dict(stale.accounting or {}).get(
+                                "unbound_parameter_member"
+                            )
+                        ):
+                            caller_function = all_functions[str(caller_symbol)]
+                            for caller_block in caller_function.blocks.values():
+                                for caller_instruction in caller_block.instrs:
+                                    caller_instruction.args = [
+                                        value if int(argument.id) == int(stale.id)
+                                        else argument
+                                        for argument in caller_instruction.args
+                                    ]
+                            caller_function.args = [
+                                argument for argument in caller_function.args
+                                if int(argument.id) != int(stale.id)
+                            ]
                     if rebound_positions:
                         linked_call.attributes[
                             "returned_record_argument_reconciled"
@@ -67847,7 +67927,30 @@ def _lower_ast_source_to_ssa_impl(
             # reads is harmless; one an instruction reads would be read
             # uninitialized, so it is refused by name.  A call operand only
             # forwards the slot; the callee's own formal answers for it.
-            for function in module.functions.values():
+            # Program: GLSL ``begin(d)`` then ``row()`` reading the global
+            # ``recorded.y``.  The member was leased from absence while the
+            # walk ran, then the returned-record reconcile bound main's call
+            # to the constant 2.5.  Rule: the formal is unbound only while
+            # some call into it still passes a leased placeholder (which
+            # carries the same marker); a proven binding at every call is a
+            # binding.
+            passed_unbound: dict[str, set[int]] = {}
+            for caller_function in module.functions.values():
+                for block in caller_function.blocks.values():
+                    for instruction in block.instrs:
+                        if instruction.op not in {"Call", "call"}:
+                            continue
+                        inputs = tuple(map(int, instruction.attributes.get(
+                            "callee_input_ids", (),
+                        )))
+                        for callee_formal, operand in zip(inputs, instruction.args):
+                            if dict(operand.accounting or {}).get(
+                                "unbound_parameter_member"
+                            ):
+                                passed_unbound.setdefault(str(
+                                    instruction.attributes.get("callee") or ""
+                                ), set()).add(int(callee_formal))
+            for function_name, function in module.functions.items():
                 read_ids = {
                     int(operand.id)
                     for block in function.blocks.values()
@@ -67855,11 +67958,38 @@ def _lower_ast_source_to_ssa_impl(
                     if instruction.op not in {"Call", "call"}
                     for operand in instruction.args
                 }
+                calls_into = tuple(
+                    instruction
+                    for caller_function in module.functions.values()
+                    for block in caller_function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op in {"Call", "call"}
+                    and str(instruction.attributes.get("callee") or "")
+                    == str(function_name)
+                )
+                # No call reaches the function any more (``row`` returns its
+                # own formal, so its result was resolved to the operand):
+                # nothing executes it, and its formal is never read.  A call
+                # without an input receipt cannot be checked: refused.
+                exported_names = {str(name) for name in (exports or ())}
+                unchecked_call = any(
+                    not instruction.attributes.get("callee_input_ids")
+                    for instruction in calls_into
+                )
                 for formal in function.args:
                     unbound = dict(formal.accounting or {}).get(
                         "unbound_parameter_member"
                     )
-                    if unbound and int(formal.id) in read_ids:
+                    if (
+                        unbound and int(formal.id) in read_ids
+                        and (
+                            str(function_name) in exported_names
+                            or unchecked_call
+                            or int(formal.id) in passed_unbound.get(
+                                str(function_name), set()
+                            )
+                        )
+                    ):
                         raise ValueError(str(unbound))
             final_pruned_entry_field_aliases = _prune_dead_entry_field_aliases(
                 module.functions, final_call_records,

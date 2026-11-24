@@ -29597,6 +29597,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
                 if prior is None or order_cell is None:
                     continue
+                # Program: GLSL ``put(inout vec3 r, vec3 d){ r = d; }`` ->
+                # ``def put(r, d): r = d; return r``.  Wrong record: ``r`` is
+                # overwritten before any read, so the formal is never bound
+                # and version 0 of ``r`` is the ASSIGNMENT; the contract cited
+                # it as the formal's entry binding and the final audit found
+                # no Input behind it.  Rule: version 0 is the formal's binding
+                # only when it names this parameter's Input; otherwise the
+                # formal is dead on entry and has no binding to cite.
+                if binding_cell is not None:
+                    bound = contract_book.page(NAME_BINDING).cell(
+                        binding_cell.row, binding_cell.column,
+                    )
+                    bound_node = function_graph.G.nodes.get(
+                        int(getattr(bound, "value_id", -1)), {},
+                    )
+                    if not (
+                        str(bound_node.get("type") or "") == "Input"
+                        and (bound_node.get("attributes") or {}).get(
+                            "binding_name"
+                        ) == contract.name
+                    ):
+                        binding_cell = None
                 contract_book.post(
                     SOURCE_PARAMETER_MEMORY_CONTRACT, row, (contract,),
                     stage=_REDUCTION,

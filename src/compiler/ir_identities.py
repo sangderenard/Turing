@@ -1363,10 +1363,30 @@ def drop_dead_pure_region_calls(functions) -> int:
         for block in function.blocks.values():
             drop: set[int] = set()
             for index, instruction in enumerate(block.instrs):
-                if (
-                    instruction.op not in ("Call", "call")
-                    or instruction.res is None
-                ):
+                if instruction.op not in ("Call", "call"):
+                    continue
+                if instruction.res is None:
+                    # Program: GLSL ``begin(vec3 d){ recorded = d; }``: the
+                    # callee only returns its record formal, and its result
+                    # was resolved through the frame alias, leaving a Call
+                    # with no result.  A callee whose body is a bare return
+                    # has no effect, so such a call is dead (the same proof
+                    # as the unconsumed bare-return result below).
+                    bare = functions.get(
+                        str(instruction.attributes.get("callee") or "")
+                    )
+                    if bare is not None and bare.blocks and all(
+                        body_instruction.op == "Ret"
+                        for body_block in bare.blocks.values()
+                        for body_instruction in body_block.instrs
+                    ):
+                        function.metadata["discarded_pure_call_sites"] = (
+                            *function.metadata.get("discarded_pure_call_sites", ()),
+                            (instruction.attributes.get("plan_callsite_id"), bare.name),
+                        )
+                        drop.add(index)
+                        removed_total += 1
+                        removed_callees.add(bare.name)
                     continue
                 callee = functions.get(
                     str(instruction.attributes.get("callee") or "")
@@ -1389,7 +1409,15 @@ def drop_dead_pure_region_calls(functions) -> int:
                            for body_block in callee.blocks.values()
                            for body_instruction in body_block.instrs):
                         continue
-                    if consumers.get(aggregate_id, 0) or aggregate_id in protected:
+                    # A frame-aliased result IS the caller's own operand
+                    # (``result_aliases_frame``): protecting it as an authored
+                    # feed protects nothing the operand does not (GLSL
+                    # ``begin(vec3 d){ recorded = d; }`` whose ``recorded``
+                    # fed a call that resolved through the same alias).
+                    if consumers.get(aggregate_id, 0) or (
+                        aggregate_id in protected
+                        and not instruction.attributes.get("result_aliases_frame")
+                    ):
                         continue
                     function.metadata["discarded_pure_call_sites"] = (
                         *function.metadata.get("discarded_pure_call_sites", ()),

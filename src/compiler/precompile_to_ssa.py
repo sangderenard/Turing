@@ -2986,6 +2986,10 @@ class _ControlSSABuilder(TiledObject):
             if not history:
                 continue
             value_id = int(history[0])
+            # A parameter overwritten before any read has no entry value of
+            # its own: its first version may be another parameter's Input.
+            if not self._is_parameter_entry(str(name), value_id):
+                continue
             if value_id in self.external_values:
                 continue
             value = self._value_from_meta(value_id)
@@ -6457,7 +6461,9 @@ class _ControlSSABuilder(TiledObject):
         if value is None:
             value = self._value_from_meta(value_id, dtype=dtype)
             description = self.source_value_descriptions.get(value_id)
-            if description is not None:
+            # A parameter Input's entry (``input_binding`` only) describes no
+            # source expression, so it is no execution receipt.
+            if description is not None and "construct" in description:
                 receipt = dict(description)
                 node_id = int(receipt.get("node_id", value_id))
                 fact = None
@@ -6538,6 +6544,22 @@ class _ControlSSABuilder(TiledObject):
             if cell is not None:
                 return cell
         return None
+
+    def _is_parameter_entry(self, name: str, value_id: int) -> bool:
+        """Whether ``value_id`` is parameter ``name``'s own entry value: not
+        another parameter's Input reached through an assignment.
+
+        Program: GLSL ``put(vec3 d)`` writing the global ``recorded`` becomes
+        ``def put(d, recorded): recorded = d; return recorded``; the first
+        identity version of ``recorded`` is ``d``'s Input.  The graph
+        declares which parameter an Input enters (its ``binding_name``,
+        carried as ``input_binding``); a value that is no Input is not
+        claimed here."""
+
+        binding = self.source_value_descriptions.get(int(value_id), {}).get(
+            "input_binding",
+        )
+        return binding is None or str(binding) == str(name)
 
     def _value_from_meta(
         self, value_id: int, *, dtype: str | None = None
@@ -24672,6 +24694,7 @@ class _ControlSSABuilder(TiledObject):
             (name, value_id)
             for name, value_id in value_names
             if name in self.parameter_names and int(value_id) in argument_ids
+            and self._is_parameter_entry(str(name), int(value_id))
         )
         # Structured control expressions can consume the initial authored
         # parameter and then publish a loop-carried alias as the latest value
@@ -24699,6 +24722,7 @@ class _ControlSSABuilder(TiledObject):
                 for candidate in self.value_name_histories.get(name, ())
                 if int(candidate) in argument_ids
                 and int(candidate) in used_value_ids
+                and self._is_parameter_entry(str(name), int(candidate))
             ), None)
             if value_id is None:
                 continue

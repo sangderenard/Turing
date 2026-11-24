@@ -6648,6 +6648,24 @@ def _build_shell_hierarchy_plan(
                     # authored tuple node into an untyped caller argument.
                     child_input = int(identities[0])
                     child_input_data = child_graph.nodes.get(child_input, {})
+                    # Program: GLSL ``put(vec3 d)`` writing the global
+                    # ``recorded``: ``def put(d, recorded): recorded = d``.
+                    # ``recorded`` is dead on entry; its first identity
+                    # version is ``d``'s Input.  Wrong record: both actuals
+                    # were bound to ``d``'s formal and the later one won.
+                    # Rule: an Input the graph declares for another
+                    # parameter is not this parameter's formal; a dead
+                    # parameter's actual binds to none.
+                    if (
+                        str(child_input_data.get("type") or "") == "Input"
+                        and (child_input_data.get("attributes") or {}).get(
+                            "binding_name"
+                        ) is not None
+                        and str((child_input_data.get("attributes") or {})[
+                            "binding_name"
+                        ]) != str(name)
+                    ):
+                        continue
                     if (child_input_data.get("attributes") or {}).get(
                         "structural_specialization"
                     ):
