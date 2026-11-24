@@ -1,31 +1,38 @@
-"""Per-participant site color experiment, using the existing game swatches.
+"""The color game: random designs, ranked and scored, teaching a native network.
 
-The profile/browser or account key is supplied by server._job_identity. A rank
-sets the initial color order; explicit good/bad feedback changes the next
-candidate. Feedback is retained as data for later training, never pooled into
-another participant's live theme.
+A round is ``ROUND`` designs drawn at random (``palette_designs.random_design``:
+one of the 148 named CSS colors with a random bevel and shadow), fresh for every
+round and every participant.  Ranking a round stores every ordered pair (the
+preferred design first).  The site then wears a proposed design -- the best
+of a random pool as the network scores it for this participant -- and the
+participant scores it on a continuous slider from 0 to 1.  Rankings and
+scores train ``palette_model`` continuously: everyone's responses train the
+shared network (the site default), each participant's own responses their
+personal layer, which only nudges that default.  The comparison view shows
+the pool's best design for everyone beside the best for this participant.
 
-Every design a participant is shown (accent plus secondary) is saved once in
-palette_saved, and palette_active names the one their site wears. Select makes
-any saved design active again; it becomes the candidate the next feedback rates.
+The owner key is the existing ``server._job_identity`` browser/account key.
+``try again`` (``/api/palette/round``) draws a new round without recording
+anything; ``clear`` (``/api/palette/clear``) forgets this participant's
+responses, designs and personal layer.  Every design the site has worn is
+kept (``saved``) and ``select`` wears one again.  The tables of the earlier
+fixed-swatch game (``palette_participants``, ``palette_feedback``,
+``palette_saved``, ``palette_active``) are left as they were.
 """
 from __future__ import annotations
 
 import json
-import math
 import secrets
 import sqlite3
 import time
 
-from meowdoku.games import PALETTES
+from . import palette_designs as designs
 
-def _srgb(channel):
-    return 12.92 * channel if channel <= 0.0031308 else 1.055 * channel ** (1 / 2.4) - 0.055
-
-
-SWATCHES = tuple("#" + "".join(f"{round(255 * _srgb(channel)):02x}" for channel in rgb)
-                 for rgb in PALETTES["Colour-blind safe"])
-COUNT = len(SWATCHES)
+ROUND = 8              # designs in one ranking round
+POOL = 48              # random designs scored for each proposal
+EXPLORE = 0.2          # chance a proposal is drawn from the pool's top eight instead of its best
+DAILY_LIMIT = 240      # responses (rankings + scores) per participant per day
+_RNG = secrets.SystemRandom()
 
 
 class PaletteError(Exception):
@@ -37,157 +44,329 @@ class PaletteError(Exception):
 def _connect(path):
     db = sqlite3.connect(str(path), timeout=10, isolation_level=None)
     db.executescript("""
-        CREATE TABLE IF NOT EXISTS palette_participants (
-            owner TEXT PRIMARY KEY, ranking TEXT NOT NULL, candidate INTEGER,
-            nonce TEXT, updated REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS palette_feedback (
+        CREATE TABLE IF NOT EXISTS palette_round (
+            owner TEXT PRIMARY KEY, nonce TEXT NOT NULL, designs TEXT NOT NULL, created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS palette_pair (
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
-            color INTEGER NOT NULL, rating INTEGER NOT NULL, created REAL NOT NULL);
-        CREATE INDEX IF NOT EXISTS palette_feedback_owner_color
-            ON palette_feedback(owner, color);
-        CREATE INDEX IF NOT EXISTS palette_feedback_owner_time
-            ON palette_feedback(owner, created);
-        CREATE TABLE IF NOT EXISTS palette_saved (
+            preferred TEXT NOT NULL, other TEXT NOT NULL, created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS palette_pair_owner ON palette_pair(owner, id);
+        CREATE TABLE IF NOT EXISTS palette_rating (
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
-            color INTEGER NOT NULL, secondary INTEGER NOT NULL, created REAL NOT NULL,
-            UNIQUE(owner, color, secondary));
-        CREATE TABLE IF NOT EXISTS palette_active (
+            design TEXT NOT NULL, secondary TEXT NOT NULL, score REAL NOT NULL, created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS palette_rating_owner ON palette_rating(owner, id);
+        CREATE TABLE IF NOT EXISTS palette_offer (
+            owner TEXT PRIMARY KEY, nonce TEXT NOT NULL, design TEXT NOT NULL,
+            secondary TEXT NOT NULL, scores TEXT NOT NULL, updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS palette_design_saved (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, design TEXT NOT NULL,
+            secondary TEXT NOT NULL, key TEXT NOT NULL, created REAL NOT NULL, UNIQUE(owner, key));
+        CREATE TABLE IF NOT EXISTS palette_design_active (
             owner TEXT PRIMARY KEY, saved INTEGER NOT NULL, updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS palette_personal (
+            owner TEXT PRIMARY KEY, weights TEXT NOT NULL, steps INTEGER NOT NULL, updated REAL NOT NULL);
     """)
     return db
 
 
-def _row(db, owner):
-    row = db.execute("SELECT ranking,candidate,nonce FROM palette_participants WHERE owner=?", (owner,)).fetchone()
-    return (json.loads(row[0]), row[1], row[2]) if row else (None, None, None)
+# -- the model ---------------------------------------------------------------
+def _model(accounts_db):
+    from . import palette_model
+    return palette_model.model_for(accounts_db)
 
 
-def _counts(db, owner):
-    answer = {i: [0, 0] for i in range(COUNT)}
-    for color, rating, n in db.execute("SELECT color,rating,COUNT(*) FROM palette_feedback WHERE owner=? GROUP BY color,rating", (owner,)):
-        if color in answer:
-            answer[color][0 if rating == 1 else 1] = n
-    return answer
+def _learner(accounts_db):
+    """The model's readers and writer of this server's tables."""
+
+    def responses(owner):
+        db = _connect(accounts_db)
+        try:
+            def pairs(rows):
+                return [(designs.features(json.loads(p)), designs.features(json.loads(o))) for p, o in rows]
+
+            def ratings(rows):
+                return [(designs.features(json.loads(d)), float(s)) for d, s in rows]
+
+            own_pairs = pairs(db.execute("SELECT preferred,other FROM palette_pair WHERE owner=? ORDER BY id DESC LIMIT 64",
+                                         (owner,)).fetchall()[::-1])
+            own_ratings = ratings(db.execute("SELECT design,score FROM palette_rating WHERE owner=? ORDER BY id DESC LIMIT 16",
+                                             (owner,)).fetchall()[::-1])
+            all_pairs = pairs(db.execute("SELECT preferred,other FROM palette_pair ORDER BY id DESC LIMIT 64").fetchall()[::-1])
+            all_ratings = ratings(db.execute("SELECT design,score FROM palette_rating ORDER BY id DESC LIMIT 16").fetchall()[::-1])
+            return own_pairs, own_ratings, all_pairs, all_ratings, _personal(db, owner)
+        finally:
+            db.close()
+
+    def store_personal(owner, weights, steps):
+        db = _connect(accounts_db)
+        try:
+            db.execute("INSERT INTO palette_personal(owner,weights,steps,updated) VALUES (?,?,?,?) "
+                       "ON CONFLICT(owner) DO UPDATE SET weights=excluded.weights,"
+                       "steps=palette_personal.steps+excluded.steps,updated=excluded.updated",
+                       (owner, json.dumps(weights), int(steps), time.time()))
+        finally:
+            db.close()
+
+    return responses, store_personal
 
 
-def _save(db, owner, color, secondary):
-    """Keeps this design (once) and makes it the one the participant's site wears."""
+def _personal(db, owner):
+    row = db.execute("SELECT weights FROM palette_personal WHERE owner=?", (owner,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+# -- rounds, proposals, saved designs ----------------------------------------
+def _new_round(db, owner):
+    round_designs = designs.random_round(_RNG, ROUND)
+    nonce = secrets.token_urlsafe(18)
+    db.execute("INSERT INTO palette_round(owner,nonce,designs,created) VALUES (?,?,?,?) "
+               "ON CONFLICT(owner) DO UPDATE SET nonce=excluded.nonce,designs=excluded.designs,created=excluded.created",
+               (owner, nonce, json.dumps(round_designs), time.time()))
+    return nonce, round_designs
+
+
+def _round(db, owner):
+    row = db.execute("SELECT nonce,designs FROM palette_round WHERE owner=?", (owner,)).fetchone()
+    return (row[0], json.loads(row[1])) if row else _new_round(db, owner)
+
+
+def _distinct(one, two):
+    """Two designs a site can wear together: different colors, apart in OKLab."""
+    a, b = designs.oklab(one["color"]), designs.oklab(two["color"])
+    return one["color"] != two["color"] and sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 > 0.1
+
+
+def _choose(pool, scores, rng):
+    order = sorted(range(len(pool)), key=lambda i: scores[i], reverse=True)
+    first = order[0] if rng.random() >= EXPLORE else rng.choice(order[:8])
+    second = next(i for i in order if i != first and _distinct(pool[first], pool[i]))
+    return first, second
+
+
+def _draft(model, personal):
+    """A random pool and its network scores, for this participant and for everyone.
+
+    Run before the request's database transaction: scoring waits for the
+    model, and training (which holds the model) writes to the database."""
+    pool = [designs.random_design(_RNG) for _ in range(POOL)]
+    rows = [designs.features(design) for design in pool]
+    yours = model.score(rows, personal) if model.ready else None
+    everyone = model.score(rows, None) if model.ready else None
+    return pool, yours, everyone
+
+
+def _propose(db, owner, draft):
+    """Offer the draft's best design for this participant."""
+    pool, yours, everyone = draft
+    if yours is None:
+        # The network has not compiled yet: a random design, said plainly in ``model``.
+        yours = everyone = [0.0] * len(pool)
+        first = 0
+        second = next(i for i in range(1, len(pool)) if _distinct(pool[0], pool[i]))
+    else:
+        first, second = _choose(pool, yours, _RNG)
+    shared_best = max(range(len(pool)), key=lambda i: everyone[i])
+    shared_second = next(i for i in sorted(range(len(pool)), key=lambda i: everyone[i], reverse=True)
+                         if i != shared_best and _distinct(pool[shared_best], pool[i]))
+    scores = {"yours": yours[first], "everyone": everyone[first],
+              "everyone_best": {"design": pool[shared_best], "secondary": pool[shared_second],
+                                "everyone": everyone[shared_best], "yours": yours[shared_best]}}
+    nonce = secrets.token_urlsafe(18)
+    db.execute("INSERT INTO palette_offer(owner,nonce,design,secondary,scores,updated) VALUES (?,?,?,?,?,?) "
+               "ON CONFLICT(owner) DO UPDATE SET nonce=excluded.nonce,design=excluded.design,"
+               "secondary=excluded.secondary,scores=excluded.scores,updated=excluded.updated",
+               (owner, nonce, json.dumps(pool[first]), json.dumps(pool[second]), json.dumps(scores), time.time()))
+    _save(db, owner, pool[first], pool[second])
+
+
+def _key(design, secondary):
+    return json.dumps([design, secondary], sort_keys=True)
+
+
+def _save(db, owner, design, secondary):
     now = time.time()
-    db.execute("INSERT OR IGNORE INTO palette_saved(owner,color,secondary,created) VALUES (?,?,?,?)",
-               (owner, color, secondary, now))
-    saved = db.execute("SELECT id FROM palette_saved WHERE owner=? AND color=? AND secondary=?",
-                       (owner, color, secondary)).fetchone()[0]
-    db.execute("INSERT INTO palette_active(owner,saved,updated) VALUES (?,?,?) "
+    key = _key(design, secondary)
+    db.execute("INSERT OR IGNORE INTO palette_design_saved(owner,design,secondary,key,created) VALUES (?,?,?,?,?)",
+               (owner, json.dumps(design), json.dumps(secondary), key, now))
+    saved = db.execute("SELECT id FROM palette_design_saved WHERE owner=? AND key=?", (owner, key)).fetchone()[0]
+    db.execute("INSERT INTO palette_design_active(owner,saved,updated) VALUES (?,?,?) "
                "ON CONFLICT(owner) DO UPDATE SET saved=excluded.saved,updated=excluded.updated", (owner, saved, now))
     return saved
 
 
-def _offer(db, owner, ranking, previous=None):
-    counts = _counts(db, owner)
-    def score(color):
-        good, bad = counts[color]
-        trials = good + bad
-        prior = (COUNT - ranking.index(color)) * 0.3
-        observed = 1.5 * (good - bad) / math.sqrt(trials + 1)
-        explore = 1.0 / math.sqrt(trials + 1)
-        return prior + observed + explore - (0.3 if color == previous else 0)
-    candidate = max(ranking, key=score)
-    nonce = secrets.token_urlsafe(18)
-    db.execute("UPDATE palette_participants SET candidate=?,nonce=?,updated=? WHERE owner=?",
-               (candidate, nonce, time.time(), owner))
-    _save(db, owner, candidate, _secondary(ranking, candidate))
-    return candidate, nonce
+def _view(design):
+    return {"name": design["name"], "color": design["color"], "square": designs.square_css(design)}
 
 
-def _secondary(ranking, color):
-    """The participant's most preferred color other than the accent."""
-    return next(c for c in ranking if c != color)
+def _wear(design, secondary):
+    return {**designs.site_css(design, secondary), "design": _view(design), "secondary_design": _view(secondary)}
 
 
-def _active(db, owner):
-    """(saved id, color, secondary) of the design this participant's site wears, or None."""
-    row = db.execute("SELECT s.id,s.color,s.secondary FROM palette_active a JOIN palette_saved s ON s.id=a.saved "
-                     "WHERE a.owner=? AND s.owner=?", (owner, owner)).fetchone()
-    if row:
-        return row
-    ranking, candidate, _ = _row(db, owner)
-    if ranking and candidate is not None:          # a participant from before designs were saved
-        secondary = _secondary(ranking, candidate)
-        return _save(db, owner, candidate, secondary), candidate, secondary
-    return None
+def _state(db, owner, model):
+    nonce, round_designs = _round(db, owner)
+    offer = db.execute("SELECT nonce,design,secondary,scores FROM palette_offer WHERE owner=?", (owner,)).fetchone()
+    active = db.execute("SELECT saved FROM palette_design_active WHERE owner=?", (owner,)).fetchone()
+    saved = []
+    for saved_id, design, secondary, created in db.execute(
+            "SELECT id,design,secondary,created FROM palette_design_saved WHERE owner=? ORDER BY id", (owner,)):
+        design, secondary = json.loads(design), json.loads(secondary)
+        css = designs.site_css(design, secondary)
+        saved.append({"id": saved_id, "color": css["color"], "secondary": css["secondary"],
+                      "names": [design["name"], secondary["name"]], "created": created})
+    candidate = comparison = None
+    if offer:
+        design, secondary, scores = json.loads(offer[1]), json.loads(offer[2]), json.loads(offer[3])
+        candidate = {**_wear(design, secondary), "nonce": offer[0], "saved": active[0] if active else None,
+                     "score": {"yours": scores["yours"], "everyone": scores["everyone"]}}
+        best = scores["everyone_best"]
+        comparison = {"yours": {**_wear(design, secondary), "score": {"yours": scores["yours"], "everyone": scores["everyone"]}},
+                      "everyone": {**_wear(best["design"], best["secondary"]),
+                                   "score": {"yours": best["yours"], "everyone": best["everyone"]}}}
+    pairs, rounds = db.execute("SELECT COUNT(*), COUNT(DISTINCT created) FROM palette_pair WHERE owner=?", (owner,)).fetchone()
+    ratings, mean = db.execute("SELECT COUNT(*), AVG(score) FROM palette_rating WHERE owner=?", (owner,)).fetchone()
+    steps = db.execute("SELECT steps FROM palette_personal WHERE owner=?", (owner,)).fetchone()
+    return {"round": {"nonce": nonce, "designs": [{"id": i, **_view(d)} for i, d in enumerate(round_designs)]},
+            "swatches": [{"id": i, "color": d["color"]} for i, d in enumerate(round_designs)],
+            "candidate": candidate, "comparison": comparison, "saved": saved,
+            "active": active[0] if active else None,
+            "history": {"rounds": rounds, "pairs": pairs, "ratings": ratings,
+                        "mean_rating": None if mean is None else round(mean, 4),
+                        "personal_steps": steps[0] if steps else 0},
+            "model": model.status()}
 
 
-def _state(db, owner):
-    ranking, candidate, nonce = _row(db, owner)
-    active = _active(db, owner)
-    saved = [{"id": i, "color": SWATCHES[c], "secondary": SWATCHES[s], "created": t}
-             for i, c, s, t in db.execute("SELECT id,color,secondary,created FROM palette_saved WHERE owner=? ORDER BY id",
-                                          (owner,)) if 0 <= c < COUNT and 0 <= s < COUNT]
-    return {"swatches": [{"id": i, "color": c} for i, c in enumerate(SWATCHES)],
-            "ranking": ranking, "candidate": ({"id": active[1], "color": SWATCHES[active[1]],
-                                               "secondary": SWATCHES[active[2]], "nonce": nonce, "saved": active[0]}
-                                              if active and ranking and candidate is not None else None),
-            "saved": saved, "active": active[0] if active else None,
-            "feedback": {str(i): {"good": v[0], "bad": v[1]} for i, v in _counts(db, owner).items()}}
+def _daily(db, owner):
+    since = time.time() - 86400
+    return sum(db.execute(f"SELECT COUNT(*) FROM {table} WHERE owner=? AND created>?", (owner, since)).fetchone()[0]
+               for table in ("palette_rating",)) + db.execute(
+        "SELECT COUNT(DISTINCT created) FROM palette_pair WHERE owner=? AND created>?", (owner, since)).fetchone()[0]
+
+
+def _limit(db, owner):
+    from meowdoku import rate_limits
+    if rate_limits.enabled() and _daily(db, owner) >= DAILY_LIMIT:
+        raise PaletteError("response limit reached for today", 429)
+
+
+ROUTES = ("/api/palette/rank", "/api/palette/feedback", "/api/palette/select",
+          "/api/palette/round", "/api/palette/clear")
 
 
 def route(handler, path, method, *, accounts_db):
     keys, _ = handler._job_identity()
     owner = keys[0]
+    model = _model(accounts_db)
     db = _connect(accounts_db)
+    learn = False
     try:
+        # The model is consulted before the transaction opens (see ``_draft``).
         if method == "GET" and path == "/api/palette":
-            return handler._json(_state(db, owner))
-        if method != "POST" or path not in ("/api/palette/rank", "/api/palette/feedback", "/api/palette/select"):
+            draft = (_draft(model, _personal(db, owner))
+                     if db.execute("SELECT 1 FROM palette_offer WHERE owner=?", (owner,)).fetchone() is None
+                     else None)
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if draft is not None and db.execute(
+                        "SELECT 1 FROM palette_offer WHERE owner=?", (owner,)).fetchone() is None:
+                    _propose(db, owner, draft)
+                state = _state(db, owner, model)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            return handler._json(state)
+        if method != "POST" or path not in ROUTES:
             raise PaletteError("not found", 404)
         if (handler.headers.get("Content-Type") or "").split(";", 1)[0].lower() != "application/json":
             raise PaletteError("JSON only", 415)
-        body = handler._body_json(2048)
+        body = handler._body_json(4096)
         if body is None:
             return
         if not isinstance(body, dict):
             raise PaletteError("expected an object")
+        draft = selected = None
+        if path in ("/api/palette/rank", "/api/palette/feedback"):
+            draft = _draft(model, _personal(db, owner))
+        elif path == "/api/palette/clear":
+            draft = _draft(model, None)
+        elif path == "/api/palette/select" and type(body.get("id")) is int:
+            chosen_row = db.execute("SELECT design FROM palette_design_saved WHERE id=? AND owner=?",
+                                    (body["id"], owner)).fetchone()
+            if chosen_row is not None:
+                selected = _selected_scores(model, db, owner, json.loads(chosen_row[0]))
         db.execute("BEGIN IMMEDIATE")
         try:
-            ranking, candidate, nonce = _row(db, owner)
             if path == "/api/palette/rank":
+                nonce, round_designs = _round(db, owner)
                 order = body.get("ranking")
-                if not isinstance(order, list) or len(order) != COUNT or any(type(i) is not int for i in order) or set(order) != set(range(COUNT)):
-                    raise PaletteError("ranking must list each swatch id exactly once")
-                db.execute("INSERT INTO palette_participants(owner,ranking,updated) VALUES (?,?,?) "
-                           "ON CONFLICT(owner) DO UPDATE SET ranking=excluded.ranking,updated=excluded.updated",
-                           (owner, json.dumps(order), time.time()))
-                _offer(db, owner, order)
+                if body.get("nonce") not in (None, nonce):
+                    raise PaletteError("that round is over; rank the current one", 409)
+                if (not isinstance(order, list) or len(order) != len(round_designs)
+                        or any(type(i) is not int for i in order) or set(order) != set(range(len(round_designs)))):
+                    raise PaletteError("ranking must list each design of the round exactly once, favorite first")
+                _limit(db, owner)
+                now = time.time()
+                db.executemany("INSERT INTO palette_pair(owner,preferred,other,created) VALUES (?,?,?,?)",
+                               [(owner, json.dumps(round_designs[order[i]]), json.dumps(round_designs[order[j]]), now)
+                                for i in range(len(order)) for j in range(i + 1, len(order))])
+                _new_round(db, owner)
+                _propose(db, owner, draft)
+                learn = True
+            elif path == "/api/palette/feedback":
+                offer = db.execute("SELECT nonce,design,secondary FROM palette_offer WHERE owner=?", (owner,)).fetchone()
+                rating = body.get("rating")
+                if rating in ("good", "bad"):
+                    rating = 1.0 if rating == "good" else 0.0
+                if offer is None:
+                    raise PaletteError("there is no design to score yet", 409)
+                if (body.get("nonce") != offer[0] or isinstance(rating, bool)
+                        or not isinstance(rating, (int, float)) or not 0.0 <= float(rating) <= 1.0):
+                    raise PaletteError("score the current design with a number from 0 to 1", 409)
+                _limit(db, owner)
+                db.execute("INSERT INTO palette_rating(owner,design,secondary,score,created) VALUES (?,?,?,?,?)",
+                           (owner, offer[1], offer[2], float(rating), time.time()))
+                _propose(db, owner, draft)
+                learn = True
             elif path == "/api/palette/select":
                 chosen = body.get("id")
                 if type(chosen) is not int:
                     raise PaletteError("id must be one of your saved palettes")
-                row = db.execute("SELECT color,secondary FROM palette_saved WHERE id=? AND owner=?", (chosen, owner)).fetchone()
-                if row is None or ranking is None:
+                row = db.execute("SELECT design,secondary FROM palette_design_saved WHERE id=? AND owner=?",
+                                 (chosen, owner)).fetchone()
+                if row is None or selected is None:
                     raise PaletteError("no saved palette with that id", 404)
-                db.execute("UPDATE palette_participants SET candidate=?,nonce=?,updated=? WHERE owner=?",
-                           (row[0], secrets.token_urlsafe(18), time.time(), owner))
-                _save(db, owner, row[0], row[1])
+                db.execute("INSERT INTO palette_offer(owner,nonce,design,secondary,scores,updated) VALUES (?,?,?,?,?,?) "
+                           "ON CONFLICT(owner) DO UPDATE SET nonce=excluded.nonce,design=excluded.design,"
+                           "secondary=excluded.secondary,scores=excluded.scores,updated=excluded.updated",
+                           (owner, secrets.token_urlsafe(18), row[0], row[1], json.dumps(selected), time.time()))
+                _save(db, owner, json.loads(row[0]), json.loads(row[1]))
+            elif path == "/api/palette/round":
+                _new_round(db, owner)
             else:
-                rating = body.get("rating")
-                if ranking is None or candidate is None or not isinstance(nonce, str):
-                    raise PaletteError("rank colors before giving feedback", 409)
-                if body.get("nonce") != nonce or rating not in ("good", "bad"):
-                    raise PaletteError("feedback must match the current palette and say good or bad", 409)
-                daily = db.execute("SELECT COUNT(*) FROM palette_feedback WHERE owner=? AND created>?",
-                                   (owner, time.time() - 86400)).fetchone()[0]
-                from meowdoku import rate_limits
-                if rate_limits.enabled() and daily >= 60:
-                    raise PaletteError("feedback limit reached for today", 429)
-                db.execute("INSERT INTO palette_feedback(owner,color,rating,created) VALUES (?,?,?,?)",
-                           (owner, candidate, 1 if rating == "good" else -1, time.time()))
-                _offer(db, owner, ranking, previous=candidate)
+                for table in ("palette_round", "palette_pair", "palette_rating", "palette_offer",
+                              "palette_design_saved", "palette_design_active", "palette_personal"):
+                    db.execute(f"DELETE FROM {table} WHERE owner=?", (owner,))
+                _propose(db, owner, draft)
+            state = _state(db, owner, model)
             db.commit()
         except BaseException:
             db.rollback()
             raise
-        return handler._json(_state(db, owner))
+        if learn:
+            model.learn(owner, *_learner(accounts_db))
+        return handler._json(state)
     except PaletteError as error:
         return handler._json({"error": str(error)}, error.status)
     finally:
         db.close()
+
+
+def _selected_scores(model, db, owner, design):
+    """The scores of a design worn again, with the comparison it was offered beside."""
+    row = designs.features(design)
+    personal = _personal(db, owner)
+    yours = model.score([row], personal) if model.ready else None
+    everyone = model.score([row], None) if model.ready else None
+    previous = db.execute("SELECT scores FROM palette_offer WHERE owner=?", (owner,)).fetchone()
+    best = json.loads(previous[0])["everyone_best"] if previous else {
+        "design": design, "secondary": design, "everyone": 0.0, "yours": 0.0}
+    return {"yours": yours[0] if yours else 0.0, "everyone": everyone[0] if everyone else 0.0, "everyone_best": best}

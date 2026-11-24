@@ -1,4 +1,4 @@
-import {applyPalette, sharePalette} from "./palette-theme.js";
+import {applyPalette, pageState, sharePalette} from "./palette-theme.js";
 
 const $ = (id) => document.getElementById(id);
 let state = null;
@@ -8,14 +8,22 @@ async function request(path, body) {
   const response = await fetch(path, {method: body ? "POST" : "GET", credentials: "same-origin", cache: "no-store",
     headers: body ? {"Content-Type": "application/json"} : {}, body: body ? JSON.stringify(body) : undefined});
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed: ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(data.error || `Request failed: ${response.status}`), {status: response.status});
   return data;
 }
 
-// Scatter the swatches over the field so each square hangs in space with
-// ample margin between its neighbours and the edges, never overlapping.
-// A jittered grid guarantees placement on any viewport size.
-function scatterChips(ids) {
+function square(view, className = "square") {
+  const node = document.createElement("span");
+  node.className = className;
+  node.style.background = view.square.background;
+  node.style.boxShadow = view.square.boxShadow;
+  node.title = view.name;
+  return node;
+}
+
+// Scatter the round over the field so each square hangs in space with ample margin between its neighbours and the
+// edges, never overlapping. A jittered grid guarantees placement on any viewport size.
+function scatterChips(designs) {
   const field = $("field");
   field.replaceChildren();
   const rect = field.getBoundingClientRect();
@@ -24,127 +32,176 @@ function scatterChips(ids) {
   const marginY = Math.max(24, rect.height * 0.12);
   const availW = Math.max(chip, rect.width - 2 * marginX);
   const availH = Math.max(chip, rect.height - 2 * marginY);
-  // Sparsest column count whose grid fits both axes at generous spacing,
-  // relaxing toward plain non-overlap on small viewports.
   let cols = 1;
   for (const attempt of [5, 4, 3, 2, 1]) {
-    const rows = Math.ceil(ids.length / attempt);
-    const spacingW = availW / attempt;
-    const spacingH = availH / rows;
-    if (spacingW >= chip * 1.35 && spacingH >= chip * 1.15) { cols = attempt; break; }
+    const rows = Math.ceil(designs.length / attempt);
+    if (availW / attempt >= chip * 1.35 && availH / rows >= chip * 1.15) { cols = attempt; break; }
   }
-  const rows = Math.ceil(ids.length / cols);
+  const rows = Math.ceil(designs.length / cols);
   const cellW = availW / cols, cellH = availH / rows;
   const cells = [];
   for (let row = 0; row < rows; ++row) {
-    const inRow = Math.min(cols, ids.length - row * cols);
-    const rowOffset = (cols - inRow) * cellW / 2; // center a short last row
-    for (let col = 0; col < inRow; ++col) cells.push({row, col, inRow, rowOffset});
+    const inRow = Math.min(cols, designs.length - row * cols);
+    const rowOffset = (cols - inRow) * cellW / 2;
+    for (let col = 0; col < inRow; ++col) cells.push({row, col, rowOffset});
   }
-  for (let i = cells.length - 1; i > 0; --i) { // shuffle cells, not colors
+  for (let i = cells.length - 1; i > 0; --i) {
     const j = Math.floor(Math.random() * (i + 1));
     [cells[i], cells[j]] = [cells[j], cells[i]];
   }
   const looseX = Math.max(0, cellW - chip), looseY = Math.max(0, cellH - chip);
-  ids.forEach((id, index) => {
+  designs.forEach((design, index) => {
     const cell = cells[index];
-    const x = marginX + cell.rowOffset + cell.col * cellW + cellW / 2 + (Math.random() - 0.5) * looseX;
-    const y = marginY + cell.row * cellH + cellH / 2 + (Math.random() - 0.5) * looseY;
-    const chipNode = document.createElement("button");
-    chipNode.type = "button";
-    chipNode.className = "chip";
-    chipNode.style.left = `${x}px`;
-    chipNode.style.top = `${y}px`;
-    chipNode.style.background = state.swatches[id].color;
-    chipNode.setAttribute("aria-label", `Choose the color ${state.swatches[id].color}`);
-    chipNode.addEventListener("click", () => choose(id, chipNode));
-    field.append(chipNode);
+    const node = document.createElement("button");
+    node.type = "button";
+    node.className = "chip";
+    node.style.left = `${marginX + cell.rowOffset + cell.col * cellW + cellW / 2 + (Math.random() - 0.5) * looseX}px`;
+    node.style.top = `${marginY + cell.row * cellH + cellH / 2 + (Math.random() - 0.5) * looseY}px`;
+    node.style.background = design.square.background;
+    node.style.boxShadow = design.square.boxShadow;
+    node.setAttribute("aria-label", `Choose ${design.name}`);
+    node.addEventListener("click", () => choose(design.id, node));
+    field.append(node);
   });
 }
 
 function choose(id, node) {
   node.remove();
   picked.push(id);
-  if (picked.length === state.swatches.length) submitOrder();
+  if (picked.length === state.round.designs.length) submitOrder();
 }
 
-async function submitOrder() {
+function closeField() {
   $("overlay").hidden = true;
   $("page").inert = false;
-  try {
-    state = await request("/api/palette/rank", {ranking: picked});
-    render();
-    $("notice").textContent = "Your personal design is ready. Rate it after viewing the home page.";
-  } catch (error) { $("notice").textContent = error.message; }
 }
 
 function openField() {
   picked = [];
   $("overlay").hidden = false;
   $("page").inert = true;
-  scatterChips(state.swatches.map((swatch) => swatch.id));
+  scatterChips(state.round.designs);
+}
+
+async function submitOrder() {
+  closeField();
+  try {
+    state = await request("/api/palette/rank", {nonce: state.round.nonce, ranking: picked});
+    render();
+    $("notice").textContent = "Ranked. The network is learning from it; score the design it proposes.";
+  } catch (error) {
+    if (error.status === 409) {
+      // The round moved on (another tab, or a first visit whose identity settled after this page loaded):
+      // read the current round and choose again.
+      state = await request("/api/palette");
+      render();
+      $("notice").textContent = "Your round changed; choose again.";
+      openField();
+      return;
+    }
+    $("notice").textContent = error.message;
+  }
+}
+
+function renderDesign(target, wear) {
+  target.replaceChildren();
+  if (!wear) {
+    target.append(Object.assign(document.createElement("p"), {className: "muted", textContent: "Rank a round to begin."}));
+    return;
+  }
+  const text = document.createElement("div");
+  text.innerHTML = "";
+  text.append(Object.assign(document.createElement("strong"), {textContent: wear.design.name}),
+    document.createTextNode(` with ${wear.secondary_design.name}`));
+  target.append(square(wear.design), square(wear.secondary_design, "square small"), text);
+}
+
+function card(title, wear) {
+  const node = document.createElement("div");
+  node.className = "card";
+  node.style.setProperty("--sample-accent", wear.color);
+  node.style.setProperty("--sample-secondary", wear.secondary);
+  node.append(Object.assign(document.createElement("h3"), {textContent: title}));
+  const row = document.createElement("div");
+  row.className = "design";
+  renderDesign(row, wear);
+  const sample = document.createElement("div");
+  sample.className = "sample";
+  sample.append(Object.assign(document.createElement("b"), {textContent: "A heading in this accent"}),
+    document.createElement("br"), document.createTextNode("Body text on the site's background."));
+  const scores = document.createElement("p");
+  scores.className = "muted";
+  scores.textContent = `Your network ${wear.score.yours.toFixed(3)} · shared network ${wear.score.everyone.toFixed(3)}`;
+  node.append(row, sample, scores);
+  return node;
 }
 
 function render() {
   const current = state.candidate;
   applyPalette(current);
   sharePalette(current);
-  $("candidate").textContent = current ? `Current accent: ${current.color}` : "Choose the colors to begin.";
-  $("good").disabled = $("bad").disabled = !current;
+  renderDesign($("candidate"), current);
+  $("rating").disabled = $("score").disabled = !current;
+  const compare = state.comparison;
+  $("compare").replaceChildren(...(compare ? [card("Yours", compare.yours), card("Everyone's default", compare.everyone)] : []));
+  const model = state.model, history = state.history;
+  $("model").textContent = (model.state === "ready"
+      ? (model.shared_steps ? `The network has trained ${model.shared_steps} shared steps.`
+                            : "The network is ready and has not learned from anyone yet.")
+      : model.state === "compiling" ? "The network is compiling; designs are random until it is ready."
+      : `The network is unavailable: ${model.error}`) +
+    ` You have ranked ${history.rounds} round${history.rounds === 1 ? "" : "s"} and scored ${history.ratings} design${history.ratings === 1 ? "" : "s"}.`;
   renderSaved();
 }
 
-// The participant's saved palettes, oldest first; the active one is pressed.
 function renderSaved() {
   const list = state.saved || [];
   $("saved").replaceChildren(...list.map((palette, index) => {
     const button = document.createElement("button");
     button.type = "button";
     button.setAttribute("aria-pressed", String(palette.id === state.active));
-    button.setAttribute("aria-label", `Palette ${index + 1}: ${palette.color} and ${palette.secondary}`);
-    button.title = `${palette.color} · ${palette.secondary}`;
+    button.setAttribute("aria-label", `Palette ${index + 1}: ${palette.names.join(" and ")}`);
+    button.title = palette.names.join(" · ");
     for (const color of [palette.color, palette.secondary]) {
       const swatch = document.createElement("span");
       swatch.style.background = color;
       button.append(swatch);
     }
-    button.addEventListener("click", () => select(palette.id));
+    button.addEventListener("click", () => act("/api/palette/select", {id: palette.id}, "Palette applied across the site."));
     return button;
   }));
   $("prev").disabled = $("next").disabled = list.length < 2;
 }
 
-async function select(id) {
+async function act(path, body, message) {
   try {
-    state = await request("/api/palette/select", {id});
+    state = await request(path, body);
     render();
-    $("notice").textContent = "Palette applied across the site.";
-  } catch (error) { $("notice").textContent = error.message; }
+    $("notice").textContent = message;
+    return true;
+  } catch (error) { $("notice").textContent = error.message; return false; }
 }
 
 function step(by) {
   const list = state.saved || [];
   if (list.length < 2) return;
   const at = list.findIndex((palette) => palette.id === state.active);
-  select(list[(at + by + list.length) % list.length].id);
+  act("/api/palette/select", {id: list[(at + by + list.length) % list.length].id}, "Palette applied across the site.");
 }
 
-async function update(path, body) {
-  try {
-    state = await request(path, body);
-    render();
-    $("notice").textContent = "Noted. The next candidate reflects your answer.";
-  } catch (error) { $("notice").textContent = error.message; }
-}
-
-$("good").addEventListener("click", () => update("/api/palette/feedback", {nonce: state.candidate.nonce, rating: "good"}));
-$("bad").addEventListener("click", () => update("/api/palette/feedback", {nonce: state.candidate.nonce, rating: "bad"}));
-$("again").addEventListener("click", () => openField());
+$("rating").addEventListener("input", () => { $("rating-value").value = Number($("rating").value).toFixed(2); });
+$("score").addEventListener("click", () => act("/api/palette/feedback",
+  {nonce: state.candidate.nonce, rating: Number($("rating").value)}, "Scored. The next design reflects what the network learned."));
+$("again").addEventListener("click", async () => { if (await act("/api/palette/round", {}, "")) openField(); });
+$("clear").addEventListener("click", async () => {
+  if (!window.confirm("Forget your rankings, scores, palettes and personal layer? The shared network keeps what it learned.")) return;
+  if (await act("/api/palette/clear", {}, "Your history is cleared.")) openField();
+});
 $("prev").addEventListener("click", () => step(-1));
 $("next").addEventListener("click", () => step(1));
 
 try {
-  state = await request("/api/palette");
+  state = await pageState(); // the page's one first request (palette-theme.js), so a first visit has one identity
   render();
-  if (!state.candidate) openField(); // first visit: the field greets you
+  if (!state.history.rounds) openField(); // first visit: the field greets you
 } catch (error) { $("notice").textContent = error.message; }

@@ -7,18 +7,29 @@
 <style>
   :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; --palette-accent: #9fc8ff; --palette-secondary: #d0a8ef; }
   body { margin: 0; color: #edf2fb; background: radial-gradient(circle at 90% 5%, color-mix(in srgb, var(--palette-accent) 28%, #101722), #101722 32rem); }
-  main { max-width: 48rem; margin: auto; padding: 2rem 1rem 5rem; }
+  main { max-width: 52rem; margin: auto; padding: 2rem 1rem 5rem; }
   a, .accent { color: var(--palette-accent); }
   h1 { line-height: 1.12; }
   .panel { border: 1px solid color-mix(in srgb, var(--palette-accent) 45%, #384d67); border-radius: 1rem; padding: 1.2rem; margin: 1.4rem 0; background: #1b2839; }
   button { font: inherit; border-radius: .5rem; border: 1px solid #6984a5; padding: .42rem .7rem; color: #edf2fb; background: #263953; cursor: pointer; }
   button:hover, button:focus-visible { border-color: var(--palette-accent); outline-color: var(--palette-accent); }
   button:disabled { opacity: .45; cursor: default; }
-  .preview { border-left: .5rem solid var(--palette-accent); background: color-mix(in srgb, var(--palette-secondary) 10%, #1b2839); }
   .muted { color: #c2cddd; }
+  .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
   #notice { min-height: 1.5rem; }
+  .design { display: flex; gap: .9rem; align-items: center; }
+  .square { width: 3.2rem; height: 3.2rem; flex: none; }
+  .square.small { width: 1.8rem; height: 1.8rem; }
+  .score label { display: block; margin: .8rem 0 .3rem; }
+  .score input[type=range] { width: min(28rem, 100%); accent-color: var(--palette-accent); }
+  .compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; }
+  .card { border-radius: .8rem; padding: 1rem; background: #101722; border: 1px solid #384d67; }
+  .card h3 { margin: 0 0 .6rem; font-size: 1rem; }
+  .card .sample { margin-top: .7rem; padding: .6rem .8rem; border-radius: .5rem; border-left: .4rem solid var(--sample-accent);
+                  background: color-mix(in srgb, var(--sample-secondary) 14%, #1b2839); }
+  .card .sample b { color: var(--sample-accent); }
   .saved { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .7rem; }
-  .saved button { display: inline-flex; padding: .25rem; }
+  .saved button { display: inline-flex; gap: .2rem; padding: .25rem; }
   .saved button[aria-pressed="true"] { border-color: var(--palette-accent); outline: 2px solid var(--palette-accent); outline-offset: 2px; }
   .saved span { display: block; width: 1.6rem; height: 1.6rem; }
   /* The choice field: a mid-alpha black layer that covers and disables the site beneath. */
@@ -34,21 +45,37 @@
 </head>
 <body>
 <div id="overlay" hidden>
-  <p class="hint">Choose the color that appeals to you right now. It will disappear.</p>
+  <p class="hint">Choose the design that appeals to you most right now. It disappears; keep choosing until none are left.</p>
   <div id="field"></div>
 </div>
 <main id="page">
   <p><a href="/">← Site home</a></p>
   <h1>Play the color preference game</h1>
-  <p>People and agents can choose from the same swatches. Pick the colors in the moment, favorite first: each square hangs in space and disappears when chosen. When every color is chosen, SpeakToMe tries that palette on your own site view and learns from your good or bad response. Your choice does not change anyone else's view.</p>
-  <section class="panel preview" aria-labelledby="preview-title">
+  <p>Each round shows designs drawn at random: a named color with its own bevel and shadow. Choose them favorite first.
+     A learning network, compiled to native code, proposes a design for your view of the site; score it with the slider.
+     Everyone's answers teach the shared network, which is the site's default. Your own answers also teach a small personal
+     layer that nudges that default for you alone.</p>
+  <section class="panel" aria-labelledby="preview-title">
     <h2 id="preview-title">Your site design</h2>
-    <p id="candidate" class="accent">Choose the colors to begin.</p>
-    <p>Every page of the site uses your current color. Visit <a href="/">the home page</a> and return to rate it.</p>
-    <button id="good" type="button" disabled>Good</button>
-    <button id="bad" type="button" disabled>Bad</button>
-    <button id="again" type="button">Choose colors again</button>
-    <h3 id="saved-title">Your palettes</h3>
+    <div class="design" id="candidate"><p class="muted">Rank a round to begin.</p></div>
+    <div class="score">
+      <label for="rating">How much do you like it? <output id="rating-value" for="rating">0.50</output></label>
+      <input id="rating" type="range" min="0" max="1" step="0.01" value="0.5" disabled>
+      <div class="row"><button id="score" type="button" disabled>Score this design</button></div>
+    </div>
+    <div class="row" style="margin-top:1rem">
+      <button id="again" type="button">Try again</button>
+      <button id="clear" type="button">Clear history</button>
+    </div>
+    <p id="model" class="muted" role="status"></p>
+  </section>
+  <section class="panel" aria-labelledby="compare-title">
+    <h2 id="compare-title">Yours beside everyone's</h2>
+    <p class="muted">The best design of the same random pool, for you and for the shared network alone. Scores are the network's.</p>
+    <div class="compare" id="compare"></div>
+  </section>
+  <section class="panel" aria-labelledby="saved-title">
+    <h2 id="saved-title">Your palettes</h2>
     <p class="muted">Every design you are shown is kept. Choose one, or step through them, to wear it across the site.</p>
     <button id="prev" type="button" disabled aria-label="Previous palette">&#9664;</button>
     <button id="next" type="button" disabled aria-label="Next palette">&#9654;</button>

@@ -4193,6 +4193,17 @@ CALLSITE_ARGUMENT_ROLE = declare_page("callsite_argument_role", (
 ABSTRACT_TENSOR_PROGRAM_VALUE = declare_page("abstract_tensor_program_value", (
     RowField("ingestion_scope", K.SCOPE), RowField("value", K.VALUE_ID),
 ), AbstractTensorValueFact)            # NOVEL(INGEST_SOURCE) root; CONCORD
+#: The tensor descriptor ``process_graph_autograd._annotate_numeric_metadata``
+#: states for one graph-native value (forward bridge, adjoint, fused training
+#: graph): ``(ingestion scope, value)`` -> ``(shape, dtype)``.  DERIVED from
+#: the value's identity cell, the ``abstract_tensor_program_value`` cell its
+#: ingestion lineage reaches (the recorded program's own declaration), and
+#: the descriptor rows of its parents.  REVISE when a later stamping states
+#: another shape for the same value.
+GRAPH_TENSOR_DESCRIPTOR = declare_page("graph_tensor_descriptor", (
+    RowField("ingestion_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+GRAPH_TENSOR_DESCRIPTOR_STAGE = declare_stage("graph_tensor_descriptor")
 
 # The compiled BACKWARD_RULES graph is built from source the compiler writes
 # itself (``_build_backward_rule_process_graph``).  Its source constructs are
@@ -4221,6 +4232,19 @@ class BackwardRuleDefinitionFact:
 BACKWARD_RULE_DEFINITION = declare_page("backward_rule_definition", (
     RowField("registry", K.SCOPE), RowField("name", K.NAME),
 ), BackwardRuleDefinitionFact)         # NOVEL(INGEST_SOURCE) root; CONCORD
+
+#: A helper formal whose VALUE decides the helper's result type: its length
+#: is the result rank and its entries decide which axes are reduced
+#: (``backward_registry.unbroadcast``'s ``target_shape``).  Such a helper has
+#: no single fixed-rank signature; it exists only as callsite copies in which
+#: the formal is a literal.  ``(registry, helper, parameter)`` -> True,
+#: DERIVED from the helper's ``backward_rule_definition`` cell (generated
+#: rule source) or its definition ``source_span`` (authored file), read from
+#: ``backward_registry.HELPER_STATIC_SHAPE_PARAMETERS``.  CONCORD.
+STATIC_SHAPE_PARAMETER = declare_page("static_shape_parameter", (
+    RowField("registry", K.SCOPE), RowField("name", K.NAME),
+    RowField("parameter", K.NAME),
+), bool)
 
 # ----------------------------------------------------------------------------
 # Edges lane A (2026-10-03): three decisions made without an edge.

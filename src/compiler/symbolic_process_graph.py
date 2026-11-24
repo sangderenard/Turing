@@ -192,6 +192,66 @@ _CANONICAL_FUNCTIONS = {
     "maximum": sympy.Max,
 }
 
+#: Operation of a Derivative SymPy could not take: operand ``arg:0`` is the
+#: differentiated value, operand ``wrt`` the variable.  It is resolved by
+#: :func:`resolve_graph_reverse_sockets`, never lowered.
+GRAPH_REVERSE_SOCKET = "graph_reverse"
+
+
+def resolve_graph_reverse_sockets(graph: Any) -> tuple[int, ...]:
+    """Replace every ``graph_reverse`` socket with its spliced graph reverse.
+
+    Call this once the graph is complete and every node carries its tensor
+    descriptor.  Sockets resolve in dependency order, so a higher order
+    differentiates the reverse spliced for the order below it.  Each splice
+    happens at the socket's own identity cell.  Returns the gradient value
+    ids that replaced the sockets.
+    """
+
+    import networkx as nx
+
+    from ..common.tensors.topological_reducer import (
+        _redirect_value, node_identity_cell,
+    )
+    from .process_graph_autograd import splice_graph_reverse
+    from .process_graph_function_linking import _replace_graph_metadata_value
+
+    resolved: list[int] = []
+    while True:
+        sockets = tuple(
+            int(node_id) for node_id in nx.topological_sort(graph.G)
+            if graph.G.nodes[node_id].get("op") == GRAPH_REVERSE_SOCKET
+        )
+        if not sockets:
+            return tuple(resolved)
+        # The reverse is taken from these descriptors, so they go on the book
+        # first: the SymPy compilers' stamped scalar model types are their
+        # declaration; values spliced in earlier derive from their reverse.
+        from .process_graph_autograd import post_graph_tensor_descriptors
+
+        post_graph_tensor_descriptors(graph, declared_by="symbolic equation model")
+        socket = sockets[0]
+        operands = dict(
+            (str(role), int(parent))
+            for parent, role in graph.G.nodes[socket].get("parents") or ()
+        )
+        if set(operands) != {"arg:0", "wrt"}:
+            raise ValueError(
+                f"graph_reverse socket {socket} has operands {sorted(operands)!r}"
+            )
+        result = splice_graph_reverse(
+            graph,
+            output=operands["arg:0"],
+            wrt=(operands["wrt"],),
+            context_cells=(node_identity_cell(graph, socket),),
+        )
+        gradient = int(result.gradient_value_ids[operands["wrt"]])
+        _replace_graph_metadata_value(graph, socket, gradient)
+        _redirect_value(graph, socket, gradient)
+        graph.node_map.pop(socket, None)
+        resolved.append(gradient)
+
+
 _LOGICAL_FUNCTIONS = {
     "LAnd": sympy.And,
     "LOr": sympy.Or,
@@ -1174,130 +1234,38 @@ def ingest_sympy_expression(
                         tuple(declared[name] for name in names if name in declared))
                 return result_id
             # SymPy could not reduce the interior: it holds content SymPy
-            # cannot see into (an applied undefined function, a bound table
-            # or callee whose body exists only once ingested), so diff hands
-            # back an unevaluated Derivative.  Only then turn to the process
-            # graph itself: ingest the interior as ordinary nodes and invert
-            # that subgraph with the existing graph reversal, one order at a
-            # time (the nesting below).  No SymPy content survives ingestion,
-            # so this is the only place such a derivative can be taken.
-            from .process_graph_autograd import obtain_graph_reverse
-
-            inner_id = add_node(value.expr)
-            # sympy.Derivative.variables repeats a symbol for higher orders
-            # (e.g. (x, x) for d^2/dx^2); this excises one order at a time by
-            # reversing w.r.t. the first variable and recursing on the rest.
-            wrt_symbol = value.variables[0]
-            wrt_id = add_node(wrt_symbol)
-            product = obtain_graph_reverse(graph, outputs=[inner_id], wrt=[wrt_id])
-            backward = product.graph
-            adjoint = product.adjoint
-
-            # `backward` is a genuinely separate ProcessGraph with its own
-            # 0-based id numbering (_AdjointBuilder.__init__ starts
-            # next_id at 0) -- it is NOT a subgraph sharing ids with `graph`.
-            # Any of its "input" nodes standing in for an already-built
-            # forward value carries that value's id as
-            # attributes['source_forward_id'] (_AdjointBuilder.input /
-            # saved_value); those redirect straight to the existing forward
-            # node instead of being duplicated. Every other backward node is
-            # a genuinely new computation and gets folded in via make_node,
-            # which already owns this graph's id counter and edge
-            # bookkeeping -- no hand-rolled id allocation here.
+            # cannot see into (a function SymPy has no derivative for, a sum
+            # whose bound depends on the variable), so diff hands back an
+            # unevaluated Derivative.  Only then turn to the process graph:
+            # ingest the interior as ordinary nodes and record one
+            # ``graph_reverse`` socket per order of differentiation.  The
+            # reverse itself cannot be taken here: the graph is not complete
+            # and carries no tensor descriptors yet, and the reverse reads
+            # them.  ``resolve_graph_reverse_sockets`` takes it once the
+            # caller has annotated the graph (``compile_sympy_equations``,
+            # ``MathProgram``), splicing the canonical graph reverse in.
             #
-            # `source_forward_id` is provenance metadata _AdjointBuilder.add
-            # attaches to nearly every backward node (which forward node a
-            # gradient contribution is FOR); it is not a redirect signal --
-            # every node carries it. Only two `binding_kind`s from
-            # _AdjointBuilder.input are real stand-ins:
-            #   "saved_forward"  -- reuses an already-computed forward value:
-            #                       redirect straight to that forward node.
-            #   "gradient_seed"  -- the incoming cotangent for one output;
-            #                       under unit_output_seed=True (the default
-            #                       obtain_graph_reverse uses) this is the
-            #                       constant 1.0, not a forward-graph alias.
-            # Every folded node is a copy of one backward node: its row is
-            # DERIVED from that node's cell in the backward graph's scope
-            # (and from the Derivative being ingested, its context).
-            from ..common.tensors.topological_reducer import (
-                node_identity_cell,
-            )
-
-            remap: dict[int, int] = {}
-            for node_id, data in backward.G.nodes(data=True):
-                attrs = data.get("attributes") or {}
-                kind = attrs.get("binding_kind")
-                source_forward_id = attrs.get("source_forward_id")
-                if kind == "saved_forward" and source_forward_id is not None \
-                        and int(source_forward_id) in graph.G:
-                    remap[node_id] = int(source_forward_id)
-                elif kind == "gradient_seed":
-                    remap[node_id] = make_node(
-                        sympy.Integer(1),
-                        SympyProcessGraphRule("const", node_type="Constant"),
-                        (), (), {"value": 1},
-                        source_cells=(node_identity_cell(backward, node_id),),
-                    )
-
-            import networkx as nx
-
-            def _rehomed_callee_ref(old_ref: int) -> int:
-                """Copy one backward-rule function-table entry from
-                `backward` into `graph`'s own table (declare() itself
-                dedupes by qualified name, so shared rules like bw_mul/
-                bw_sin across several derivatives in one equation collapse
-                to one entry), and return the address to use in `graph`.
-                """
-                old_entry = backward.function_table.entry(old_ref)
-                new_ref = graph.function_table.declare(
-                    old_entry.name,
-                    qualified_name=old_entry.qualified_name,
-                    external=(old_entry.state.name == "EXTERNAL"),
-                    metadata=dict(old_entry.metadata),
-                    parameter_contracts=old_entry.parameter_contracts,
+            # Program: ``Derivative(x*floor(x), x)``.  Wrong record: the
+            # reverse ran during ingestion and refused "forward value 0
+            # reaches the adjoint graph with no recorded tensor dtype"; had
+            # it got further, the rule functions were redeclared with no
+            # ``function_address`` source and a higher order differentiated
+            # a placeholder Symbol, which is zero.  Rule: the socket waits for
+            # the annotated graph, and each order is a socket over the last.
+            current = add_node(value.expr)
+            variables = tuple(value.variables)
+            for order, variable in enumerate(variables, start=1):
+                wrt_id = add_node(variable)
+                current = make_node(
+                    sympy.Derivative(value.expr, *variables[:order]),
+                    SympyProcessGraphRule(
+                        GRAPH_REVERSE_SOCKET, node_type="Derivative",
+                    ),
+                    (current, wrt_id), ("arg:0", "wrt"),
+                    {"graph_reverse_order": int(order)},
                 )
-                new_entry = graph.function_table.entry(new_ref)
-                if old_entry.graph is not None and new_entry.graph is None:
-                    graph.function_table.resolve_graph(new_ref, old_entry.graph)
-                if old_entry.python_callable is not None:
-                    graph.function_table.resolve_callable(
-                        new_ref, old_entry.python_callable)
-                for target, impl in old_entry.implementations.items():
-                    graph.function_table.install_implementation(new_ref, target, impl)
-                return int(new_ref.address) if hasattr(new_ref, "address") else int(new_ref)
-
-            for node_id in nx.topological_sort(backward.G):
-                if node_id in remap:
-                    continue
-                data = backward.G.nodes[node_id]
-                parent_ids = tuple(remap[p] for p, _role in data.get("parents", ()))
-                roles = tuple(role for _p, role in data.get("parents", ()))
-                rule = SympyProcessGraphRule(
-                    data.get("op") or "grad", node_type=data.get("type"))
-                attributes = dict(data.get("attributes") or {})
-                if attributes.get("callee_ref") is not None:
-                    attributes["callee_ref"] = _rehomed_callee_ref(attributes["callee_ref"])
-                placeholder = sympy.Symbol(f"_adjoint_{node_id}_{data.get('label', 'grad')}")
-                new_id = make_node(
-                    placeholder, rule, parent_ids, roles, attributes,
-                    source_cells=(node_identity_cell(backward, node_id),),
-                )
-                if data.get("tensor"):
-                    graph.G.nodes[new_id]["tensor"] = dict(data["tensor"])
-                remap[node_id] = new_id
-
-            grad_backward_id = adjoint.gradient_value_ids[wrt_id]
-            grad_id = remap[grad_backward_id]
-            remaining_variables = value.variables[1:]
-            if remaining_variables:
-                result_id = add_node(
-                    sympy.Derivative(graph.node_map.get(grad_id, sympy.Symbol(f"_grad_{grad_id}")),
-                                      *remaining_variables)
-                )
-            else:
-                result_id = grad_id
-            memo[value] = result_id
-            return result_id
+            memo[value] = current
+            return current
 
         respelled = _exact_respelling(value)
         if respelled is not None:
@@ -2274,6 +2242,8 @@ __all__ = [
     "matrix_component_name",
     "process_graph_to_sympy_expressions",
     "process_graph_to_sympy_relations",
+    "GRAPH_REVERSE_SOCKET",
+    "resolve_graph_reverse_sockets",
     "ingest_sympy_process_model",
     "process_graph_to_sympy_package",
     "symbolically_reduce_process_graph",

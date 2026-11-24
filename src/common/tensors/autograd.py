@@ -58,7 +58,7 @@ def grad(self):
     return getattr(self, "_grad", None)
 
 
-def detach(self):
+def detach(self) -> "AbstractTensor":
     result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.data
     result._requires_grad = False

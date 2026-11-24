@@ -1331,6 +1331,16 @@ def specialize_python_precision_widths(
                 _Derived(class_sources) if class_sources else None
             ),
         )
+    # The operator results of this copy, now that its formals have the
+    # classes its callsite passed.  Program: the palette scorer's training
+    # graph; ``bw_mul``'s ``g * y`` is reduced once, when the backward
+    # registry is built and ``g``/``y`` have no class, so no operator result
+    # of a rule body was ever classed and ``unbroadcast(g * y, ...)`` copies
+    # had no ``value_type_abi`` for ``G``.  Rule: the existing operator class
+    # pass runs in each specialization scope after its formal classes are
+    # posted, to its fixed point.
+    while _propagate_builtin_scalar_operator_classes(target_wrapper):
+        pass
     # The _tensor(bytes) callsite's first structural descriptor read happens
     # before the later Precision refresh. Its exact actual class must already
     # be in this specialization scope for list(bytes) row typing. The early
@@ -5261,6 +5271,161 @@ _BUILTIN_SCALAR_COMPARISONS = (
 )
 
 
+_TENSOR_BINARY_DUNDERS = {
+    ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "truediv",
+    ast.FloorDiv: "floordiv", ast.Mod: "mod", ast.Pow: "pow",
+    ast.MatMult: "matmul",
+}
+_TENSOR_COMPARE_DUNDERS = {
+    ast.Lt: "__lt__", ast.Gt: "__gt__", ast.LtE: "__le__", ast.GtE: "__ge__",
+    ast.Eq: "__eq__", ast.NotEq: "__ne__",
+}
+_TENSOR_UNARY_DUNDERS = {
+    ast.USub: "__neg__", ast.UAdd: "__pos__", ast.Invert: "__invert__",
+}
+
+
+def _abstract_tensor_operator_class(
+    expression: Any, operand_classes: tuple,
+) -> tuple[str, Any] | None:
+    """The class an ``AbstractTensor`` operator returns, and the cell of the
+    dunder that defines it; None where the operands do not decide it.
+
+    Program: ``bw_mul``'s ``unbroadcast(g * y, x.shape)`` in the palette
+    scorer's training graph (``examples/meowdoku/palette_native_training``).
+    Wrong record: ``g * y`` of two AbstractTensor formals had no
+    ``source_value_class`` row (only builtin scalar operators were classed),
+    so the ``unbroadcast`` copy's ``G`` had no ``value_type_abi`` and its
+    planned ``sum`` refused "dynamic reduction lacks a typed source span".
+    Rule: an operator with at least one AbstractTensor operand and every
+    other operand AbstractTensor or a builtin number dispatches to the
+    AbstractTensor dunder for it (reflected when only the right operand is a
+    tensor), which returns an AbstractTensor; the row derives from that
+    dunder's ``static_symbol_definition`` cell.  ``not`` (truthiness) and an
+    operator AbstractTensor does not define get no class.
+    """
+
+    from .abstraction import AbstractTensor
+
+    tensor = _canonical_source_class_identity(
+        f"{AbstractTensor.__module__}.{AbstractTensor.__qualname__}"
+    )
+    classes = tuple(operand_classes)
+    numbers = {"builtins.int", "builtins.bool", "builtins.float", tensor}
+    if tensor not in classes or any(item not in numbers for item in classes):
+        return None
+    name = None
+    if isinstance(expression, (ast.BinOp, ast.AugAssign)) and len(classes) == 2:
+        stem = _TENSOR_BINARY_DUNDERS.get(type(expression.op))
+        if stem is not None:
+            name = f"__{stem}__" if classes[0] == tensor else f"__r{stem}__"
+    elif (
+        isinstance(expression, ast.Compare) and len(classes) == 2
+        and len(expression.ops) == 1 and classes[0] == tensor
+    ):
+        name = _TENSOR_COMPARE_DUNDERS.get(type(expression.ops[0]))
+    elif isinstance(expression, ast.UnaryOp) and len(classes) == 1:
+        name = _TENSOR_UNARY_DUNDERS.get(type(expression.op))
+    dunder = None if name is None else getattr(AbstractTensor, name, None)
+    if dunder is None:
+        return None
+    definition = _static_symbol_definition_cell(dunder)
+    if definition is None:
+        return None
+    return tensor, definition
+
+
+def _abstract_tensor_method_result_class(
+    graph: Any, node_id: int, data: Mapping[str, Any], scope: Any, page: Any,
+) -> str | None:
+    """Class one AbstractTensor method result by the method's declaration.
+
+    Program: ``bw_tanh``'s ``y = x.detach().tanh()`` in the palette scorer's
+    training graph.  Wrong record: a tensor method call (a node whose
+    ``tensor_candidate`` names the method, receiver in role ``operand`` or
+    ``arg:0``) had no class row, so ``g * (1 - y * y)`` and the
+    ``unbroadcast`` copy fed by it had none.  Rule: when the receiver's class
+    row is AbstractTensor and ``AbstractTensor.<method>`` declares its return
+    ``AbstractTensor``, the result is AbstractTensor, DERIVED from the node's
+    cell, the receiver's class cell and the method's
+    ``static_symbol_definition`` cell.  A method with no such declaration
+    (``sum``/``mean`` return a scalar for a full reduction) gets no class.
+    Returns the class posted, or None.
+    """
+
+    import inspect
+
+    from .abstraction import AbstractTensor
+
+    attributes = data.get("attributes") or {}
+    method_name = attributes.get("tensor_candidate")
+    if not isinstance(method_name, str) or not method_name:
+        return None
+    target = getattr(graph, "G", graph)
+    value_id = int(data.get("value_id", node_id))
+    if page.latest((scope, value_id)) is not None:
+        return None
+    receiver = next((
+        int(parent) for parent, role in data.get("parents") or ()
+        if str(role) in {"operand", "arg:0"} and int(parent) in target
+    ), None)
+    if receiver is None:
+        return None
+    receiver_value = int(target.nodes[receiver].get("value_id", receiver))
+    receiver_cell = current_identity_book().latest_ref(
+        _SOURCE_VALUE_CLASS, (scope, receiver_value),
+    )
+    if receiver_cell is None:
+        return None
+    tensor = _canonical_source_class_identity(
+        f"{AbstractTensor.__module__}.{AbstractTensor.__qualname__}"
+    )
+    receiver_class = _canonical_source_class_identity(
+        page.cell(receiver_cell.row, receiver_cell.column)[0]
+    )
+    if receiver_class != tensor:
+        return None
+    method = getattr(AbstractTensor, method_name, None)
+    if method is None:
+        return None
+    try:
+        declared = inspect.signature(method).return_annotation
+    except (TypeError, ValueError):
+        return None
+    # Under ``from __future__ import annotations`` a quoted ``-> "AbstractTensor"``
+    # arrives as the text ``'AbstractTensor'`` with its quotes; read the
+    # annotation expression, not its spelling.
+    if declared is not AbstractTensor:
+        text = declared if isinstance(declared, str) else None
+        while isinstance(text, str):
+            try:
+                parsed = ast.parse(text, mode="eval").body
+            except SyntaxError:
+                return None
+            if isinstance(parsed, ast.Constant) and isinstance(parsed.value, str):
+                text = parsed.value
+                continue
+            break
+        if not (isinstance(text, str) and isinstance(parsed, ast.Name)
+                and parsed.id == AbstractTensor.__name__):
+            return None
+    definition = _static_symbol_definition_cell(method)
+    if definition is None:
+        return None
+    _concord_source_value_class(
+        scope, value_id, tensor,
+        source="AbstractTensor method result",
+        provenance=_Derived(tuple(dict.fromkeys(
+            cell for cell in (
+                node_identity_cell(graph, int(node_id)), receiver_cell,
+                definition,
+            )
+            if cell is not None
+        ))),
+    )
+    return tensor
+
+
 def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> str | None:
     """Python's own result class of a builtin scalar operator, or None.
 
@@ -5639,6 +5804,12 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
                         )
                         changed = True
             continue
+        method_class = _abstract_tensor_method_result_class(
+            graph, int(node_id), data, scope, page,
+        )
+        if method_class is not None:
+            changed = True
+            continue
         if conditional_phi:
             roles = ("body", "orelse")
         elif isinstance(expression, (ast.BinOp, ast.AugAssign, ast.Compare)):
@@ -5686,15 +5857,26 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             result_limbs = int(arm_facts[0][1])
         else:
             result_class = _builtin_scalar_operator_class(expression, operand_classes)
+        dunder_cell = None
+        if result_class is None and not conditional_phi:
+            tensor_result = _abstract_tensor_operator_class(
+                expression, operand_classes,
+            )
+            if tensor_result is not None:
+                result_class, dunder_cell = tensor_result
         if result_class is None:
             continue
         node_cell = node_identity_cell(graph, int(node_id))
         _concord_source_value_class(
             scope, value_id, result_class,
             precision_limbs=result_limbs,
-            source="conditional scalar arm classes" if conditional_phi else "builtin scalar operator result",
+            source=(
+                "conditional scalar arm classes" if conditional_phi
+                else "AbstractTensor operator result" if dunder_cell is not None
+                else "builtin scalar operator result"
+            ),
             provenance=_Derived(tuple(dict.fromkeys(
-                cell for cell in (node_cell, *operand_cells, *(
+                cell for cell in (node_cell, *operand_cells, dunder_cell, *(
                     (node_identity_cell(graph, parents["test"]),) if conditional_phi else ()
                 ))
                 if cell is not None
@@ -9390,6 +9572,27 @@ def _normalize_lexical_values(
                     activity_book.edges_into(identity)
                     if source.page == SOURCE_SPAN
                 )
+                if not occurrences:
+                    # Program: ``sorted(item ... for item in axis)`` in the
+                    # rejected ``elif`` of backward_registry.expand_reduction.
+                    # Wrong record: the loop-target Input derives from the
+                    # target Name's own ingestion cell (bind_loop_target),
+                    # not from a SOURCE_SPAN, so it was taken for a
+                    # source-free capture and bound to FunctionDef.entry; the
+                    # rejected arm's membership never named it, the fold left
+                    # it resident, and the host-scalar freeze refused it
+                    # (tests/test_llvm_training_runtime, 2026-11-22, case
+                    # 9f272724).  Rule: an Input derived from an authored
+                    # occurrence's ingestion cell owns that occurrence's
+                    # activity; only an Input with no such derivation is
+                    # source-free.
+                    occurrences = tuple(dict.fromkeys(
+                        span
+                        for source, _stage in activity_book.edges_into(identity)
+                        if source.page == _INGESTION_VALUE
+                        for span, _span_stage in activity_book.edges_into(source)
+                        if span.page == SOURCE_SPAN
+                    ))
                 if len(occurrences) == 1:
                     bind_activity(
                         identity, value_class_scope, occurrences[0],

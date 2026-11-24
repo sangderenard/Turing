@@ -387,6 +387,13 @@ def _identifier(name):
         raise MathOperatorError(f"not a source parameter/function identifier: {name!r}")
 
 
+def rebuild_math_program_graph(recipe):
+    """The authored program of a ``math_program_recipe``, ingested in the
+    active identity book (its numeric ProcessGraph)."""
+    return _make_program(tuple(recipe["values"]), tuple(recipe["inputs"]),
+                         recipe["shape"], "authored", (), None).numeric
+
+
 def _make_program(values, inputs, shape, operation, sources, shell):
     if not values:
         raise MathOperatorError("a mathematical function needs an output")
@@ -424,11 +431,23 @@ def _make_program(values, inputs, shape, operation, sources, shell):
     parameters = {str(x): parameters[str(x)] for x in inputs}
     for _, data in graph.G.nodes(data=True):
         data["tensor"] = {"shape": (), "dtype": "float64"}
+    # Derivatives SymPy could not take are spliced as graph reverses now
+    # that every node is annotated (``resolve_graph_reverse_sockets``).
+    from .symbolic_process_graph import resolve_graph_reverse_sockets
+
+    if resolve_graph_reverse_sockets(graph):
+        roots = tuple(graph.roots)
     graph.G.graph.update(deployment_outputs=roots, function_outputs=names,
         function_parameters=tuple(parameters), positional_parameters=tuple(parameters),
         identity_table={**{n:(i,) for n,i in parameters.items()}, **dict(zip(names, ((i,) for i in roots)))},
         math_result_shape=shape, math_operator_cells=cells,
         math_operator_scope=scope, semantic_authority="ProcessGraph")
+    if operation == "authored" and not sources:
+        # An authored program is its expressions: this is the portable recipe
+        # a graph that splices it in replays in another identity book.
+        graph.G.graph["math_program_recipe"] = {
+            "values": values, "inputs": inputs, "shape": shape,
+        }
     control = ControlProgram(StatementBlock(("__scheduled_region_0__",)), region_indices=(0,))
     return MathProgram(graph, control, {0:tuple(graph.G)}, parameters, shape, shell, tuple(sources), book)
 

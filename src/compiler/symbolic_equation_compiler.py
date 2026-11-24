@@ -486,6 +486,15 @@ def _compile_sympy_equations_uncached(
             data["op"] = "input"
             data.setdefault("attributes", {})["binding_kind"] = "parameter"
 
+    # A Derivative SymPy could not take is a ``graph_reverse`` socket until
+    # now: every node has its descriptor, so the canonical graph reverse can
+    # be taken and spliced in.  A socket that was an output is replaced in
+    # the graph's roots, which are re-read here.
+    from .symbolic_process_graph import resolve_graph_reverse_sockets
+
+    if resolve_graph_reverse_sockets(graph):
+        roots = tuple(graph.roots)
+
     symbolic_inputs = sorted(
         (
             str(data.get("attributes", {}).get("binding_name")),
@@ -848,6 +857,24 @@ def rebuild_symbolic_process_graph_in_current_book(graph: ProcessGraph) -> Proce
         external_derivatives=dict(recipe["external_derivatives"]),
     )
     _post_symbolic_outputs(rebuilt, str(recipe["name"]))
+    # The recorded socket bindings are part of the authored graph: rebuild
+    # each body in this book and bind it again, in the order first bound.
+    from .dual_ir_math import rebuild_math_program_graph
+    from .process_graph_function_linking import bind_process_graph_function_sockets
+
+    for socket in tuple(recipe.get("socket_bindings") or ()):
+        bind_process_graph_function_sockets(
+            rebuilt.process_graph,
+            {socket["function"]: rebuild_math_program_graph(socket["body"])},
+        )
+    if (
+        len(rebuilt.process_graph.G) != int(recipe["node_count"])
+        or rebuilt.process_graph.G.number_of_edges() != int(recipe["edge_count"])
+    ):
+        raise ValueError(
+            "replaying a linked symbolic ProcessGraph's recipe did not reproduce "
+            "its recorded topology"
+        )
     rebuilt.process_graph.G.graph["symbolic_compilation_recipe"] = dict(recipe)
 
     # Some callers narrow only the public boundary of the compiled law (for

@@ -597,7 +597,7 @@ def sign(self):
     return self._v1_valuewise("sign", annotate={"op":"sign"})
 
 
-def sigmoid(self):
+def sigmoid(self) -> "AbstractTensor":
     """Logistic activation, as a primitive rather than a composition.
 
     ``abstract_nn.Sigmoid`` built this from comparisons, ``exp``, and division

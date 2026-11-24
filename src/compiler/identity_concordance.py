@@ -1703,6 +1703,7 @@ class CorrelationTable:
         found.extend(self._source_evidence_flush_round_findings(module))
         found.extend(self._source_guarded_callable_findings(module))
         found.extend(self._source_parameter_memory_contract_findings(module))
+        found.extend(self._graph_tensor_descriptor_findings(module))
         found.extend(self._source_function_exit_field_state_findings(module))
         found.extend(self._source_constructor_field_effect_demand_findings(module))
         found.extend(self._source_call_tuple_member_projection_demand_findings(module))
@@ -1780,12 +1781,84 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _graph_tensor_descriptor_findings(module: Any) -> list[Finding]:
+        """Each graph-native descriptor stands on its value and its evidence.
+
+        ``graph_tensor_descriptor`` (``process_graph_autograd.
+        _post_graph_tensor_descriptors``): the row must derive from its own
+        value's ``ingestion_value`` cell (same scope and id), and its fact's
+        basis must match its causes: ``program`` cites an
+        ``abstract_tensor_program_value`` cell, ``lineage`` an ancestor's or
+        parent's descriptor row, and any other basis names the compiler that
+        declared the value (a SymPy model scalar).  A ``source_value_class``
+        row posted as a graph-native tensor value must derive from a
+        descriptor row, or from such a class row (a specialization copy).
+        """
+        from .concordance_declarations import (
+            ABSTRACT_TENSOR_PROGRAM_VALUE, GRAPH_TENSOR_DESCRIPTOR,
+            INGESTION_VALUE, SOURCE_VALUE_CLASS,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.pages.get(GRAPH_TENSOR_DESCRIPTOR.name)
+        for row in (() if page is None else page.rows()):
+            cell = book.latest_ref(GRAPH_TENSOR_DESCRIPTOR, row)
+            causes = tuple(source for source, _stage in book.edges_into(cell))
+            identity = tuple(
+                source for source in causes
+                if source.page == INGESTION_VALUE
+                and tuple(source.row) == (tuple(row[0]), int(row[1]))
+            )
+            program = any(
+                source.page == ABSTRACT_TENSOR_PROGRAM_VALUE for source in causes
+            )
+            lineage = any(
+                source.page == GRAPH_TENSOR_DESCRIPTOR and source != cell
+                for source in causes
+            )
+            fact = page.latest(row)
+            basis = fact[2] if isinstance(fact, tuple) and len(fact) >= 3 else None
+            supported = (
+                program if basis == "program"
+                else lineage if basis == "lineage"
+                else isinstance(basis, str) and bool(basis)
+            )
+            if len(identity) != 1 or not supported:
+                found.append(Finding(
+                    "graph-tensor-descriptor-provenance", str(row[0]),
+                    int(row[1]),
+                    "graph tensor descriptor lacks its value identity, or its "
+                    f"basis {basis!r} has no cause behind it",
+                ))
+        class_page = book.pages.get(SOURCE_VALUE_CLASS.name)
+        for row in (() if class_page is None else class_page.rows()):
+            fact = class_page.latest(row)
+            if not (
+                isinstance(fact, tuple) and len(fact) >= 3
+                and fact[2] == "graph-native tensor value"
+            ):
+                continue
+            cell = book.latest_ref(SOURCE_VALUE_CLASS, row)
+            if not any(
+                source.page in (GRAPH_TENSOR_DESCRIPTOR, SOURCE_VALUE_CLASS)
+                for source, _stage in book.edges_into(cell)
+            ):
+                found.append(Finding(
+                    "graph-native-class-unproven", str(row[0]), int(row[1]),
+                    "graph-native tensor class has no descriptor row behind it",
+                ))
+        return found
+
+    @staticmethod
     def _source_parameter_memory_contract_findings(module: Any) -> list[Finding]:
         """Check the one selected contract against authored and formal cells."""
         from .concordance_declarations import (
             CLASS_DECLARATION, CLASS_METHOD_DECLARATION, NAME_BINDING,
             PARAMETER_ANNOTATION, SOURCE_FORMAL_ORDER,
-            SOURCE_PARAMETER_MEMORY_CONTRACT,
+            FUNCTION_ADDRESS, LOWERED_SOURCE_FUNCTION, SOURCE_FUNCTION_REACHABILITY,
+            SOURCE_PARAMETER_MEMORY_CONTRACT, SOURCE_SPAN,
         )
         from ..transmogrifier.function_table import (
             ParameterContract, ParameterStorage,
@@ -1795,6 +1868,10 @@ class CorrelationTable:
             return []
         page = book.page(SOURCE_PARAMETER_MEMORY_CONTRACT)
         found = []
+        # Authored identities this compilation reached or lowered, read once
+        # from the book on the first row whose function the module does not
+        # hold.
+        program_scopes = None
         for row in page.rows():
             cell = book.latest_ref(SOURCE_PARAMETER_MEMORY_CONTRACT, row)
             fact = page.cell(cell.row, cell.column)
@@ -1818,6 +1895,59 @@ class CorrelationTable:
                 if getattr(getattr(entry, "graph", None), "G", None) is not None
                 and tuple(entry.graph.G.graph.get("authored_function_identity") or ()) == row[0]
             )
+            # The definition catalogue is not the program (the emitter's
+            # ``_walk_planned_shells`` rule), and the book says which is
+            # which.  Program: linear-MSE training linked into
+            # ``lower_ast_source_to_ssa``.  The backward registry is compiled
+            # whole into this book (``_compiled_backward_rule_process_graph``)
+            # and linking adopts only the called closure, so
+            # ``NormalizedIndexAxis.advanced``'s receiver contract row has no
+            # function in this compilation.  Wrong record: the audit checked
+            # it as this module's and reported its receiver as lost.
+            # ``source_pursuit_activation`` is not the membership record: the
+            # registry build activates its whole generated module (demand =
+            # that module's span), so every helper there reads True.  Rule: a
+            # contract row is this compilation's when the module holds its
+            # function, when the book records the function reached by a call
+            # (``source_function_reachability``), or when a
+            # ``lowered_source_function`` row's address cell derives -- through
+            # its ``function_address`` predecessors -- from the function's
+            # definition span.  Such a row is checked in full, so a reached or
+            # lowered function missing from the module is still reported.  A
+            # row with none of these is a catalogue row of another
+            # compilation in the book.
+            if not matching_entries:
+                if program_scopes is None:
+                    program_scopes = {
+                        tuple(reach_row[2])
+                        for reach_row in book.page(
+                            SOURCE_FUNCTION_REACHABILITY
+                        ).rows()
+                    }
+                    lowered_page = book.page(LOWERED_SOURCE_FUNCTION)
+                    for lowered_row in lowered_page.rows():
+                        lowered = lowered_page.latest(lowered_row)
+                        pending = [
+                            lowered[0]
+                        ] if isinstance(lowered, tuple) and lowered and isinstance(
+                            lowered[0], Ref,
+                        ) else []
+                        visited = set()
+                        while pending:
+                            address = pending.pop()
+                            if address in visited:
+                                continue
+                            visited.add(address)
+                            for cause, _stage in book.edges_into(address):
+                                if cause.page == FUNCTION_ADDRESS:
+                                    pending.append(cause)
+                                elif (
+                                    cause.page == SOURCE_SPAN
+                                    and tuple(cause.row[2:]) == ((),)
+                                ):
+                                    program_scopes.add(tuple(cause.row[:2]))
+                if tuple(row[0]) not in program_scopes:
+                    continue
             installed = tuple(
                 installed_contract
                 for entry in matching_entries
@@ -3646,7 +3776,13 @@ class CorrelationTable:
             cell = book.latest_ref(SOURCE_ACTIVITY_NODE, row)
             kind, owners = value(cell)
             sources = {source for source, _stage in book.edges_into(cell)}
-            if (row[1].page != SOURCE_SPAN or row[1] not in sources
+            # A graph-native body (``ingest_graph_activity``) has no source
+            # text: its occurrence is the node's own ingestion cell, and it
+            # has no authored control owner.  Every other occurrence is a
+            # source span.
+            graph_native = row[1].page == INGESTION_VALUE and not owners
+            if ((row[1].page != SOURCE_SPAN and not graph_native)
+                    or row[1] not in sources
                     or not isinstance(kind, str)
                     or any(owner.page != SOURCE_SPAN or not isinstance(arm, str) for owner, arm in owners)):
                 found.append(Finding("activity-node-source", str(row[0]), None,
@@ -10839,8 +10975,16 @@ class CorrelationTable:
                     source for source, _ in book.edges_into(value_cell)})
                 abi_causes = {source for source, _ in
                               book.edges_into(abi_cell)}
+                # The value's identity at the ABI row: its canonical cell, or
+                # -- for a graph-native function, whose read scope IS its
+                # ingestion scope (``admit_process_graph_function``) -- its
+                # ingestion cell at that same row.  Training graph inputs
+                # (``ingestion:training_motion|fork``) carry no canonical
+                # relabel; requiring one refused every typed seed.
+                from .concordance_declarations import INGESTION_VALUE
                 canonical = tuple(source for source in binding_causes
-                                  if source.page == CANONICAL_VALUE
+                                  if source.page in (CANONICAL_VALUE,
+                                                     INGESTION_VALUE)
                                   and source.row == abi_cell.row)
                 valid = (
                     len(canonical) == 1

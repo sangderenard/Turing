@@ -283,7 +283,14 @@ def capture_reverse_fused_program(
                 step_id=len(steps), op_name="sub", input_ids=[feed_id, scaled_id],
                 result_id=result_id,
             ))
-            meta[result_id] = replace(meta[feed_id]) if feed_id in meta else Meta()
+            # A proposal has its feed's shape and dtype, and the feed's record is
+            # the retained forward program, which declares every feed. The
+            # backward program's meta holds only the values its VJP reads: a bias
+            # that enters by broadcast add (the palette scorer's b1 (1, 16) and
+            # b2 (1, 1)) is never read there, so proposed_b1 got an empty Meta()
+            # and the Fortran target refused "sub ... result=((), None)".
+            feed_meta = (retained.meta or {}).get(feed_id)
+            meta[result_id] = replace(feed_meta) if feed_meta is not None else Meta()
         outputs[proposal_name] = result_id
 
     reverse_program = FusedProgram(

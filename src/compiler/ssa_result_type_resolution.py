@@ -241,6 +241,42 @@ def settle_call_result_types(functions, emit_outputs, function_values):
     # field would otherwise raise TransformationConflict.
     carried_physical = {}
 
+    def static_view_proof(callee, caller_id, physical):
+        """The structure cell of a static view the callee returns by its carrier.
+
+        Program: linear-MSE training through ``lower_ast_source_to_ssa``;
+        ``expand_reduction``'s ``G.reshape((1, 1))`` of the literal seed
+        ``G = 1.0``.  The region returns the scalar carrier (``Ret 0``) for
+        semantic output 57.  Wrong record: with no runtime reshape row, 57
+        was typed from the carrier as scalar ``()``, against its own
+        ``value_type_abi`` span ``(1, 1)``
+        (``physical concordance disagreement ... 'scalar' versus 'span'``).
+        Rule: when the semantic id is not the carrier, the book states a
+        structure for the semantic id in the callee's scopes, and the two
+        describe the same buffer (``equivalent_physical_layout``) with
+        different shapes, that structure is the semantic type.  A structure
+        with another layout (an unrelated value sharing the id) is no proof.
+        """
+        if int(caller_id) == int(physical.id):
+            return None
+        from .structural_concordance import function_value_structure
+        try:
+            structure, cell = function_value_structure(callee, int(caller_id))
+        except (KeyError, LookupError, ValueError):
+            return None
+        if cell is None or structure.dtype in {None, '', 'unknown'}:
+            return None
+        semantic = (
+            structure.physical_dtype or structure.dtype,
+            tuple(structure.shape or ()), physical.device,
+        )
+        carrier = _recorded_storage_type(callee, physical)
+        if semantic[1] == tuple(carrier[1]) or not equivalent_physical_layout(
+            carrier, semantic,
+        ):
+            return None
+        return cell
+
     def semantic_view_output(callee, caller_id, physical):
         """Read a computed view's exact result, distinct from its Ret carrier."""
         book = current_identity_book()
@@ -251,7 +287,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             raise ValueError("one call output has two runtime view geometries")
         proof = reshape or unsqueeze
         if proof is None:
-            return physical, None
+            return physical, static_view_proof(callee, caller_id, physical)
         source_id = int(book.page(proof.page).cell(
             proof.row, proof.column,
         )[1] if unsqueeze is not None else book.page(proof.page).cell(
