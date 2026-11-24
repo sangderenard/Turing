@@ -4650,15 +4650,43 @@ def _prune_unused_callee_formals_once(
             if str(name) in record_parameter_names
         }
 
+        # The record parameters whose fields cross as field formals of their
+        # own (``program_abi_parameter`` + ``program_abi_field``).
+        fielded_record_parameters = {
+            str((formal.accounting or {}).get("program_abi_parameter"))
+            for formal in callee.args
+            if (formal.accounting or {}).get("program_abi_parameter") is not None
+            and (formal.accounting or {}).get("program_abi_field") is not None
+        }
+        record_parameter_name_of = {
+            int(value_id): str(name)
+            for name, value_id in metadata.get("parameter_names", ())
+            if str(name) in record_parameter_names
+        }
+
         def conceptual_record_formal(formal: Any) -> bool:
             accounting = dict(formal.accounting or {})
             declared_parameter = accounting.get("program_abi_parameter")
+            storage = accounting.get("program_abi_storage")
+            # Program: GLSL ``outer(float a, vec2 b)`` forwarding ``b`` to
+            # ``inner(vec2 b)``.  Wrong record: once demand propagation gave
+            # ``outer`` the field formal ``b.x``, the whole-record formal
+            # ``b`` was left holding the source class's opaque ``reference``
+            # view settled from the call edge; it was kept as a slot and its
+            # caller had no handle to pass.  Rule: a record parameter whose
+            # fields cross as field formals of their own is correlation
+            # whether its container view is ``record`` or ``reference``.
+            fielded_reference = (
+                storage == "reference"
+                and record_parameter_name_of.get(int(formal.id))
+                in fielded_record_parameters
+            )
             # A record container (declared ``storage: record`` with no field of
             # its own) is correlation: only its leaves cross the native ABI.
             return (
                 not tuple(formal.shape or ())
                 and accounting.get("program_abi_field") is None
-                and accounting.get("program_abi_storage") in {None, "record"}
+                and (storage in {None, "record"} or fielded_reference)
                 and (
                     int(formal.id) in record_parameter_ids
                     or (
@@ -64925,7 +64953,37 @@ def _lower_ast_source_to_ssa_impl(
         if not glsl_result.complete:
             raise ValueError(glsl_result.shortfall_report())
         glsl_tree = retain_glsl_source_evidence(glsl_result.module, source)
+        # The program's module is its GLSL document (``glsl:<sha256>``, the
+        # identity its source evidence already names), so a record the
+        # reader emits is ``glsl:<sha256>.vec3`` and the caller can declare
+        # it in program_abi.  A hash of the generated tree would be an
+        # identity no caller can name.
+        glsl_tree._turing_source_module = f"glsl:{authored_source_sha256}"
         source = ast.unparse(glsl_tree)
+        # Program: GLSL ``vec2 p = vec2(2.0, 3.0); o[0] = outer(1.0, p)``.
+        # Wrong record: the reader's generated nodes all sat at
+        # ``fix_missing_locations``' (1, 0, 1, 0), so source-span identities
+        # of distinct statements coincided and ``outer``'s field formal was
+        # linked to a minted, unsupplied entry formal (it read 0).  Rule:
+        # the preserved tree (it carries the GLSL evidence) takes the
+        # positions of the Python text the compiler reads -- its own
+        # ``unparse`` -- node for node; a tree that does not round-trip is
+        # refused, never located approximately.
+        _located_tree = ast.parse(source)
+        for _generated, _located in zip(
+            ast.walk(glsl_tree), ast.walk(_located_tree), strict=True,
+        ):
+            if type(_generated) is not type(_located):
+                raise ValueError(
+                    "GLSL reader tree does not round-trip through its "
+                    f"source: {type(_generated).__name__} parses as "
+                    f"{type(_located).__name__}"
+                )
+            for _position in (
+                "lineno", "col_offset", "end_lineno", "end_col_offset",
+            ):
+                if hasattr(_located, _position):
+                    setattr(_generated, _position, getattr(_located, _position))
         glsl_source_receipt = {
             "source_sha256": authored_source_sha256,
             "normalized_ast_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
@@ -66370,10 +66428,20 @@ def _lower_ast_source_to_ssa_impl(
             node._linked_repository_ssa_module = linked_module
             node._linked_repository_ssa_root = linked_root
             node._linked_repository_ssa_outputs = linked_outputs
+    # Program: GLSL ``float outer(float a, vec2 b){ return b.x + a; }``.
+    # Wrong record: the graph of the GLSL reader's tree was built as
+    # ``source_language="glsl"``, which skips the Python attribute special
+    # cases, so ``b.x`` stayed a raw Attribute the backends read as an
+    # external value (0).  Rule: that tree IS ordinary Python
+    # (``lower_glsl_source_to_ast``); its graph has Python's semantics, and
+    # the GLSL origin is its evidence (``retain_glsl_source_evidence``) and
+    # the module's ``glsl_source_ingestion`` receipt.
     graph = ProcessGraph(
         materialize_memory=True,
         boundary_namespace=boundary_namespace,
-        source_language=source_language,
+        source_language=(
+            "python" if glsl_tree is not None else source_language
+        ),
     )
     # A source slice keeps the imports authored in its original module.  Their
     # leading dots are meaningful only with that module's package identity.

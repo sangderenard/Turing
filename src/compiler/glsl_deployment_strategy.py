@@ -12641,7 +12641,11 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
         # string erased the whole node: scatter, and ``a.pad(pad=(1, 1),
         # value=0, mode="constant")``, whose root then returned nothing
         # (2026-11-18, case 6393486c).  The declared table is the proof.
-        if _constant_value(parent_data) in _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
+        # Only a string can be such a keyword; a list constant (the
+        # ``[0] * 4`` fill of a GLSL ``uint active[4]``) is not hashable.
+        if isinstance(_constant_value(parent_data), str) and _constant_value(
+            parent_data
+        ) in _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
             (str(data.get("op") or node_type), str(role)), frozenset()
         ):
             continue

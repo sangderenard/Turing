@@ -7942,8 +7942,15 @@ def _normalize_lexical_values(
             if not (isinstance(node, ast.Name) and node.id == name):
                 continue
             if isinstance(node.ctx, (ast.Store, ast.Del)):
-                stores = True
-                break
+                # Program: Studio ``studio_boundary_step(t, rd, ...)`` does
+                # ``rd = vec3(...)``.  Rebinding (or unbinding) the local
+                # name gives it another object; the caller's record is not
+                # touched.  Only ``name += ...`` (an in-place ``__iadd__``)
+                # may store into it.
+                if isinstance(parents.get(id(node)), ast.AugAssign):
+                    stores = True
+                    break
+                continue
             attribute = parents.get(id(node))
             # Program: Studio ``splat_segment_multiscale(a, b, ...)`` hands
             # ``b`` straight on to ``splat_segment_spectral(a, b, ...)``,
