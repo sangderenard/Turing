@@ -312,7 +312,15 @@ class Instance:
             return argv + ["--instance", self.name, *self.federation_args]
         if self.kind == "nodus":
             n = self.spec["nodus"]
-            argv = [py, n["tool"], "--canvas", str(_abs(n["canvas"])), "--rate", str(n.get("rate", 60))]
+            # "native": true -- the tool is the native Nodus host (nodus frontend_shell --canvas,
+            # docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md), run directly with run_canvas.py's arguments and the same ready
+            # line, Ctrl+Break and exit codes; "--offscreen" unless "window": true (a service has no display of its own).
+            native = bool(n.get("native"))
+            argv = ([n["tool"]] if native else [py, n["tool"]]) + ["--canvas", str(_abs(n["canvas"])), "--rate", str(n.get("rate", 60))]
+            if native and not n.get("window"):
+                argv += ["--offscreen"]
+            if native and n.get("link_route_map"):
+                argv += ["--link-route-map", str(n["link_route_map"])]
             for a in n.get("acquire", []):
                 argv += ["--acquire", a]
             if self.console_requested():

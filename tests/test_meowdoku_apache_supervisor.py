@@ -466,6 +466,31 @@ def test_nodus_console_token_port_and_cleanup(tmp_path):
     assert _rows(db, "SELECT console_port, state FROM service_instances")[0] == {"console_port": None, "state": "stopped"}
 
 
+def test_nodus_native_host_command(tmp_path):
+    """"native": true runs the native Nodus host directly (no Python), offscreen unless "window": true, with run_canvas's
+    arguments (nodus docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md, stage D)."""
+    tool = tmp_path / "frontend_shell.exe"
+    tool.write_bytes(b"")
+    canvas = tmp_path / "x.canvas"
+    canvas.write_text("canvas", encoding="utf-8")
+    spec = {"name": "nodus-native", "kind": "nodus", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-nodus-native",
+            "args": ["--cron", "cron:7201:jobs"], "leases": [], "python": sys.executable,
+            "nodus": {"tool": str(tool), "native": True, "canvas": str(canvas), "acquire": ["cron:4:36000"], "rate": 60,
+                      "console_port": 0, "link_route_map": "C:/routes/link.map"}}
+    db, state, inst = _setup(tmp_path, spec)
+    plan = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
+    command = json.loads(plan.stdout)["instances"][0]["command"]
+    assert command[0] == str(tool) and sys.executable not in command
+    assert command[1:5] == ["--canvas", str(canvas), "--rate", "60"]
+    assert "--offscreen" in command and command[command.index("--link-route-map") + 1] == "C:/routes/link.map"
+    assert command[command.index("--acquire") + 1] == "cron:4:36000" and command[-2:] == ["--cron", "cron:7201:jobs"]
+    assert "--console-port" in command and "--console-token-file" in command
+    spec["nodus"]["window"] = True
+    inst.write_text(json.dumps([spec]), encoding="utf-8")
+    plan = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
+    assert "--offscreen" not in json.loads(plan.stdout)["instances"][0]["command"]
+
+
 def test_console_port_column_added_to_old_table(tmp_path):
     db = tmp_path / "accounts.db"
     conn = sqlite3.connect(db)
