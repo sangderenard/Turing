@@ -1161,6 +1161,45 @@ _UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity",
 _IDENTITY_PAGES = frozenset(("canonical_value", "ingestion_value"))
 
 
+def heap_view_result(function: Any, row: Any, fact: Any) -> Any:
+    """The caller id and Call that keep a receipted consumer's borrowed view.
+
+    ``row``/``fact`` are one ``TENSOR_HEAP_CONSUMER_NONESCAPE`` receipt. The
+    program: declared ``Sum(f(k, x), (k, 1, n))``. Region 5 returns its
+    borrowed arange formal 8 itself with new shape/rank outputs (unsqueeze is
+    metadata-only); the caller's aggregate Call names that output 11 through
+    ``output_ids``. Its single non-metadata output, when it is the borrowed
+    formal or a view of it, is still the caller's storage under this id.
+    Returns ``(view_id, call)`` or ``None`` (no view; a retired reborrow).
+    """
+
+    if not (isinstance(fact, tuple) and len(fact) == 4
+            and isinstance(fact[2], tuple) and isinstance(fact[3], tuple)
+            and len(fact[3]) == 1 and len(fact[3][0]) == 3):
+        return None
+    logical, data, alias = fact[3][0]
+    if data not in fact[2] and alias not in fact[2]:
+        return None
+    calls = tuple(
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call" and instruction.res is not None
+        and int(instruction.res.id) == int(row[2])
+        and instruction.attributes.get("callee") == fact[0]
+    )
+    if len(calls) != 1:
+        return None
+    call = calls[0]
+    outputs = tuple(map(int, call.attributes.get("output_ids", ()) or ()))
+    callee_outputs = tuple(map(int, call.attributes.get(
+        "callee_output_ids", ()) or ()))
+    if not outputs:
+        return int(call.res.id), call
+    if len(outputs) != len(callee_outputs) or callee_outputs.count(logical) != 1:
+        return None
+    return outputs[callee_outputs.index(logical)], call
+
+
 def _canonical_identity_base(book: Any, ref: Any) -> Any:
     """The first copy of an identity cell: a ``canonical_value`` row of a
     read-scope fork derives from the row it copies (``read_scope_fork``),
@@ -6472,7 +6511,10 @@ class CorrelationTable:
                         and len(previous_fact) == 2
                         and previous_fact[1] == fact[1]
                         and len(previous_fact[0]) == len(fact[0])
-                        and len(rebindings) == 3
+                        # A partial fold (unsqueeze keeps only its element
+                        # count) rebinds just the ids it replaced; each is
+                        # checked below, every other id must stay unchanged.
+                        and 1 <= len(rebindings) <= len(previous_fact[0])
                         and bool(result_refs)
                     )
                     if valid:
@@ -7274,6 +7316,22 @@ class CorrelationTable:
                         candidate)[3:5] == (int(row[3]), fact[1])
                 ) if len(calls) == 1 else ()
                 owner_bindings = (*owner_bindings, *source_bindings)
+                if not owner_bindings:
+                    # The borrowed tensor is a view an earlier consumer of
+                    # this same owner returned: that consumer's receipt, whose
+                    # exact caller output is this tensor, stands for the owner.
+                    owner_bindings = tuple(
+                        source for source, _stage in book.edges_into(cell)
+                        if source.page == TENSOR_HEAP_CONSUMER_NONESCAPE
+                        and source.row[:2] == row[:2]
+                        and source.row[3] == row[3]
+                        and book.latest_ref(source.page, source.row) == source
+                        and (parent_view := heap_view_result(
+                            caller, source.row,
+                            page.cell(source.row, source.column),
+                        )) is not None
+                        and parent_view[0] == fact[1]
+                    )
                 valid = len(calls) == len(owner_bindings) == 1
             if valid:
                 call = calls[0]
@@ -7350,7 +7408,13 @@ class CorrelationTable:
                                  for logical, data, alias in layouts
                                  if data in formals or alias in formals)
                 valid = valid and tuple(layouts) == fact[3]
-                if valid and borrowed:
+                if valid and borrowed and call.res is not None:
+                    # A returned view: its Call result stays borrowed; the
+                    # release audit follows its own consumers.
+                    valid = (len(borrowed) == len(layouts) == 1
+                             and heap_view_result(caller, row, fact)
+                             is not None)
+                elif valid and borrowed:
                     retirement_causes = {
                         source for source, _stage in book.edges_into(retired)
                     } if isinstance(retired, Ref) else set()
@@ -7501,6 +7565,39 @@ class CorrelationTable:
                 producer_block, producer_index, producer = producers[0]
                 release_index, release = releases[0]
                 return_index, terminal = terminals[0]
+                # The owner's tensor plus every view a receipted consumer
+                # returned of it: the same borrowed storage under each id.
+                nonescape_page = book.page(TENSOR_HEAP_CONSUMER_NONESCAPE)
+                borrowed_ids = {fact[1]}
+                view_definitions = {}
+                views_defined = True
+                frontier = [fact[1]]
+                while frontier:
+                    current = frontier.pop()
+                    for candidate in nonescape_page.rows():
+                        candidate_fact = nonescape_page.latest(candidate)
+                        if (candidate[:2] != row[:2] or candidate[3] != row[2]
+                                or not isinstance(candidate_fact, tuple)
+                                or len(candidate_fact) != 4
+                                or candidate_fact[1] != current):
+                            continue
+                        view = heap_view_result(
+                            function, candidate, candidate_fact,
+                        )
+                        if view is None:
+                            continue
+                        if (view[0] in borrowed_ids
+                                or not any(instruction is view[1]
+                                           for instruction in producer_block.instrs)):
+                            views_defined = False
+                            continue
+                        borrowed_ids.add(view[0])
+                        view_definitions[view[0]] = next(
+                            index for index, instruction
+                            in enumerate(producer_block.instrs)
+                            if instruction is view[1]
+                        )
+                        frontier.append(view[0])
                 if terminal.op != "Ret":
                     valid = producer_block is block
                 control_refs = ()
@@ -7573,16 +7670,19 @@ class CorrelationTable:
                          or book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
                              owner_calls[0].row, owner_calls[0].column,
                          )[1] == int(row[2]))
-                    and valid
+                    and valid and views_defined
                     and (producer_block is not block
                          or producer_index < release_index)
                     and release_index < return_index
-                    and all(int(value.id) not in (fact[1], int(row[2]))
+                    and all(int(value.id) not in {*borrowed_ids, int(row[2])}
                             for value in terminal.args)
                     and all(
                         ((other is producer_block and index > producer_index
-                          and (other is not block or index < release_index))
-                         if any(int(value.id) == fact[1]
+                          and (other is not block or index < release_index)
+                          and all(view_definitions.get(int(value.id), -1) < index
+                                  for value in instruction.args
+                                  if int(value.id) in borrowed_ids))
+                         if any(int(value.id) in borrowed_ids
                                 for value in instruction.args)
                          else (
                              (instruction is producer
@@ -7592,7 +7692,7 @@ class CorrelationTable:
                         for other in function.blocks.values()
                         for index, instruction in enumerate(other.instrs)
                         if instruction is not release
-                        and any(int(value.id) in (fact[1], int(row[2]))
+                        and any(int(value.id) in {*borrowed_ids, int(row[2])}
                                 for value in instruction.args)
                     )
                 )
@@ -7602,7 +7702,7 @@ class CorrelationTable:
                     instruction for other in function.blocks.values()
                     for instruction in other.instrs
                     if instruction is not producer and instruction is not release
-                    and any(int(value.id) == fact[1]
+                    and any(int(value.id) in borrowed_ids
                             for value in instruction.args)
                 )
                 def consumer_result_id(instruction):
@@ -7926,8 +8026,8 @@ class CorrelationTable:
         """An axis-changing view owns an exact transform of its storage."""
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
-            TENSOR_RUNTIME_VIEW_GEOMETRY,
+            CANONICAL_VALUE, SSA_VALUE, TENSOR_METADATA_CALL_BINDING,
+            TENSOR_METADATA_RESULT_BINDING, TENSOR_RUNTIME_VIEW_GEOMETRY,
         )
         from .concorded_literals import literal_from_identity
         from .ssa_record_return_state import (
@@ -7987,9 +8087,14 @@ class CorrelationTable:
                 values = (source_id, row[2], source_shape, source_rank,
                           source_count, result_shape, result_rank)
                 if unsqueeze:
+                    from .concordance_declarations import INGESTION_VALUE
+
+                    # A SymPy law's axis literal is an ``ingestion_value``
+                    # identity (no canonical relabel), exactly as the
+                    # lowering that posted this view reads it.
                     axis_cell = ssa_value_identity_cell(function, axis_id, book=book)
                     canonical_axes = (tuple(cause for cause, _stage in book.edges_into(
-                        axis_cell) if cause.page == CANONICAL_VALUE)
+                        axis_cell) if cause.page in (CANONICAL_VALUE, INGESTION_VALUE))
                         if axis_cell is not None else ())
                     literal, literal_cells = (
                         literal_from_identity(book, canonical_axes[0])
@@ -8028,9 +8133,33 @@ class CorrelationTable:
                     and rank_definition is not None
                     and _constant_payload(rank_definition) == output_rank
                 )
+                # Program: declared Sum; region 5 unsqueezes its input formal
+                # 8 (the caller's arange span). Its geometry is not measured
+                # by local extents: it arrives as the formals 020/021/022
+                # that the caller's exact metadata Call binding pairs with
+                # the producer's projected triple. That booked binding is the
+                # source metadata's identity here.
+                formal_ids = {int(formal.id) for formal in function.args}
+                call_bound = (
+                    source_id in formal_ids
+                    and {source_shape, source_rank, source_count} <= formal_ids
+                    and any(
+                        binding[4] == function.name
+                        and (bound := book.page(
+                            TENSOR_METADATA_CALL_BINDING).latest(binding))
+                        and isinstance(bound, tuple) and len(bound) == 2
+                        and any(tuple(map(int, bound[1][index:index + 3]))
+                                == (source_shape, source_rank, source_count)
+                                for index in range(0, len(bound[1]), 3))
+                        for binding in book.page(
+                            TENSOR_METADATA_CALL_BINDING).rows()
+                    )
+                )
                 for value_id, kind in ((source_shape, "shape"),
                                        (source_rank, "rank"),
                                        (source_count, "element_count")):
+                    if call_bound:
+                        continue
                     extent = definition(value_id, "extent", (source_id,))
                     valid = (valid and extent is not None
                              and extent.attributes.get("extent_kind") == kind)
@@ -8102,11 +8231,28 @@ class CorrelationTable:
                     and call.attributes.get("callee") == function.name
                     and int(row[2]) in tuple(map(int, call.attributes.get("output_ids", ())))
                 }
+                def revision_causes(binding):
+                    # A passthrough fold revises the result row (its latest
+                    # column cites its prior column and the rebinding); the
+                    # row's own revision chain is one identity.
+                    causes, seen = set(), set()
+                    pending = [book.latest_ref(TENSOR_METADATA_RESULT_BINDING, binding)]
+                    while pending:
+                        revision = pending.pop()
+                        if revision is None or revision in seen:
+                            continue
+                        seen.add(revision)
+                        for cause, _stage in book.edges_into(revision):
+                            causes.add(cause)
+                            if (cause.page == TENSOR_METADATA_RESULT_BINDING
+                                    and cause.row == binding):
+                                pending.append(cause)
+                    return causes
+
                 valid = set(bindings) == expected and all(
                     book.page(TENSOR_METADATA_RESULT_BINDING).latest(binding)[1]
                     == (result_shape, result_rank, source_count)
-                    and ref in {cause for cause, _stage in book.edges_into(
-                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING, binding))}
+                    and ref in revision_causes(binding)
                     for binding in bindings
                 )
             if not valid:
@@ -9751,8 +9897,21 @@ class CorrelationTable:
                         ),
                     ) for source in rebinding_cells
                 }
+                # Program: declared Sum; region 5 returns arange.unsqueeze(0).
+                # Only its element count passes through unchanged; its new
+                # shape and rank remain live caller projections. The fold
+                # names exactly the ids it replaced, each with its receipt.
+                folded = (
+                    {int(old_id) for old_id, new_id in zip(
+                        previous_fact[2], fact[2], strict=True)
+                     if int(old_id) != int(new_id)}
+                    if isinstance(previous_fact, tuple) and len(previous_fact) == 3
+                    and isinstance(fact, tuple) and len(fact) == 3
+                    and len(previous_fact[2]) == len(fact[2]) else set()
+                )
                 valid = (
-                    previous in causes and len(rebinding_cells) == 3
+                    previous in causes and bool(folded)
+                    and len(rebinding_cells) == len(folded)
                     and isinstance(previous_fact, tuple)
                     and len(previous_fact) == 3
                     and previous_fact[0] == fact[0]
@@ -9760,13 +9919,15 @@ class CorrelationTable:
                     and len(returns) == 1
                     and row[3] in tuple(map(int, call.attributes.get(
                         "output_ids", ())))
-                    and set(map(int, previous_fact[2])) == set(mapping)
-                    and len(passthroughs) >= 3
+                    and folded == set(mapping)
+                    and len(passthroughs) >= len(folded)
                 )
                 if valid:
                     for old_id, new_id, callee_id in zip(
                         previous_fact[2], fact[2], fact[1], strict=True,
                     ):
+                        if int(old_id) not in folded:
+                            continue
                         rebind = mapping.get(int(old_id))
                         matching = tuple(binding for binding in passthroughs
                                          if len(binding) >= 4

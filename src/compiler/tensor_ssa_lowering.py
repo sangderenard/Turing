@@ -2600,8 +2600,29 @@ def publish_computed_region_result_metadata(
                 "private owned tensor has no ordered final consumer"
             )
         nonescape_cells = []
-        for other_block, position in uses:
+        # Program: declared Sum(f(k, x), (k, 1, n)). Region 5 returns
+        # arange_k.unsqueeze(0), a view of the caller-owned arange storage;
+        # regions 6 and 7 consume that view. The caller still owns the one
+        # heap cell. Each returned view is the same borrowed storage under a
+        # new caller id: it is followed here exactly like the owned tensor
+        # (uses ordered after its defining Call, in the producer block, never
+        # returned), its consumers get their own nonescape receipts derived
+        # from the view-producing receipt, and the release stays after them.
+        borrowers = [(tensor_id, uses, None)]
+        borrowed_ids = {tensor_id}
+        receipted_consumers = set()
+        while borrowers:
+          borrowed_id, borrowed_uses, parent_cell = borrowers.pop(0)
+          for other_block, position in borrowed_uses:
             consumer = other_block.instrs[position]
+            if id(consumer) in receipted_consumers or sum(
+                int(value.id) in borrowed_ids for value in consumer.args
+            ) != sum(int(value.id) == borrowed_id for value in consumer.args):
+                raise ValueError(
+                    "private owned tensor consumer reads two borrowed views"
+                )
+            receipted_consumers.add(id(consumer))
+            view_output = None
             target = module.functions.get(str(
                 consumer.attributes.get("callee") or ""
             )) if consumer.op == "Call" else None
@@ -2622,7 +2643,7 @@ def publish_computed_region_result_metadata(
             consumed_formals = {
                 formal_id for formal_id, actual in zip(
                     declared_inputs, consumer.args
-                ) if int(actual.id) == tensor_id
+                ) if int(actual.id) == borrowed_id
             }
             if not consumed_formals:
                 raise ValueError(
@@ -2688,17 +2709,17 @@ def publish_computed_region_result_metadata(
                             source.page == SSA_VALUE
                             and source.row == (function_scope_of(caller), value_id)
                             for source in rebinding_causes
-                        ) for value_id in (alias_id, tensor_id))
+                        ) for value_id in (alias_id, borrowed_id))
                         or book.latest_ref(prior_call.page, prior_call.row) != prior_call
                         or book.latest_ref(rebinding.page, rebinding.row) != rebinding
                         or rebinding.row != (function_scope_of(caller), alias_id)
-                        or binding_fact != (tensor_id, target.name, alias_id)
+                        or binding_fact != (borrowed_id, target.name, alias_id)
                         or passthroughs[0][4] != "exact_callee_output_formal"
                         or any(int(value.id) == alias_id
                                for caller_block in caller.blocks.values()
                                for live in caller_block.instrs
                                for value in live.args)
-                        or any(int(value.id) in {tensor_id, alias_id, owner_actual_id}
+                        or any(int(value.id) in {*borrowed_ids, alias_id, owner_actual_id}
                                for value in returns[0][1].args)):
                     raise ValueError(
                         "private owned tensor reborrow escapes its owning caller"
@@ -2732,7 +2753,7 @@ def publish_computed_region_result_metadata(
                 if (len(data_outputs) != 1
                         or data_outputs[0] not in consumed_formals
                         or passthroughs[0][:4] != (
-                            0, alias_id, data_outputs[0], tensor_id,
+                            0, alias_id, data_outputs[0], borrowed_id,
                         )):
                     raise ValueError(
                         "private owned tensor reborrow lacks exact data output"
@@ -2781,9 +2802,14 @@ def publish_computed_region_result_metadata(
                     and int(descriptor.data_value_id) == reborrow[3]
                     and descriptor.alias_of is None
                 ):
-                    raise ValueError(
-                        "private owned tensor consumer may return its storage"
-                    )
+                    # The borrowed formal itself (a metadata-only view such
+                    # as unsqueeze) or a view of it stays borrowed under the
+                    # caller's exact output id; it is followed below.
+                    if consumer.res is None or view_output is not None:
+                        raise ValueError(
+                            "private owned tensor consumer may return its storage"
+                        )
+                    view_output = int(output.id)
                 output_layouts.append((
                     int(output.id), int(descriptor.data_value_id),
                     None if descriptor.alias_of is None
@@ -2810,8 +2836,12 @@ def publish_computed_region_result_metadata(
                 caller, (int(consumer.res.id) if consumer.res is not None
                          else int(reborrow[0].row[1])), book=book,
             )
+            if view_output is not None and len(output_layouts) != 1:
+                raise ValueError(
+                    "private owned tensor view consumer has more than one output"
+                )
             tensor_cell = ssa_value_identity_cell(
-                caller, tensor_id, book=book,
+                caller, borrowed_id, book=book,
             )
             if consumer_cell is None or tensor_cell is None:
                 raise ValueError(
@@ -2828,11 +2858,12 @@ def publish_computed_region_result_metadata(
             )
             book.post(
                 TENSOR_HEAP_CONSUMER_NONESCAPE, nonescape_row,
-                (target.name, tensor_id,
+                (target.name, borrowed_id,
                  tuple(sorted(consumed_formals)), tuple(output_layouts)),
                 stage=TENSOR_SSA_LOWERING,
                 provenance=Derived(tuple(dict.fromkeys((
                     owner_origin,
+                    *((parent_cell,) if parent_cell is not None else ()),
                     consumer_cell, tensor_cell, *output_cells,
                     *metadata_cells,
                     *((reborrow[1], reborrow[2])
@@ -2843,6 +2874,36 @@ def publish_computed_region_result_metadata(
             nonescape_cells.append(book.latest_ref(
                 TENSOR_HEAP_CONSUMER_NONESCAPE, nonescape_row,
             ))
+            if view_output is not None:
+                from .identity_concordance import heap_view_result
+
+                view = heap_view_result(caller, nonescape_row, (
+                    target.name, borrowed_id,
+                    tuple(sorted(consumed_formals)), tuple(output_layouts),
+                ))
+                if view is None or view[1] is not consumer:
+                    raise ValueError(
+                        "private owned tensor view lost its caller output"
+                    )
+                view_id = view[0]
+                view_uses = tuple(
+                    (use_block, use_block.instrs.index(instruction))
+                    for use_block in caller.blocks.values()
+                    for instruction in use_block.instrs
+                    if any(int(value.id) == view_id
+                           for value in instruction.args)
+                )
+                if (view_id in borrowed_ids
+                        or any(use_block is not other_block
+                               or use_position <= position
+                               for use_block, use_position in view_uses)
+                        or any(int(value.id) == view_id
+                               for value in returns[0][1].args)):
+                    raise ValueError(
+                        "private owned tensor view has no ordered nonescaping lifetime"
+                    )
+                borrowed_ids.add(view_id)
+                borrowers.append((view_id, view_uses, nonescape_cells[-1]))
         owner_actual = owner_actuals[0]
         block.instrs.insert(return_position, heap_release(owner_actual))
         release_sources = (

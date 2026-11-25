@@ -1025,6 +1025,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
             for _position, original, callee_id, actual, *_ in bindings
         }
         page = book.page(TENSOR_METADATA_RESULT_BINDING)
+        folded_rows = []
         for row in tuple(page.rows()):
             if row[0] != function_scope_of(function):
                 continue
@@ -1103,52 +1104,66 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                                     *((incoming,) if incoming is not None else ()))),
                 mode=Mode.REVISE,
             )
-            # The same projected values can already be actuals of a later
-            # planned Call. The fold rewrites its live operands; revise the
-            # one booked Call binding through the same exact three rebindings.
-            call_page = book.page(TENSOR_METADATA_CALL_BINDING)
-            for call_row in tuple(call_page.rows()):
-                if call_row[0] != function_scope_of(function) or call_row[1] != function.name:
-                    continue
-                previous_call = book.latest_ref(TENSOR_METADATA_CALL_BINDING, call_row)
-                actual_ids, formal_input_ids = call_page.cell(
-                    previous_call.row, previous_call.column,
-                )
-                if not any(int(value_id) in caller_ids for value_id in actual_ids):
-                    continue
-                if not all(any(int(actual_id) == int(old_id)
-                               for actual_id in actual_ids)
-                           for old_id in caller_ids):
-                    raise ValueError("computed metadata Call fold is incomplete")
-                consumers = tuple(instruction for block in function.blocks.values()
-                                  for instruction in block.instrs
-                                  if instruction.op == "Call" and instruction.res is not None
-                                  and int(instruction.res.id) == call_row[3]
-                                  and instruction.attributes.get("callee") == call_row[4])
-                if len(consumers) != 1:
-                    continue
-                # two_cast_shared_geometry and _varints return several
-                # tensors with one input geometry. The row being folded owns
-                # these exact metadata IDs; searching all results by equal
-                # geometry made the second tensor ambiguous and left its
-                # booked actuals stale after the live operands were rebound.
-                source_result = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
-                revised_actuals = tuple(
-                    replacements[int(value_id)][0]
-                    if int(value_id) in caller_ids
-                    and int(value_id) in replacements else int(value_id)
-                    for value_id in actual_ids
-                )
-                book.post(
-                    TENSOR_METADATA_CALL_BINDING, call_row,
-                    (revised_actuals, tuple(map(int, formal_input_ids))),
-                    stage=AGGREGATE_ABI_LEGALIZATION,
-                    provenance=Derived((previous_call, *rebinding_cells,
-                                        source_result,
-                                        *(source for source, _ in book.edges_into(previous_call)
-                                          if source.page == TENSOR_METADATA_RESULT_BINDING))),
-                    mode=Mode.REVISE,
-                )
+            folded_rows.append((row, tuple(map(int, caller_ids)), rebinding_cells))
+        # The same projected values can already be actuals of a later planned
+        # Call. The fold rewrites its live operands; revise each booked Call
+        # binding once, after every folded result row is revised. Program:
+        # declared Sum; region 6 returns two tensors (12, 21) sharing one
+        # metadata triple, both feeding region 7. Wrong record: revising per
+        # row left the binding citing row 21's stale column (row 12's fold had
+        # already rewritten the shared actuals, so row 21's fold skipped it).
+        # Rule: one revision, through every exact rebinding, citing the latest
+        # column of every result row the binding names.
+        call_page = book.page(TENSOR_METADATA_CALL_BINDING)
+        for call_row in tuple(call_page.rows()):
+            if call_row[0] != function_scope_of(function) or call_row[1] != function.name:
+                continue
+            previous_call = book.latest_ref(TENSOR_METADATA_CALL_BINDING, call_row)
+            actual_ids, formal_input_ids = call_page.cell(
+                previous_call.row, previous_call.column,
+            )
+            hits = tuple(
+                folded for folded in folded_rows
+                if any(int(value_id) in folded[1] for value_id in actual_ids)
+            )
+            if not hits:
+                continue
+            if not all(any(int(actual_id) == int(old_id)
+                           for actual_id in actual_ids)
+                       for folded in hits for old_id in folded[1]):
+                raise ValueError("computed metadata Call fold is incomplete")
+            consumers = tuple(instruction for block in function.blocks.values()
+                              for instruction in block.instrs
+                              if instruction.op == "Call" and instruction.res is not None
+                              and int(instruction.res.id) == call_row[3]
+                              and instruction.attributes.get("callee") == call_row[4])
+            if len(consumers) != 1:
+                continue
+            # two_cast_shared_geometry and _varints return several tensors
+            # with one input geometry. Each folded row owns its exact metadata
+            # IDs; no search by equal geometry chooses between them.
+            folded_ids = {value_id for folded in hits for value_id in folded[1]}
+            revised_actuals = tuple(
+                replacements[int(value_id)][0]
+                if int(value_id) in folded_ids
+                and int(value_id) in replacements else int(value_id)
+                for value_id in actual_ids
+            )
+            book.post(
+                TENSOR_METADATA_CALL_BINDING, call_row,
+                (revised_actuals, tuple(map(int, formal_input_ids))),
+                stage=AGGREGATE_ABI_LEGALIZATION,
+                provenance=Derived(tuple(dict.fromkeys((
+                    previous_call,
+                    *(cell for folded in hits for cell in folded[2]),
+                    *(book.latest_ref(TENSOR_METADATA_RESULT_BINDING, folded[0])
+                      for folded in hits),
+                    *(book.latest_ref(TENSOR_METADATA_RESULT_BINDING, source.row)
+                      for source, _ in book.edges_into(previous_call)
+                      if source.page == TENSOR_METADATA_RESULT_BINDING),
+                )))),
+                mode=Mode.REVISE,
+            )
 
     def returned_formal_cells(function, call, callee_id, caller_id, actual):
         """The exact callsite's incumbent formal/result/storage relation."""

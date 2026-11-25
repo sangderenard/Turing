@@ -94,14 +94,30 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
         view_row = (
             function_scope_of(callee), callee.name, callee_id,
         ) if callee is not None else None
-        view_refs = tuple(
-            parent for parent, _stage in book.edges_into(result_ref)
+        # Program: declared Sum; region 5's unsqueeze result row 11 was
+        # revised by the element-count passthrough fold. Its latest column
+        # cites its prior column and the rebinding, not the view receipt the
+        # first column cites. The row's own revision chain is one identity.
+        result_chain, pending_chain = [], [result_ref]
+        while pending_chain:
+            revision = pending_chain.pop()
+            if revision in result_chain:
+                continue
+            result_chain.append(revision)
+            pending_chain.extend(
+                parent for parent, _stage in book.edges_into(revision)
+                if parent.page == TENSOR_METADATA_RESULT_BINDING
+                and parent.row == result_ref.row
+            )
+        view_refs = tuple(dict.fromkeys(
+            parent for revision in result_chain
+            for parent, _stage in book.edges_into(revision)
             if parent.page in {
                 TENSOR_RUNTIME_RESHAPE_VALIDITY,
                 TENSOR_RUNTIME_VIEW_GEOMETRY,
                 TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
             } and parent.row == view_row
-        )
+        ))
         if len(view_refs) == 1 and descriptor is not None:
             view_ref = view_refs[0]
             view_page = book.page(view_ref.page)
