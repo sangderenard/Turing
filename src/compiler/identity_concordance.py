@@ -9221,6 +9221,130 @@ class CorrelationTable:
             ref = book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING, row)
             fact = page.cell(ref.row, ref.column)
             function = module.functions.get(str(row[1])) if isinstance(row, tuple) and len(row) == 3 else None
+            if (function is not None and isinstance(fact, tuple)
+                    and len(fact) == 7 and fact[0] == "where"):
+                # The selection over one shared runtime geometry
+                # (``tensor_ssa_lowering._shared_select_geometry``):
+                # ``("where", condition, if_true, if_false, shape, rank,
+                # count)``. The live where_double reads each operand or the
+                # fill_double temporary of its rank-0 value over that count.
+                ids = tuple(fact[4:7])
+                table = module.tensor_tables.get(function.name)
+                producers = [instruction for block in function.blocks.values()
+                             for instruction in block.instrs
+                             if instruction.res is not None
+                             and int(instruction.res.id) == row[2]]
+                call = producers[0] if len(producers) == 1 else None
+                result = None if table is None else table.by_id(row[2])
+                if (call is not None and call.op != "Call"
+                        and str(call.attributes.get("tensor_operation") or call.op) == "where"):
+                    # A non-float selection stays the instruction
+                    # (``_reference_kernel_lacks_dtype``): its operands are
+                    # exactly the booked three, its descriptor the shared one.
+                    valid = (
+                        function_scope_of(function) == row[0]
+                        and all(type(value_id) is int for value_id in fact[1:])
+                        and tuple(int(value.id) for value in call.args) == tuple(fact[1:4])
+                        and result is not None and result.metadata_state == "dynamic"
+                        and tuple(getattr(result, field) for field in (
+                            "shape_value_id", "rank_value_id",
+                            "element_count_value_id")) == ids
+                        and any(
+                            (descriptor := table.by_id(operand_id)) is not None
+                            and descriptor.metadata_state == "dynamic"
+                            and tuple(getattr(descriptor, field) for field in (
+                                "shape_value_id", "rank_value_id",
+                                "element_count_value_id")) == ids
+                            for operand_id in fact[1:4]
+                        )
+                    )
+                    if valid:
+                        causes = {cause for cause, _stage in book.edges_into(ref)}
+                        valid = all(
+                            (cell := ssa_value_identity_cell(
+                                function, value_id, book=book,
+                            )) is not None and cell in causes
+                            for value_id in (*fact[1:4], row[2], *ids)
+                        )
+                    if not valid:
+                        found.append(Finding(
+                            "tensor-elementwise-extent-binding", str(row[1]), row[2],
+                            "selection over runtime span lacks exact operands or "
+                            "shared descriptor",
+                        ))
+                    continue
+                valid = (
+                    function_scope_of(function) == row[0]
+                    and all(type(value_id) is int for value_id in fact[1:])
+                    and call is not None and call.op == "Call"
+                    and call.attributes.get("callee") == "where_double"
+                    and call.attributes.get("ssa_output_argument") == 3
+                    and len(call.args) == 5
+                    and int(call.args[4].id) == ids[2]
+                    and result is not None and result.metadata_state == "dynamic"
+                    and int(call.args[3].id) == result.data_value_id
+                    and tuple(getattr(result, field) for field in (
+                        "shape_value_id", "rank_value_id",
+                        "element_count_value_id")) == ids
+                )
+                fills = {}
+                if valid:
+                    for block in function.blocks.values():
+                        for instruction in block.instrs:
+                            if (instruction.op == "Call"
+                                    and instruction.attributes.get("callee") == "fill_double"
+                                    and len(instruction.args) == 3
+                                    and instruction.res is not None):
+                                fills.setdefault(int(instruction.res.id), []).append(instruction)
+                    spans = 0
+                    for position, operand_id in enumerate(fact[1:4]):
+                        argument = call.args[position]
+                        operand_fact = posted_ssa_value_fact(function, operand_id, book=book)
+                        if operand_fact is None:
+                            valid = False
+                            break
+                        if operand_fact.storage == "span":
+                            descriptor = None if table is None else table.by_id(operand_id)
+                            valid = (
+                                int(argument.id) == operand_id
+                                and descriptor is not None
+                                and descriptor.metadata_state == "dynamic"
+                                and tuple(getattr(descriptor, field) for field in (
+                                    "shape_value_id", "rank_value_id",
+                                    "element_count_value_id")) == ids
+                            )
+                            spans += 1
+                        else:
+                            filled = fills.get(int(argument.id), ())
+                            descriptor = None if table is None else table.by_id(int(argument.id))
+                            valid = (
+                                operand_fact.storage == "scalar" and operand_fact.rank == 0
+                                and len(filled) == 1
+                                and int(filled[0].args[2].id) == ids[2]
+                                and descriptor is not None
+                                and descriptor.metadata_state == "dynamic"
+                                and tuple(getattr(descriptor, field) for field in (
+                                    "shape_value_id", "rank_value_id",
+                                    "element_count_value_id")) == ids
+                            )
+                        if not valid:
+                            break
+                    valid = valid and spans > 0
+                if valid:
+                    causes = {cause for cause, _stage in book.edges_into(ref)}
+                    valid = all(
+                        (cell := ssa_value_identity_cell(
+                            function, value_id, book=book,
+                        )) is not None and cell in causes
+                        for value_id in (*fact[1:4], row[2], *ids)
+                    )
+                if not valid:
+                    found.append(Finding(
+                        "tensor-elementwise-extent-binding", str(row[1]), row[2],
+                        "selection over runtime span lacks exact operands, shared "
+                        "descriptor, fill or where_double execution",
+                    ))
+                continue
             valid = (
                 function is not None and function_scope_of(function) == row[0]
                 and isinstance(fact, tuple) and len(fact) in (5, 6)

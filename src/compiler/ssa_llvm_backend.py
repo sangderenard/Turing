@@ -1989,6 +1989,7 @@ def _span_element_count(
     body: list,
     public_span_value: _Any,
     module_extent_slot: _Any,
+    descriptor_count: _Any = None,
 ) -> str | None:
     """An i32 register (or literal) holding this span's element count.
 
@@ -2006,6 +2007,12 @@ def _span_element_count(
         return str(total)
     public_id = public_span_value(function_name, int(value.id))
     if public_id is None or not rank:
+        # Program: declared Sum(f(k, x), (k, 1, n)). Its index axis is
+        # ``arange(count)`` over a count computed in the program, so no
+        # program parameter's extents vector states it. Its dynamic tensor
+        # descriptor does: the exact element-count SSA value. Read that.
+        if descriptor_count is not None and rank:
+            return descriptor_count(value, tag, body)
         return None
     running: str | None = None
     for axis in range(rank):
@@ -2962,6 +2969,38 @@ def _emit_repository_call_module(
                             str(block_name_), [],
                         ).append(result_id_)
 
+        def descriptor_element_count(
+            value: _Any, label: str, lines: list, *, at_entry: bool = False,
+        ) -> str | None:
+            """The span's runtime element count from its dynamic descriptor.
+
+            ``tensor_ssa_lowering`` gives a runtime-sized span a dynamic
+            descriptor whose element count is an exact int32 SSA value (a
+            metadata formal across a region call, or the local value that
+            computed it). In the entry frame only a formal is defined.
+            """
+
+            table = (getattr(module, "tensor_tables", {}) or {}).get(name)
+            descriptor = None if table is None else table.by_id(int(value.id))
+            if (descriptor is None or descriptor.metadata_state != "dynamic"
+                    or descriptor.element_count_value_id is None):
+                return None
+            count_id = int(descriptor.element_count_value_id)
+            count_value = values_by_function.get(name, {}).get(count_id)
+            if at_entry:
+                if count_id not in formal_positions:
+                    return None
+                address = pointers[count_id]
+            elif count_id in pointers:
+                address = pointers[count_id]
+            elif count_value is not None:
+                address = pointer(count_value)
+            else:
+                return None
+            register = f"%dcount.{label}"
+            lines.append(f"  {register} = load i32, ptr {address}, align 4")
+            return register
+
         def pointer(value: _Any) -> str:
             value_id = int(value.id)
             known = pointers.get(value_id)
@@ -2989,7 +3028,22 @@ def _emit_repository_call_module(
                 requirement = frame_storage_requirements.get(name, {}).get(value_id)
                 if requirement is not None and requirement.element_count is not None:
                     count = max(count, int(requirement.element_count))
-            if value_id not in allocated and (
+            # Program: declared Sum; region 6 writes its runtime-sized mask 12
+            # into the caller-owned heap carrier (``tensor_heap_owner_call
+            # _binding``), exactly as region 4 writes the index axis. Wrong
+            # record: the root still claimed a runtime frame for 12 that its
+            # entry cannot measure. Rule: a value whose storage is a booked
+            # caller-owned heap carrier of this frame has that storage.
+            from .concordance_declarations import (
+                TENSOR_HEAP_OWNER_CALL_BINDING as _OWNER_CALL,
+            )
+            _owner_book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+            heap_owned_here = _owner_book is not None and any(
+                owner_row[1] == str(name) and int(owner_row[4]) == value_id
+                for owner_row in _owner_book.page(_OWNER_CALL).rows()
+                if len(owner_row) == 5
+            )
+            if value_id not in allocated and not heap_owned_here and (
                 (str(name), value_id) in elementwise_runtime_results
                 # A region's runtime-sized span result, projected here and
                 # fed on to its consumer (``(x * y).sum()``).
@@ -3008,6 +3062,9 @@ def _emit_repository_call_module(
                 runtime_count = _span_element_count(
                     name, value, f"frame.{value_id}", entry_allocas,
                     public_span_value, module_extent_slot,
+                    lambda counted, label, lines: descriptor_element_count(
+                        counted, label, lines, at_entry=True,
+                    ),
                 )
                 if runtime_count is None:
                     shortfalls.append(LLVMEmissionShortfall(
@@ -3787,6 +3844,7 @@ def _emit_repository_call_module(
                     total = _span_element_count(
                         name, result, tag, body,
                         public_span_value, module_extent_slot,
+                        descriptor_element_count,
                     )
                     if total is None:
                         shortfalls.append(LLVMEmissionShortfall(
@@ -5303,6 +5361,7 @@ def _emit_repository_call_module(
                 total = _span_element_count(
                     name, result, tag, body,
                     public_span_value, module_extent_slot,
+                    descriptor_element_count,
                 )
                 if total is None:
                     shortfalls.append(LLVMEmissionShortfall(
@@ -5671,6 +5730,7 @@ def _emit_repository_call_module(
                 total = _span_element_count(
                     name, result, tag, body,
                     public_span_value, module_extent_slot,
+                    descriptor_element_count,
                 )
                 if total is None:
                     shortfalls.append(LLVMEmissionShortfall(
@@ -5698,10 +5758,32 @@ def _emit_repository_call_module(
                     ))
                     continue
                 extent_operand = _elementwise_extent_operand(instruction)
+                geometry_table = (getattr(module, "tensor_tables", {}) or {}).get(name)
+
+                def shared_geometry(argument: _Any) -> bool:
+                    # Tensors sharing one geometry name the same exact shape/
+                    # rank/count SSA values in their dynamic descriptors
+                    # (``tensor_ssa_lowering``): equal by construction, as
+                    # region 7's mask and term over the Sum's index axis.
+                    if geometry_table is None:
+                        return False
+                    left = geometry_table.by_id(int(argument.id))
+                    right = geometry_table.by_id(int(result.id))
+                    triple = ("shape_value_id", "rank_value_id",
+                              "element_count_value_id")
+                    return (
+                        left is not None and right is not None
+                        and left.metadata_state == right.metadata_state == "dynamic"
+                        and all(getattr(left, key) is not None for key in triple)
+                        and tuple(getattr(left, key) for key in triple)
+                        == tuple(getattr(right, key) for key in triple)
+                    )
+
                 checked = [
                     argument for argument in instruction.args
                     if _runtime_sized_span(argument)
                     and argument is not extent_operand
+                    and not shared_geometry(argument)
                 ]
                 # Axis by axis: equal element counts over different extents
                 # ((2, 3) against (3, 2)) are a broadcast error in Python.
@@ -6238,6 +6320,7 @@ def _emit_repository_call_module(
                     measured = _span_element_count(
                         name, source, f"red.{tag}", body,
                         public_span_value, module_extent_slot,
+                        descriptor_element_count,
                     )
                     if measured is not None:
                         body.append(f"  %red.n64.{tag} = sext i32 {measured} to i64")

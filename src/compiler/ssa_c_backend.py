@@ -4363,7 +4363,7 @@ def emit_ssa_module_to_c(
                                 ).cell(geometry_cell.row, geometry_cell.column)
                                 geometry_ids = (
                                     tuple(map(int, geometry_fact[-3:]))
-                                    if isinstance(geometry_fact, tuple) and len(geometry_fact) in (5, 6)
+                                    if isinstance(geometry_fact, tuple) and len(geometry_fact) in (5, 6, 7)
                                     else ()
                                 )
                                 descriptor_ids = (

@@ -28974,7 +28974,8 @@ def _tensor_descriptor_rule(
         provisional_tensor = dict(tensor)
         tensor = {}
     elif (
-        descriptor_operation in _ELEMENTWISE_BINARY_OPERATIONS
+        (descriptor_operation in _ELEMENTWISE_BINARY_OPERATIONS
+         or descriptor_operation == "where")
         and not tuple(tensor.get("shape") or ())
         and any(
             _runtime_sized_descriptor(_tensor_descriptor(graph, operand, seen))
@@ -30254,8 +30255,16 @@ def _tensor_descriptor_rule(
             attributes.get("source_type") == "Call"
             and attributes.get("method_ref") is not None
         )
+        # Program: declared Sum; ``where(mask, term, 0)`` masks entries past
+        # the index bound over the runtime span mask and term share. Wrong
+        # record: ``where`` had only the static-broadcast fold, which drops a
+        # runtime-sized operand, so the selection was stamped rank 0 and its
+        # consumer received a scalar. Rule: a selection is elementwise over
+        # its condition and both arms; its element class is the promotion of
+        # the two value arms (np.where), never of the condition.
+        selection = operation == "where"
         if (
-            operation in _ELEMENTWISE_BINARY_OPERATIONS
+            (operation in _ELEMENTWISE_BINARY_OPERATIONS or selection)
             and not resolved_method_call
         ) or variadic_builtin_selector:
             operands = tuple(
@@ -30501,9 +30510,10 @@ def _tensor_descriptor_rule(
                     if broadcast is not None:
                         promoting_dtypes = tuple(
                             str(side.get("dtype"))
-                            for side in _promoting_sides(
-                                graph, operands, sides,
-                            )
+                            for side in (_promoting_sides(
+                                graph, operands[1:], sides[1:],
+                            ) if selection and len(sides) == 3
+                                else _promoting_sides(graph, operands, sides))
                             if str(side.get("dtype") or "unknown")
                             != "unknown"
                         )
@@ -30562,7 +30572,9 @@ def _tensor_descriptor_rule(
                     known_dtypes = tuple(
                         str(side.get("dtype"))
                         for side in (
-                            _promoting_sides(graph, operands, sides)
+                            (_promoting_sides(graph, operands[1:], sides[1:])
+                             if selection and len(sides) == 3
+                             else _promoting_sides(graph, operands, sides))
                             if scalar_sides else ()
                         )
                         if str(side.get("dtype") or "unknown") != "unknown"
@@ -30900,6 +30912,27 @@ def _tensor_descriptor_rule(
             if source is not None:
                 attributes = data.get("attributes") or {}
                 axis = attributes.get("axis", attributes.get("dim"))
+                if axis is None and static_form:
+                    # Program: declared Sum(f(k, x), (k, 1, n)) reduces its
+                    # masked term with ``AbstractTensor.sum(term, 0)``: the
+                    # tensor is ``arg:0`` and the axis ``arg:1``. Wrong
+                    # record: only the receiver form's positional axis was
+                    # read, so the (n, 1) term's axis-0 sum was typed an
+                    # all-axis scalar. Rule: in the static form the axis is
+                    # the literal ``arg:1`` carries.
+                    positional = [
+                        int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role).casefold() == "arg:1"
+                        and int(parent) in graph.G
+                    ]
+                    if positional:
+                        node = graph.G.nodes[positional[0]]
+                        literal = node.get("constant")
+                        if literal is None:
+                            literal = (node.get("attributes") or {}).get("value")
+                        if isinstance(literal, int) and not isinstance(literal, bool):
+                            axis = int(literal)
                 if axis is None and not static_form:
                     # ``x.sum(0)``: the reduction axis is the first positional
                     # argument (``AbstractTensor.sum(self, dim, keepdim)``),
