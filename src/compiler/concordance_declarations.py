@@ -4561,6 +4561,13 @@ class ConstantRoleFact:
 
 
 @dataclass(frozen=True)
+class LawValueAxesFact:
+    #: True: no declared reduction axis (a Sum/Integral ``tensor_operation``)
+    #: is among the value's causes, so it is one rank-zero value of the law.
+    axis_free: bool
+
+
+@dataclass(frozen=True)
 class SymbolicTransformFact:
     #: ``resolve_external_derivative`` / ``integral_quadrature``.
     transform: str
@@ -4573,6 +4580,16 @@ TENSOR_OPERATION_PARAMETER = declare_page("tensor_operation_parameter", (
 CONSTANT_ROLE = declare_page("constant_role", (
     RowField("ingestion_scope", K.SCOPE), RowField("constant", K.VALUE_ID),
 ), ConstantRoleFact)                   # DERIVED(constant, consumers, parameter cells); CONCORD
+LAW_VALUE_AXES = declare_page("law_value_axes", (
+    RowField("ingestion_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), LawValueAxesFact)                   # DERIVED(value, operand graph, operand rows); CONCORD
+RUNTIME_ARANGE_PARAMETERS = declare_page("runtime_arange_parameters", (
+    RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("result", K.VALUE_ID),
+), tuple)                              # (end, step, dtype); DERIVED(default cells | declared transform)
+DECLARED_TENSOR_OPERATION = declare_page("declared_tensor_operation", (
+    RowField("ingestion_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), str)                                # DERIVED(value cell); the operator whose law states the result
 SYMBOLIC_TRANSFORM = declare_page("symbolic_transform", (
     RowField("ingestion_scope", K.SCOPE), RowField("result", K.VALUE_ID),
 ), SymbolicTransformFact)              # DERIVED(authored, declaration, result cells); CONCORD

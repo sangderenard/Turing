@@ -12011,9 +12011,66 @@ def lower_tensor_calls_to_repository_ssa(
                                 return False, None
                             return True, value.value
 
-                        has_end, default_end = _arange_default("end")
-                        has_step, default_step = _arange_default("step")
-                        has_dtype, default_dtype = _arange_default("dtype")
+                        # Program: tests/test_graph_function_splicing.py
+                        # finite sum.  A declared Sum's index axis has no
+                        # authored call, so no omitted-argument rows; its
+                        # parameters are its declaration's, read from the
+                        # ``symbolic_transform`` row the Sum lowering posted
+                        # (``REDUCTION_INDEX_AXIS``: end None, step 1, no
+                        # dtype).  An authored call is read as before.
+                        from .concordance_declarations import SYMBOLIC_TRANSFORM
+                        from .symbolic_process_graph import REDUCTION_INDEX_AXIS
+
+                        declared_cell = instruction.attributes.get(
+                            "declared_lowering_cell"
+                        )
+                        declared_fact = (
+                            book.page(SYMBOLIC_TRANSFORM).cell(
+                                declared_cell.row, declared_cell.column,
+                            )
+                            if getattr(declared_cell, "page", None)
+                            == SYMBOLIC_TRANSFORM else None
+                        )
+                        if getattr(declared_fact, "transform", None) == (
+                            REDUCTION_INDEX_AXIS
+                        ):
+                            has_end, default_end = True, None
+                            has_step, default_step = True, 1
+                            has_dtype, default_dtype = True, None
+                            parameter_causes = (declared_cell,)
+                        else:
+                            has_end, default_end = _arange_default("end")
+                            has_step, default_step = _arange_default("step")
+                            has_dtype, default_dtype = _arange_default("dtype")
+                            parameter_causes = tuple(
+                                defaults[name] for name in ("end", "step", "dtype")
+                                if defaults.get(name) is not None
+                            )
+                        if (
+                            has_end and default_end is None
+                            and has_step and default_step == 1
+                            and has_dtype and default_dtype is None
+                        ):
+                            # The parameters this arange runs with, and the
+                            # cells that proved them: one row per result.
+                            from .concordance_declarations import (
+                                RUNTIME_ARANGE_PARAMETERS,
+                                TENSOR_SSA_LOWERING as _ARANGE_STAGE,
+                            )
+                            from .identity_concordance import Derived as _Derived
+                            from .identity_concordance import Mode as _Mode
+                            from .ssa_record_return_state import (
+                                function_scope_of as _arange_scope,
+                            )
+
+                            book.post(
+                                RUNTIME_ARANGE_PARAMETERS,
+                                (_arange_scope(function), function.name,
+                                 int(result.id)),
+                                (None, 1, None), stage=_ARANGE_STAGE,
+                                provenance=_Derived(parameter_causes),
+                                mode=_Mode.CONCORD,
+                            )
                         if (
                             has_end and default_end is None
                             and has_step and default_step == 1

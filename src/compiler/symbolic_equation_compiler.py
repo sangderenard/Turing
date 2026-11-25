@@ -451,6 +451,20 @@ def _compile_sympy_equations_uncached(
     # ``constant_role`` row (``_post_constant_roles``) decides.
     # keeps its integer.
     constant_roles = _post_constant_roles(graph)
+    # Every value's ``law_value_axes`` row, in operand order: whether a
+    # declared reduction axis (a Sum/Integral ``tensor_operation``) is among
+    # its causes, derived through the book's operand rows.
+    import networkx as nx
+
+    from .concorded_literals import literal as concorded_literal
+    from .symbolic_process_graph import (
+        declared_tensor_operation, law_value_axis_free, post_law_value_axes,
+        resident_identity_nodes,
+    )
+
+    resident = resident_identity_nodes(graph)
+    for _node_id in nx.topological_sort(graph.G):
+        post_law_value_axes(graph, int(_node_id), resident)
     for _node_id, data in graph.G.nodes(data=True):
         # A relation's result is not a value of the model, it is a
         # predicate, and blanket float64 erased that. The backend cannot
@@ -463,6 +477,37 @@ def _compile_sympy_equations_uncached(
             "dtype": "bool" if is_predicate_operation(spelling) else dtype,
             "shape": (),
         }
+        # Program: tests/test_graph_function_splicing.py (finite sum,
+        # integral, zeta series).  Wrong record: a declared Sum/Integral's
+        # reduction axis -- ``arange(count)``, the quadrature rule's
+        # ``get_tensor`` and their ``unsqueeze`` placements, which
+        # ``symbolic_process_graph`` builds through ``ingest.op`` and
+        # declares ``tensor_operation`` -- was stamped ``shape: ()`` with
+        # the law's values.  ``arange`` of a runtime count was posted a
+        # scalar, its placement a ``(1,)`` span, and the body evaluated over
+        # it had no physical span result.  Rule: the scalar shape is stamped
+        # only on a value whose ``law_value_axes`` row says no axis is among
+        # its causes; a declared tensor operation states its result through
+        # its operator law; a literal payload of the lowering (the rule's
+        # node and weight tuples) has the extents of its own concorded value.
+        if (
+            declared_tensor_operation(graph, int(_node_id)) is not None
+            or not law_value_axis_free(graph, int(_node_id))
+        ):
+            if declared_tensor_operation(graph, int(_node_id)) is not None:
+                # Its operator law states element class too: the arange over
+                # an int64 count is int64 (its ``ssa_value`` row took this
+                # stamp's float64, with no physical storage).
+                data["tensor"].pop("dtype", None)
+            del data["tensor"]["shape"]
+            if str(data.get("type") or data.get("op") or "").casefold() in {
+                "const", "constant",
+            }:
+                import numpy
+
+                payload, _cells = concorded_literal(graph, int(_node_id))
+                data["tensor"]["shape"] = tuple(
+                    int(extent) for extent in numpy.shape(payload))
         role = constant_roles.get(int(_node_id))
         if role is not None and role.role == "structural":
             # read from the row; the attribute cites it

@@ -30462,6 +30462,19 @@ def _tensor_descriptor_rule(
                         # unsettled tensor call, so retain the reduction law's
                         # descriptor when it enters later elementwise work.
                         continue
+                    # Program: tests/test_graph_function_splicing.py finite
+                    # sum.  Wrong record: in ``Le(k_axis, n - 1)`` and
+                    # ``Add(1, k_axis)`` the rank-0 side was taken for an
+                    # ingestion placeholder and dropped, the runtime-span law
+                    # below declined, and the result answered the graph
+                    # domain's scalar default.  Rule: a side whose
+                    # ``law_value_axes`` row says no declared reduction axis
+                    # is among its causes is one settled value of the law.
+                    if int(side.get("rank", 0)) == 0:
+                        from .symbolic_process_graph import law_value_axis_free
+
+                        if law_value_axis_free(graph, int(operand)):
+                            continue
                     if (
                         node.get("tensor")
                         or attributes.get("tensor_candidate")
@@ -31238,6 +31251,20 @@ def _tensor_descriptor_rule(
                     ):
                         result["dtype"] = reference_descriptor["dtype"]
                     return result
+        if operation == "get_tensor":
+            # ``AbstractTensor.get_tensor(data)`` is ``data`` as a tensor:
+            # the quadrature rule's node tuple, stated by its own literal
+            # (``compile_sympy_equations`` stamps no dtype on a declared
+            # tensor operation; its law states it).
+            data_parents = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if _positional_argument_index(str(role)) == 0
+                and int(parent) in graph.G
+            )
+            if len(data_parents) == 1:
+                stated = _tensor_descriptor(graph, data_parents[0], seen)
+                if stated is not None and stated.get("dtype"):
+                    return dict(stated)
         if operation in _DTYPE_CAST_OPERATIONS:
             # ``x.to_dtype("int64")`` preserves the shape exactly and only
             # changes the element type.  Leaving it descriptor-less made

@@ -661,6 +661,120 @@ def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
     return node_id
 
 
+def resident_identity_nodes(graph: Any) -> dict[Any, int]:
+    """Each resident node by its identity cell: the one map an operand cell
+    (``process_graph_operands``) is resolved through, built once."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    return {node_identity_cell(graph, int(node)): int(node) for node in graph.G}
+
+
+def post_law_value_axes(graph: Any, node_id: int, resident: Mapping[Any, int]):
+    """Post whether a declared reduction axis is among ``node_id``'s causes.
+
+    A value with a ``reduction_index_axis`` transform row is an axis; any
+    other value is axis-free exactly when every operand is.  The row is DERIVED
+    from the value's identity cell, its ``process_graph_operands`` row and
+    each operand's own ``law_value_axes`` row, so the whole answer is a path
+    through the book.  An operand with no row (a graph this rule never
+    declared) leaves the value undeclared: ``None``, no claim either way.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        INGESTION, LAW_VALUE_AXES, SYMBOLIC_TRANSFORM, LawValueAxesFact,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .process_graph_facts import operands
+
+    book = current_identity_book()
+    scope = tuple(graph.G.graph["ingestion_value_scope"])
+    data = graph.G.nodes[int(node_id)]
+    sources = [node_identity_cell(graph, int(node_id))]
+    # An axis is what a declared reduction says it is: its
+    # ``reduction_index_axis`` transform row (the Sum's arange, the
+    # Integral's rule nodes and weights).  ``max(n - 1)`` and the count's
+    # ``to_dtype`` are tensor operations but values of the law.
+    axis_cell = book.latest_ref(SYMBOLIC_TRANSFORM, (scope, int(node_id)))
+    axis_free = not (
+        axis_cell is not None
+        and getattr(book.page(SYMBOLIC_TRANSFORM).cell(
+            axis_cell.row, axis_cell.column,
+        ), "transform", None) == REDUCTION_INDEX_AXIS
+    )
+    if not axis_free:
+        sources.append(axis_cell)
+    if str(data.get("type") or data.get("op") or "").casefold() in {
+        "const", "constant",
+    }:
+        # A literal is one value of the law only when its own concorded
+        # payload is rank zero; the quadrature rule's node tuple is not.
+        import numpy
+
+        from .concorded_literals import MISSING, literal
+
+        payload, literal_cells = literal(graph, int(node_id))
+        if payload is MISSING:
+            return None
+        sources.extend(literal_cells)
+        axis_free = axis_free and numpy.ndim(payload) == 0
+    if data.get("parents"):
+        edges, edge_cell = operands(graph, int(node_id))
+        sources.append(edge_cell)
+        for operand_cell, _role in edges:
+            parent = resident.get(operand_cell)
+            row = (None if parent is None
+                   else book.latest_ref(LAW_VALUE_AXES, (scope, int(parent))))
+            if row is None:
+                return None
+            sources.append(row)
+            axis_free = axis_free and book.page(LAW_VALUE_AXES).cell(
+                row.row, row.column,
+            ).axis_free
+    return book.post(
+        LAW_VALUE_AXES, (scope, int(node_id)), LawValueAxesFact(axis_free),
+        stage=INGESTION, provenance=Derived(tuple(dict.fromkeys(sources))),
+        mode=Mode.CONCORD,
+    )
+
+
+def declared_tensor_operation(graph: Any, node_id: int) -> str | None:
+    """The operator ``node_id`` was declared at ingestion
+    (``declared_tensor_operation`` row), else ``None``."""
+
+    from .concordance_declarations import DECLARED_TENSOR_OPERATION
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("ingestion_value_scope")
+    if scope is None:
+        return None
+    return current_identity_book().page(DECLARED_TENSOR_OPERATION).latest(
+        (tuple(scope), int(node_id)),
+    )
+
+
+def law_value_axis_free(graph: Any, node_id: int) -> bool:
+    """Read ``node_id``'s ``law_value_axes`` row: True only when posted
+    axis-free."""
+
+    from .concordance_declarations import LAW_VALUE_AXES
+    from .identity_concordance import current_identity_book
+
+    scope = graph.G.graph.get("ingestion_value_scope")
+    if scope is None:
+        return False
+    fact = current_identity_book().page(LAW_VALUE_AXES).latest(
+        (tuple(scope), int(node_id)),
+    )
+    return bool(getattr(fact, "axis_free", False))
+
+
+#: The ``symbolic_transform`` kind a declared Sum posts on its index axis:
+#: ``arange(count)`` with end None, step 1 and no dtype, by declaration.
+REDUCTION_INDEX_AXIS = "reduction_index_axis"
+
+
 def _reduce_axes(ingest, term: int, rank: int, reduction: str) -> int:
     zero = ingest.literal(0)    # the axis, its own constant (``_place_axis``)
     for _ in range(rank):
@@ -699,9 +813,26 @@ def lower_sum_declaration(declaration, graph, ingest) -> int:
             span_id = ingest.bound(span, bindings)
             extent = ingest.op("max", (span_id,))
             step = sympy.Dummy("extent")
-            count = ingest.bound(step + 1, {step: extent})
+            # An index range is integral by the Sum's own declaration: its
+            # count is that integer, ``to_dtype(count, "int64")`` as the
+            # AbstractTensor source spells it, so the arange is the
+            # runtime-count arange every backend receives as a dynamic
+            # descriptor (``tensor_ssa_lowering``).
+            count = ingest.op("to_dtype", (
+                ingest.bound(step + 1, {step: extent}), ingest.literal("int64"),
+            ), roles=("receiver", "arg:0"))
         offset = sympy.Dummy("k")
-        axis = _place_axis(ingest, ingest.op("arange", (count,)), position, rank)
+        arange = ingest.op("arange", (count,))
+        # The transform edge: this arange is the Sum's index axis, declared
+        # here as ``arange(count)`` -- end None, step 1, no dtype -- so the
+        # lowering reads its parameters from this row, not from an authored
+        # call's omitted arguments (there is no authored call).
+        graph.G.nodes[arange].setdefault("attributes", {})[
+            "declared_lowering_cell"
+        ] = ingest.transform(
+            arange, REDUCTION_INDEX_AXIS, "arange(count)", declaration.sympy,
+        )
+        axis = _place_axis(ingest, arange, position, rank)
         spanned = sympy.Dummy("span")
         masks.append(ingest.bound(sympy.Le(offset, spanned), {offset: axis, spanned: span_id}))
         bindings[var] = ingest.bound(offset + limit.lower, {**bindings, offset: axis})
@@ -741,10 +872,17 @@ def lower_integral_declaration(declaration, graph, ingest) -> int:
                 f"declare a mapped Domain before quadrature: {declaration.sympy!r}")
         half = (limit.upper - limit.lower) / 2
         mid = (limit.upper + limit.lower) / 2
-        nodes = _place_axis(ingest, ingest.op("get_tensor", (
-            ingest.literal(tuple(float(node) for node, _weight in rule)),)), position, rank)
-        weights = _place_axis(ingest, ingest.op("get_tensor", (
-            ingest.literal(tuple(float(weight) for _node, weight in rule)),)), position, rank)
+        rule_nodes = ingest.op("get_tensor", (
+            ingest.literal(tuple(float(node) for node, _weight in rule)),))
+        rule_weights = ingest.op("get_tensor", (
+            ingest.literal(tuple(float(weight) for _node, weight in rule)),))
+        # The quadrature's axis, declared as the Sum's index axis is.
+        for axis_value, detail in ((rule_nodes, "quadrature nodes"),
+                                   (rule_weights, "quadrature weights")):
+            ingest.transform(axis_value, REDUCTION_INDEX_AXIS, detail,
+                             declaration.sympy)
+        nodes = _place_axis(ingest, rule_nodes, position, rank)
+        weights = _place_axis(ingest, rule_weights, position, rank)
         node_symbol, weight_symbol = sympy.Dummy("node"), sympy.Dummy("weight")
         bindings[var] = ingest.bound(mid + half * node_symbol, {**bindings, node_symbol: nodes})
         weight_bindings[weight_symbol] = weights
@@ -986,6 +1124,25 @@ def ingest_sympy_expression(
         # cell) under this ingestion's scope.
         if parents:
             _set_operands(graph, node_id, parents, cause=INGEST_EDGE)
+        if "value" in attributes and str(node_type).casefold() in {
+            "const", "constant",
+        }:
+            # A SymPy literal enters the same literal page an authored one
+            # does (``topological_reducer``): readers -- the cast's dtype
+            # fold, ``law_value_axes`` -- read the row, never the payload.
+            from ..common.tensors.topological_reducer import (
+                _source_numeric_scope, node_identity_cell,
+            )
+            from .concordance_declarations import INGESTION, SOURCE_LITERAL_VALUE
+            from .identity_concordance import Derived, Mode
+
+            provenance.book.post(
+                SOURCE_LITERAL_VALUE,
+                (_source_numeric_scope(graph), int(node_id)),
+                attributes["value"], stage=INGESTION,
+                provenance=Derived((node_identity_cell(graph, node_id),)),
+                mode=Mode.CONCORD,
+            )
         return node_id
 
     _unbound = object()
@@ -1014,12 +1171,32 @@ def ingest_sympy_expression(
                 else:
                     memo[symbol] = previous
 
-    def tensor_operation(name: str, parent_ids: Sequence[int]) -> int:
-        return make_node(
+    def tensor_operation(
+        name: str, parent_ids: Sequence[int],
+        roles: Sequence[str] | None = None,
+    ) -> int:
+        from .concordance_declarations import (
+            DECLARED_TENSOR_OPERATION, INGESTION, INGESTION_VALUE,
+        )
+        from .identity_concordance import Derived, Mode
+
+        node_id = make_node(
             sympy.Dummy(name), SympyProcessGraphRule(name), tuple(parent_ids),
-            tuple(f"arg:{index}" for index in range(len(parent_ids))),
+            tuple(roles) if roles is not None
+            else tuple(f"arg:{index}" for index in range(len(parent_ids))),
             {"tensor_operation": name},
         )
+        # The declaration that this value's result is stated by ``name``'s
+        # operator law (the stamp reads this row, not the attribute).
+        provenance.book.post(
+            DECLARED_TENSOR_OPERATION, (provenance.scope, int(node_id)),
+            str(name), stage=INGESTION,
+            provenance=Derived((provenance.book.latest_ref(
+                INGESTION_VALUE, (provenance.scope, int(node_id)),
+            ),)),
+            mode=Mode.CONCORD,
+        )
+        return node_id
 
     def literal(value: Any) -> int:
         return make_node(
@@ -1053,7 +1230,7 @@ def ingest_sympy_expression(
         cells = tuple(dict.fromkeys((
             *provenance.node_cells(authored), *extra_cells,
             *((result_cell,) if result_cell is not None else ()))))
-        book.post(
+        return book.post(
             SYMBOLIC_TRANSFORM, (provenance.scope, int(result_id)),
             SymbolicTransformFact(str(transform), str(detail)),
             stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,

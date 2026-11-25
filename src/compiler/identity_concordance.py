@@ -1623,6 +1623,7 @@ class CorrelationTable:
         found.extend(self._named_intrinsic_result_projection_findings(module))
         found.extend(self._source_intrinsic_admission_findings(module))
         found.extend(self._source_call_parameter_default_findings(module))
+        found.extend(self._declared_reduction_findings(module))
         found.extend(self._numerical_constructor_default_findings(module))
         found.extend(self._materialized_byte_row_findings(module))
         found.extend(self._specialized_literal_materialized_row_findings(module))
@@ -13504,6 +13505,102 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _declared_reduction_findings(module: Any) -> list[Finding]:
+        """Re-derive each declared-reduction row from its own cause cells.
+
+        ``declared_tensor_operation``: the operator named is the op of the
+        value's ``ingestion_value`` row it derives from.
+        ``law_value_axes``: False exactly when a ``reduction_index_axis``
+        transform, a False operand row or a non-scalar literal is among its
+        causes; one operand row per edge of its ``process_graph_operands``
+        cause.  ``runtime_arange_parameters``: ``(None, 1, None)``, proved
+        by a ``reduction_index_axis`` transform or by source default cells.
+        """
+
+        from .concordance_declarations import (
+            DECLARED_TENSOR_OPERATION, INGESTION_VALUE, LAW_VALUE_AXES,
+            PROCESS_GRAPH_OPERANDS, RUNTIME_ARANGE_PARAMETERS,
+            SOURCE_CALL_PARAMETER_DEFAULT, SYMBOLIC_TRANSFORM,
+        )
+        from .symbolic_process_graph import REDUCTION_INDEX_AXIS
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+
+        def causes(page, row):
+            receipt = book.latest_ref(page, row)
+            return receipt, tuple(
+                source for source, _stage in book.edges_into(receipt)
+            )
+
+        def is_axis(cell) -> bool:
+            return (cell.page == SYMBOLIC_TRANSFORM and getattr(
+                book.page(SYMBOLIC_TRANSFORM).cell(cell.row, cell.column),
+                "transform", None,
+            ) == REDUCTION_INDEX_AXIS)
+
+        page = book.page(DECLARED_TENSOR_OPERATION)
+        for row in page.rows():
+            _receipt, sources = causes(DECLARED_TENSOR_OPERATION, row)
+            values = [cell for cell in sources if cell.page == INGESTION_VALUE]
+            if not (len(values) == 1 and getattr(book.page(INGESTION_VALUE).cell(
+                    values[0].row, values[0].column), "op", None)
+                    == page.latest(row)):
+                found.append(Finding(
+                    "declared-tensor-operation", str(row), None,
+                    "declared operator is not its value's ingested operation",
+                ))
+
+        page = book.page(LAW_VALUE_AXES)
+        for row in page.rows():
+            _receipt, sources = causes(LAW_VALUE_AXES, row)
+            fact = page.latest(row)
+            operand_rows = [cell for cell in sources if cell.page == LAW_VALUE_AXES]
+            edge_rows = [cell for cell in sources if cell.page == PROCESS_GRAPH_OPERANDS]
+            edges = (book.page(PROCESS_GRAPH_OPERANDS).cell(
+                edge_rows[0].row, edge_rows[0].column) if edge_rows else ())
+            axis = any(is_axis(cell) for cell in sources)
+            operand_false = any(
+                not book.page(LAW_VALUE_AXES).cell(cell.row, cell.column).axis_free
+                for cell in operand_rows
+            )
+            literal = any(
+                cell.page not in {LAW_VALUE_AXES, PROCESS_GRAPH_OPERANDS,
+                                  SYMBOLIC_TRANSFORM, INGESTION_VALUE}
+                for cell in sources
+            )
+            valid = (
+                len(edge_rows) <= 1
+                and len(operand_rows) == len(tuple(edges or ()))
+                and (not fact.axis_free or not (axis or operand_false))
+                and (fact.axis_free or axis or operand_false or literal)
+            )
+            if not valid:
+                found.append(Finding(
+                    "law-value-axes", str(row), None,
+                    "law_value_axes row does not follow from its axis, operand "
+                    "and literal causes",
+                ))
+
+        page = book.page(RUNTIME_ARANGE_PARAMETERS)
+        for row in page.rows():
+            _receipt, sources = causes(RUNTIME_ARANGE_PARAMETERS, row)
+            declared = [cell for cell in sources if is_axis(cell)]
+            defaults = [cell for cell in sources
+                        if cell.page == SOURCE_CALL_PARAMETER_DEFAULT]
+            if not (page.latest(row) == (None, 1, None) and (
+                    (len(declared) == 1 and len(sources) == 1)
+                    or (len(defaults) == 3 and len(sources) == 3))):
+                found.append(Finding(
+                    "runtime-arange-parameters", str(row), None,
+                    "runtime arange parameters lack a declared index axis or "
+                    "their three source default cells",
+                ))
+        return found
+
+    @staticmethod
     def _source_call_parameter_default_findings(module: Any) -> list[Finding]:
         """Check an intrinsic omitted argument against its source call."""
 
@@ -14721,8 +14818,15 @@ class CorrelationTable:
                     and (parent, role) in book.page(PROCESS_GRAPH_OPERANDS).cell(
                         operands[0].row, operands[0].column,
                     )
-                    and consumer in {
-                        source for source, _stage in book.edges_into(operands[0])
+                    # A read-scope fork's operand row is a copy of the
+                    # authored operand row (its ``_canonical_identity_base``);
+                    # that row derives from the consumer.
+                    and _canonical_identity_base(book, consumer) in {
+                        _canonical_identity_base(book, source)
+                        for source, _stage in book.edges_into(
+                            _canonical_identity_base(book, operands[0]),
+                        )
+                        if source.page == consumer.page
                     }
                 )
             if valid:
@@ -14730,7 +14834,7 @@ class CorrelationTable:
                     dtype_cells[0].row, dtype_cells[0].column,
                 )
                 valid = (
-                    dtype_cells[0].row == consumer.row
+                    dtype_cells[0].row[1] == consumer.row[1]
                     and settled_dtype == dtype
                     and consumer in {
                         source for source, _stage in book.edges_into(dtype_cells[0])

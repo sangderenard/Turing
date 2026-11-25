@@ -52,7 +52,11 @@ def literal_from_identity(book, identity, _seen=()):
     pending, visited, matches = [identity], set(), set()
     while pending:
         current = pending.pop()
-        if current in visited or current.page != CANONICAL_VALUE:
+        # A SymPy ingestion's read-scope fork copies ``ingestion_value``
+        # identities by the same ``read_scope_fork`` edge (the linked
+        # finite-sum envelope's ``to_dtype(.., "int64")`` literal); follow it
+        # exactly as the canonical relation is followed.
+        if current in visited or current.page not in (CANONICAL_VALUE, INGESTION_VALUE):
             continue
         visited.add(current)
         direct = book.latest_ref(SOURCE_LITERAL_VALUE, current.row)
@@ -61,7 +65,7 @@ def literal_from_identity(book, identity, _seen=()):
         matches.update(target for target, _stage in book.edges_out_of(current)
                        if target.page == SOURCE_LITERAL_VALUE)
         pending.extend(source for source, stage in book.edges_into(current)
-                       if source.page == CANONICAL_VALUE
+                       if source.page == current.page
                        and stage.name == 'read_scope_fork')
     for current in visited:
         sync = book.latest_ref(SYNCHRONIZATION_LITERAL, (current,))
