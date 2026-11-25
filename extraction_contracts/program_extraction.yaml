@@ -307,6 +307,10 @@ rules:
     match: {module: time, qualname: perf_counter, occurrence: definition}
     action: use_native
     parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: float64}
+  - id: native-genericpath-exists-bool-result
+    match: {module: genericpath, qualname: exists, occurrence: definition}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: bool}
   - id: native-wall-clock-scalar-result
     match: {module: time, qualname: time, occurrence: definition}
     action: use_native

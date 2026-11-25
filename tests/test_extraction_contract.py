@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -353,11 +354,59 @@ def test_frozen_stdlib_definition_is_stdlib_not_repository_source():
     spec = genericpath.__spec__
     if spec.origin != "frozen" or spec.loader is not FrozenImporter:
         pytest.skip("this interpreter does not freeze genericpath")
-    decision = ExtractionContract(CONTRACT).decide(genericpath.exists)
+    # genericpath.exists now has its own rule; isfile is from the same
+    # frozen module and still falls to the stdlib default.
+    decision = ExtractionContract(CONTRACT).decide(genericpath.isfile)
 
     assert decision.subject.classification == "stdlib_python"
     assert decision.rule_id == "default:stdlib_python"
     assert decision.action is ExtractionAction.USE_NATIVE
+
+
+def test_path_exists_returns_an_inline_bool_scalar():
+    decision = ExtractionContract(CONTRACT).decide(os.path.exists)
+
+    assert decision.subject.classification == "stdlib_python"
+    assert decision.action is ExtractionAction.USE_NATIVE
+    assert decision.rule_id == "native-genericpath-exists-bool-result"
+    assert decision.parameters["result_dtype"] == "bool"
+    assert decision.parameters["native_abi"] == "cpython-c-api"
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import os\ndef entry():\n    return os.path.exists('x.bin')\n",
+        "import os\ndef entry():\n"
+        "    if os.path.exists('x.bin'):\n        return 1\n    return 0\n",
+    ),
+    ids=("returned", "branch_condition"),
+)
+def test_path_exists_lowers_through_the_native_callsite_as_bool(source):
+    # Ticket b043a7c9 / case 6b7d429f: `return os.path.exists(p)` gave
+    # "Ret returns none", then plan A's "no recorded result_dtype".
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, outputs, exports = lower_ast_source_to_ssa(
+            source, "entry", name="path_exists",
+            extraction_contract=ExtractionContract(CONTRACT),
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+    assert exports == ("path_exists__entry",)
+    operations = tuple(
+        instruction
+        for block in module.functions["path_exists__entry"].blocks.values()
+        for instruction in block.instrs
+    )
+    native, = (
+        instruction for instruction in operations
+        if (instruction.attributes or {}).get("external_reference")
+    )
+    assert native.attributes["external_identity"] == "genericpath.exists"
+    assert native.attributes["native_abi"] == "cpython-c-api"
+    assert native.res.dtype == "bool"
 
 
 def test_wall_clock_return_is_supplied_by_the_native_callsite_as_float64():
