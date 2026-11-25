@@ -1665,8 +1665,269 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
     return changed
 
 
+def retire_passthrough_aggregate_outputs(functions: Mapping[str, Function]) -> int:
+    """Retire a returned tuple member that every caller rebound to its actual.
+
+    Program: GLSL ``vec3 recorded; int hits; void begin(vec3 d){ recorded =
+    d; hits += 1; }`` becomes ``def begin(d, recorded, hits): recorded = d;
+    hits += 1; return (recorded, hits)``.  Wrong record: the caller's member 0
+    was folded to its own actual (``aggregate_output_passthrough_bindings``,
+    ``exact_callee_output_formal``, booked on AGGREGATE_PASSTHROUGH_REBINDING),
+    yet the callee still returned formal ``d`` at position 0, so ``d`` stayed
+    live and main passed its fields-only ``vec3(...)`` construction as an
+    opaque handle no instruction defines.  Rule: when every call into a callee
+    folded Ret position ``k`` as the callee's own formal and no call selects
+    ``k``, that member is no output of the callee: it leaves every Ret, and
+    every call's selected positions, slots and result contract are re-indexed
+    in the same transaction.  The formal is then judged by the ordinary
+    unused-formal prune.  Returns the number of retired members.
+    """
+
+    from .concordance_declarations import (
+        AGGREGATE_ABI_LEGALIZATION, AGGREGATE_PASSTHROUGH_REBINDING,
+        PASSTHROUGH_OUTPUT_RETIREMENT, SSA_BLOCK_GEOMETRY,
+    )
+    from .identity_concordance import Mode, current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+    from .ssa_record_return_state import function_scope_of, identity_cells
+
+    book = current_identity_book()
+    returns = {"Ret", "ret", "Return", "return"}
+    retired_total = 0
+    for callee_name, callee in functions.items():
+        if callee.metadata.get("native_interface") or callee.metadata.get(
+            "linked_piece_interface"
+        ):
+            continue
+        rets = [
+            instruction
+            for block in callee.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in returns
+        ]
+        if not rets or len({len(ret.args) for ret in rets}) != 1:
+            continue
+        arity = len(rets[0].args)
+        if arity < 2:
+            continue
+        calls = [
+            (caller, instruction)
+            for caller in functions.values()
+            for block in caller.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Call", "call"}
+            and str(instruction.attributes.get("callee") or "") == str(callee_name)
+        ]
+        if not calls:
+            continue
+        formal_ids = {int(formal.id) for formal in callee.args}
+        retire: list[int] = []
+        rebinding_cells: dict[int, list] = {}
+        for position in range(arity):
+            member_ids = {int(ret.args[position].id) for ret in rets}
+            if len(member_ids) != 1:
+                continue
+            member_id = next(iter(member_ids))
+            if member_id not in formal_ids:
+                continue
+            folded_everywhere = True
+            for caller, call in calls:
+                attributes = call.attributes
+                if attributes.get("result_convention") != "ssa.aggregate":
+                    folded_everywhere = False
+                    break
+                selected = {
+                    *map(int, attributes.get("output_positions", ())),
+                    *map(int, attributes.get("output_slots", ())),
+                }
+                bindings = tuple(
+                    binding
+                    for binding in attributes.get(
+                        "aggregate_output_passthrough_bindings", ()
+                    )
+                    if int(binding[0]) == position
+                    and int(binding[2]) == member_id
+                    and str(binding[4]) == "exact_callee_output_formal"
+                )
+                rebinding = None if position in selected or len(bindings) != 1 else (
+                    book.latest_ref(
+                        AGGREGATE_PASSTHROUGH_REBINDING,
+                        (function_scope_of(caller), int(bindings[0][1])),
+                    )
+                )
+                if rebinding is None:
+                    folded_everywhere = False
+                    break
+                rebinding_cells.setdefault(position, []).append(rebinding)
+            if folded_everywhere:
+                retire.append(position)
+        if not retire:
+            continue
+        retired = set(retire)
+        # The retirement is this pass's decision: one book row per retired
+        # Ret slot, DERIVED from every call's passthrough rebinding of it,
+        # the member's identity and the Ret block's prior geometry.  The
+        # block's next geometry derives from these rows
+        # (``_post_ssa_block_geometry``), as it does from a removed pure call.
+        callee_scope = function_scope_of(callee)
+        for label, block in callee.blocks.items():
+            if not any(instruction.op in returns for instruction in block.instrs):
+                continue
+            prior_geometry = book.latest_ref(
+                SSA_BLOCK_GEOMETRY, (callee_scope, str(callee.name), str(label)),
+            )
+            for position in sorted(retire):
+                member = rets[0].args[position]
+                _post_derived_or_raw(
+                    book, PASSTHROUGH_OUTPUT_RETIREMENT,
+                    ((callee_scope, str(callee.name)), str(label), int(position)),
+                    int(member.id),
+                    tuple(dict.fromkeys((
+                        *rebinding_cells.get(position, ()),
+                        *identity_cells(callee, member),
+                        *(() if prior_geometry is None else (prior_geometry,)),
+                    ))),
+                    stage=AGGREGATE_ABI_LEGALIZATION, mode=Mode.CONCORD,
+                )
+        retired_ids = {int(rets[0].args[position].id) for position in retire}
+        retired_members = tuple(
+            (int(position), int(rets[0].args[position].id))
+            for position in sorted(retire)
+        )
+
+        def shift(position: int) -> int:
+            return int(position) - sum(1 for k in retired if k < int(position))
+
+        for ret in rets:
+            ret.args = [
+                value for index, value in enumerate(ret.args)
+                if index not in retired
+            ]
+        # Program: GLSL ``begin(vec3 d){ recorded = d; hits += 1; }`` read
+        # with value copies returns ``(vec3(d.x, d.y, d.z), hits)``: ONE
+        # source output (the copied record) spread over three Ret slots by
+        # its record return layout, every one of them a retired formal.
+        # Wrong record: the source outputs were trimmed only when they
+        # matched the Ret one to one, so the copy stayed a source output
+        # with no Ret slot ("source-output-arity-short").  Rule: each source
+        # output occupies its record layout's slots (one slot otherwise); an
+        # output all of whose slots retired leaves with them.
+        from .ssa_record_return_state import record_return_layouts
+
+        layouts = record_return_layouts(callee)
+        for key in ("semantic_output_ids", "source_output_value_ids", "ssa_aggregate_outputs"):
+            values = tuple(callee.metadata.get(key, ()) or ())
+            if len(values) == arity:
+                callee.metadata[key] = tuple(
+                    value for index, value in enumerate(values)
+                    if index not in retired
+                )
+                continue
+            try:
+                widths = [len(layouts.get(int(value), ())) or 1 for value in values]
+            except (TypeError, ValueError):
+                continue
+            if not values or sum(widths) != arity:
+                continue
+            kept, start = [], 0
+            for value, width in zip(values, widths):
+                if not all(slot in retired for slot in range(start, start + width)):
+                    kept.append(value)
+                start += width
+            callee.metadata[key] = tuple(kept)
+        if callee.metadata.get("named_outputs"):
+            callee.metadata["named_outputs"] = tuple(
+                (name, value_id)
+                for name, value_id in callee.metadata["named_outputs"]
+                if int(value_id) not in retired_ids
+            )
+        callee.metadata["retired_passthrough_outputs"] = (
+            *callee.metadata.get("retired_passthrough_outputs", ()),
+            *retired_members,
+        )
+        for caller, call in calls:
+            attributes = call.attributes
+            for key in ("output_positions", "output_slots"):
+                if key in attributes:
+                    attributes[key] = tuple(
+                        shift(position) for position in attributes[key]
+                    )
+            contract = tuple(attributes.get("native_result_contract", ()) or ())
+            if len(contract) == arity:
+                attributes["native_result_contract"] = tuple(
+                    entry for index, entry in enumerate(contract)
+                    if index not in retired
+                )
+            if attributes.get("physical_result_bindings"):
+                attributes["physical_result_bindings"] = tuple(
+                    pair for pair in attributes["physical_result_bindings"]
+                    if int(pair[0]) not in retired_ids
+                )
+            # The caller's projections address the result by member index
+            # (the GEP's ``aggregate_index`` and its constant operand).
+            if call.res is not None:
+                instructions = [
+                    instruction
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                ]
+                constants = {
+                    int(instruction.res.id): instruction
+                    for instruction in instructions
+                    if instruction.op in {"Const", "const"}
+                    and instruction.res is not None
+                }
+                projections = [
+                    instruction for instruction in instructions
+                    if instruction.op in {"GetElementPtr", "getelementptr"}
+                    and instruction.args
+                    and int(instruction.args[0].id) == int(call.res.id)
+                    and instruction.attributes.get("aggregate_index") is not None
+                ]
+                for projection in projections:
+                    old = int(projection.attributes["aggregate_index"])
+                    new = shift(old)
+                    if new == old:
+                        continue
+                    projection.attributes["aggregate_index"] = new
+                    if len(projection.args) < 2:
+                        continue
+                    index_id = int(projection.args[1].id)
+                    constant = constants.get(index_id)
+                    if constant is None or int(
+                        constant.attributes.get("value", -1)
+                    ) != old:
+                        raise ValueError(
+                            "retired passthrough member: projection index "
+                            f"{index_id} of call {int(call.res.id)} in "
+                            f"{caller.name!r} is not the constant {old}"
+                        )
+                    if any(
+                        instruction is not projection
+                        and any(int(arg.id) == index_id for arg in instruction.args)
+                        for instruction in instructions
+                    ):
+                        raise ValueError(
+                            "retired passthrough member: projection index "
+                            f"constant {index_id} in {caller.name!r} is shared"
+                        )
+                    constant.attributes["value"] = new
+            attributes["retired_passthrough_outputs"] = tuple(
+                book.latest_ref(
+                    AGGREGATE_PASSTHROUGH_REBINDING,
+                    (function_scope_of(caller), int(binding[1])),
+                )
+                for binding in attributes.get(
+                    "aggregate_output_passthrough_bindings", ()
+                )
+                if int(binding[0]) in retired
+            )
+        retired_total += len(retire)
+    return retired_total
+
+
 __all__ = [
     "AggregateABIAnalysis", "AggregateCallRecord", "AggregateProjection",
     "analyze_aggregate_abi", "is_storage_view", "legalize_aggregate_adapters",
-    "legalize_aggregate_output_views",
+    "legalize_aggregate_output_views", "retire_passthrough_aggregate_outputs",
 ]

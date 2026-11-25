@@ -1289,6 +1289,60 @@ def drop_dead_pure_structural_instructions(functions) -> int:
     return removed
 
 
+def _post_pure_call_retirement(function, label, index, instruction) -> None:
+    """Book one removed pure call as the cause of its block's new geometry.
+
+    Program: ``def ident(v: vec2) -> vec2: return vec2(v.x, v.y)`` with
+    ``q = ident(p); out[0] = q.y`` (the GLSL reader's spelling of every
+    struct copy).  Wrong record: ``q.y`` resolved to ``p``'s own field, the
+    call's results became dead and were removed here, but nothing on the
+    book said so; the block's next geometry derived from the cells of its
+    remaining values alone, the book refused it ("REVISE without a changed
+    source").  Rule: the removal is a decision of this pass, posted here
+    (PURE_CALL_RETIREMENT) from the block's prior geometry and the call's
+    operand identities; the geometry poster cites it.
+    """
+
+    from .concordance_declarations import (
+        CELL_SET, DEAD_STRUCTURAL_SWEEP, PURE_CALL_RETIREMENT,
+        SSA_BLOCK_GEOMETRY,
+    )
+    from .identity_concordance import Mode, current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+    from .ssa_record_return_state import function_scope_of, identity_cells
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    prior_geometry = book.latest_ref(
+        SSA_BLOCK_GEOMETRY, (scope, str(function.name), str(label)),
+    )
+    cells = tuple(dict.fromkeys((
+        *(() if prior_geometry is None else (prior_geometry,)),
+        *(cell for operand in instruction.args
+          for cell in identity_cells(function, operand)),
+        *(() if instruction.res is None
+          else identity_cells(function, instruction.res)),
+    )))
+    if not cells:
+        root = book.latest_ref(CELL_SET, (scope, 0))
+        cells = () if root is None else (root,)
+    call_site = instruction.attributes.get("plan_callsite_id")
+    _post_derived_or_raw(
+        book, PURE_CALL_RETIREMENT,
+        (
+            (scope, str(function.name)), str(label),
+            f"callsite:{call_site}" if call_site is not None
+            else f"index:{int(index)}",
+        ),
+        (
+            str(instruction.attributes.get("callee") or ""),
+            tuple(int(operand.id) for operand in instruction.args),
+            None if instruction.res is None else int(instruction.res.id),
+        ),
+        cells, stage=DEAD_STRUCTURAL_SWEEP, mode=Mode.CONCORD,
+    )
+
+
 def drop_dead_pure_region_calls(functions) -> int:
     """Remove pure calls whose scalar results or aggregate projections are dead.
 
@@ -1360,13 +1414,33 @@ def drop_dead_pure_region_calls(functions) -> int:
                             continue
                         consumers[identity] = consumers.get(identity, 0) + 1
 
-        for block in function.blocks.values():
+        for label, block in function.blocks.items():
             drop: set[int] = set()
             for index, instruction in enumerate(block.instrs):
-                if (
-                    instruction.op not in ("Call", "call")
-                    or instruction.res is None
-                ):
+                if instruction.op not in ("Call", "call"):
+                    continue
+                if instruction.res is None:
+                    # Program: GLSL ``begin(vec3 d){ recorded = d; }``: the
+                    # callee only returns its record formal, and its result
+                    # was resolved through the frame alias, leaving a Call
+                    # with no result.  A callee whose body is a bare return
+                    # has no effect, so such a call is dead (the same proof
+                    # as the unconsumed bare-return result below).
+                    bare = functions.get(
+                        str(instruction.attributes.get("callee") or "")
+                    )
+                    if bare is not None and bare.blocks and all(
+                        body_instruction.op == "Ret"
+                        for body_block in bare.blocks.values()
+                        for body_instruction in body_block.instrs
+                    ):
+                        function.metadata["discarded_pure_call_sites"] = (
+                            *function.metadata.get("discarded_pure_call_sites", ()),
+                            (instruction.attributes.get("plan_callsite_id"), bare.name),
+                        )
+                        drop.add(index)
+                        removed_total += 1
+                        removed_callees.add(bare.name)
                     continue
                 callee = functions.get(
                     str(instruction.attributes.get("callee") or "")
@@ -1389,7 +1463,15 @@ def drop_dead_pure_region_calls(functions) -> int:
                            for body_block in callee.blocks.values()
                            for body_instruction in body_block.instrs):
                         continue
-                    if consumers.get(aggregate_id, 0) or aggregate_id in protected:
+                    # A frame-aliased result IS the caller's own operand
+                    # (``result_aliases_frame``): protecting it as an authored
+                    # feed protects nothing the operand does not (GLSL
+                    # ``begin(vec3 d){ recorded = d; }`` whose ``recorded``
+                    # fed a call that resolved through the same alias).
+                    if consumers.get(aggregate_id, 0) or (
+                        aggregate_id in protected
+                        and not instruction.attributes.get("result_aliases_frame")
+                    ):
                         continue
                     function.metadata["discarded_pure_call_sites"] = (
                         *function.metadata.get("discarded_pure_call_sites", ()),
@@ -1458,6 +1540,11 @@ def drop_dead_pure_region_calls(functions) -> int:
                     str(instruction.attributes.get("callee") or "")
                 )
             if drop:
+                for index in sorted(drop):
+                    if block.instrs[index].op in ("Call", "call"):
+                        _post_pure_call_retirement(
+                            function, label, index, block.instrs[index],
+                        )
                 block.instrs = [
                     instruction
                     for index, instruction in enumerate(block.instrs)

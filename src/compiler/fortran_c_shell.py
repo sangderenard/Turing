@@ -1281,6 +1281,7 @@ def _retained_parameter_identity(
     wrapper and leave the real scalar formal backed by zeroed scratch storage.
     """
 
+    retained_parameters = tuple(retained_parameters)
     retained = tuple(
         int(value_id)
         for name, value_id in retained_parameters
@@ -1289,6 +1290,18 @@ def _retained_parameter_identity(
     if len(set(retained)) == 1:
         return retained[0]
     history = tuple(map(int, identity_history))
+    # Program: GLSL ``put(vec3 d)`` writing the global ``recorded``:
+    # ``def put(d, recorded): recorded = d; return recorded``.  ``recorded``
+    # is dead on entry and retains no formal; its first identity version is
+    # ``d``'s formal, which ``d`` retains.  Wrong record: the fallback bound
+    # the caller's ``recorded`` into ``d``'s slot.  Rule: a formal another
+    # parameter retains is not this parameter's.
+    claimed = {
+        int(value_id) for name, value_id in retained_parameters
+        if str(name) != str(parameter_name)
+    }
+    if history and history[0] in claimed:
+        return None
     return history[0] if history else None
 
 
@@ -4650,15 +4663,37 @@ def _prune_unused_callee_formals_once(
             if str(name) in record_parameter_names
         }
 
+        record_parameter_name_of = {
+            int(value_id): str(name)
+            for name, value_id in metadata.get("parameter_names", ())
+            if str(name) in record_parameter_names
+        }
+
         def conceptual_record_formal(formal: Any) -> bool:
             accounting = dict(formal.accounting or {})
             declared_parameter = accounting.get("program_abi_parameter")
+            storage = accounting.get("program_abi_storage")
+            # Program: GLSL ``outer(float a, vec2 b)`` forwarding ``b`` to
+            # ``inner(vec2 b)``.  Wrong record: once demand propagation gave
+            # ``outer`` the field formal ``b.x``, the whole-record formal
+            # ``b`` was left holding the source class's opaque ``reference``
+            # view settled from the call edge; it was kept as a slot and its
+            # caller had no handle to pass.  Rule: a record parameter whose
+            # fields cross as field formals of their own is correlation
+            # whether its container view is ``record`` or ``reference``.
+            # A dead one (GLSL ``r = d`` before any read of ``r``) has no
+            # field formals at all and crosses nothing; removal still
+            # requires the formal to be unreferenced.
+            fielded_reference = (
+                storage == "reference"
+                and int(formal.id) in record_parameter_name_of
+            )
             # A record container (declared ``storage: record`` with no field of
             # its own) is correlation: only its leaves cross the native ABI.
             return (
                 not tuple(formal.shape or ())
                 and accounting.get("program_abi_field") is None
-                and accounting.get("program_abi_storage") in {None, "record"}
+                and (storage in {None, "record"} or fielded_reference)
                 and (
                     int(formal.id) in record_parameter_ids
                     or (
@@ -11320,12 +11355,22 @@ def _field_slot_ops(
 
     class_table = dict(graph_obj.graph.get("class_table") or {})
     owner = graph_obj.graph.get("method_owner")
+    receiver = _graph_receiver_formal(graph_obj)
+    # Program: free ``inner(b: vec2)`` reading ``b.x``, its program's only
+    # dataclass ``vec2``.  Wrong record: with one class in the table it was
+    # taken as this graph's receiver class, so ``b.x`` (a record PARAMETER's
+    # field, passed fields-only) became a receiver slot read of record None
+    # ("record scalar slot ABI lacks dtype").  Rule: only a method graph has
+    # a receiver arena; the one-class fallback names a method's owner.
     record = (
         class_table.get(owner)
         if owner in class_table
-        else (next(iter(class_table.values())) if len(class_table) == 1 else None)
+        else (
+            next(iter(class_table.values()))
+            if len(class_table) == 1 and receiver is not None
+            else None
+        )
     )
-    receiver = _graph_receiver_formal(graph_obj)
     declared_self_record = dict(
         (graph_obj.graph.get("parameter_record_abi") or {}).get(receiver) or {}
         if receiver is not None else {}
@@ -20156,6 +20201,24 @@ def _propagate_record_field_demand(
             {int(value.id) for value in caller.args},
             callee_cell=_frame_value_cell(callee, formal.id),
         )
+        if member_id is None:
+            # Program: GLSL ``begin(d)`` writes the global ``recorded``,
+            # then ``row()`` reads ``recorded.y``: main's ``recorded`` is
+            # begin's returned record, whose ``y`` the call record already
+            # binds (frame binding caller_storage -> the constant 2.5).
+            # Wrong record: the member walk found no caller member, so a
+            # fresh formal was minted on ``main`` -- an input no caller can
+            # supply -- and the frame-aliased result disagreed with the
+            # recorded storage.  Rule: the call record's exact frame binding
+            # for this callee formal names the caller value to pass.
+            recorded = tuple(
+                int(source) for callee_id, kind, source in record.frame_bindings
+                if int(callee_id) == int(formal.id)
+                and str(kind) in {"caller_value", "caller_alias", "caller_storage"}
+                and isinstance(source, int)
+            )
+            if len(recorded) == 1 and recorded[0] in caller_values:
+                member_id = recorded[0]
         return None if member_id is None else caller_values.get(int(member_id))
 
     grew = True
@@ -26973,8 +27036,55 @@ def _class_surface_ssa_program(
             # below retains the exact authored table/key declaration.
             from .concordance_declarations import POLICY_PHYSICAL_KIND
             storage = POLICY_PHYSICAL_KIND.get(storage, storage)
+            # Program: GLSL ``begin(vec3 d, int hits)`` -> ``hits: 'i32'``.
+            # Wrong record: an annotated primitive parameter with no contract
+            # dtype took its class receipt (``int`` -> int64) although its arm
+            # cites the parameter's own ``'i32'`` annotation, and main read the
+            # value back as int64 against its declared int32 binding.  Rule:
+            # the annotation cell this arm cites is the declared width when it
+            # is the class's kind (an integer for ``int``, a float for
+            # ``float``); the class receipt is the default only without one.
+            declared_annotation_dtype = None
+            if (
+                primitive_receipt is not None
+                and not contract.get("dtype")
+                and not node_abi.get("program_abi_dtype")
+            ):
+                from ..transmogrifier.dtype_layout import (
+                    resolve as _annotation_layout,
+                    source_annotation_dtype as _annotation_dtype,
+                )
+                from .concordance_declarations import (
+                    ANNOTATION_DECLARATION as _ARM_ANNOTATION,
+                    PARAMETER_ANNOTATION as _ARM_PARAMETER_ANNOTATION,
+                )
+
+                receipt_layout = _annotation_layout(str(primitive_receipt["dtype"]))
+                declared_widths = set()
+                for cell in source_cells:
+                    page_name = getattr(cell.page, "name", cell.page)
+                    if page_name not in {
+                        _ARM_PARAMETER_ANNOTATION.name, _ARM_ANNOTATION.name,
+                    }:
+                        continue
+                    stated = _cell_fact(cell)
+                    width = _annotation_dtype(
+                        getattr(stated, "annotation", stated)
+                    )
+                    layout = _annotation_layout(width) if width else None
+                    if layout is not None and receipt_layout is not None and (
+                        layout.kind == receipt_layout.kind
+                        or (
+                            layout.kind in {"int", "uint"}
+                            and receipt_layout.kind in {"int", "uint"}
+                        )
+                    ):
+                        declared_widths.add(str(width))
+                if len(declared_widths) == 1:
+                    declared_annotation_dtype = next(iter(declared_widths))
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
+                or declared_annotation_dtype
                 or (primitive_receipt or {}).get("dtype")
                 or ""
             )
@@ -27629,11 +27739,23 @@ def _class_surface_ssa_program(
                     and descriptor.get("metadata_state") != "dynamic"
                 ):
                     extents = tuple(descriptor["shape"])
+                    # The descriptor supplies what the contract lacks; it
+                    # never overrides what the contract declares.  Program:
+                    # GLSL ``begin(vec3 d, int hits)``: the formal's contract
+                    # states its ``'i32'`` annotation while the graph
+                    # descriptor holds the ``int`` class default, and the
+                    # override handed main an int64 ``hits`` against its
+                    # declared int32 binding.
                     source = {
-                        **dict(source or {}),
                         "dtype": descriptor["dtype"],
                         "rank": len(extents),
                         "storage": "span" if extents else "scalar",
+                        **{
+                            key: value
+                            for key, value in dict(source or {}).items()
+                            if value is not None
+                            and not (key == "dtype" and str(value) in {"", "unknown"})
+                        },
                     }
                     # A shape is recorded only when the descriptor states
                     # EXTENTS.  An empty shape from this query is equally
@@ -32978,6 +33100,27 @@ def _class_surface_ssa_program(
         from .source_comprehension_capacity import publish_source_comprehension_capacity
         publish_source_comprehension_capacity(graph_obj, control)
 
+        # The kind each version of a parameter's name was ingested as, read
+        # from the book (``ingestion_value``, through the version's canonical
+        # cell): ``_is_parameter_entry`` admits only an ingested Input as a
+        # parameter's entry value, never a value the function computes.
+        from .control_activity import _ingested_kind
+        parameter_entry_kinds = {}
+        for parameter_name in graph_obj.graph.get("function_parameters") or ():
+            for value_id in (graph_obj.graph.get("identity_table") or {}).get(
+                str(parameter_name), ()
+            ):
+                if int(value_id) not in graph_obj:
+                    continue
+                try:
+                    kind = _ingested_kind(_GraphView(G=graph_obj), int(value_id))
+                except ValueError:
+                    # A version with no identity row: the book states no
+                    # kind for it, and no rule is drawn from one.
+                    continue
+                if kind is not None:
+                    parameter_entry_kinds[int(value_id)] = kind
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -33041,10 +33184,40 @@ def _class_surface_ssa_program(
                         } if (data.get("attributes") or {}).get(
                             "program_abi_optional_presence_value_id"
                         ) is not None else {}),
+                        # The ingested kind of a parameter name's version, as
+                        # the book records it (``_is_parameter_entry``).
+                        **({
+                            "ingested_kind": parameter_entry_kinds[int(node_id)],
+                        } if int(node_id) in parameter_entry_kinds else {}),
+                        # The parameter an Input is the entry value of, as
+                        # the graph declares it (``_is_parameter_entry``).
+                        **({
+                            "input_binding": str(
+                                (data.get("attributes") or {})["binding_name"]
+                            ),
+                        } if str(data.get("type") or "") == "Input"
+                        and (data.get("attributes") or {}).get(
+                            "binding_name"
+                        ) is not None else {}),
                     }
                     for node_id, data in graph_obj.nodes(data=True)
                     for expression in (data.get("expr_obj"),)
                     if isinstance(expression, ast.AST)
+                    and int(data.get("value_id", node_id)) == int(node_id)
+                } | {
+                    # A parameter Input has no expression of its own; the
+                    # graph still declares which parameter it enters.
+                    int(node_id): {
+                        "node_id": int(node_id),
+                        "input_binding": str(
+                            (data.get("attributes") or {})["binding_name"]
+                        ),
+                    }
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("type") or "") == "Input"
+                    and not isinstance(data.get("expr_obj"), ast.AST)
+                    and (data.get("attributes") or {}).get("binding_name")
+                    is not None
                     and int(data.get("value_id", node_id)) == int(node_id)
                 },
                 shape_scope=shape_scope_of(graph_obj),
@@ -51115,10 +51288,50 @@ def _class_surface_ssa_program(
             aliases = _concordant_function_aliases(function)
             unresolved_projections = []
             descriptors_by_owner = dict(record_table.records)
-            for history in (
-                graph.graph.get("identity_table") or {}
-            ).values():
-                history_ids = tuple(map(int, history))
+
+            def call_result_object(value_id: int) -> bool:
+                """Whether a name version is an object a call returned."""
+
+                node = graph.nodes.get(int(value_id), {})
+                kind = str(node.get("op") or node.get("type") or "").casefold()
+                if kind == "call":
+                    return True
+                if kind != "indexed":
+                    return False
+                return any(
+                    str(role) == "base" and parent in graph and str(
+                        graph.nodes[parent].get("op")
+                        or graph.nodes[parent].get("type") or ""
+                    ).casefold() == "call"
+                    for parent, role in node.get("parents") or ()
+                )
+
+            def object_segments(history_ids: tuple[int, ...]):
+                # Program: ``q = vec2(0.0, 0.0)`` then ``q, n = ident(v,
+                # n)`` and ``q.y``.  Wrong record: ``q``'s history (the
+                # constructor 4, the call-result member 12) shared record
+                # 4's descriptor, so ``q.y`` after the call read the
+                # constructor's ``y`` -- a silent wrong value.  Rule: a name
+                # rebound to a call's result (the Call or a member of it)
+                # names the object the call returned, not the one before;
+                # the history splits there and a descriptor extends only
+                # through the versions of its own object.
+                segment: list[int] = []
+                for value_id in history_ids:
+                    if segment and call_result_object(value_id):
+                        yield tuple(segment)
+                        segment = []
+                    segment.append(int(value_id))
+                if segment:
+                    yield tuple(segment)
+
+            for history_ids in (
+                segment
+                for history in (
+                    graph.graph.get("identity_table") or {}
+                ).values()
+                for segment in object_segments(tuple(map(int, history)))
+            ):
                 residents = tuple(dict.fromkeys(
                     record_table.records[value_id]
                     for value_id in history_ids
@@ -51155,6 +51368,21 @@ def _class_surface_ssa_program(
                     None if receiver_origin_id is None
                     else descriptors_by_owner.get(int(receiver_origin_id))
                 )
+                # Program: ``q, n = ident(vec2(2.0, 3.0), n)`` returning its
+                # record formal as member 0, then ``q.y``.  The member is
+                # the caller's actual (its planning alias is concorded, the
+                # identity-return proof); with no descriptor of its own it
+                # reads the fields of the record it is.
+                aliased_origins: set[int] = set()
+                while (
+                    descriptor is None
+                    and receiver_origin_id is not None
+                    and int(receiver_origin_id) in aliases
+                    and int(receiver_origin_id) not in aliased_origins
+                ):
+                    aliased_origins.add(int(receiver_origin_id))
+                    receiver_origin_id = int(aliases[int(receiver_origin_id)])
+                    descriptor = descriptors_by_owner.get(int(receiver_origin_id))
                 attribute = str(
                     (data.get("attributes") or {}).get("attribute") or ""
                 )
@@ -61452,12 +61680,15 @@ def _class_surface_ssa_program(
                     == callee_symbol
                 ), None)
                 if linked_call is not None:
-                    caller_values = {
-                        int(value.id): value
-                        for value in all_functions[
-                            str(caller_symbol)
-                        ].args
-                    }
+                    # Every value the caller defines, not only its formals:
+                    # GLSL ``begin(d)`` then ``row()`` reads the global
+                    # ``recorded.y`` -- the rebound storage is main's own
+                    # constant 2.5 (``d.y``), a body value.  Looking only at
+                    # formals left the call on the storage leased from
+                    # absence while the record named the constant.
+                    caller_values = dict(function_values(
+                        all_functions[str(caller_symbol)]
+                    ))
                     rebound_positions = []
                     for position, callee_id in enumerate(
                         map(int, linked_call.attributes.get(
@@ -61508,10 +61739,37 @@ def _class_surface_ssa_program(
                                 )),
                             )
                             value.dtype = field_dtype
+                        stale = linked_call.args[position]
                         linked_call.args[position] = value
                         rebound_positions.append((
                             position, callee_id, int(caller_id),
                         ))
+                        # Program: GLSL ``begin(d)`` then ``row()`` reading
+                        # the global ``recorded.y``.  The operand was storage
+                        # leased from absence for exactly this binding, and
+                        # ``row``'s frame-aliased result had already been
+                        # read through it downstream (main fed it to its
+                        # region: an input no caller supplies, read as 0).
+                        # Rule: once the binding is proven, the leased
+                        # placeholder is that value everywhere in the caller.
+                        if (
+                            int(stale.id) != int(value.id)
+                            and dict(stale.accounting or {}).get(
+                                "unbound_parameter_member"
+                            )
+                        ):
+                            caller_function = all_functions[str(caller_symbol)]
+                            for caller_block in caller_function.blocks.values():
+                                for caller_instruction in caller_block.instrs:
+                                    caller_instruction.args = [
+                                        value if int(argument.id) == int(stale.id)
+                                        else argument
+                                        for argument in caller_instruction.args
+                                    ]
+                            caller_function.args = [
+                                argument for argument in caller_function.args
+                                if int(argument.id) != int(stale.id)
+                            ]
                     if rebound_positions:
                         linked_call.attributes[
                             "returned_record_argument_reconciled"
@@ -64991,7 +65249,37 @@ def _lower_ast_source_to_ssa_impl(
         if not glsl_result.complete:
             raise ValueError(glsl_result.shortfall_report())
         glsl_tree = retain_glsl_source_evidence(glsl_result.module, source)
+        # The program's module is its GLSL document (``glsl:<sha256>``, the
+        # identity its source evidence already names), so a record the
+        # reader emits is ``glsl:<sha256>.vec3`` and the caller can declare
+        # it in program_abi.  A hash of the generated tree would be an
+        # identity no caller can name.
+        glsl_tree._turing_source_module = f"glsl:{authored_source_sha256}"
         source = ast.unparse(glsl_tree)
+        # Program: GLSL ``vec2 p = vec2(2.0, 3.0); o[0] = outer(1.0, p)``.
+        # Wrong record: the reader's generated nodes all sat at
+        # ``fix_missing_locations``' (1, 0, 1, 0), so source-span identities
+        # of distinct statements coincided and ``outer``'s field formal was
+        # linked to a minted, unsupplied entry formal (it read 0).  Rule:
+        # the preserved tree (it carries the GLSL evidence) takes the
+        # positions of the Python text the compiler reads -- its own
+        # ``unparse`` -- node for node; a tree that does not round-trip is
+        # refused, never located approximately.
+        _located_tree = ast.parse(source)
+        for _generated, _located in zip(
+            ast.walk(glsl_tree), ast.walk(_located_tree), strict=True,
+        ):
+            if type(_generated) is not type(_located):
+                raise ValueError(
+                    "GLSL reader tree does not round-trip through its "
+                    f"source: {type(_generated).__name__} parses as "
+                    f"{type(_located).__name__}"
+                )
+            for _position in (
+                "lineno", "col_offset", "end_lineno", "end_col_offset",
+            ):
+                if hasattr(_located, _position):
+                    setattr(_generated, _position, getattr(_located, _position))
         glsl_source_receipt = {
             "source_sha256": authored_source_sha256,
             "normalized_ast_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
@@ -66436,10 +66724,20 @@ def _lower_ast_source_to_ssa_impl(
             node._linked_repository_ssa_module = linked_module
             node._linked_repository_ssa_root = linked_root
             node._linked_repository_ssa_outputs = linked_outputs
+    # Program: GLSL ``float outer(float a, vec2 b){ return b.x + a; }``.
+    # Wrong record: the graph of the GLSL reader's tree was built as
+    # ``source_language="glsl"``, which skips the Python attribute special
+    # cases, so ``b.x`` stayed a raw Attribute the backends read as an
+    # external value (0).  Rule: that tree IS ordinary Python
+    # (``lower_glsl_source_to_ast``); its graph has Python's semantics, and
+    # the GLSL origin is its evidence (``retain_glsl_source_evidence``) and
+    # the module's ``glsl_source_ingestion`` receipt.
     graph = ProcessGraph(
         materialize_memory=True,
         boundary_namespace=boundary_namespace,
-        source_language=source_language,
+        source_language=(
+            "python" if glsl_tree is not None else source_language
+        ),
     )
     # A source slice keeps the imports authored in its original module.  Their
     # leading dots are meaningful only with that module's package identity.
@@ -67835,6 +68133,14 @@ def _lower_ast_source_to_ssa_impl(
                     module.record_tables,
                 )
             )
+            # A returned tuple member every caller rebound to its own actual
+            # (an exact callee formal) is no output; retiring it lets the
+            # prune below judge that formal by its remaining readers.
+            from .ssa_aggregate_abi import retire_passthrough_aggregate_outputs
+
+            module.metadata["final_retired_passthrough_outputs"] = (
+                retire_passthrough_aggregate_outputs(module.functions)
+            )
             final_pruned_formals += _prune_unused_callee_formals(
                 module.functions, final_call_records,
                 module.sequence_tables,
@@ -67845,7 +68151,30 @@ def _lower_ast_source_to_ssa_impl(
             # reads is harmless; one an instruction reads would be read
             # uninitialized, so it is refused by name.  A call operand only
             # forwards the slot; the callee's own formal answers for it.
-            for function in module.functions.values():
+            # Program: GLSL ``begin(d)`` then ``row()`` reading the global
+            # ``recorded.y``.  The member was leased from absence while the
+            # walk ran, then the returned-record reconcile bound main's call
+            # to the constant 2.5.  Rule: the formal is unbound only while
+            # some call into it still passes a leased placeholder (which
+            # carries the same marker); a proven binding at every call is a
+            # binding.
+            passed_unbound: dict[str, set[int]] = {}
+            for caller_function in module.functions.values():
+                for block in caller_function.blocks.values():
+                    for instruction in block.instrs:
+                        if instruction.op not in {"Call", "call"}:
+                            continue
+                        inputs = tuple(map(int, instruction.attributes.get(
+                            "callee_input_ids", (),
+                        )))
+                        for callee_formal, operand in zip(inputs, instruction.args):
+                            if dict(operand.accounting or {}).get(
+                                "unbound_parameter_member"
+                            ):
+                                passed_unbound.setdefault(str(
+                                    instruction.attributes.get("callee") or ""
+                                ), set()).add(int(callee_formal))
+            for function_name, function in module.functions.items():
                 read_ids = {
                     int(operand.id)
                     for block in function.blocks.values()
@@ -67853,11 +68182,38 @@ def _lower_ast_source_to_ssa_impl(
                     if instruction.op not in {"Call", "call"}
                     for operand in instruction.args
                 }
+                calls_into = tuple(
+                    instruction
+                    for caller_function in module.functions.values()
+                    for block in caller_function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op in {"Call", "call"}
+                    and str(instruction.attributes.get("callee") or "")
+                    == str(function_name)
+                )
+                # No call reaches the function any more (``row`` returns its
+                # own formal, so its result was resolved to the operand):
+                # nothing executes it, and its formal is never read.  A call
+                # without an input receipt cannot be checked: refused.
+                exported_names = {str(name) for name in (exports or ())}
+                unchecked_call = any(
+                    not instruction.attributes.get("callee_input_ids")
+                    for instruction in calls_into
+                )
                 for formal in function.args:
                     unbound = dict(formal.accounting or {}).get(
                         "unbound_parameter_member"
                     )
-                    if unbound and int(formal.id) in read_ids:
+                    if (
+                        unbound and int(formal.id) in read_ids
+                        and (
+                            str(function_name) in exported_names
+                            or unchecked_call
+                            or int(formal.id) in passed_unbound.get(
+                                str(function_name), set()
+                            )
+                        )
+                    ):
                         raise ValueError(str(unbound))
             final_pruned_entry_field_aliases = _prune_dead_entry_field_aliases(
                 module.functions, final_call_records,

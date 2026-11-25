@@ -7435,15 +7435,33 @@ def lower_tensor_calls_to_repository_ssa(
             # while its booked descriptor carries runtime row geometry.
             # That descriptor controls reduction inputs and output extent;
             # the display tuple cannot turn it into a fixed one-row tensor.
-            existing = tensor_table.by_id(int(value.id))
-            if existing is not None and existing.metadata_state != "static":
-                return True
-            if tuple(value.shape or ()):
-                return False
             from .ssa_record_return_state import posted_ssa_value_fact
             physical = posted_ssa_value_fact(
                 function, int(value.id), book=book,
             )
+            existing = tensor_table.by_id(int(value.id))
+            # Program: GLSL ``bump(h); outv[0] = float(h)`` -- ``h`` is the
+            # value ``bump`` hands back, a region input whose descriptor is
+            # ``unresolved`` (its producer is a control Call).  Wrong record:
+            # every non-static descriptor meant "shape unknown", so the
+            # scalar cast went to the dynamic span-cast kernel and refused.
+            # Rule: an unresolved descriptor states no geometry; the value's
+            # own ``ssa_value`` row that posts it a rank-0 scalar does.  A
+            # dynamic descriptor (runtime geometry) still wins.
+            unresolved_scalar = (
+                existing is not None
+                and existing.metadata_state == "unresolved"
+                and not tuple(existing.shape or ())
+                and physical is not None
+                and physical.storage == "scalar"
+                and physical.rank == 0
+                and value.dtype is not None
+            )
+            if (existing is not None and existing.metadata_state != "static"
+                    and not unresolved_scalar):
+                return True
+            if tuple(value.shape or ()):
+                return False
             if (physical is not None and physical.storage == "span"
                     and isinstance(physical.rank, int)
                     and physical.rank > 0):

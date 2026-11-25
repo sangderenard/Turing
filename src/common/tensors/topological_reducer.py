@@ -3357,12 +3357,18 @@ def _replication_name_needs_storage(graph: Any, node_id: Any, expression: Any) -
     reads at a runtime index (``name[i]``): both need resident storage, which
     a folded literal does not have."""
 
+    # ``active: list['u32'] = [0] * 4`` (an annotated binding, GLSL
+    # ``uint active[4]``) binds its name exactly as ``active = [0] * 4``.
     names = {
         target.id
         for successor in graph.G.successors(node_id)
         for statement in (graph.G.nodes[successor].get("expr_obj"),)
-        if isinstance(statement, ast.Assign) and statement.value is expression
-        for target in statement.targets
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and statement.value is expression
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign)
+            else (statement.target,)
+        )
         if isinstance(target, ast.Name)
     }
     if not names:
@@ -3393,6 +3399,23 @@ def _replication_name_needs_storage(graph: Any, node_id: Any, expression: Any) -
             and other.func.attr in writers
             and isinstance(other.func.value, ast.Name)
             and other.func.value.id in names
+        ):
+            return True
+        # Program: ``active = [0] * 4; begin(active); active[2]`` with
+        # ``def begin(active): active[2] = 5`` (GLSL ``uint active[4]``
+        # written by a helper).  Wrong record: the call was no writer, so
+        # the list folded to a literal and ``active[2]`` read 0 -- the
+        # helper's store was lost (a silent wrong value).  Rule: a list
+        # handed to a call is the callee's object too, which may write it.
+        # This pass runs before any call has an identity, so no callee is
+        # known to only read (a name spelled ``len`` proves nothing); as an
+        # unknown callee may store, every call keeps the list's storage.
+        if isinstance(other, ast.Call) and any(
+            isinstance(argument, ast.Name) and argument.id in names
+            for argument in (
+                *other.args,
+                *(keyword.value for keyword in other.keywords),
+            )
         ):
             return True
     return False
@@ -8062,11 +8085,65 @@ def _normalize_lexical_values(
     storing_call_values: set[int] = set()
     storing_call_effects: dict[int, list[int]] = {}
     #: For each loop being reduced, innermost last: the names a call in the
-    #: body may store into, and the values they hold at loop entry.  A call
-    #: later in the body stores before the next iteration's read.
+    #: body may store into, the values they hold at loop entry, and the
+    #: loop's own node.  A call later in the body stores before the next
+    #: iteration's read.
     loop_body_storing_receivers: list[
-        tuple[frozenset[str], frozenset[int]]
+        tuple[frozenset[str], frozenset[int], int]
     ] = []
+
+    def loop_stores_into(
+        name: Any, receiver: int,
+        names: frozenset[str], values: frozenset[int], depth: int,
+    ) -> bool:
+        """Whether one open loop's storing call may reach this receiver.
+
+        Program: Studio ``trace_bounce``'s ``rd = vec3(...)`` built in the
+        bounce loop and read on the next line (``rd.x * n.x``), while a call
+        later in that loop may store into ``rd``.  Wrong record: the read
+        was refused (record_stored_by_call) by the name alone.  Rule: a
+        record constructed in the loop's own body is a fresh object each
+        iteration; a call reaches it only once it is passed, which the
+        receiver's own storing-call record decides.  A receiver from
+        before the loop (or carried by it) is still reached by name.
+        """
+
+        if record_built_in_loop(name, receiver, depth):
+            return False
+        return name in names or int(receiver) in values
+
+    def record_built_in_loop(name: Any, receiver: int, depth: int) -> bool:
+        """Whether ``name``'s binding to ``receiver`` is executed by the open
+        loop at ``depth`` (or one nested in it), as the book records it.
+
+        The binding's own ``name_binding`` row names its value; the
+        ``name_binding_loop_owner`` row beside it names the loop whose body
+        executes it.  Such a record is a fresh object each iteration of that
+        loop: nothing that loop did on an earlier iteration reaches it.
+        """
+
+        from ...compiler.concordance_declarations import (
+            NAME_BINDING_LOOP_OWNER,
+        )
+
+        if not isinstance(name, str):
+            return False
+        open_loops = {
+            int(loop)
+            for _names, _values, loop in loop_body_storing_receivers[depth:]
+        }
+        book = current_identity_book()
+        binding_page = book.page(_NAME_BINDING)
+        owner_page = book.page(NAME_BINDING_LOOP_OWNER)
+        for version in range(len(identity_bindings.get(name, ())) - 1, -1, -1):
+            row = (ingestion_read_scope, name, version)
+            binding = binding_page.latest(row)
+            bound = getattr(binding, "value_id", None)
+            if bound is None or int(bound) != int(receiver):
+                continue
+            owner = owner_page.latest(row)
+            return isinstance(owner, int) and int(owner) in open_loops
+        return False
     storing_definitions = dict(authored_definitions_by_name or {})
     #: ``acc.add`` in ``acc.add(b)`` is a method lookup, not a field read.
     method_lookup_ids = {
@@ -8124,9 +8201,56 @@ def _normalize_lexical_values(
             if not (isinstance(node, ast.Name) and node.id == name):
                 continue
             if isinstance(node.ctx, (ast.Store, ast.Del)):
-                stores = True
-                break
+                # Program: Studio ``studio_boundary_step(t, rd, ...)`` does
+                # ``rd = vec3(...)``.  Rebinding (or unbinding) the local
+                # name gives it another object; the caller's record is not
+                # touched.  Only ``name += ...`` (an in-place ``__iadd__``)
+                # may store into it.
+                if isinstance(parents.get(id(node)), ast.AugAssign):
+                    stores = True
+                    break
+                continue
             attribute = parents.get(id(node))
+            # Program: Studio ``splat_segment_multiscale(a, b, ...)`` hands
+            # ``b`` straight on to ``splat_segment_spectral(a, b, ...)``,
+            # which only reads its fields.  Wrong record: a bare name passed
+            # to a call was an escape, so ``b`` (and every caller's record
+            # passed through it) "may store", and the tracer's later
+            # ``hp.x`` refused (record_stored_by_call).  Rule: a bare
+            # argument may store exactly when the callee's own parameter at
+            # that position or keyword may (``callee_may_store``; an
+            # unknown callee still may).
+            call = parents.get(id(attribute)) if isinstance(
+                attribute, ast.keyword,
+            ) else attribute
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(node.ctx, ast.Load)
+                and call.func is not node
+            ):
+                callee = (
+                    call.func.id if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute) else None
+                )
+                if isinstance(attribute, ast.keyword):
+                    forwarded_store = (
+                        callee is None or attribute.arg is None
+                        or callee_may_store(callee, keyword=attribute.arg)
+                    )
+                else:
+                    position = next((
+                        index for index, argument in enumerate(call.args)
+                        if argument is node
+                    ), None)
+                    forwarded_store = (
+                        callee is None or position is None
+                        or callee_may_store(callee, position=position)
+                    )
+                if forwarded_store:
+                    stores = True
+                    break
+                continue
             if not (
                 isinstance(attribute, ast.Attribute)
                 and attribute.value is node
@@ -8245,11 +8369,19 @@ def _normalize_lexical_values(
             return False
         if not isinstance(name, str):
             return True
+        # A record constructed in a loop's own body is a fresh object each
+        # iteration (``record_built_in_loop``): that loop's field writes are
+        # this iteration's, read through the field-state cursor like any
+        # straight-line write, not a change carried from a previous one.
         return any(
-            (name, str(attr)) in writes for writes in loop_body_field_writes
+            (name, str(attr)) in writes
+            and not record_built_in_loop(name, receiver, depth)
+            for depth, writes in enumerate(loop_body_field_writes)
         ) or any(
-            name in names or int(receiver) in values
-            for names, values in loop_body_storing_receivers
+            loop_stores_into(name, receiver, names, values, depth)
+            for depth, (names, values, _loop) in enumerate(
+                loop_body_storing_receivers
+            )
         )
 
     def concord_carried_field_read(
@@ -8279,13 +8411,18 @@ def _normalize_lexical_values(
             ),
         )
 
-    def constructed_field_value(name: str, attr: str) -> int | None:
+    def constructed_field_value(
+        name: str | None, attr: str, *, receiver: int | None = None,
+        exact_operand: bool = False,
+    ) -> int | None:
         """The current value of field ``attr`` of the record ``name`` this
         function constructed: the field-state cursor's value, else the
         constructor argument that initialised it.  None when neither is
-        known (no constructor schema, a nested call)."""
-
-        receiver = environment.get(name)
+        known (no constructor schema, a nested call).  ``receiver`` names the
+        record by its value instead of its name; ``exact_operand`` answers
+        the constructor's operand edge (see below)."""
+        if receiver is None:
+            receiver = environment.get(name)
         if not isinstance(receiver, int) or receiver not in graph.G:
             return None
         receiver_data = graph.G.nodes[int(receiver)]
@@ -8315,6 +8452,28 @@ def _normalize_lexical_values(
             # is not the constructor's argument order (``self.b = a``).
             return None
         field_names = tuple(map(str, dict(matching[0].get("fields") or {})))
+        if exact_operand:
+            # The constructor's operand edge for the field (``kw:<field>``
+            # or the field's position), read through the declared edge
+            # roles exactly as the field-read path reads it (``_set_operands``
+            # writes these edges with the operand-position rows): the value
+            # the field was initialised with, never the argument re-read in
+            # a later environment.  Answers ``(value, None)``.
+            from ...transmogrifier.graph.edge_roles import (
+                keyword_arguments as _keyword_arguments,
+                ordered_arguments as _ordered_arguments,
+            )
+
+            parents = tuple(receiver_data.get("parents") or ())
+            operand = _keyword_arguments(parents).get(attr)
+            if operand is None and attr in field_names:
+                positional = _ordered_arguments(parents)
+                position = field_names.index(attr)
+                if position < len(positional):
+                    operand = positional[position]
+            if isinstance(operand, int) and int(operand) in graph.G:
+                return int(operand), None
+            return None
         field_expression = next((
             keyword.value for keyword in construction.keywords
             if keyword.arg == attr
@@ -12420,9 +12579,13 @@ def _normalize_lexical_values(
                     and (
                         int(receiver) in storing_call_values
                         or any(
-                            str(expression.value.id) in names
-                            or int(receiver) in values
-                            for names, values in loop_body_storing_receivers
+                            loop_stores_into(
+                                str(expression.value.id), int(receiver),
+                                names, values, depth,
+                            )
+                            for depth, (names, values, _loop) in enumerate(
+                                loop_body_storing_receivers
+                            )
                         )
                     )
                 )
@@ -12468,6 +12631,13 @@ def _normalize_lexical_values(
                             graph, int(attribute_id), int(current_value)
                         )
                         return int(current_value)
+                # Program: the Studio tracer's ``emit_pkt = vec4(...)``
+                # built in the bounce loop, then ``emit_pkt.z *= w`` under an
+                # ``if``.  Wrong record: the loop writes ``emit_pkt.z``, so
+                # the read was refused as a field the loop carries with no
+                # merge.  Rule: a record constructed in a loop's own body is
+                # a fresh object each iteration (``loop_stores_into``); that
+                # loop rewrites none of its fields from a previous one.
                 rewritten_by_enclosing_loop = (
                     isinstance(expression.value, ast.Name)
                     and any(
@@ -12475,9 +12645,12 @@ def _normalize_lexical_values(
                         in writes
                         and (int(receiver), str(expression.attr))
                         not in entries
-                        for writes, entries in zip(
-                            loop_body_field_writes, loop_field_entry_values,
+                        and not record_built_in_loop(
+                            str(expression.value.id), int(receiver), depth,
                         )
+                        for depth, (writes, entries) in enumerate(zip(
+                            loop_body_field_writes, loop_field_entry_values,
+                        ))
                     )
                 )
                 if (
@@ -12534,8 +12707,44 @@ def _normalize_lexical_values(
                         position = field_names.index(expression.attr)
                         if position < len(receiver_expression.args):
                             field_expression = receiver_expression.args[position]
+                    # Program: ``u = vec2(u.x * k, u.y * k)`` then ``u.x``.
+                    # Wrong record: the field's value was found by resolving
+                    # the constructor's argument AST again, in the CURRENT
+                    # environment, where ``u`` already names this
+                    # constructor, so ``u.x`` resolved through itself
+                    # without end (and a rebound argument name would have
+                    # been read at its later value).  Rule: the argument the
+                    # constructor was built from is its own operand edge
+                    # (``kw:<field>`` or the field's position), already the
+                    # producer resolved at construction.
+                    from ...transmogrifier.graph.edge_roles import (
+                        keyword_arguments as _keyword_arguments,
+                        ordered_arguments as _ordered_arguments,
+                    )
+
+                    constructor_parents = tuple(
+                        receiver_data.get("parents") or ()
+                    )
+                    constructed_operand = _keyword_arguments(
+                        constructor_parents,
+                    ).get(expression.attr)
+                    if (
+                        constructed_operand is None
+                        and expression.attr in field_names
+                    ):
+                        positional_operands = _ordered_arguments(
+                            constructor_parents,
+                        )
+                        position = field_names.index(expression.attr)
+                        if position < len(positional_operands):
+                            constructed_operand = positional_operands[position]
                     if field_expression is not None:
-                        field_value = resolve_expression(field_expression)
+                        field_value = (
+                            int(constructed_operand)
+                            if isinstance(constructed_operand, int)
+                            and int(constructed_operand) in graph.G
+                            else resolve_expression(field_expression)
+                        )
                         if isinstance(field_value, int) and (
                             constructed_state is None
                             or _cell_node_id(constructed_state.value)
@@ -17587,8 +17796,20 @@ def _normalize_lexical_values(
                 aggregate_attributes = graph.G.nodes[int(value)].setdefault(
                     "attributes", {}
                 )
+                # Program: GLSL ``uint active[4]`` read as ``active:
+                # list['u32'] = [0] * 4``.  Wrong record: the declaration
+                # replaced the value's ``sequence_replication`` birth, so the
+                # fill was lowered as an elementwise ``Mul`` of ``[0]`` by 4
+                # (one row) and ``active[2] = 5`` faulted out of range.
+                # Rule: an annotation declares the binding's kind; the
+                # replication that produced the value stays its producer.
                 aggregate_attributes.update({
-                    "producer_kind": "annotated_aggregate_binding",
+                    "producer_kind": (
+                        "sequence_replication"
+                        if aggregate_attributes.get("producer_kind")
+                        == "sequence_replication"
+                        else "annotated_aggregate_binding"
+                    ),
                     "aggregate_kind": aggregate_kind,
                     "sequence_key_columns": (
                         (0,) if aggregate_kind in {"set", "dict"} else ()
@@ -17654,6 +17875,31 @@ def _normalize_lexical_values(
                 ) if cell is not None)
                 book.post(NAME_BINDING_CAPTURE, row, (source_binding, source_version, owner),
                           stage=_REDUCTION, provenance=_Derived(cells), mode=_Mode.CONCORD)
+            # The loop whose body executes this binding, as the AST owns it
+            # (``binding_loop_owners``), on the book beside the binding's
+            # own ``name_binding`` row.  ``record_built_in_loop`` reads it to
+            # decide that a record built in a loop body is fresh each
+            # iteration; nothing outside the book decides that.
+            from ...compiler.concordance_declarations import (
+                NAME_BINDING_LOOP_OWNER,
+            )
+            owner_book = current_identity_book()
+            owner_row = (
+                ingestion_read_scope, target.id,
+                len(identity_bindings[target.id]) - 1,
+            )
+            owner_loop = binding_loop_owners.get(id(target))
+            owner_cells = tuple(cell for cell in (
+                owner_book.latest_ref(_NAME_BINDING, owner_row),
+                node_identity_cell(graph, owner_loop)
+                if owner_loop is not None else None,
+            ) if cell is not None)
+            if owner_cells:
+                owner_book.post(
+                    NAME_BINDING_LOOP_OWNER, owner_row, owner_loop,
+                    stage=_REDUCTION, provenance=_Derived(owner_cells),
+                    mode=_Mode.CONCORD,
+                )
             _remove_node(graph, id(target))
             return
         if isinstance(target, ast.Attribute):
@@ -19248,6 +19494,36 @@ def _normalize_lexical_values(
                             if arm_effect_cell(arm_cells, field_key) is None:
                                 arm_cells[field_key] = seeded_cell
                         continue
+                    # Program: the Studio tracer's ``emit_pkt = vec4(...)``
+                    # built in the bounce loop, then ``if w: emit_pkt.z *=
+                    # k``.  Wrong record: the field had no state before the
+                    # branch, so the arm that left it alone was seeded with a
+                    # GetAttr of the record -- a handle no storage backs, an
+                    # undefined operand once the loop kept it.  Rule: a field
+                    # of a record this function constructed, untouched since,
+                    # holds its constructor operand; the seed is that value.
+                    constructed = constructed_field_value(
+                        None, str(field_key[1]), receiver=int(field_key[0]),
+                        exact_operand=True,
+                    )
+                    if constructed is not None:
+                        constructed, position_cell = constructed
+                        seeded_cell = post_field_state(
+                            field_key[0], field_key[1],
+                            _FieldStateKind.OBSERVED,
+                            int(constructed), int(constructed),
+                            sources=field_state_sources(
+                                field_key[0], field_key[1],
+                                node_identity_cell(graph, int(constructed)),
+                                *(() if position_cell is None else (position_cell,)),
+                            ),
+                            stage=_REDUCER_FIELD_MERGE,
+                        )
+                        before_field_cells[field_key] = seeded_cell
+                        for arm_cells in (body_field_cells, else_field_cells):
+                            if arm_effect_cell(arm_cells, field_key) is None:
+                                arm_cells[field_key] = seeded_cell
+                        continue
                     receiver_id, attribute_name = field_key
                     receiver_class = receiver_class_identity(receiver_id)
                     if receiver_class is None:
@@ -20152,6 +20428,7 @@ def _normalize_lexical_values(
                     int(environment[name]) for name in loop_storing_names
                     if isinstance(environment.get(name), int)
                 ),
+                id(body_statement),
             ))
             try:
                 for nested in body_statement.body:
@@ -29757,6 +30034,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
                 if prior is None or order_cell is None:
                     continue
+                # Program: GLSL ``put(inout vec3 r, vec3 d){ r = d; }`` ->
+                # ``def put(r, d): r = d; return r``.  Wrong record: ``r`` is
+                # overwritten before any read, so the formal is never bound
+                # and version 0 of ``r`` is the ASSIGNMENT; the contract cited
+                # it as the formal's entry binding and the final audit found
+                # no Input behind it.  Rule: version 0 is the formal's binding
+                # only when it names this parameter's Input; otherwise the
+                # formal is dead on entry and has no binding to cite.
+                if binding_cell is not None:
+                    bound = contract_book.page(NAME_BINDING).cell(
+                        binding_cell.row, binding_cell.column,
+                    )
+                    bound_node = function_graph.G.nodes.get(
+                        int(getattr(bound, "value_id", -1)), {},
+                    )
+                    if not (
+                        str(bound_node.get("type") or "") == "Input"
+                        and (bound_node.get("attributes") or {}).get(
+                            "binding_name"
+                        ) == contract.name
+                    ):
+                        binding_cell = None
                 contract_book.post(
                     SOURCE_PARAMETER_MEMORY_CONTRACT, row, (contract,),
                     stage=_REDUCTION,

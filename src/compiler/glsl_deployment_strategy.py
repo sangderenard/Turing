@@ -6648,6 +6648,24 @@ def _build_shell_hierarchy_plan(
                     # authored tuple node into an untyped caller argument.
                     child_input = int(identities[0])
                     child_input_data = child_graph.nodes.get(child_input, {})
+                    # Program: GLSL ``put(vec3 d)`` writing the global
+                    # ``recorded``: ``def put(d, recorded): recorded = d``.
+                    # ``recorded`` is dead on entry; its first identity
+                    # version is ``d``'s Input.  Wrong record: both actuals
+                    # were bound to ``d``'s formal and the later one won.
+                    # Rule: an Input the graph declares for another
+                    # parameter is not this parameter's formal; a dead
+                    # parameter's actual binds to none.
+                    if (
+                        str(child_input_data.get("type") or "") == "Input"
+                        and (child_input_data.get("attributes") or {}).get(
+                            "binding_name"
+                        ) is not None
+                        and str((child_input_data.get("attributes") or {})[
+                            "binding_name"
+                        ]) != str(name)
+                    ):
+                        continue
                     if (child_input_data.get("attributes") or {}).get(
                         "structural_specialization"
                     ):
@@ -6658,6 +6676,29 @@ def _build_shell_hierarchy_plan(
                         # non-argument formal, while the call record preserves
                         # which source value selected this specialized body.
                         argument_bindings.append((parent, child_input))
+                        continue
+                    # Program: the same global read with GLSL value copies:
+                    # ``def begin(d, recorded): recorded = vec3(d.x, d.y,
+                    # d.z)``.  ``recorded`` is dead on entry and the graph
+                    # has no Input for it: its first identity version is the
+                    # constructor.  Wrong record: the caller's ``recorded``
+                    # was bound to that constructor, whose members are
+                    # ``d``'s, so the frame link found ``d.x`` bound to two
+                    # caller values.  Rule: an actual binds only to what the
+                    # book records as an ingested Input (``ingestion_value``,
+                    # read through the version's canonical cell), or the
+                    # literal a callsite specialization folded the formal
+                    # into (above); a first version the callee computes is
+                    # no formal.
+                    from .control_activity import _ingested_kind
+
+                    try:
+                        child_input_kind = _ingested_kind(
+                            child.process_graph, int(child_input),
+                        )
+                    except ValueError:
+                        child_input_kind = None
+                    if child_input_kind not in (None, "Input"):
                         continue
                     argument_bindings.append((parent, child_input))
                     child_leaves = _authored_aggregate_leaves(
@@ -32142,9 +32183,12 @@ def _mutated_sequence_node_ids(
             return True
         # A list merged from branches is the taken arm's own mutable list
         # (``grow(t, k)`` then ``len(a)``, c739), not an immutable value.
+        # So is a list fill: ``active = [0] * 4; begin(active)`` with
+        # ``begin`` storing ``active[2] = 5`` (GLSL ``uint active[4]``)
+        # folded ``active[2]`` to the fill's 0 -- a silent wrong value.
         if (
             (data.get("attributes") or {}).get("producer_kind")
-            in {"aggregate_phi", "aggregate_merge"}
+            in {"aggregate_phi", "aggregate_merge", "sequence_replication"}
             and (data.get("attributes") or {}).get("aggregate_kind") == "list"
         ):
             return True

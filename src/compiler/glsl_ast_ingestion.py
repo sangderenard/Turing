@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import keyword
 from dataclasses import dataclass
 import re
 from typing import Any, Mapping, Sequence
@@ -279,10 +280,22 @@ class _HelperSignature:
     # by reference after the authored parameters; the compiler passes each
     # copy only the spans it touches.
     buffers: tuple[str, ...] = ()
+    # Mutable globals (per-invocation state ``main`` owns) the helper reads
+    # or writes, directly or through its callees: ``(name, GLSL type,
+    # written)``.  Each follows the authored parameters; a written scalar,
+    # vector or struct is ``inout`` (returned), an array is passed as its
+    # list and written in place (``_source_mutable_globals``).
+    globals: tuple[tuple[str, str, bool], ...] = ()
+
+    @property
+    def carried_parameters(self) -> list[tuple[str, str, str]]:
+        return [*self.parameters, *(
+            ("inout" if written and not _array_type(kind) else "in", kind, name)
+            for name, kind, written in self.globals)]
 
     @property
     def outputs(self) -> list[int]:
-        return [i for i, (qualifier, _, _) in enumerate(self.parameters)
+        return [i for i, (qualifier, _, _) in enumerate(self.carried_parameters)
                 if qualifier in {"out", "inout"}]
 
 
@@ -923,8 +936,12 @@ class _ASTExpressionParser:
     def _helper_call(self, token: _Token, signature: _HelperSignature,
                      args: Sequence[ast.expr]) -> ast.expr:
         self._arity(token, args, len(signature.parameters))
-        # The storage buffers the helper touches follow its authored
-        # arguments; each is the caller's own span, handed by reference.
+        # The mutable globals the helper touches follow its authored
+        # arguments (the caller's current values); then the storage buffers,
+        # each the caller's own span, handed by reference.
+        args = [*args, *(
+            _typed(_name(self.context.resolve(name)), kind)
+            for name, kind, _written in signature.globals)]
         call = _call(token.text, [*args, *map(_name, signature.buffers)])
         outputs = signature.outputs
         if not outputs:
@@ -1412,6 +1429,9 @@ class _ASTStatementReader(_ASTExpressionParser):
                 value, prelude = _zero_value(self.context, declared, name), []
             elif declarator[1].text == "=" and len(declarator) > 2:
                 value, prelude = self.expression(declarator[2:])
+                # A declaration initialized from existing storage is a
+                # copy of it, as an assignment is (_value_copy).
+                value = _copied_read(self.context, value, name)
             else:
                 raise _ExpressionError(name, "Expected '=' or ',' after declaration name")
             if self.context is not None:
@@ -1496,6 +1516,8 @@ class _ASTStatementReader(_ASTExpressionParser):
             op = "="
         target.ctx=ast.Store()
         if op=="=":
+            # GLSL assignment copies a vector, struct or array (_value_copy).
+            value = _copied_read(self.context, value, token)
             return target_prelude + prelude + [ast.Assign(targets=[target],value=value)]
         return target_prelude + prelude + [ast.AugAssign(target=target,op=_BINARY_AST[op[:-1]](),value=value)]
 
@@ -1933,6 +1955,96 @@ def _source_textures(cleaned, shortfalls, texture_fields=None):
     return textures
 
 
+def _source_mutable_globals(cleaned, type_names, shortfalls):
+    """The file-scope variables with no storage qualifier.
+
+    ``vec3 studio_response_direction;`` is per-invocation state: it starts
+    undefined when the invocation does, every function of the invocation
+    sees the one copy, and it ends with the invocation.  ``main`` owns it
+    (its declaration statement, read at its own source position, becomes
+    ``main``'s first statement: initializer, or zero) and each helper that
+    touches it takes it after its authored parameters
+    (``_HelperSignature.globals``).  Reading each use as a Python local
+    silently dropped the write another function reads.  A ``shared``
+    variable is workgroup memory, not carried: a named shortfall.  ``const``
+    globals are constant expressions (inlined); uniforms, inputs, outputs,
+    buffers, images and samplers are caller memory read elsewhere.
+
+    Returns ``[(statement text, line, column, ((name, GLSL type), ...))]``,
+    a fixed array's type spelled ``T[N]``.
+    """
+
+    declarations = []
+
+    depth, segment, segment_start, segments = 0, [], 0, []
+    for index, character in enumerate(cleaned):
+        if character == "{":
+            if depth == 0:
+                segment.append(";")
+            depth += 1
+        elif character == "}":
+            depth -= 1
+        elif depth == 0:
+            if not segment:
+                segment_start = index
+            segment.append(character)
+            if character == ";":
+                segments.append(("".join(segment), segment_start))
+                segment = []
+    for text, start in segments:
+        statement = text.strip().rstrip(";").strip()
+        if not statement or statement.startswith("#"):
+            continue
+        head = re.match(r"(?P<qualifiers>(?:(?:shared|coherent|volatile|restrict|"
+                        r"precise|highp|mediump|lowp)\s+)*)(?P<type>[A-Za-z_]\w*)\s+",
+                        statement)
+        if head is None or head.group("type") not in type_names:
+            continue
+        line = cleaned.count("\n", 0, start) + 1
+        # The declarators, split at top-level commas (an initializer may
+        # hold a call, ``vec3 a = vec3(0.0), b;``).
+        declarators, depth, current = [], 0, []
+        for character in statement[head.end():]:
+            depth += (character in "([") - (character in ")]")
+            if character == "," and depth == 0:
+                declarators.append("".join(current))
+                current = []
+            else:
+                current.append(character)
+        declarators.append("".join(current))
+        names = []
+        for declarator in declarators:
+            match = re.match(r"\s*(?P<name>[A-Za-z_]\w*)\s*(?:\[\s*(?P<extent>\w*)\s*\])?"
+                             r"\s*(?:=.*)?$", declarator, re.S)
+            if match is None:
+                names = None
+                break
+            extent = match.group("extent")
+            if extent is not None and not extent.isdigit():
+                names = None
+                break
+            names.append((match.group("name"), head.group("type")
+                          if extent is None else f"{head.group('type')}[{extent}]"))
+        if names is None:
+            # A function prototype or a declaration form not read here.
+            if "(" not in statement.split("=", 1)[0]:
+                shortfalls.append(GLSLSourceShortfall(
+                    "GLSL_GLOBAL", line, 1,
+                    f"file-scope declaration is not read: {statement[:80]}"))
+            continue
+        if "shared" in head.group("qualifiers"):
+            for name, _kind in names:
+                shortfalls.append(GLSLSourceShortfall(
+                    "GLSL_GLOBAL", line, 1,
+                    f"workgroup-shared variable {name} is not carried"))
+            continue
+        text_start = cleaned.index(statement, start)
+        line = cleaned.count("\n", 0, text_start) + 1
+        column = text_start - cleaned.rfind("\n", 0, text_start)
+        declarations.append((statement + ";", line, column, tuple(names)))
+    return declarations
+
+
 def _source_buffers(cleaned, shortfalls, types):
     """Read storage-buffer blocks as ``member -> (element, extent, scalar, layout)``.
 
@@ -2013,6 +2125,7 @@ def lower_glsl_source_to_ast(
                         | {f"{p}{n}" for p in _VECTOR_PREFIX.values() for n in (2, 3, 4)},
                         key=len, reverse=True)
     type_pattern = "|".join(map(re.escape, ["void", *type_names]))
+    mutable_globals = _source_mutable_globals(cleaned, set(type_names), shortfalls)
     helpers: dict[str, _HelperSignature] = {}
     source_functions = {}
     for match in re.finditer(r"\b(" + type_pattern + r")\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\s*\{", cleaned):
@@ -2114,6 +2227,62 @@ def lower_glsl_source_to_ast(
                 changed = True
     for helper in source_functions:
         helpers[helper].buffers = tuple(b for b in resources if b in buffer_uses[helper])
+
+    # Mutable globals: which each helper reads and which it writes, directly
+    # or through its callees (the same fixed point as the buffers).  A write
+    # is an assignment, a compound assignment or ``++``/``--`` of the global
+    # or of an element or field of it.  A parameter of the same name shadows.
+    mutable_global_types = {
+        name: kind
+        for _text, _line, _column, names in mutable_globals for name, kind in names
+    }
+
+    def global_writes(text):
+        tokens = [token.text for token in _tokenize(text, start_line=1)]
+        written = set()
+        for index, spelling in enumerate(tokens):
+            if spelling not in mutable_global_types:
+                continue
+            if index and tokens[index - 1] in {"++", "--"}:
+                written.add(spelling)
+                continue
+            after = index + 1
+            while after < len(tokens) and tokens[after] in {"[", "."}:
+                if tokens[after] == ".":
+                    after += 2
+                    continue
+                depth = 0
+                while after < len(tokens):
+                    depth += (tokens[after] == "[") - (tokens[after] == "]")
+                    after += 1
+                    if depth == 0:
+                        break
+            if after < len(tokens) and tokens[after] in {
+                "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+                "++", "--",
+            }:
+                written.add(spelling)
+        return written
+
+    global_uses, global_written = {}, {}
+    for helper, (text, _line, _column) in source_functions.items():
+        shadowed = {name for _, _, name in helpers[helper].parameters}
+        global_uses[helper] = (identifiers(text) & set(mutable_global_types)) - shadowed
+        global_written[helper] = global_writes(text) - shadowed
+    changed = True
+    while changed:
+        changed = False
+        for helper, callees in helper_calls.items():
+            uses = global_uses[helper].union(*(global_uses[c] for c in callees))
+            writes = global_written[helper].union(*(global_written[c] for c in callees))
+            if uses != global_uses[helper] or writes != global_written[helper]:
+                global_uses[helper], global_written[helper] = uses, writes
+                changed = True
+    for helper in source_functions:
+        helpers[helper].globals = tuple(
+            (name, kind, name in global_written[helper])
+            for name, kind in mutable_global_types.items()
+            if name in global_uses[helper])
     main_names = identifiers(body)
     main_buffers = tuple(b for b in resources if b in main_names or any(
         b in buffer_uses[helper] for helper in main_names & set(source_functions)))
@@ -2133,7 +2302,14 @@ def lower_glsl_source_to_ast(
     context.scope = dict(global_types)
     context.lexical = [{}]
     try:
-        reader = _ASTStatementReader(_source_tokens(body, body_line, cleaned.find(body)-cleaned.rfind("\n",0,cleaned.find(body))), reserved_names=[*arguments, *main_buffers], context=context)
+        # ``main`` owns the invocation's mutable globals: their declarations,
+        # read at their own source positions, are its first statements.
+        global_declaration_tokens = [
+            token
+            for text, line, column, _names in mutable_globals
+            for token in _source_tokens(text, line, column)
+        ]
+        reader = _ASTStatementReader([*global_declaration_tokens, *_source_tokens(body, body_line, cleaned.find(body)-cleaned.rfind("\n",0,cleaned.find(body)))], reserved_names=[*arguments, *main_buffers], context=context)
         statements = constant_array_declarations(body) + reader.read_all()
     except _ExpressionError as error:
         shortfalls.append(GLSLSourceShortfall(
@@ -2181,10 +2357,10 @@ def lower_glsl_source_to_ast(
         try:
             # Document globals are visible in every helper; parameters shadow.
             context.scope = dict(global_types)
-            context.scope.update({name: kind for _, kind, name in signature.parameters})
+            context.scope.update({name: kind for _, kind, name in signature.carried_parameters})
             context.lexical = [{}]
             helper_reader=_ASTStatementReader(_source_tokens(helper_body,helper_line,helper_column),
-                reserved_names=[*(name for _, _, name in signature.parameters),
+                reserved_names=[*(name for _, _, name in signature.carried_parameters),
                                 *signature.buffers],context=context)
             helper_statements=(constant_array_declarations(helper_body)
                                + helper_reader.read_all())
@@ -2193,6 +2369,22 @@ def lower_glsl_source_to_ast(
         except _ExpressionError as error:
             shortfalls.append(GLSLSourceShortfall("GLSL_HELPER",error.token.line,
                 error.token.column,str(error)))
+    # A helper that rebinds a global it does not hand back (an array assigned
+    # whole, or a write the token scan did not see, such as an ``out``
+    # argument) would drop that write: refuse it by name.
+    for definition in helper_definitions:
+        signature = helpers[definition.name]
+        returned = {name for qualifier, _kind, name in signature.carried_parameters
+                    if qualifier == "inout"}
+        for name, _kind, _written in signature.globals:
+            if name not in returned and any(
+                isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                and node.id == name for node in ast.walk(definition)
+            ):
+                shortfalls.append(GLSLSourceShortfall(
+                    "GLSL_GLOBAL", 1, 1,
+                    f"helper {definition.name} rebinds global {name}, which is "
+                    "not handed back to its caller"))
     records = types.class_definitions()
     prelude = ([ast.ImportFrom(module="dataclasses", names=[ast.alias(name="dataclass")], level=0)]
                if records else [])
@@ -2205,22 +2397,154 @@ def lower_glsl_source_to_ast(
         prelude.append(ast.ImportFrom(
             module="src.common.tensors.abstraction_methods.bit_reinterpretation",
             names=[ast.alias(name=name) for name in sorted(context.imports)], level=0))
-    module = ast.fix_missing_locations(ast.Module(
+    module = _python_identifiers(ast.fix_missing_locations(ast.Module(
         body=prelude + records + [_retain_literal_widths(fn) for fn in helper_definitions+[function]],
         type_ignores=[]
-    ))
+    )))
     def buffer_abi(name):
         element, extent, _scalar, layout = buffers[name]
         if layout is None:
-            return name, _BUFFER_ELEMENT_DTYPES[element], extent, None
+            return _python_identifier(name), _BUFFER_ELEMENT_DTYPES[element], extent, None
         stride, _fields, component = layout
-        return name, _BUFFER_ELEMENT_DTYPES[component], extent, stride
+        return _python_identifier(name), _BUFFER_ELEMENT_DTYPES[component], extent, stride
 
     return GLSLASTLoweringResult(
         module, tuple(shortfalls),
         tuple(buffer_abi(name) for name in main_buffers if name in buffers),
-        tuple((name, _BUFFER_ELEMENT_DTYPES[textures[name][1]], textures[name][2])
+        tuple((_python_identifier(name), _BUFFER_ELEMENT_DTYPES[textures[name][1]],
+               textures[name][2])
               for name in main_buffers if name in textures))
+
+
+def _python_identifier(name):
+    """A GLSL identifier as a Python one.
+
+    GLSL allows Python's keywords as names (the Studio tracer's ``uint
+    from``).  Such a name gets the suffix ``__glsl_keyword``; GLSL reserves
+    every identifier containing ``__``, so no source name can collide.
+    """
+    return f"{name}__glsl_keyword" if keyword.iskeyword(name) else name
+
+
+class _NegativeNumbers(ast.NodeTransformer):
+    """A negative number in the form Python parses it: ``-x`` is
+    ``UnaryOp(USub, Constant(x))``.  The reader's tree must be the tree of
+    its own text (``ast.parse(ast.unparse(tree))``) node for node, so the
+    compiler can give it that text's source positions; a ``Constant(-x)``
+    was the one node that did not round-trip.  The reader's annotations
+    stay on the outer node."""
+
+    def visit_Constant(self, node):  # noqa: N802
+        value = node.value
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and (value < 0 or str(value).startswith("-"))):
+            negated = ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=-value))
+            for name, attribute in vars(node).items():
+                if name.startswith("_"):
+                    setattr(negated, name, attribute)
+            return ast.copy_location(negated, node)
+        return node
+
+
+def _python_identifiers(module):
+    """Apply ``_python_identifier`` to every name the AST binds or reads:
+    variables, parameters, functions, record fields and attributes; and put
+    negative numbers in Python's own form (``_NegativeNumbers``)."""
+    module = ast.fix_missing_locations(_NegativeNumbers().visit(module))
+    for node in ast.walk(module):
+        if isinstance(node, ast.Name):
+            node.id = _python_identifier(node.id)
+        elif isinstance(node, ast.arg):
+            node.arg = _python_identifier(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            node.name = _python_identifier(node.name)
+        elif isinstance(node, ast.Attribute):
+            node.attr = _python_identifier(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            node.arg = _python_identifier(node.arg)
+    return module
+
+
+def _value_copy(context, value, glsl_type, token):
+    """``value`` as a new object of its GLSL type, member by member.
+
+    Program: the Studio tracer's ``studio_response_begin`` does
+    ``studio_response_direction = direction`` and ``studio_boundary_step``
+    returns its ``inout vec3 rd``; and ``vec3 a = b; a.x = 9.0;``.  Wrong
+    record: GLSL assigns, passes and returns vectors, structs and arrays BY
+    VALUE, but the reader spelled each as a Python binding of the same
+    object.  As Python, ``a.x = 9.0`` then also wrote ``b.x`` (a silent
+    wrong value), and every record a helper returned or rebound was an
+    escape of its caller's object, so the tracer's ``rd.x`` was refused
+    (record_stored_by_call).  Rule: where GLSL copies, the Python names a
+    new object: a record is its constructor over its copied members, a
+    fixed array the list of its copied elements.  A scalar is a value; a
+    resource handle (buffer, image, sampler) is not copied by GLSL either.
+    """
+
+    if glsl_type is None or glsl_type in _SCALAR_TYPES:
+        return value
+    array = _array_type(glsl_type)
+    if array is not None:
+        element, extent = array
+        members = []
+        for index in range(extent):
+            position = ast.Constant(value=index)
+            position._glsl_raw_literal = True
+            members.append(_value_copy(context, _typed(ast.Subscript(
+                value=copy.deepcopy(value), slice=position, ctx=ast.Load(),
+            ), element), element, token))
+        return _typed(ast.List(elts=members, ctx=ast.Load()), glsl_type)
+    record = context.types.record(glsl_type)
+    if record is None:
+        return value
+    return _typed(_call(record, [
+        _value_copy(context, _typed(ast.Attribute(
+            value=copy.deepcopy(value), attr=field, ctx=ast.Load(),
+        ), member), member, token)
+        for field, member in context.types.fields(glsl_type)
+    ]), glsl_type)
+
+
+def _copied_read(context, value, token, glsl_type=None):
+    """A GLSL value read from existing storage (a name, field or element),
+    copied as GLSL copies it on assignment and return.  A value computed
+    here (a constructor, call or operator result) is already its own
+    object."""
+
+    if context is None or not isinstance(
+        value, (ast.Name, ast.Attribute, ast.Subscript),
+    ):
+        return value
+    return _value_copy(
+        context, value, _type_of(value) if glsl_type is None else glsl_type,
+        token,
+    )
+
+
+def _stored_roots(statements):
+    """Names whose fields or elements ``statements`` store into."""
+
+    roots = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []
+            )
+            for target in targets:
+                for element in (
+                    target.elts if isinstance(target, ast.Tuple) else [target]
+                ):
+                    if not isinstance(element, (ast.Attribute, ast.Subscript)):
+                        continue
+                    root = element
+                    while isinstance(root, (ast.Attribute, ast.Subscript)):
+                        root = root.value
+                    if isinstance(root, ast.Name):
+                        roots.add(root.id)
+    return roots
 
 
 def _helper_definition(context, name, signature, statements, token):
@@ -2232,14 +2556,77 @@ def _helper_definition(context, name, signature, statements, token):
     ``out`` parameter is undefined on entry and starts at its type's zero.
     """
 
-    outputs = [signature.parameters[i] for i in signature.outputs]
+    carried = signature.carried_parameters
+    outputs = [carried[i] for i in signature.outputs]
     body = list(statements)
+
+    class ReturnCopies(ast.NodeTransformer):
+        """A returned vector, struct or array is a copy (_value_copy)."""
+
+        def visit_Return(self, node):
+            if node.value is not None:
+                node.value = _copied_read(
+                    context, node.value, token,
+                    _type_of(node.value) or signature.result_type,
+                )
+            return node
+
+        def visit_FunctionDef(self, node):
+            return node
+
+    body = [ReturnCopies().visit(statement) for statement in body]
+    # An ``in``/``inout`` parameter is the helper's own copy of its actual:
+    # one whose fields or elements the helper stores into starts as a copy,
+    # so the caller's object is never written (_value_copy).  The copy is a
+    # block-to-open spelling change: it gets its own Python name
+    # (``d__glsl_scope_N``, as a redeclared block local does) and the body
+    # uses that name, so the parameter itself is only ever read.  A mutable
+    # global array is the caller's storage by design (carried, not a
+    # parameter) and is written in place.
+    stored = _stored_roots(body)
+    copies = {
+        parameter: (kind, context.temporaries.fresh().replace(
+            "__glsl_value_", f"{parameter}__glsl_scope_"))
+        for qualifier, kind, parameter in signature.parameters
+        if qualifier != "out" and parameter in stored
+        and not (kind in _SCALAR_TYPES or (
+            _array_type(kind) is None and context.types.record(kind) is None
+        ))
+    }
+
+    class CopyNames(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if node.id in copies:
+                node.id = copies[node.id][1]
+            return node
+
+        def visit_FunctionDef(self, node):
+            return node
+
+    body = [CopyNames().visit(statement) for statement in body]
+    body = [
+        ast.AnnAssign(
+            target=ast.Name(id=local, ctx=ast.Store()),
+            annotation=_value_annotation(context, kind),
+            value=_value_copy(
+                context, _typed(_name(parameter), kind), kind, token,
+            ),
+            simple=1,
+        )
+        for parameter, (kind, local) in copies.items()
+    ] + body
     if outputs:
         entry = [ast.AnnAssign(target=ast.Name(id=parameter, ctx=ast.Store()),
                                annotation=context.types.annotation(kind),
                                value=_zero_value(context, kind, token), simple=1)
                  for qualifier, kind, parameter in outputs if qualifier == "out"]
-        names = [_name(parameter) for _, _, parameter in outputs]
+        # Each out/inout value goes back to the caller as GLSL copies it.
+        names = [
+            _value_copy(context, _typed(_name(
+                copies[parameter][1] if parameter in copies else parameter
+            ), kind), kind, token)
+            for _, kind, parameter in outputs
+        ]
 
         class OutputReturns(ast.NodeTransformer):
             def visit_Return(self, node):
@@ -2254,19 +2641,51 @@ def _helper_definition(context, name, signature, statements, token):
         if signature.result_type == "void" and not (body and isinstance(body[-1], ast.Return)):
             body.append(OutputReturns().visit(ast.Return(value=None)))
         body = entry + body
-    returns = (None if outputs or signature.result_type == "void"
-               else context.types.annotation(signature.result_type)
-               if context.types.known(signature.result_type)
-               else ast.Constant(_dtype(signature.result_type)))
+    if outputs:
+        # The returned values' declared types: the result (unless void) and
+        # each out/inout value, as a ``tuple[...]`` when there are several.
+        # Undeclared, a returned ``int`` member took the Python class
+        # default (int64) against its caller's ``'i32'`` binding.
+        returned = ([signature.result_type] if signature.result_type != "void" else []) + [
+            kind for _qualifier, kind, _name in outputs]
+        annotations = [_value_annotation(context, kind) for kind in returned]
+        returns = (annotations[0] if len(annotations) == 1 else ast.Subscript(
+            value=_name("tuple"), slice=ast.Tuple(elts=annotations, ctx=ast.Load()),
+            ctx=ast.Load()))
+    else:
+        returns = (None if signature.result_type == "void"
+                   else context.types.annotation(signature.result_type)
+                   if context.types.known(signature.result_type)
+                   else ast.Constant(_dtype(signature.result_type)))
     return ast.FunctionDef(
         name=name,
         args=ast.arguments(posonlyargs=[], args=[
-            *(ast.arg(arg=parameter, annotation=context.types.annotation(kind))
-              for _, kind, parameter in signature.parameters),
+            *(ast.arg(arg=parameter, annotation=_value_annotation(context, kind))
+              for _, kind, parameter in carried),
             *(ast.arg(arg=buffer, annotation=_name("AbstractTensor"))
               for buffer in signature.buffers)],
             kwonlyargs=[], kw_defaults=[], defaults=[]),
         body=body or [ast.Pass()], decorator_list=[], returns=returns)
+
+
+_ARRAY_TYPE = re.compile(r"(?P<element>[A-Za-z_]\w*)\[(?P<extent>\d+)\]")
+
+
+def _array_type(glsl_type):
+    """``(element, extent)`` of a fixed array type ``T[N]``, or None."""
+    match = _ARRAY_TYPE.fullmatch(str(glsl_type))
+    return None if match is None else (match.group("element"), int(match.group("extent")))
+
+
+def _value_annotation(context, glsl_type):
+    """The Python annotation of a value of ``glsl_type``: its record or
+    scalar dtype, and ``list[...]`` of that for a fixed array (the form a
+    local array is declared with)."""
+    array = _array_type(glsl_type)
+    if array is None:
+        return context.types.annotation(glsl_type)
+    return ast.Subscript(value=_name("list"),
+                         slice=context.types.annotation(array[0]), ctx=ast.Load())
 
 
 __all__ = ["GLSLASTLoweringResult", "lower_glsl_source_to_ast"]

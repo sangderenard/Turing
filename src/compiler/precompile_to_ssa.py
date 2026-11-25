@@ -2986,6 +2986,10 @@ class _ControlSSABuilder(TiledObject):
             if not history:
                 continue
             value_id = int(history[0])
+            # A parameter overwritten before any read has no entry value of
+            # its own: its first version may be another parameter's Input.
+            if not self._is_parameter_entry(str(name), value_id):
+                continue
             if value_id in self.external_values:
                 continue
             value = self._value_from_meta(value_id)
@@ -5693,12 +5697,17 @@ class _ControlSSABuilder(TiledObject):
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(contract_cell, value),
         )
+        # The fill helper's count formal is int64 (``lower_sequence_fill``:
+        # compared with and stored into the int64 length cell).  Passing it
+        # as ``int`` (a class, not a width) made the shape transport between
+        # caller and helper flip int <-> int64 with no new cause; program
+        # ``a = [0] * 5; a[2] = 3`` on the LLVM lane was refused.
         self.emit(
             Handler.Call,
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 value,
-                self.external_value(int(count_id), dtype="int"),
+                self.external_value(int(count_id), dtype="int64"),
             ],
             status,
             attributes={
@@ -5748,12 +5757,13 @@ class _ControlSSABuilder(TiledObject):
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(contract_cell, value),
         )
+        # As for ``fill``: the helper's count formal is int64.
         self.emit(
             Handler.Call,
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 value,
-                self.external_value(int(count_id), dtype="int"),
+                self.external_value(int(count_id), dtype="int64"),
             ],
             status,
             attributes={
@@ -6457,7 +6467,9 @@ class _ControlSSABuilder(TiledObject):
         if value is None:
             value = self._value_from_meta(value_id, dtype=dtype)
             description = self.source_value_descriptions.get(value_id)
-            if description is not None:
+            # A parameter Input's entry (``input_binding`` only) describes no
+            # source expression, so it is no execution receipt.
+            if description is not None and "construct" in description:
                 receipt = dict(description)
                 node_id = int(receipt.get("node_id", value_id))
                 fact = None
@@ -6538,6 +6550,33 @@ class _ControlSSABuilder(TiledObject):
             if cell is not None:
                 return cell
         return None
+
+    def _is_parameter_entry(self, name: str, value_id: int) -> bool:
+        """Whether ``value_id`` is parameter ``name``'s own entry value: not
+        another parameter's Input reached through an assignment.
+
+        Program: GLSL ``put(vec3 d)`` writing the global ``recorded`` becomes
+        ``def put(d, recorded): recorded = d; return recorded``; the first
+        identity version of ``recorded`` is ``d``'s Input.  The graph
+        declares which parameter an Input enters (its ``binding_name``,
+        carried as ``input_binding``); a value that is no Input is not
+        claimed here."""
+
+        description = self.source_value_descriptions.get(int(value_id), {})
+        binding = description.get("input_binding")
+        # Program: the same global read with GLSL value copies: ``def
+        # begin(d, recorded): recorded = vec3(d.x, d.y, d.z)``.  ``recorded``
+        # is dead on entry; its only identity version is the constructor
+        # call.  Wrong record: that call result was named the formal
+        # ``recorded`` and the call site was refused for a caller value no
+        # one binds.  Rule: only a value the book records as an ingested
+        # Input (``ingested_kind``, read from ``ingestion_value``) is a
+        # parameter's entry value; one the callee computes never is.
+        if binding is None and description.get("ingested_kind") not in (
+            None, "Input",
+        ):
+            return False
+        return binding is None or str(binding) == str(name)
 
     def _value_from_meta(
         self, value_id: int, *, dtype: str | None = None
@@ -24672,6 +24711,7 @@ class _ControlSSABuilder(TiledObject):
             (name, value_id)
             for name, value_id in value_names
             if name in self.parameter_names and int(value_id) in argument_ids
+            and self._is_parameter_entry(str(name), int(value_id))
         )
         # Structured control expressions can consume the initial authored
         # parameter and then publish a loop-carried alias as the latest value
@@ -24699,6 +24739,7 @@ class _ControlSSABuilder(TiledObject):
                 for candidate in self.value_name_histories.get(name, ())
                 if int(candidate) in argument_ids
                 and int(candidate) in used_value_ids
+                and self._is_parameter_entry(str(name), int(candidate))
             ), None)
             if value_id is None:
                 continue
@@ -25883,13 +25924,25 @@ def _post_ssa_block_geometry(book, scope, function):
     are refused, rather than given a diagnostic-only root or guessed edge.
     """
     from .concordance_declarations import (
-        CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING, SSA_BLOCK_GEOMETRY,
-        SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
+        CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING,
+        PASSTHROUGH_OUTPUT_RETIREMENT, PURE_CALL_RETIREMENT,
+        SSA_BLOCK_GEOMETRY, SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
         TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_CALL_BINDING,
         TENSOR_METADATA_RESULT_BINDING,
     )
     from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL
     result = {}
+    # A pure call ``drop_dead_pure_region_calls`` removed: its row is the
+    # cause of the block's shorter geometry.
+    # So is a Ret slot ``retire_passthrough_aggregate_outputs`` retired.
+    retired = {}
+    for retirement_page in (PURE_CALL_RETIREMENT, PASSTHROUGH_OUTPUT_RETIREMENT):
+        for row in book.page(retirement_page).scope_rows(
+            (scope, str(function.name))
+        ):
+            cell = book.latest_ref(retirement_page, row)
+            if cell is not None:
+                retired.setdefault(str(row[1]), []).append(cell)
     moved = {}
     for row in book.page(SSA_CONSTANT_HOIST).scope_rows((scope, str(function.name))):
         cell = book.latest_ref(SSA_CONSTANT_HOIST, row)
@@ -26039,6 +26092,7 @@ def _post_ssa_block_geometry(book, scope, function):
         sources = tuple(dict.fromkeys(cell for cell in (
             book.latest_ref(SSA_BLOCK, (scope, str(function.name), str(label))),
             *moved.get(label, ()),
+            *retired.get(str(label), ()),
             *rebound.get(str(label), ()),
             *materialized.get(str(label), ()),
             *metadata_bindings.get(str(label), ()),

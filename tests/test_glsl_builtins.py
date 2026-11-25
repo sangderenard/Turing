@@ -77,6 +77,38 @@ def test_texel_lanes_the_format_does_not_store_are_refused():
     assert any("does not store" in s.message for s in result.shortfalls)
 
 
+def test_glsl_names_that_are_python_keywords_are_renamed():
+    # The Studio tracer declares ``uint from``: valid GLSL, a Python keyword.
+    source = '''uniform int lambda; out int y; int pass(int from){ return from + 1; }
+void main(){ int from = lambda; y = pass(from); }'''
+    result = lower_glsl_source_to_ast(source)
+    assert result.complete, result.shortfall_report()
+    text = ast.unparse(result.module)
+    ast.parse(text)
+    assert "from__glsl_keyword" in text and "pass__glsl_keyword" in text
+    namespace = {"__name__": "__main__"}
+    exec(compile(ast.parse(text), "<glsl>", "exec"), namespace)
+    assert namespace["main"](4) == 5
+
+
+def test_mutable_globals_are_main_owned_state_threaded_through_helpers():
+    # ``vec3 g;`` is per-invocation state: written in one function, read in
+    # another.  Read as a Python local, the write was silently dropped.
+    # ``main`` now owns it (initializer or zero); a helper that writes a
+    # value global hands it back, an array global is written in place.
+    source = '''vec3 g; uint flags[4]; int k = 2, m = -1; out float y;
+void put(vec3 d){ g = d; flags[1] = 7u; k += 1; }
+float get(){ return g.x + float(flags[1]) + float(k) + float(m); }
+void main(){ put(vec3(1.5)); y = get(); }'''
+    assert _run(source) == 1.5 + 7 + 3 - 1
+
+
+def test_workgroup_shared_and_unhanded_global_writes_are_shortfalls():
+    shared = lower_glsl_source_to_ast(
+        "shared float tile[8]; out float y; void main(){ y = tile[0]; }")
+    assert any("workgroup-shared variable tile" in s.message for s in shared.shortfalls)
+
+
 def test_store_through_a_runtime_vector_index_writes_that_component():
     source = '''uniform int k; out int y; void main(){
   ivec3 q = ivec3(1, 2, 3); q[k] = 10; q[k] += 5; y = q.x*100 + q.y*10 + q.z; }'''
