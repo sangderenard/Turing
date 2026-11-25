@@ -49,9 +49,38 @@ _PROGRAMS = {
     "global_uint_array": (
         "uint active[4];\nvoid begin(){ active[2] = 5u; }\n"
         "void main(){ begin(); o[0] = float(active[2]); }\n", 5.0),
+    # A caller local that shadows a global is not the global (issue
+    # e24175de): the helper reads the global's own binding, 0.
+    "global_shadowed_by_caller_local": (
+        "int g = 0;\nint get(){ return g; }\n"
+        "void main(){ int g = 5; o[0] = float(get()); }\n", 0.0),
+    # The same through an intermediate helper that declares the local.
+    "global_shadowed_in_intermediate_helper": (
+        "int g = 0;\nint get(){ return g; }\n"
+        "int mid(){ int g = 5; return get(); }\n"
+        "void main(){ o[0] = float(mid()); }\n", 0.0),
+    # The write-back lands in the global, not in the shadowing local:
+    # get() sees bump's 1, the local keeps its 5 (1 + 10 * 5).
+    "global_written_under_shadowing_local": (
+        "int g = 0;\nvoid bump(){ g += 1; }\nint get(){ return g; }\n"
+        "void main(){ int g = 5; bump(); o[0] = float(get()) + 10.0 * float(g); }\n",
+        51.0),
     # A local array written and read in place.
     "local_float_array": (
         "void main(){ float a[4]; a[1] = 2.5; o[0] = a[1] + a[3]; }\n", 2.5),
+}
+
+
+# Lowered correctly (``mid`` hands ``get`` its carried ``g``), but ``mid``
+# carries ``g`` inout and forwards it, a shape the compiler refuses on main
+# today (issue 45a22a5d318b429d9c4fa29b2f8f5390).  The refusal is pinned to
+# that issue's own diagnostic, so another concordance regression in this
+# program fails; when the program lowers, ``pytest.raises`` fails too:
+# remove the entry when that issue is fixed.
+_KNOWN_REFUSALS = {
+    "global_shadowed_in_intermediate_helper": (
+        r"post ssa_block_geometry \('main__mid__specialized_[0-9a-f]+@control:0'"
+        r".*REVISE without a changed source"),
 }
 
 
@@ -78,14 +107,25 @@ def test_inout_and_mutable_globals_run_on_llvm(name):
     }]}).with_execution_file(
         ROOT / "extraction_contracts/vehicle_full_native_execution.yaml"
     )
-    module, _outputs, exports = lower_ast_source_to_ssa(
-        _HEADER + body, "main", source_language="glsl",
-        extraction_contract=contract,
-        python_bindings={"AbstractTensor": AbstractTensor},
-        tensor_ssa_reference=c_backend_repository_ssa_reference(),
-        runtime_closure_only=True, progress=lambda _: None,
-        progress_bars=False,
-    )
+
+    def lower():
+        return lower_ast_source_to_ssa(
+            _HEADER + body, "main", source_language="glsl",
+            extraction_contract=contract,
+            python_bindings={"AbstractTensor": AbstractTensor},
+            tensor_ssa_reference=c_backend_repository_ssa_reference(),
+            runtime_closure_only=True, progress=lambda _: None,
+            progress_bars=False,
+        )
+
+    refusal = _KNOWN_REFUSALS.get(name)
+    if refusal is not None:
+        from src.compiler.identity_concordance import ConcordanceRefusal
+
+        with pytest.raises(ConcordanceRefusal, match=refusal):
+            lower()
+        pytest.xfail("issue 45a22a5d318b429d9c4fa29b2f8f5390")
+    module, _outputs, exports = lower()
     entry = exports[0]
     names = dict(module.functions[entry].metadata["parameter_names"])
     emitted = emit_ssa_function_to_llvm(module, entry)
@@ -94,3 +134,24 @@ def test_inout_and_mutable_globals_run_on_llvm(name):
     out = np.zeros(1, dtype=np.float32)
     prepare_artifact_execution(artifact, {names["o"]: out}).run()
     assert float(out[0]) == expected
+
+
+def test_carried_global_names_its_own_binding_not_a_shadowing_local():
+    """Issue e24175de: the argument and the write-back target are the global."""
+    import ast
+
+    from src.compiler.glsl_ast_ingestion import lower_glsl_source_to_ast
+
+    source = _HEADER + (
+        "int g = 0;\nvoid bump(){ g += 1; }\n"
+        "int mid(){ int g = 5; bump(); return g; }\n"
+        "void main(){ int g = 7; bump(); o[0] = float(mid()) + float(g); }\n")
+    lowered = lower_glsl_source_to_ast(source)
+    assert not lowered.shortfalls, lowered.shortfalls
+    calls = [node for node in ast.walk(lowered.module)
+             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+             and isinstance(node.value.func, ast.Name) and node.value.func.id == "bump"]
+    assert len(calls) == 2, ast.unparse(lowered.module)
+    for call in calls:
+        assert [ast.unparse(arg) for arg in call.value.args] == ["g"], ast.unparse(call)
+        assert [ast.unparse(target) for target in call.targets] == ["g"], ast.unparse(call)

@@ -938,9 +938,14 @@ class _ASTExpressionParser:
         self._arity(token, args, len(signature.parameters))
         # The mutable globals the helper touches follow its authored
         # arguments (the caller's current values); then the storage buffers,
-        # each the caller's own span, handed by reference.
+        # each the caller's own span, handed by reference.  A global is
+        # named by its own binding, never by the caller's lexical scopes: in
+        # ``main`` its declaration is read first and keeps its spelling, and
+        # in a helper it is the carried parameter of that spelling, so a
+        # caller local that shadows it (renamed ``g__glsl_scope_N``) is
+        # neither handed in nor written back (``outputs`` below).
         args = [*args, *(
-            _typed(_name(self.context.resolve(name)), kind)
+            _typed(_name(name), kind)
             for name, kind, _written in signature.globals)]
         call = _call(token.text, [*args, *map(_name, signature.buffers)])
         outputs = signature.outputs
