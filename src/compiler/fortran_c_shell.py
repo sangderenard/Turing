@@ -27036,8 +27036,55 @@ def _class_surface_ssa_program(
             # below retains the exact authored table/key declaration.
             from .concordance_declarations import POLICY_PHYSICAL_KIND
             storage = POLICY_PHYSICAL_KIND.get(storage, storage)
+            # Program: GLSL ``begin(vec3 d, int hits)`` -> ``hits: 'i32'``.
+            # Wrong record: an annotated primitive parameter with no contract
+            # dtype took its class receipt (``int`` -> int64) although its arm
+            # cites the parameter's own ``'i32'`` annotation, and main read the
+            # value back as int64 against its declared int32 binding.  Rule:
+            # the annotation cell this arm cites is the declared width when it
+            # is the class's kind (an integer for ``int``, a float for
+            # ``float``); the class receipt is the default only without one.
+            declared_annotation_dtype = None
+            if (
+                primitive_receipt is not None
+                and not contract.get("dtype")
+                and not node_abi.get("program_abi_dtype")
+            ):
+                from ..transmogrifier.dtype_layout import (
+                    resolve as _annotation_layout,
+                    source_annotation_dtype as _annotation_dtype,
+                )
+                from .concordance_declarations import (
+                    ANNOTATION_DECLARATION as _ARM_ANNOTATION,
+                    PARAMETER_ANNOTATION as _ARM_PARAMETER_ANNOTATION,
+                )
+
+                receipt_layout = _annotation_layout(str(primitive_receipt["dtype"]))
+                declared_widths = set()
+                for cell in source_cells:
+                    page_name = getattr(cell.page, "name", cell.page)
+                    if page_name not in {
+                        _ARM_PARAMETER_ANNOTATION.name, _ARM_ANNOTATION.name,
+                    }:
+                        continue
+                    stated = _cell_fact(cell)
+                    width = _annotation_dtype(
+                        getattr(stated, "annotation", stated)
+                    )
+                    layout = _annotation_layout(width) if width else None
+                    if layout is not None and receipt_layout is not None and (
+                        layout.kind == receipt_layout.kind
+                        or (
+                            layout.kind in {"int", "uint"}
+                            and receipt_layout.kind in {"int", "uint"}
+                        )
+                    ):
+                        declared_widths.add(str(width))
+                if len(declared_widths) == 1:
+                    declared_annotation_dtype = next(iter(declared_widths))
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
+                or declared_annotation_dtype
                 or (primitive_receipt or {}).get("dtype")
                 or ""
             )
@@ -27692,11 +27739,23 @@ def _class_surface_ssa_program(
                     and descriptor.get("metadata_state") != "dynamic"
                 ):
                     extents = tuple(descriptor["shape"])
+                    # The descriptor supplies what the contract lacks; it
+                    # never overrides what the contract declares.  Program:
+                    # GLSL ``begin(vec3 d, int hits)``: the formal's contract
+                    # states its ``'i32'`` annotation while the graph
+                    # descriptor holds the ``int`` class default, and the
+                    # override handed main an int64 ``hits`` against its
+                    # declared int32 binding.
                     source = {
-                        **dict(source or {}),
                         "dtype": descriptor["dtype"],
                         "rank": len(extents),
                         "storage": "span" if extents else "scalar",
+                        **{
+                            key: value
+                            for key, value in dict(source or {}).items()
+                            if value is not None
+                            and not (key == "dtype" and str(value) in {"", "unknown"})
+                        },
                     }
                     # A shape is recorded only when the descriptor states
                     # EXTENTS.  An empty shape from this query is equally
@@ -51127,10 +51186,50 @@ def _class_surface_ssa_program(
             aliases = _concordant_function_aliases(function)
             unresolved_projections = []
             descriptors_by_owner = dict(record_table.records)
-            for history in (
-                graph.graph.get("identity_table") or {}
-            ).values():
-                history_ids = tuple(map(int, history))
+
+            def call_result_object(value_id: int) -> bool:
+                """Whether a name version is an object a call returned."""
+
+                node = graph.nodes.get(int(value_id), {})
+                kind = str(node.get("op") or node.get("type") or "").casefold()
+                if kind == "call":
+                    return True
+                if kind != "indexed":
+                    return False
+                return any(
+                    str(role) == "base" and parent in graph and str(
+                        graph.nodes[parent].get("op")
+                        or graph.nodes[parent].get("type") or ""
+                    ).casefold() == "call"
+                    for parent, role in node.get("parents") or ()
+                )
+
+            def object_segments(history_ids: tuple[int, ...]):
+                # Program: ``q = vec2(0.0, 0.0)`` then ``q, n = ident(v,
+                # n)`` and ``q.y``.  Wrong record: ``q``'s history (the
+                # constructor 4, the call-result member 12) shared record
+                # 4's descriptor, so ``q.y`` after the call read the
+                # constructor's ``y`` -- a silent wrong value.  Rule: a name
+                # rebound to a call's result (the Call or a member of it)
+                # names the object the call returned, not the one before;
+                # the history splits there and a descriptor extends only
+                # through the versions of its own object.
+                segment: list[int] = []
+                for value_id in history_ids:
+                    if segment and call_result_object(value_id):
+                        yield tuple(segment)
+                        segment = []
+                    segment.append(int(value_id))
+                if segment:
+                    yield tuple(segment)
+
+            for history_ids in (
+                segment
+                for history in (
+                    graph.graph.get("identity_table") or {}
+                ).values()
+                for segment in object_segments(tuple(map(int, history)))
+            ):
                 residents = tuple(dict.fromkeys(
                     record_table.records[value_id]
                     for value_id in history_ids
@@ -51167,6 +51266,21 @@ def _class_surface_ssa_program(
                     None if receiver_origin_id is None
                     else descriptors_by_owner.get(int(receiver_origin_id))
                 )
+                # Program: ``q, n = ident(vec2(2.0, 3.0), n)`` returning its
+                # record formal as member 0, then ``q.y``.  The member is
+                # the caller's actual (its planning alias is concorded, the
+                # identity-return proof); with no descriptor of its own it
+                # reads the fields of the record it is.
+                aliased_origins: set[int] = set()
+                while (
+                    descriptor is None
+                    and receiver_origin_id is not None
+                    and int(receiver_origin_id) in aliases
+                    and int(receiver_origin_id) not in aliased_origins
+                ):
+                    aliased_origins.add(int(receiver_origin_id))
+                    receiver_origin_id = int(aliases[int(receiver_origin_id)])
+                    descriptor = descriptors_by_owner.get(int(receiver_origin_id))
                 attribute = str(
                     (data.get("attributes") or {}).get("attribute") or ""
                 )
@@ -67916,6 +68030,14 @@ def _lower_ast_source_to_ssa_impl(
                     module.functions, module.sequence_tables,
                     module.record_tables,
                 )
+            )
+            # A returned tuple member every caller rebound to its own actual
+            # (an exact callee formal) is no output; retiring it lets the
+            # prune below judge that formal by its remaining readers.
+            from .ssa_aggregate_abi import retire_passthrough_aggregate_outputs
+
+            module.metadata["final_retired_passthrough_outputs"] = (
+                retire_passthrough_aggregate_outputs(module.functions)
             )
             final_pruned_formals += _prune_unused_callee_formals(
                 module.functions, final_call_records,

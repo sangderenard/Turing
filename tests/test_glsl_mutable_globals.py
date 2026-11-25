@@ -38,6 +38,13 @@ _PROGRAMS = {
         "vec3 recorded;\nvoid begin(vec3 d){ recorded = d; }\n"
         "float row(){ return recorded.y; }\n"
         "void main(){ begin(vec3(1.0, 2.5, 3.0)); o[0] = row(); }\n", 2.5),
+    # One helper writes a record global and an int global: begin returns
+    # (recorded, hits), member 0 being its own formal ``d``.
+    "global_vec3_and_int": (
+        "vec3 recorded; int hits = 0;\n"
+        "void begin(vec3 d){ recorded = d; hits += 1; }\n"
+        "void main(){ begin(vec3(1.0, 2.5, 3.0)); "
+        "o[0] = recorded.y + float(hits); }\n", 3.5),
 }
 
 

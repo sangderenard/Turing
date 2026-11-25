@@ -46,6 +46,31 @@ def main(out: AbstractTensor):
     a = 5.0
     out[0] = p.x + a
 ''', 7.0),
+    # ``q`` rebound to a call's returned tuple member names the record the
+    # call returned (here its own formal ``v``), not the earlier ``q``.
+    "rebound_to_returned_member": ('''def ident(v: vec2, k: 'int32') -> tuple[vec2, 'int32']:
+    k += 1
+    return (v, k)
+
+def main(out: AbstractTensor):
+    q: vec2 = vec2(0.0, 0.0)
+    n: 'int32' = 1
+    q, n = ident(vec2(2.0, 3.0), n)
+    out[0] = q.y + float(n)
+''', 5.0),
+    # The GLSL global shape: the callee rebinds its formal ``q`` to ``v``
+    # and returns it beside an int.
+    "rebound_formal_returned_as_member": ('''def ident(v: vec2, q: vec2, k: 'int32') -> tuple[vec2, 'int32']:
+    q = v
+    k += 1
+    return (q, k)
+
+def main(out: AbstractTensor):
+    q: vec2 = vec2(0.0, 0.0)
+    n: 'int32' = 1
+    q, n = ident(vec2(2.0, 3.0), q, n)
+    out[0] = q.y + float(n)
+''', 5.0),
 }
 
 
