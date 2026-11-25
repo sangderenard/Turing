@@ -374,15 +374,17 @@ def test_path_exists_returns_an_inline_bool_scalar():
 
 
 @pytest.mark.parametrize(
-    "source",
+    ("source", "consumer"),
     (
-        "import os\ndef entry():\n    return os.path.exists('x.bin')\n",
-        "import os\ndef entry():\n"
-        "    if os.path.exists('x.bin'):\n        return 1\n    return 0\n",
+        ("import os\ndef entry():\n    return os.path.exists('x.bin')\n",
+         "Ret"),
+        ("import os\ndef entry():\n"
+         "    if os.path.exists('x.bin'):\n        return 1\n    return 0\n",
+         "CondBr"),
     ),
     ids=("returned", "branch_condition"),
 )
-def test_path_exists_lowers_through_the_native_callsite_as_bool(source):
+def test_path_exists_lowers_through_the_native_callsite_as_bool(source, consumer):
     # Ticket b043a7c9 / case 6b7d429f: `return os.path.exists(p)` gave
     # "Ret returns none", then plan A's "no recorded result_dtype".
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
@@ -407,6 +409,12 @@ def test_path_exists_lowers_through_the_native_callsite_as_bool(source):
     assert native.attributes["external_identity"] == "genericpath.exists"
     assert native.attributes["native_abi"] == "cpython-c-api"
     assert native.res.dtype == "bool"
+    # The native bool itself is the returned value or the branch condition
+    # (review c6ab461c comments 576 and 578).
+    used, = (
+        instruction for instruction in operations if instruction.op == consumer
+    )
+    assert [value.id for value in used.args] == [native.res.id]
 
 
 def test_wall_clock_return_is_supplied_by_the_native_callsite_as_float64():
