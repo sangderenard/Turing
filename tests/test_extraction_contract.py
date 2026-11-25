@@ -376,23 +376,28 @@ def test_wall_clock_return_is_supplied_by_the_native_callsite_as_float64():
 
 
 @pytest.mark.parametrize(
-    "source,native_calls",
+    "source,expected_identity,expected_count",
     (
-        ("import time\ndef entry():\n    t = time.time()\n    return t + 1.0\n", 1),
+        ("import time\ndef entry():\n    t = time.time()\n    return t + 1.0\n",
+         "time.time", 1),
         ("import time\ndef entry():\n"
-         "    t0 = time.perf_counter()\n    return time.perf_counter() - t0\n", 2),
+         "    t0 = time.perf_counter()\n    return time.perf_counter() - t0\n",
+         "time.perf_counter", 2),
     ),
     ids=("wall_clock_plus_constant", "performance_counter_difference"),
 )
 def test_clock_reading_used_in_arithmetic_is_a_float64_host_scalar(
-    source, native_calls,
+    source, expected_identity, expected_count,
 ):
     # Ticket b043a7c9 / case 6b7d429f: a use_native float64 result consumed
     # by arithmetic was refused by _refuse_unsettled_host_scalars as
     # missing_source_value_class.  The contract's result_dtype now publishes
     # the call's class, so the arithmetic lowers to a float64 return.  Each
     # clock read stays its own native call: two perf_counter reads must not
-    # collapse into one (review 753568f5, comment 508).
+    # collapse into one (review 753568f5, comment 508).  The whole sequence
+    # of external calls is pinned by identity, so a missing clock read, an
+    # extra unrelated external call or a wrong identity all fail (review
+    # f7b4f6ca, comments 520-523).
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -411,7 +416,9 @@ def test_clock_reading_used_in_arithmetic_is_a_float64_host_scalar(
         for instruction in block.instrs
         if (instruction.attributes or {}).get("external_reference")
     )
-    assert len(natives) == native_calls
+    assert tuple(
+        native.attributes["external_identity"] for native in natives
+    ) == (expected_identity,) * expected_count
     assert all(native.res.dtype == "float64" for native in natives)
 
 
