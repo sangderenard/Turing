@@ -452,3 +452,258 @@ def save_map(p, m):
 """)
     assert any(isinstance(node, ast.With) for node in ast.walk(tree))
     assert not hasattr(tree, "_turing_tensor_payload_scopes")
+
+
+def _file_plan(source: str) -> dict:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "open"
+        ):
+            node._extraction_contract = _file_receipt("builtins.open")
+    lower_python_shell_file_contexts(tree)
+    (plan,) = tree._turing_shell_file_contexts
+    return plan
+
+
+def test_file_plan_of_parameters_and_literals_is_pre_entry_eligible():
+    # The acceptance program of case 6b7d429f (ticket b043a7c9).
+    plan = _file_plan("""
+def entry(p):
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + 1
+""")
+
+    assert plan["phase"] == "pre_entry"
+    assert plan["phase_reason"] is None
+    assert [operation["result"] for operation in plan["operations"]] == [
+        "turing_file_handle_1", "n", None,
+    ]
+
+
+@pytest.mark.parametrize("helper", [
+    # Neither store can run before the entry's first statement, so the
+    # first-statement plan reads p as the caller's value either way
+    # (review a04ac60a, comments 600 to 605).
+    """
+    def helper():
+        p = 'shadow'
+        return p
+""",
+    """
+    def helper():
+        nonlocal p
+        p = 'shadow'
+""",
+])
+def test_later_nested_store_to_a_parameter_keeps_a_first_statement_plan(
+    helper,
+):
+    plan = _file_plan(
+        "def entry(p):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        n: int = f.write(b'ab')\n"
+        + helper
+        + "    return n + 1\n"
+    )
+
+    assert plan["phase"] == "pre_entry"
+    assert plan["phase_reason"] is None
+
+
+def test_plan_operands_resolve_in_operation_order():
+    # `as p` names the stream p after open has read the parameter p: the
+    # open's path operand is the entry parameter, and the write's handle
+    # operand is the open's result (review a04ac60a, comments 604 and 606).
+    plan = _file_plan("""
+def entry(p):
+    with open(p, 'wb') as p:
+        n: int = p.write(b'ab')
+    return n + 1
+""")
+
+    opened, written, _closed = plan["operations"]
+    assert opened["arguments"][0] == {"kind": "name", "name": "p"}
+    assert written["arguments"][0] == {
+        "kind": "name", "name": opened["result"],
+    }
+    assert opened["result"] != "p"
+    assert plan["phase"] == "pre_entry"
+
+
+@pytest.mark.parametrize(("source", "reason"), [
+    # Anything before the scope, effectful or not, keeps it post_entry: the
+    # predicate is FunctionDef.body[0] (review a04ac60a, comments 596-597).
+    ("""
+def entry(p):
+    print(p)
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + 1
+""", "scope-not-first-statement"),
+    ("""
+def entry(p):
+    k = len(p)
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + k
+""", "scope-not-first-statement"),
+    ("""
+def entry(p, k):
+    q = 1 // k
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + q
+""", "scope-not-first-statement"),
+    ("""
+def entry(p):
+    return 0
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + 1
+""", "scope-not-first-statement"),
+    ('''
+def entry(p):
+    """Write two bytes."""
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + 1
+''', "scope-not-first-statement"),
+    ("""
+def entry(p):
+    p = p + '.bin'
+    with open(p, 'wb') as f:
+        n: int = f.write(b'ab')
+    return n + 1
+""", "scope-not-first-statement"),
+    ("""
+DATA = b'ab'
+def entry(p):
+    with open(p, 'wb') as f:
+        n: int = f.write(DATA)
+    return n + 1
+""", "operand-not-available-before-entry"),
+    ("""
+def entry(p, k):
+    if k:
+        with open(p, 'wb') as f:
+            n: int = f.write(b'ab')
+        return n + 1
+    return 0
+""", "scope-not-a-direct-function-statement"),
+    ("""
+def entry(p, k):
+    with open(p, 'wb') as f:
+        k = k + 1
+        n: int = f.write(b'ab')
+    return n + k
+""", "scope-body-is-not-plan-operations"),
+    ("""
+with open('out.bin', 'wb') as f:
+    f.write(b'ab')
+""", "no-enclosing-function"),
+])
+def test_file_plan_that_cannot_run_before_the_entry_stays_post_entry(
+    source, reason,
+):
+    plan = _file_plan(source)
+
+    assert plan["phase"] == "post_entry"
+    assert plan["phase_reason"] == reason
+
+
+@pytest.mark.parametrize(("source", "phase", "reason"), [
+    ("""
+def entry(p):
+    with open(p, 'wb') as f:
+        f.write(b'ab')
+    return 1
+""", "pre_entry", None),
+    ('''
+def entry(p):
+    """Write two bytes."""
+    with open(p, 'wb') as f:
+        f.write(b'ab')
+    return 1
+''', "post_entry", "scope-not-first-statement"),
+])
+def test_compiled_module_carries_the_plan_phase(source, phase, reason):
+    # The phase must survive ingestion: read it from the plan the compiler
+    # publishes, not only from the raw-AST lowering (review a04ac60a,
+    # comments 596 to 599).
+    import contextlib
+    import io
+    from pathlib import Path
+
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, _, _ = lower_ast_source_to_ssa(
+            source, "entry", name="file_plan_phase",
+            extraction_contract=contract,
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+    (plan,) = module.metadata["shell_io"]["boundary_plans"]
+    assert plan["function"] == "entry"
+    assert plan["phase"] == phase
+    assert plan["phase_reason"] == reason
+
+
+_OWNER_HELPER = """
+def helper(q):
+    with open(q, 'wb') as g:
+        g.write(b'zz')
+    return 2
+"""
+
+
+@pytest.mark.parametrize(("entry", "owners"), [
+    ("""
+def entry(p):
+    with open(p, 'wb') as f:
+        f.write(b'ab')
+    return 1
+""", ["entry"]),
+    ("""
+def entry(p, q):
+    with open(p, 'wb') as f:
+        f.write(b'ab')
+    return helper(q)
+""", ["entry", "helper"]),
+])
+def test_published_plans_name_their_own_function_owner(entry, owners):
+    # Lexical eligibility does not decide which plans run before the entry:
+    # a helper whose first statement is a file scope is pre_entry too. Each
+    # published plan must name its own function so the entry ABI can keep
+    # only the entry's plans (review 301e340f, comments 613 to 615). An
+    # uncalled helper's plan is not published at all.
+    import contextlib
+    import io
+    from pathlib import Path
+
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, _, _ = lower_ast_source_to_ssa(
+            _OWNER_HELPER + entry, "entry", name="file_plan_owner",
+            extraction_contract=contract,
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+    plans = module.metadata["shell_io"]["boundary_plans"]
+    assert sorted(plan["function"] for plan in plans) == owners
+    assert all(plan["phase"] == "pre_entry" for plan in plans)

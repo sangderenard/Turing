@@ -133,15 +133,102 @@ class _ShellFileContextLowerer(ast.NodeTransformer):
         self.counter = 0
         self.lowered: list[dict[str, Any]] = []
         self.function_stack: list[str] = []
+        self.function_nodes: list[ast.AST] = []
 
     def visit_FunctionDef(self, node):  # noqa: N802
         self.function_stack.append(str(node.name))
+        self.function_nodes.append(node)
         try:
             return self.generic_visit(node)
         finally:
             self.function_stack.pop()
+            self.function_nodes.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    @staticmethod
+    def _entry_parameters(function: ast.AST) -> set[str]:
+        """The scalar parameters of ``function``.
+
+        Variadic parameters are excluded: they are not one scalar slot. No
+        rebinding scan is needed here: the plan is only eligible when its
+        scope is the function's first statement, and when that statement
+        runs no statement of the function has run, so every parameter still
+        holds the caller's value whatever the function stores later (review
+        a04ac60a, comments 601 and 603).
+        """
+
+        arguments = function.args
+        return {
+            str(argument.arg) for argument in (
+                *arguments.posonlyargs, *arguments.args,
+                *arguments.kwonlyargs,
+            )
+        }
+
+    def _boundary_phase(
+        self,
+        node: ast.With,
+        body: list[ast.stmt],
+        body_calls: list[ast.Call],
+        operations: tuple[dict[str, Any], ...],
+    ) -> tuple[str, str | None]:
+        """Decide whether a plan may run before the entry (case 6b7d429f).
+
+        D2, lexical: the scope is the first statement of its function
+        (``FunctionDef.body[0]``, a docstring included), so nothing the
+        function does can come before it, and the scope's body is only the
+        plan's own operations. D1: every operand, read in operation order,
+        is a literal, bytes, a parameter of the function, or a result an
+        earlier operation of the same plan produced. Anything else stays
+        ``post_entry``, and the shell keeps its existing refusals for it.
+
+        ``pre_entry`` records eligibility only. Running the plan before the
+        entry also requires the plan's function to be the entry itself; that
+        is decided where the entry ABI is planned, not here.
+        """
+
+        if not self.function_nodes:
+            return "post_entry", "no-enclosing-function"
+        function = self.function_nodes[-1]
+        position = next((
+            index for index, statement in enumerate(function.body)
+            if statement is node
+        ), None)
+        if position is None:
+            return "post_entry", "scope-not-a-direct-function-statement"
+        if position != 0:
+            return "post_entry", "scope-not-first-statement"
+        operation_calls = {id(call) for call in body_calls}
+        for statement in body:
+            value = (
+                statement.value
+                if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign))
+                else None
+            )
+            if value is None or id(value) not in operation_calls:
+                return "post_entry", "scope-body-is-not-plan-operations"
+            if isinstance(statement, ast.Assign) and not (
+                len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+            ):
+                return "post_entry", "scope-body-is-not-plan-operations"
+            if isinstance(statement, ast.AnnAssign) and not isinstance(
+                statement.target, ast.Name
+            ):
+                return "post_entry", "scope-body-is-not-plan-operations"
+        available = self._entry_parameters(function)
+        for operation in operations:
+            for operand in operation["arguments"]:
+                kind = operand.get("kind")
+                if kind in {"literal", "bytes"}:
+                    continue
+                if kind == "name" and str(operand.get("name")) in available:
+                    continue
+                return "post_entry", "operand-not-available-before-entry"
+            if operation.get("result"):
+                available.add(str(operation["result"]))
+        return "pre_entry", None
 
     @staticmethod
     def _plan_operand(node: ast.expr) -> dict[str, Any]:
@@ -274,6 +361,25 @@ class _ShellFileContextLowerer(ast.NodeTransformer):
             id(opened): handle_name,
             **direct_results,
         }
+        operations = tuple({
+            "operation": str(
+                (_call._extraction_contract or {}).get(
+                    "parameters", {}
+                ).get("operation") or ""
+            ),
+            "sequence": int(sequence),
+            "arguments": tuple(
+                self._plan_operand(argument) for argument in _call.args
+            ),
+            "result": operation_results.get(id(_call)),
+            "source_span": {
+                "line": int(getattr(_call, "lineno", -1)),
+                "column": int(getattr(_call, "col_offset", -1)),
+            },
+        } for sequence, _call in enumerate(ordered_calls))
+        phase, phase_reason = self._boundary_phase(
+            node, body, rewriter.calls, operations,
+        )
         self.lowered.append({
             "schema": "turing.python-shell-file-context.v1",
             "identity": receipt.get("identity"),
@@ -291,22 +397,10 @@ class _ShellFileContextLowerer(ast.NodeTransformer):
                 str((_call._extraction_contract or {}).get("identity") or "")
                 for _call in ordered_calls
             ),
-            "operations": tuple({
-                "operation": str(
-                    (_call._extraction_contract or {}).get(
-                        "parameters", {}
-                    ).get("operation") or ""
-                ),
-                "sequence": int(sequence),
-                "arguments": tuple(
-                    self._plan_operand(argument) for argument in _call.args
-                ),
-                "result": operation_results.get(id(_call)),
-                "source_span": {
-                    "line": int(getattr(_call, "lineno", -1)),
-                    "column": int(getattr(_call, "col_offset", -1)),
-                },
-            } for sequence, _call in enumerate(ordered_calls)),
+            "operations": operations,
+            # A plan without "phase" reads as post_entry (schema stays v1).
+            "phase": phase,
+            "phase_reason": phase_reason,
         })
         return [
             ast.copy_location(ast.Assign(
