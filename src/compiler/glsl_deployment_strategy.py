@@ -33198,6 +33198,72 @@ def _fold_callsite_structural_values(
             return None
         return min(widths)
 
+    def batch_axis_alias(
+        node_id: int, data: Mapping[str, Any], batch_cell: Any,
+    ) -> Any:
+        """A declared reduction's batch axis folded to its operand when every
+        input of this copy is a declared scalar, else ``unresolved``."""
+
+        from .concordance_declarations import (
+            PLANNER_STRUCTURAL_FOLD, SYMBOLIC_TRANSFORM, SymbolicTransformFact,
+        )
+        from .identity_concordance import Derived, Mode, current_identity_book
+        from ..common.tensors.topological_reducer import (
+            _posted_node_identity_cell,
+        )
+
+        book = current_identity_book()
+        fact = book.page(SYMBOLIC_TRANSFORM).cell(
+            batch_cell.row, batch_cell.column,
+        )
+        operand = next((
+            int(parent) for parent, role in (data.get("parents") or ())
+            if str(role) == "arg:0" and int(parent) in graph.G
+        ), None)
+        inputs = tuple(
+            int(candidate) for candidate, candidate_data in graph.G.nodes(data=True)
+            if str(candidate_data.get("type") or "").casefold() == "input"
+        )
+        if (
+            operand is None or not inputs
+            or getattr(fact, "transform", None) not in {
+                "reduction_batch_axis", "reduction_batch_axis_elided",
+            }
+        ):
+            return unresolved
+        facts = tuple(known.get(candidate, unresolved) for candidate in inputs)
+        if not all(
+            isinstance(value, _ProgramABIValueFact)
+            and value.storage == "scalar"
+            and value.rank in {None, 0}
+            and not value.optional
+            for value in facts
+        ):
+            return unresolved
+        cells = tuple(dict.fromkeys(cell for cell in (
+            batch_cell,
+            _posted_node_identity_cell(graph, int(node_id)),
+            *(_posted_node_identity_cell(graph, candidate) for candidate in inputs),
+        ) if cell is not None))
+        if len(cells) < 2 + len(inputs):
+            return unresolved
+        row = tuple(batch_cell.row)
+        if getattr(book.page(SYMBOLIC_TRANSFORM).latest(row), "transform", None) != (
+            "reduction_batch_axis_elided"
+        ):
+            round_cells.append(book.post(
+                SYMBOLIC_TRANSFORM, row,
+                SymbolicTransformFact(
+                    "reduction_batch_axis_elided",
+                    "every input of "
+                    f"{graph.G.graph.get('function_name')!s} is a declared "
+                    "scalar: no batch",
+                ),
+                stage=PLANNER_STRUCTURAL_FOLD, provenance=Derived(cells),
+                mode=Mode.REVISE,
+            ))
+        return _StructuralValueAlias(operand)
+
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
         if (data.get("attributes") or {}).get("bound_method_ref") is not None:
             return unresolved
@@ -33781,6 +33847,21 @@ def _fold_callsite_structural_values(
                 for extent in descriptor["shape"]:
                     count *= int(extent)
                 return count
+        batch_axis_cell = (data.get("attributes") or {}).get(
+            "declared_batch_axis_cell"
+        )
+        if operation == "unsqueeze" and batch_axis_cell is not None:
+            # Program: ``def root(n: float, x: float): return fsum(n, x)``
+            # with ``fsum = Sum(k*x, (k, 1, n))`` (owner, 2026-11-25).  Wrong
+            # record: the declared reduction keeps a trailing unit axis for
+            # the batch its law runs over, so a Sum of scalars returned shape
+            # ``(1,)`` whose extent was a runtime value no public input
+            # states, and the root's return was refused.  Rule: the batch is
+            # the broadcast of the law's inputs; when every input of this
+            # copy is a declared scalar there is none, and the batch axis
+            # (``reduction_batch_axis`` row) is its operand.  The fold is a
+            # REVISE of that row, DERIVED from it and every input's cells.
+            return batch_axis_alias(int(node_id), data, batch_axis_cell)
         if node_type == "Phi" or isinstance(expression, ast.IfExp):
             parents = {
                 str(role): int(parent)

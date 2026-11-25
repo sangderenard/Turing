@@ -639,11 +639,22 @@ def _split_reduction(value):
     return value
 
 
-def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
+#: The ``symbolic_transform`` kind a declared reduction posts on the trailing
+#: ``unsqueeze(-1)`` that leaves room for the batch the law runs over.  A
+#: callsite whose every input is a declared scalar has no batch: its
+#: specialized copy folds this node to its operand (``glsl_deployment_strategy``
+#: structural fold), so a Sum of scalars is a scalar.
+REDUCTION_BATCH_AXIS = "reduction_batch_axis"
+
+
+def _place_axis(ingest, node_id: int, position: int, rank: int,
+                authored: Any = None) -> int:
     """A 1-D axis tensor reshaped to ``rank + 1`` dims, its extent at ``position``.
 
     The trailing dimension is left for the batch the law runs over, so every
     ordinary law value (shape ``(batch,)``) broadcasts against every axis.
+    That last ``unsqueeze(-1)`` is declared the batch axis
+    (``REDUCTION_BATCH_AXIS``) on the book.
     """
 
     # The axes are their own constants (``literal``: not memoized), never the
@@ -658,6 +669,15 @@ def _place_axis(ingest, node_id: int, position: int, rank: int) -> int:
         node_id = ingest.op("unsqueeze", (node_id, zero))
     for _ in range(rank - position):
         node_id = ingest.op("unsqueeze", (node_id, minus_one))
+    # The last axis appended is the batch's (every unsqueeze(-1) appends one
+    # unit axis; the final one is dimension ``rank``).
+    # The cell rides on the node as the index axis's does
+    # (``declared_lowering_cell``), so a copy of the graph reads its row.
+    if authored is not None:
+        ingest.node_attributes(node_id)["declared_batch_axis_cell"] = (
+            ingest.transform(node_id, REDUCTION_BATCH_AXIS,
+                             f"batch axis {rank} of {rank + 1}", authored)
+        )
     return node_id
 
 
@@ -832,7 +852,7 @@ def lower_sum_declaration(declaration, graph, ingest) -> int:
         ] = ingest.transform(
             arange, REDUCTION_INDEX_AXIS, "arange(count)", declaration.sympy,
         )
-        axis = _place_axis(ingest, arange, position, rank)
+        axis = _place_axis(ingest, arange, position, rank, declaration.sympy)
         spanned = sympy.Dummy("span")
         masks.append(ingest.bound(sympy.Le(offset, spanned), {offset: axis, spanned: span_id}))
         bindings[var] = ingest.bound(offset + limit.lower, {**bindings, offset: axis})
@@ -881,8 +901,8 @@ def lower_integral_declaration(declaration, graph, ingest) -> int:
                                    (rule_weights, "quadrature weights")):
             ingest.transform(axis_value, REDUCTION_INDEX_AXIS, detail,
                              declaration.sympy)
-        nodes = _place_axis(ingest, rule_nodes, position, rank)
-        weights = _place_axis(ingest, rule_weights, position, rank)
+        nodes = _place_axis(ingest, rule_nodes, position, rank, declaration.sympy)
+        weights = _place_axis(ingest, rule_weights, position, rank, declaration.sympy)
         node_symbol, weight_symbol = sympy.Dummy("node"), sympy.Dummy("weight")
         bindings[var] = ingest.bound(mid + half * node_symbol, {**bindings, node_symbol: nodes})
         weight_bindings[weight_symbol] = weights
@@ -1237,6 +1257,9 @@ def ingest_sympy_expression(
         )
 
     ingest.transform = post_transform
+    ingest.node_attributes = (
+        lambda node_id: graph.G.nodes[int(node_id)].setdefault("attributes", {})
+    )
 
     def lower_declared(value: sympy.Basic) -> int:
         from . import bitops

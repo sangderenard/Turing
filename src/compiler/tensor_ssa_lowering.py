@@ -14402,6 +14402,39 @@ def lower_tensor_calls_to_repository_ssa(
                     axis_sequence = _as_sequence(axis)
                     if axis_sequence is not None and len(axis_sequence) == 1:
                         axis = axis_sequence[0]
+                    # Program: ``def root(n: float, x: float): return
+                    # fsum(n, x)``, ``fsum = Sum(k*x, (k, 1, n))`` once its
+                    # batch axis folds away (owner, 2026-11-25).  Wrong
+                    # record: ``sum(term, 0)`` over the rank-1 runtime span
+                    # took the axis kernel, whose rank-0 float result has no
+                    # output geometry.  Rule: reducing a rank-1 span over its
+                    # only axis IS the all-axis reduction (an identity), so
+                    # it lowers as that one; the decision is its book row.
+                    if (
+                        isinstance(axis, int) and not isinstance(axis, bool)
+                        and axis in {0, -1}
+                        and not bool(_attribute(
+                            instruction.attributes, "keepdim",
+                        ) or False)
+                    ):
+                        from .ssa_record_return_state import (
+                            posted_ssa_value_fact as _axis_source_fact,
+                        )
+                        sole_axis_source = _axis_source_fact(
+                            function, int(source.id), book=book,
+                        )
+                        if (
+                            sole_axis_source is not None
+                            and sole_axis_source.storage == "span"
+                            and sole_axis_source.rank == 1
+                        ):
+                            _concord_scalar_kernel_operand(
+                                module, function,
+                                (str(function_name), int(result.id)),
+                                ("sole_axis_reduction", str(operation)),
+                                (result, source),
+                            )
+                            axis = None
                     if (
                         axis is None
                         and not shape_unknown(source)

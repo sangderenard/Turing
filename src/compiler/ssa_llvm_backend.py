@@ -2922,6 +2922,66 @@ def _emit_repository_call_module(
             int(value.id): f"%out.{index}"
             for index, value in enumerate(outputs)
         }
+        # Owned-heap tensors cross a region boundary as the C module lane
+        # carries them (``ssa_c_backend``: ``owned_tensor_data_bindings``).
+        # Program: declared ``Sum(k*x, (k, 1, n))`` over scalar ``n, x``
+        # (owner, 2026-11-25).  Wrong record: region 4 wrote its runtime
+        # ``arange`` into a private heap arena and never published it, and
+        # the caller sized each runtime span result as ONE element, so the
+        # consumers wrote whole spans into it and the sum read 0.0.  Rule:
+        # (1) in the allocating region, the logical tensor is a view of its
+        # carrier's arena and the output port is the carrier's: the Alloca
+        # stores the arena address into the caller's pointer cell; (2) a
+        # caller value the Call names (``output_ids``) for a callee carrier
+        # (``callee_output_ids``) is one pointer cell, and every later reader
+        # receives the arena it holds.
+        from .ssa_storage_requirements import owned_tensor_data_bindings
+        local_owned_views: dict[int, int] = {
+            int(binding.tensor_id): int(binding.data_value_id)
+            for binding in owned_tensor_data_bindings(module, name)
+            if not binding.inherited
+        }
+        local_owned_carriers = set(local_owned_views.values())
+        for output_index_, output_ in enumerate(outputs):
+            carrier_id_ = local_owned_views.get(int(output_.id))
+            if carrier_id_ is not None:
+                output_pointer.pop(int(output_.id), None)
+                output_pointer[carrier_id_] = f"%out.{output_index_}"
+        caller_heap_cells: dict[int, str] = {}
+        caller_heap_producers: dict[int, int] = {}
+        for block_ in function.blocks.values():
+            for instruction_ in block_.instrs:
+                callee_name_ = str(instruction_.attributes.get("callee") or "")
+                if (instruction_.op != "Call" or callee_name_ not in module.functions
+                        or callee_name_ == name):
+                    continue
+                caller_ids_ = tuple(map(int, instruction_.attributes.get(
+                    "output_ids", ()) or ()))
+                callee_ids_ = tuple(map(int, instruction_.attributes.get(
+                    "callee_output_ids", ()) or ()))
+                if not caller_ids_ or len(caller_ids_) != len(callee_ids_):
+                    continue
+                callee_carriers_ = {
+                    int(binding.data_value_id)
+                    for binding in owned_tensor_data_bindings(module, callee_name_)
+                    if not binding.inherited
+                }
+                for caller_id_, callee_id_ in zip(caller_ids_, callee_ids_):
+                    if callee_id_ in callee_carriers_:
+                        caller_heap_cells[caller_id_] = f"%heapcell.{caller_id_}"
+                        caller_heap_producers[caller_id_] = id(instruction_)
+        heap_view_loads = [0]
+        current_instruction: list = [None]
+        for heap_cell_ in caller_heap_cells.values():
+            entry_allocas.append(f"  {heap_cell_} = alloca ptr, i64 1, align 8")
+            entry_allocas.append(f"  store ptr null, ptr {heap_cell_}, align 8")
+
+        def heap_arena(cell: str, value_id: int) -> str:
+            """The arena address a pointer cell holds, loaded where it is read."""
+            heap_view_loads[0] += 1
+            register = f"%heap.view.{value_id}.{heap_view_loads[0]}"
+            body.append(f"  {register} = load ptr, ptr {cell}, align 8")
+            return register
         # A watched value whose storage is a Phi register cannot be copied at
         # the return -- the register does not dominate it. Give it a slot in
         # the entry frame (which dominates everything) and copy the phi's
@@ -3003,6 +3063,18 @@ def _emit_repository_call_module(
 
         def pointer(value: _Any) -> str:
             value_id = int(value.id)
+            heap_cell = caller_heap_cells.get(value_id)
+            if heap_cell is not None:
+                # The producing Call writes the arena address into the cell;
+                # every other reader receives the arena.
+                if id(current_instruction[0]) == caller_heap_producers[value_id]:
+                    return heap_cell
+                return heap_arena(heap_cell, value_id)
+            carrier_id = local_owned_views.get(value_id)
+            if carrier_id is not None:
+                carrier = values_by_function.get(name, {}).get(carrier_id)
+                if carrier is not None:
+                    return heap_arena(pointer(carrier), value_id)
             known = pointers.get(value_id)
             if known is not None:
                 return known
@@ -3028,22 +3100,7 @@ def _emit_repository_call_module(
                 requirement = frame_storage_requirements.get(name, {}).get(value_id)
                 if requirement is not None and requirement.element_count is not None:
                     count = max(count, int(requirement.element_count))
-            # Program: declared Sum; region 6 writes its runtime-sized mask 12
-            # into the caller-owned heap carrier (``tensor_heap_owner_call
-            # _binding``), exactly as region 4 writes the index axis. Wrong
-            # record: the root still claimed a runtime frame for 12 that its
-            # entry cannot measure. Rule: a value whose storage is a booked
-            # caller-owned heap carrier of this frame has that storage.
-            from .concordance_declarations import (
-                TENSOR_HEAP_OWNER_CALL_BINDING as _OWNER_CALL,
-            )
-            _owner_book = (getattr(module, "metadata", {}) or {}).get("identity_book")
-            heap_owned_here = _owner_book is not None and any(
-                owner_row[1] == str(name) and int(owner_row[4]) == value_id
-                for owner_row in _owner_book.page(_OWNER_CALL).rows()
-                if len(owner_row) == 5
-            )
-            if value_id not in allocated and not heap_owned_here and (
+            if value_id not in allocated and (
                 (str(name), value_id) in elementwise_runtime_results
                 # A region's runtime-sized span result, projected here and
                 # fed on to its consumer (``(x * y).sum()``).
@@ -3355,6 +3412,12 @@ def _emit_repository_call_module(
             ret_positions = function_output_ret_positions.get(name)
             for output_index, output in enumerate(outputs):
                 destination = f"%out.{output_index}"
+                if (local_owned_views.get(int(output.id)) is not None
+                        and output_pointer.get(local_owned_views[int(output.id)])
+                        == destination):
+                    # The carrier's Alloca stored the arena address into the
+                    # caller's pointer cell; there is nothing else to copy.
+                    continue
                 ret_position = (
                     ret_positions[output_index]
                     if ret_positions is not None and returned_values
@@ -3507,6 +3570,7 @@ def _emit_repository_call_module(
                 register_cache.clear()
                 span.take(UnitKind.BLOCK_LABEL, spelling=block_name, block=block_name)
             span.open(instruction)
+            current_instruction[0] = instruction
             operation = str(instruction.op)
             if operation not in {"Phi", "phi"}:
                 capture_phi_values()
@@ -4841,8 +4905,14 @@ def _emit_repository_call_module(
                         arguments.insert(int(output_argument), result)
                     rendered: list[str] = []
                     for position, (argument_type, argument) in enumerate(zip(argument_types, arguments)):
+                        # An owned carrier holds its arena's address; the
+                        # kernel's span formal receives that arena (as the C
+                        # module lane passes the carrier local).
                         rendered.append(
-                            f"ptr {pointer(argument)}"
+                            f"ptr {heap_arena(pointer(argument), int(argument.id))}"
+                            if argument_type == "ptr"
+                            and int(argument.id) in local_owned_carriers
+                            else f"ptr {pointer(argument)}"
                             if argument_type == "ptr"
                             else f"{argument_type} {load_as(argument, argument_type, f'{tag}.{position}')}"
                         )
@@ -5491,6 +5561,114 @@ def _emit_repository_call_module(
                 # through the same truthiness conversion every other target
                 # applies, so a numeric mask needs no separate opcode.
                 result_type = _value_llvm_type(result)
+                if _runtime_sized_span(result):
+                    # Program: declared ``Sum(k*x, (k, 1, n))``; its Boolean
+                    # mask keeps ``where`` as the instruction (rule of
+                    # 2026-11-18: a double kernel stands in only for float
+                    # operands).  Wrong record: the span lowered as ONE
+                    # select, so the sum read its first term.  Rule: over a
+                    # runtime-sized result the select runs over the result's
+                    # own element count (``_span_element_count``, as every
+                    # elementwise loop), each span operand read at the same
+                    # index and each rank-0 operand once.
+                    total = _span_element_count(
+                        name, result, tag, body,
+                        public_span_value, module_extent_slot,
+                        descriptor_element_count,
+                    )
+                    if total is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"select over span %t{result_id} needs its "
+                            "extents; refusing a one-element stand-in",
+                        ))
+                        continue
+                    if any(
+                        _declared_span_rank(argument) not in {
+                            0, _declared_span_rank(result),
+                        }
+                        for argument in instruction.args
+                    ):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"select over runtime-sized span %t{result_id} "
+                            "mixes operand ranks; a runtime broadcast is not stated",
+                        ))
+                        continue
+                    scalar_sides = {
+                        position: (
+                            load_as(argument, "i1", f"select.{tag}.s{position}")
+                            if position == 0 else
+                            load_as(argument, result_type, f"select.{tag}.s{position}")
+                        )
+                        for position, argument in enumerate(instruction.args)
+                        if _declared_span_rank(argument) == 0
+                    }
+                    span_sides = {
+                        position: pointer(argument)
+                        for position, argument in enumerate(instruction.args)
+                        if position not in scalar_sides
+                    }
+                    destination = pointer(result)
+                    entry_label = block_exit_label.get(
+                        active_block or "", active_block or "entry",
+                    )
+                    head, loop_body, done = (
+                        f"sel.head.{tag}", f"sel.body.{tag}", f"sel.done.{tag}",
+                    )
+                    index, nxt = f"%sel.i.{tag}", f"%sel.next.{tag}"
+                    body.append(f"  br label %{head}")
+                    body.append(f"{head}:")
+                    body.append(
+                        f"  {index} = phi i32 [ 0, %{entry_label} ], "
+                        f"[ {nxt}, %{loop_body} ]"
+                    )
+                    body.append(f"  %sel.more.{tag} = icmp slt i32 {index}, {total}")
+                    body.append(
+                        f"  br i1 %sel.more.{tag}, label %{loop_body}, label %{done}"
+                    )
+                    body.append(f"{loop_body}:")
+                    lanes = []
+                    for position, argument in enumerate(instruction.args):
+                        if position in scalar_sides:
+                            lanes.append(scalar_sides[position])
+                            continue
+                        stored_type = _value_llvm_type(argument)
+                        address = f"%sel.op.{tag}.{position}.addr"
+                        loaded = f"%sel.op.{tag}.{position}"
+                        body.append(
+                            f"  {address} = getelementptr {stored_type}, "
+                            f"ptr {span_sides[position]}, i32 {index}"
+                        )
+                        body.append(
+                            f"  {loaded} = load {stored_type}, ptr {address}, "
+                            f"align {_align(stored_type)}"
+                        )
+                        wanted = "i1" if position == 0 else result_type
+                        lanes.append(convert_loaded(
+                            loaded, stored_type, wanted, f"sel.{tag}.{position}",
+                            source_unsigned=_unsigned_value(argument),
+                        ))
+                    chosen = f"%sel.val.{tag}"
+                    body.append(
+                        f"  {chosen} = select i1 {lanes[0]}, "
+                        f"{result_type} {lanes[1]}, {result_type} {lanes[2]}"
+                    )
+                    body.append(
+                        f"  %sel.dst.{tag} = getelementptr {result_type}, "
+                        f"ptr {destination}, i32 {index}"
+                    )
+                    body.append(
+                        f"  store {result_type} {chosen}, ptr %sel.dst.{tag}, "
+                        f"align {_align(result_type)}"
+                    )
+                    body.append(f"  {nxt} = add i32 {index}, 1")
+                    body.append(f"  br label %{head}")
+                    body.append(f"{done}:")
+                    if active_block is not None:
+                        block_exit_label[active_block] = done
+                    register_cache.clear()
+                    continue
                 mask = load_as(instruction.args[0], "i1", f"select.{tag}")
                 when_true = load_as(
                     instruction.args[1], result_type, f"select.{tag}.true",
