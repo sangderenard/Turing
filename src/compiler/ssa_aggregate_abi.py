@@ -1033,18 +1033,30 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
             output_id, formal_ids, caller_ids = page.cell(prior.row, prior.column)
             if not any(int(value_id) in replacements for value_id in caller_ids):
                 continue
+            # Program: tests/test_graph_function_splicing.py finite sum.  A
+            # region returning ``arange(count).unsqueeze(-1)`` returns the
+            # view's own shape and rank (minted in the region) with the
+            # source's count (its input formal, passed through).  Wrong
+            # record: the fold required all three IDs to be passthroughs and
+            # refused.  Rule: fold exactly the IDs that are passthroughs (each
+            # by its own rebinding); a minted ID stays the region's output.
             if not all(
-                int(value_id) in replacements
-                and (not direct or replacements[int(value_id)][1] == int(formal_id))
+                int(value_id) not in replacements
+                or not direct
+                or replacements[int(value_id)][1] == int(formal_id)
                 for value_id, formal_id in zip(caller_ids, formal_ids, strict=True)
             ):
                 raise ValueError("computed metadata has an incomplete aggregate fold")
-            current_ids = tuple(replacements[int(value_id)][0]
-                                for value_id in caller_ids)
+            current_ids = tuple(
+                replacements[int(value_id)][0]
+                if int(value_id) in replacements else int(value_id)
+                for value_id in caller_ids
+            )
             rebinding_cells = tuple(
                 book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING,
                                 (function_scope_of(function), int(value_id)))
                 for value_id in caller_ids
+                if int(value_id) in replacements
             )
             if any(cell is None for cell in rebinding_cells):
                 raise ValueError("computed metadata fold lacks its exact rebinding")
@@ -1123,7 +1135,8 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                 source_result = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
                 revised_actuals = tuple(
                     replacements[int(value_id)][0]
-                    if int(value_id) in caller_ids else int(value_id)
+                    if int(value_id) in caller_ids
+                    and int(value_id) in replacements else int(value_id)
                     for value_id in actual_ids
                 )
                 book.post(

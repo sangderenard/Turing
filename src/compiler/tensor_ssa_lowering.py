@@ -86,6 +86,25 @@ class TensorSSALoweringShortfall:
     reason: str
 
 
+def _shared_geometry_formal(
+    target: Any, formal: Any, tensor_id: int, metadata_ids: Any, keys: Any,
+) -> bool:
+    """Whether metadata formal ``formal`` belongs to tensor ``tensor_id``'s
+    geometry: it is declared for that tensor, or for a formal tensor that
+    carries this exact shape/rank/count triple (tensors sharing ONE
+    geometry -- a declared Sum's ``Le`` and ``Mul`` over its index axis --
+    share its formals; the first tensor's id is on the formal)."""
+
+    owner_id = (formal.accounting or {}).get("tensor_extent_for")
+    if owner_id == tensor_id:
+        return True
+    owner = next((member for member in target.args
+                  if int(member.id) == owner_id), None)
+    return owner is not None and tuple(
+        (owner.accounting or {}).get(key) for key in keys
+    ) == tuple(metadata_ids)
+
+
 def _own_dynamic_tensor_output(
     module: IRModule, function, book, tensor_table, fresh, register_tensor,
     result: SSAValue, count: SSAValue, element_dtype: str,
@@ -1191,9 +1210,24 @@ def publish_computed_region_result_metadata(
         if binding is None:
             return False
         result_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, result_row)
-        if result_ref is None or result_ref not in {
-            cause for cause, _stage in book.edges_into(binding)
-        }:
+        # The binding is one row per Call; tensors sharing one geometry are
+        # each its cause in some revision (an aggregate fold revises it
+        # citing only the row it folded).  Read the whole revision chain.
+        chain_causes, pending_chain, seen_chain = set(), [binding], set()
+        while pending_chain:
+            current = pending_chain.pop()
+            if current in seen_chain:
+                continue
+            seen_chain.add(current)
+            for cause, _stage in book.edges_into(current):
+                chain_causes.add(cause)
+                if cause.page == current.page and cause.row == current.row:
+                    pending_chain.append(cause)
+        if result_ref is None or not any(
+            cause.page == TENSOR_METADATA_RESULT_BINDING
+            and cause.row == result_ref.row
+            for cause in chain_causes
+        ):
             return False
         bound_actuals, bound_formals = book.page(
             TENSOR_METADATA_CALL_BINDING
@@ -1230,8 +1264,9 @@ def publish_computed_region_result_metadata(
                 extent_formals = tuple(
                     formal for formal in target.args
                     if int(formal.id) == value_id
-                    and (formal.accounting or {}).get("tensor_extent_for")
-                        == target_tensor_id
+                    and _shared_geometry_formal(
+                        target, formal, target_tensor_id, local_ids, keys,
+                    )
                     and (formal.accounting or {}).get("tensor_extent_kind")
                         == kind
                 )
@@ -1968,9 +2003,42 @@ def publish_computed_region_result_metadata(
                         )
                         if not fresh_formals:
                             if local_descriptor is None:
-                                raise ValueError(
-                                    "computed tensor metadata has no exact live Call binding"
+                                # Program: tests/test_graph_function_splicing.py
+                                # finite sum.  Region 6's ``Le`` (12) and
+                                # ``Mul`` (21) results carry ONE callee
+                                # geometry triple, projected to one caller
+                                # triple; the triple's formals were added for
+                                # the first tensor.  Rule: a second tensor of
+                                # the same triple binds those existing formals
+                                # when this live Call already pairs each with
+                                # the same metadata actual; no formal is added
+                                # twice.
+                                existing_formals = tuple(
+                                    formal for formal_id in formal_ids
+                                    for formal in target.args
+                                    if int(formal.id) == int(formal_id)
                                 )
+                                live = tuple(zip(
+                                    (int(value.id) for value in downstream.args),
+                                    (int(value.id) for value in target.args),
+                                ))
+                                if (len(existing_formals) != len(keys)
+                                        or any(
+                                            (int(actual.id), int(formal.id)) not in live
+                                            for actual, formal in zip(
+                                                metadata_actuals, existing_formals,
+                                                strict=True,
+                                            )
+                                        )):
+                                    raise ValueError(
+                                        "computed tensor metadata has no exact live Call binding"
+                                    )
+                                pending_input_bindings.append((
+                                    caller, downstream_block, downstream, target,
+                                    metadata_actuals, existing_formals, row,
+                                    target_tensor_id, alias_cell,
+                                ))
+                                changed = True
                             continue
                         from .concordance_declarations import (
                             TENSOR_HEAP_OWNER_CALL_BINDING,
@@ -2147,12 +2215,18 @@ def publish_computed_region_result_metadata(
                 entry for entry in pending_input_bindings
                 if entry[2] is downstream and entry[3] is target
             )
-            requested_pairs = tuple(
+            # Tensors sharing one geometry name the same (actual, formal)
+            # pair; that is one binding.  An actual bound to two formals, or
+            # a formal fed by two actuals, is a conflict.
+            requested_pairs = tuple(dict.fromkeys(
                 (int(actual.id), int(formal.id))
                 for entry in same_call
                 for actual, formal in zip(entry[4], entry[5], strict=True)
-            )
-            if len(set(requested_pairs)) != len(requested_pairs):
+            ))
+            if (len({actual for actual, _formal in requested_pairs})
+                    != len(requested_pairs)
+                    or len({formal for _actual, formal in requested_pairs})
+                    != len(requested_pairs)):
                 raise ValueError("computed tensor metadata repeats a Call binding")
             live_pairs = tuple(
                 (int(actual.id), int(formal.id))
@@ -2209,13 +2283,26 @@ def publish_computed_region_result_metadata(
         metadata_ids = tuple(int(formal.id) for formal in fresh_formals)
         if len(metadata_ids) != len(keys):
             raise ValueError("computed tensor metadata has incomplete formal geometry")
+        # Program: tests/test_graph_function_splicing.py finite sum.  The
+        # declared Sum's ``arange(count).unsqueeze(-1)`` lowers to a view
+        # that keeps the storage id (``ssa_storage_view``: storage 8, its
+        # own rank-2 geometry).  Wrong record: that view occurrence took the
+        # rank-1 formal's projected metadata and refused as a conflict.
+        # Rule: a declared view of this storage is its own identity
+        # (``ssa_view_structure``); only the formal's occurrences take the
+        # formal's geometry.
+        def _view_of_formal(value: SSAValue) -> bool:
+            view = (value.accounting or {}).get("ssa_storage_view")
+            return (isinstance(view, Mapping)
+                    and view.get("storage_value_id") == tensor_id)
+
         occurrences = (
             *formal_matches,
             *(value for block in target.blocks.values()
               for instruction in block.instrs
               for value in (*instruction.args,
                             *((instruction.res,) if instruction.res is not None else ()))
-              if int(value.id) == tensor_id),
+              if int(value.id) == tensor_id and not _view_of_formal(value)),
         )
         for occurrence in occurrences:
             prior = dict(occurrence.accounting or {})
@@ -2302,7 +2389,8 @@ def publish_computed_region_result_metadata(
                                           if int(member.id) == value_id), None)
                                      for value_id in metadata_ids)
             if (any(member is None for member in metadata_formals)
-                    or any((member.accounting or {}).get("tensor_extent_for") != tensor_id
+                    or any(not _shared_geometry_formal(
+                               target, member, tensor_id, metadata_ids, keys)
                            or (member.accounting or {}).get("tensor_extent_kind") != kind
                            or ssa_value_identity_cell(target, value_id, book=book)
                               is None
@@ -7776,6 +7864,37 @@ def lower_tensor_calls_to_repository_ssa(
                             for arm in abi.physical_alternatives
                         ) for abi in declared_abis
                     )
+                    if not full_shape_proved and scalar_slot and not declared_abis:
+                        # Program: tests/test_graph_function_splicing.py
+                        # finite sum.  The declared Sum's count is a region
+                        # formal of a SymPy law: no source annotation, so no
+                        # ``value_type_abi`` row; its ``ssa_value`` row
+                        # derives from the graph's resolved shape state
+                        # (static, rank 0).  Wrong record: registered
+                        # ``unresolved``, its ``to_dtype`` was taken for a
+                        # dynamic span cast and refused.  Rule: that
+                        # concorded shape state is the scalar's proof.
+                        from .identity_concordance import (
+                            SHAPE_STATE_PAGE, shape_transformation_state,
+                        )
+
+                        states = [
+                            shape_book.page(SHAPE_STATE_PAGE).cell(
+                                parent.row, parent.column,
+                            )
+                            for cell in visited
+                            for parent, _stage in shape_book.edges_into(cell)
+                            if parent.page == SHAPE_STATE_PAGE
+                        ]
+                        full_shape_proved = bool(states) and all(
+                            isinstance(state, tuple) and state
+                            and state[0] == "resolved"
+                            and (lambda parts: tuple(parts[0]) == ()
+                                 and int(parts[2]) == 0
+                                 and parts[3] == "static")(
+                                shape_transformation_state(state[1]))
+                            for state in states
+                        )
                 if not full_shape_proved:
                     shape_book = identity_book(module)
                     full_shape_proved = any(
@@ -11039,10 +11158,20 @@ def lower_tensor_calls_to_repository_ssa(
                                     function, int(args[1].id), book=book,
                                 ) if len(args) == 2 else None
                             )
+                            # A SymPy law's axis literal is an
+                            # ``ingestion_value`` identity (no canonical
+                            # relabel); ``literal_from_identity`` reads both.
+                            from .concordance_declarations import (
+                                INGESTION_VALUE as _AXIS_INGESTION_VALUE,
+                            )
+
                             axis_origins = (
                                 tuple(parent for parent, _stage in
                                       book.edges_into(axis_cell)
-                                      if parent.page == CANONICAL_VALUE)
+                                      if parent.page in (
+                                          CANONICAL_VALUE,
+                                          _AXIS_INGESTION_VALUE,
+                                      ))
                                 if axis_cell is not None else ()
                             )
                             axis_literal, literal_cells = (
@@ -12161,6 +12290,49 @@ def lower_tensor_calls_to_repository_ssa(
                                 [zero64, one64, count32, carrier],
                                 result, instruction, output_argument=3,
                             ))
+                            # Program: tests/test_graph_function_splicing.py
+                            # finite sum.  Wrong record: the logical arange
+                            # span's ``ssa_value`` row had storage/rank from
+                            # its dynamic shape state but no physical element
+                            # class, so the next region's runtime unsqueeze
+                            # refused its source.  Rule: the lanes are the
+                            # selected kernel's output formal's: DERIVED from
+                            # that formal's cell (as a dynamic cast's are).
+                            from .ssa_record_return_state import (
+                                posted_ssa_value_fact as _arange_formal_fact,
+                                revise_ssa_value as _revise_arange,
+                                ssa_value_identity_cell as _arange_cell,
+                            )
+                            from .concordance_declarations import (
+                                TENSOR_SSA_LOWERING as _ARANGE_LANE_STAGE,
+                            )
+
+                            arange_kernel = reference.module.functions.get(
+                                "create_arange_int64"
+                            )
+                            if arange_kernel is not None and len(arange_kernel.args) > 3:
+                                link_repository_function(
+                                    "create_arange_int64", arange_kernel,
+                                )
+                                lane_formal = arange_kernel.args[3]
+                                lane_cell = _arange_cell(
+                                    arange_kernel, int(lane_formal.id), book=book,
+                                )
+                                lane_fact = _arange_formal_fact(
+                                    arange_kernel, int(lane_formal.id), book=book,
+                                )
+                                if (lane_cell is not None and lane_fact is not None
+                                        and lane_fact.physical_dtype == "int64"):
+                                    _revise_arange(
+                                        function, result.id, dtype="int64",
+                                        shape=tuple(result.shape or ()),
+                                        stage=_ARANGE_LANE_STAGE,
+                                        sources=(lane_cell,), book=book,
+                                        physical={
+                                            "physical_dtype": "int64",
+                                            "storage": "span", "rank": 1,
+                                        },
+                                    )
                 elif operation == "gather" and len(data_args) >= 2:
                     indices = data_args[1]
                     if not tuple(source.shape or ()):

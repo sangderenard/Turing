@@ -25884,6 +25884,7 @@ def _post_ssa_block_geometry(book, scope, function):
     """
     from .concordance_declarations import (
         CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING, SSA_BLOCK_GEOMETRY,
+        SCALAR_KERNEL_OPERAND,
         SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
         TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_CALL_BINDING,
         TENSOR_METADATA_RESULT_BINDING,
@@ -26052,6 +26053,16 @@ def _post_ssa_block_geometry(book, scope, function):
                      for value in instruction.args)),
             *release_cells,
             *block_call_bindings,
+            # Program: tests/test_graph_function_splicing.py finite sum.  A
+            # scalar ``to_dtype`` lowered to its scalar ``Cast`` keeps its
+            # value IDs and facts; the decision that changed the opcode is
+            # its ``scalar_kernel_operand_concordance`` row, which owns that
+            # revision of the block's geometry.
+            *(book.latest_ref(SCALAR_KERNEL_OPERAND, (
+                str(function.name), int(instruction.res.id),
+            ))
+              for instruction in block.instrs
+              if instruction.res is not None),
             *(function_outputs if any(
                 instruction.op in {"Ret", "ret", "Return", "return"}
                 for instruction in block.instrs
