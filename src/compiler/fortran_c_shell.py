@@ -34124,6 +34124,43 @@ def _class_surface_ssa_program(
                 for value_id in source_output_value_ids
                 if value_id in unplaced_output_ids
             )
+            # Program: ``with open(p, 'wb') as f: n = f.write(b'ab')`` then
+            # ``return n`` (ticket b043a7c9, case 6b7d429f, plan C).  Wrong
+            # record: file-broker operations are a shell boundary plan, not
+            # SSA instructions (python_special_cases.visit_With), and
+            # _native_shell_boundary_lines runs that plan after the backend
+            # entry.  Nothing in the entry produces the returned value, so
+            # the first finding was final concordance's "a Ret ... returns
+            # none", which hides the cause.  Rule: a source output that is a
+            # file-broker call's own value is a lowering shortfall naming the
+            # operation and callsite.  A broker result consumed by arithmetic
+            # is not a source output and is untouched here.
+            shell_file_result_ids = {
+                int(data.get("value_id", node_id)): (
+                    int(node_id),
+                    str((data.get("attributes") or {}).get(
+                        "shell_operation"
+                    ) or ""),
+                )
+                for node_id, data in graph_obj.nodes(data=True)
+                if (data.get("attributes") or {}).get("shell_boundary")
+            }
+            lowering_failures.extend(
+                (
+                    symbol,
+                    SSALoweringShortfall(
+                        "control",
+                        "shell-file-result",
+                        symbol,
+                        f"source output value {value_id} is the result of "
+                        f"file-broker operation "
+                        f"{shell_file_result_ids[value_id][1]!r} at "
+                        f"callsite {shell_file_result_ids[value_id][0]}",
+                    ),
+                )
+                for value_id in source_output_value_ids
+                if value_id in shell_file_result_ids
+            )
             lowered_source_value_ids = set(
                 _lowered_source_control_ids(control.root)
             )

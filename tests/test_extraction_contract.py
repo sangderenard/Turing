@@ -415,6 +415,35 @@ def test_clock_reading_used_in_arithmetic_is_a_float64_host_scalar(
     assert all(native.res.dtype == "float64" for native in natives)
 
 
+def test_returned_file_broker_result_is_refused_with_a_named_shortfall():
+    # Ticket b043a7c9 / case 6b7d429f, plan C: the shell runs the file-broker
+    # plan after the entry, so a returned f.write() count has no producer in
+    # the entry.  The refusal must name that cause, not the hidden symptom
+    # "Ret returns none" from final concordance.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.precompile_to_ssa import SSALoweringIncompleteError
+
+    source = (
+        "def entry(p):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        n = f.write(b'ab')\n"
+        "    return n\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()), pytest.raises(
+        SSALoweringIncompleteError
+    ) as refused:
+        lower_ast_source_to_ssa(
+            source, "entry", name="file_result",
+            extraction_contract=ExtractionContract(CONTRACT),
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+    message = str(refused.value)
+    assert "shell-file-result" in message
+    assert "file-broker operation 'write'" in message
+    assert "returns none" not in message
+
+
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
     contract = ExtractionContract(CONTRACT)
     graph = ProcessGraph(materialize_memory=False)
