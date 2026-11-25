@@ -36,7 +36,7 @@ from pathlib import Path
 
 from meowdoku import branch_gate, branch_review, branch_servers
 
-MAX_FILE_BYTES = 2_000_000
+MAX_FILE_BYTES = 10_000_000
 MAX_LISTING = 2000
 MAX_DIFF_BYTES = 400_000
 MAX_MESSAGE = 5000

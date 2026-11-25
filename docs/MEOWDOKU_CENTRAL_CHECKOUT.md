@@ -54,7 +54,7 @@ session:
   the working folder.
 - Another account's checkout (404) or branch (409); a branch that already
   exists and is not the caller's; a default branch.
-- Binary or non-UTF-8 files when reading; files over 2 MB; listings over 2000
+- Binary or non-UTF-8 files when reading; files over 10 MB; listings over 2000
   entries; diffs are cut at 400 kB.
 - Closing with uncommitted changes; committing with nothing to commit or
   without a declared identity.
