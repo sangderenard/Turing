@@ -485,7 +485,7 @@ def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
     assert "consumed-file-broker-result" in message
     assert re.search(
         r"file-broker operation 'write' at callsite \d+ "
-        r"is consumed by Add node \d+",
+        r"is consumed by Add node \d+ as lhs",
         message,
     )
     assert "final concordance" not in message
@@ -494,7 +494,10 @@ def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
 def test_effect_only_file_broker_write_is_not_a_consumed_result():
     # Control for the consumed-file-broker-result rule: a write whose value
     # nothing reads, and the write reading open's handle, stay inside the
-    # broker plan and must not be classified as consumed.
+    # broker plan and must not be classified as consumed.  Job ecd255a6
+    # showed this fixture lowers at c4e06679, so the control requires
+    # successful lowering (review d2344047, comments 563 and 565): any
+    # refusal, whatever it names, fails here.
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = (
@@ -503,15 +506,13 @@ def test_effect_only_file_broker_write_is_not_a_consumed_result():
         "        f.write(b'ab')\n"
         "    return 1\n"
     )
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            lower_ast_source_to_ssa(
-                source, "entry", name="file_write_effect_only",
-                extraction_contract=ExtractionContract(CONTRACT),
-                progress=lambda _message: None, progress_bars=False,
-            )
-    except Exception as refused:  # noqa: BLE001 - only the class is checked
-        assert "consumed-file-broker-result" not in str(refused)
+    with contextlib.redirect_stdout(io.StringIO()):
+        lowered = lower_ast_source_to_ssa(
+            source, "entry", name="file_write_effect_only",
+            extraction_contract=ExtractionContract(CONTRACT),
+            progress=lambda _message: None, progress_bars=False,
+        )
+    assert lowered is not None
 
 
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
