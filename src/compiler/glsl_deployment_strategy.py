@@ -32136,9 +32136,12 @@ def _mutated_sequence_node_ids(
             return True
         # A list merged from branches is the taken arm's own mutable list
         # (``grow(t, k)`` then ``len(a)``, c739), not an immutable value.
+        # So is a list fill: ``active = [0] * 4; begin(active)`` with
+        # ``begin`` storing ``active[2] = 5`` (GLSL ``uint active[4]``)
+        # folded ``active[2]`` to the fill's 0 -- a silent wrong value.
         if (
             (data.get("attributes") or {}).get("producer_kind")
-            in {"aggregate_phi", "aggregate_merge"}
+            in {"aggregate_phi", "aggregate_merge", "sequence_replication"}
             and (data.get("attributes") or {}).get("aggregate_kind") == "list"
         ):
             return True

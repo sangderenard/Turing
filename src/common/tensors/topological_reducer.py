@@ -3347,12 +3347,18 @@ def _replication_name_needs_storage(graph: Any, node_id: Any, expression: Any) -
     reads at a runtime index (``name[i]``): both need resident storage, which
     a folded literal does not have."""
 
+    # ``active: list['u32'] = [0] * 4`` (an annotated binding, GLSL
+    # ``uint active[4]``) binds its name exactly as ``active = [0] * 4``.
     names = {
         target.id
         for successor in graph.G.successors(node_id)
         for statement in (graph.G.nodes[successor].get("expr_obj"),)
-        if isinstance(statement, ast.Assign) and statement.value is expression
-        for target in statement.targets
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and statement.value is expression
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign)
+            else (statement.target,)
+        )
         if isinstance(target, ast.Name)
     }
     if not names:
@@ -3383,6 +3389,24 @@ def _replication_name_needs_storage(graph: Any, node_id: Any, expression: Any) -
             and other.func.attr in writers
             and isinstance(other.func.value, ast.Name)
             and other.func.value.id in names
+        ):
+            return True
+        # Program: ``active = [0] * 4; begin(active); active[2]`` with
+        # ``def begin(active): active[2] = 5`` (GLSL ``uint active[4]``
+        # written by a helper).  Wrong record: the call was no writer, so
+        # the list folded to a literal and ``active[2]`` read 0 -- the
+        # helper's store was lost (a silent wrong value).  Rule: a list
+        # handed to a call is the callee's object too, which may write it.
+        # A builtin (``len(xs)``, ``sum(xs)``) only reads its argument.
+        if isinstance(other, ast.Call) and not (
+            isinstance(other.func, ast.Name)
+            and hasattr(builtins, other.func.id)
+        ) and any(
+            isinstance(argument, ast.Name) and argument.id in names
+            for argument in (
+                *other.args,
+                *(keyword.value for keyword in other.keywords),
+            )
         ):
             return True
     return False
@@ -17427,8 +17451,20 @@ def _normalize_lexical_values(
                 aggregate_attributes = graph.G.nodes[int(value)].setdefault(
                     "attributes", {}
                 )
+                # Program: GLSL ``uint active[4]`` read as ``active:
+                # list['u32'] = [0] * 4``.  Wrong record: the declaration
+                # replaced the value's ``sequence_replication`` birth, so the
+                # fill was lowered as an elementwise ``Mul`` of ``[0]`` by 4
+                # (one row) and ``active[2] = 5`` faulted out of range.
+                # Rule: an annotation declares the binding's kind; the
+                # replication that produced the value stays its producer.
                 aggregate_attributes.update({
-                    "producer_kind": "annotated_aggregate_binding",
+                    "producer_kind": (
+                        "sequence_replication"
+                        if aggregate_attributes.get("producer_kind")
+                        == "sequence_replication"
+                        else "annotated_aggregate_binding"
+                    ),
                     "aggregate_kind": aggregate_kind,
                     "sequence_key_columns": (
                         (0,) if aggregate_kind in {"set", "dict"} else ()

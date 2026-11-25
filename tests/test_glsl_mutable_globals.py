@@ -45,6 +45,13 @@ _PROGRAMS = {
         "void begin(vec3 d){ recorded = d; hits += 1; }\n"
         "void main(){ begin(vec3(1.0, 2.5, 3.0)); "
         "o[0] = recorded.y + float(hits); }\n", 3.5),
+    # An array global written by a helper (``[0] * 4`` handed to begin).
+    "global_uint_array": (
+        "uint active[4];\nvoid begin(){ active[2] = 5u; }\n"
+        "void main(){ begin(); o[0] = float(active[2]); }\n", 5.0),
+    # A local array written and read in place.
+    "local_float_array": (
+        "void main(){ float a[4]; a[1] = 2.5; o[0] = a[1] + a[3]; }\n", 2.5),
 }
 
 

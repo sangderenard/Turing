@@ -5697,12 +5697,17 @@ class _ControlSSABuilder(TiledObject):
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(contract_cell, value),
         )
+        # The fill helper's count formal is int64 (``lower_sequence_fill``:
+        # compared with and stored into the int64 length cell).  Passing it
+        # as ``int`` (a class, not a width) made the shape transport between
+        # caller and helper flip int <-> int64 with no new cause; program
+        # ``a = [0] * 5; a[2] = 3`` on the LLVM lane was refused.
         self.emit(
             Handler.Call,
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 value,
-                self.external_value(int(count_id), dtype="int"),
+                self.external_value(int(count_id), dtype="int64"),
             ],
             status,
             attributes={
@@ -5752,12 +5757,13 @@ class _ControlSSABuilder(TiledObject):
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(contract_cell, value),
         )
+        # As for ``fill``: the helper's count formal is int64.
         self.emit(
             Handler.Call,
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 value,
-                self.external_value(int(count_id), dtype="int"),
+                self.external_value(int(count_id), dtype="int64"),
             ],
             status,
             attributes={
