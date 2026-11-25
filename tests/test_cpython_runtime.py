@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import sys
 import zipfile
@@ -38,6 +39,62 @@ def test_private_runtime_is_staged_with_manifest_and_no_site_packages(tmp_path):
     assert any(name.casefold() == "pyyaml" for name in manifest["installed_distributions"])
     assert (library_directory / "yaml" / "__init__.py").is_file()
     assert manifest["provenance"] == "supplied"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PE dependency harvest is Windows-only")
+def test_unreadable_path_directory_is_skipped_and_later_roots_are_searched(
+    tmp_path, monkeypatch,
+):
+    # Issue ee5a06ff / case 792eeb0b: a PATH entry whose stat raises
+    # PermissionError (another user's profile) aborted runtime staging. The
+    # denied entry must be skipped AND the PATH entries after it must still be
+    # search roots: the staged extension's only dependency lives in the
+    # readable directory that follows the denied one.
+    from types import SimpleNamespace
+
+    from src.compiler import binary_ingestion
+    from src.compiler.cpython_runtime import _stage_pe_dependency_closure
+
+    runtime = discover_cpython_runtime(supplied=sys.executable)
+    denied = tmp_path / "denied"
+    readable = tmp_path / "readable"
+    staged_directory = tmp_path / "staged"
+    target = tmp_path / "target"
+    readable.mkdir()
+    staged_directory.mkdir()
+    dependency_name = "ee5a06ff_path_root_dependency.dll"
+    (readable / dependency_name).write_bytes(b"dependency")
+    extension = staged_directory / "ee5a06ff_extension.pyd"
+    extension.write_bytes(b"extension")
+
+    def parse_pe_image(encoded, *, maximum_file_size):
+        libraries = (dependency_name,) if encoded == b"extension" else ()
+        image = SimpleNamespace(
+            imports=tuple(SimpleNamespace(library=name) for name in libraries),
+            delay_imports=(),
+        )
+        return image, None
+
+    original_is_dir = Path.is_dir
+    probed = []
+
+    def is_dir(self):
+        if self in (denied, readable):
+            probed.append(self)
+        if self == denied:
+            raise PermissionError(13, "Access is denied", str(self))
+        return original_is_dir(self)
+
+    monkeypatch.setattr(binary_ingestion, "parse_pe_image", parse_pe_image)
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(denied), str(readable))))
+
+    harvested = _stage_pe_dependency_closure(runtime, target, [extension])
+
+    assert probed[:2] == [denied, readable]
+    assert probed.count(denied) == 1
+    assert harvested == (dependency_name,)
+    assert (target / dependency_name).read_bytes() == b"dependency"
 
 
 def test_private_cpython_adapter_is_headerless_and_owns_object_handles():
