@@ -33231,6 +33231,21 @@ def _fold_callsite_structural_values(
             }
         ):
             return unresolved
+        # The scalars must be STATED by this copy's callsite contract
+        # (``planner_tensor_descriptors``, part of its symbol digest).  A copy
+        # with no contract is the law for every type (``def root(n, x)``):
+        # its batch may be any extent, and it keeps the axis.
+        stated = graph.G.graph.get("planner_tensor_descriptors") or {}
+        if not all(
+            isinstance(stated.get(str((
+                graph.G.nodes[candidate].get("attributes") or {}
+            ).get("binding_name"))), Mapping)
+            and int(stated[str((
+                graph.G.nodes[candidate].get("attributes") or {}
+            ).get("binding_name"))].get("rank", -1)) == 0
+            for candidate in inputs
+        ):
+            return unresolved
         facts = tuple(known.get(candidate, unresolved) for candidate in inputs)
         if not all(
             isinstance(value, _ProgramABIValueFact)
@@ -33262,6 +33277,19 @@ def _fold_callsite_structural_values(
                 stage=PLANNER_STRUCTURAL_FOLD, provenance=Derived(cells),
                 mode=Mode.REVISE,
             ))
+        # Every descriptor derived THROUGH the batch axis stated one more
+        # axis than the law now has (``def root(n, x)``: region 5's mask and
+        # term kept rank 2 over the rank-1 index axis, and the rank law never
+        # takes a lower rank as a refinement).  They are re-derived from
+        # their operands in this fixed point; only their element type stays.
+        import networkx as _nx
+
+        for descendant in _nx.descendants(graph.G, int(node_id)):
+            stated = graph.G.nodes[int(descendant)].get("tensor") or {}
+            if "rank" in stated or "shape" in stated:
+                graph.G.nodes[int(descendant)]["tensor"] = {
+                    key: stated[key] for key in ("dtype",) if key in stated
+                }
         return _StructuralValueAlias(operand)
 
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:

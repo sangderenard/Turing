@@ -229,6 +229,9 @@ _C_MATH_INTRINSICS = {
     "asin": "asin", "acos": "acos", "atan": "atan",
     "sinh": "sinh", "cosh": "cosh",
     "asinh": "asinh", "acosh": "acosh", "atanh": "atanh",
+    # ``binary_value``'s atan2 arm (repository kernel, the LLVM lane's
+    # ``@atan2``): C spells the same libm call.
+    "atan2": "atan2",
 }
 
 #: Python's ``%`` and ``//`` are FLOORED -- the remainder carries the
@@ -4637,6 +4640,14 @@ def emit_ssa_module_to_c(
                 )
             elif op == "Pow" and len(elements) == 2 and not integral:
                 expression = f"pow({elements[0]}, {elements[1]})"
+            elif op in {"where", "Select"} and len(elements) == 3:
+                # A kept selection (its Boolean mask is not a double
+                # kernel's operand, rule of 2026-11-18) is one select per
+                # element, as the LLVM lane's span loop spells it.
+                expression = (
+                    f"(({elements[0]}) ? ({result_type})({elements[1]}) "
+                    f": ({result_type})({elements[2]}))"
+                )
             elif op == "Neg" and len(elements) == 1 and integral:
                 # Negation through the unsigned type, as Add/Sub/Mul above:
                 # INT64_MIN wraps to itself instead of being undefined.
@@ -7935,7 +7946,9 @@ def emit_ssa_module_to_c(
                     op.casefold(), op,
                 )
                 if (
-                    scalar_likeness(span_op) is not None
+                    (scalar_likeness(span_op) is not None
+                     or (op in {"where", "Select"}
+                         and len(instruction.args) == 3))
                     and (
                         _declared_span_rank(instruction.res) > 0
                         or tuple(instruction.res.shape or ())

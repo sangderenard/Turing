@@ -2130,8 +2130,15 @@ class _FunctionEmitter:
         if operation == "arange":
             start = int(attributes.get("start", 0))
             step = int(attributes.get("step", 1))
-            end = int(attributes["end"])
             index = self._loop_variable()
+            if "end" not in attributes:
+                # ``arange(count)`` with a runtime count (a declared Sum's
+                # index axis, ``tensor_ssa_lowering``'s dynamic descriptor):
+                # its one operand IS the end, read at run time.
+                if len(args) != 1 or start != 0 or step != 1:
+                    return None
+                return f"[({index}, {index} = 0, int({args[0]}) - 1)]"
+            end = int(attributes["end"])
             # An implied-do array constructor: the Fortran form of arange,
             # with no materialised element list regardless of length.
             return (
