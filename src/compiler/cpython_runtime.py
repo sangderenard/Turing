@@ -370,11 +370,17 @@ def _stage_pe_dependency_closure(
     search_roots = [runtime.home, runtime.executable.parent]
     if runtime.dlls is not None:
         search_roots.append(runtime.dlls)
-    search_roots.extend(
-        Path(item).resolve()
-        for item in os.environ.get("PATH", "").split(os.pathsep)
-        if item and Path(item).is_dir()
-    )
+    for item in os.environ.get("PATH", "").split(os.pathsep):
+        if not item:
+            continue
+        # A PATH directory this account cannot stat supplies no DLL, exactly
+        # as an unreadable root does in locate() below (issue ee5a06ff, case
+        # 792eeb0b): it is not a search root, and staging continues.
+        try:
+            if Path(item).is_dir():
+                search_roots.append(Path(item).resolve())
+        except OSError:
+            continue
     search_roots.extend(path.parent for path in files)
     indexes: dict[Path, dict[str, Path]] = {}
 
