@@ -310,6 +310,9 @@ def abstract_tensor_program_to_process_graph(
             attributes={
                 "binding_name": name,
                 "binding_kind": "parameter",
+                # The recorded program's own argument order: a function
+                # declared over this graph takes its formals in this order.
+                "argument_position": int(position),
             },
         )
         graph.G.nodes[value_id]["label"] = name
@@ -3354,7 +3357,28 @@ def training_motion_function(
     used_names: set[str] = set()
     parameter_names: list[str] = []
     identity_table: dict[str, tuple[int, ...]] = {}
-    for position, node_id in enumerate(nx.topological_sort(graph.G)):
+    # Program: PolicyNetwork's step, recorded as features, targets,
+    # input_weight, hidden_bias, output_weight, output_bias.  Wrong record:
+    # the formals were the input nodes in topological order, which put them
+    # as features, targets, hidden_bias, output_bias, output_weight,
+    # input_weight; a host calling the function in the recorded order bound
+    # output_bias to the input_weight formal (concordance refusal at the
+    # callsite's proven_shape).  Rule: the formals are the recorded program's
+    # arguments in its own order (``argument_position``, posted where the
+    # program is ingested); topological order only places inputs that are
+    # not program arguments, after them.
+    ordered_nodes = tuple(nx.topological_sort(graph.G))
+    topological_rank = {int(node): rank for rank, node in enumerate(ordered_nodes)}
+
+    def formal_order(node: Any) -> tuple[int, int, int]:
+        position_value = (
+            graph.G.nodes[node].get("attributes") or {}
+        ).get("argument_position")
+        if position_value is None:
+            return (1, 0, topological_rank[int(node)])
+        return (0, int(position_value), topological_rank[int(node)])
+
+    for position, node_id in enumerate(sorted(ordered_nodes, key=formal_order)):
         node_id = int(node_id)
         data = graph.G.nodes[node_id]
         if _operation(data) != "input":
