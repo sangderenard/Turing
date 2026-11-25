@@ -12682,12 +12682,16 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
         # string erased the whole node: scatter, and ``a.pad(pad=(1, 1),
         # value=0, mode="constant")``, whose root then returned nothing
         # (2026-11-18, case 6393486c).  The declared table is the proof.
-        # Only a string can be such a keyword; a list constant (the
-        # ``[0] * 4`` fill of a GLSL ``uint active[4]``) is not hashable.
-        if isinstance(_constant_value(parent_data), str) and _constant_value(
-            parent_data
-        ) in _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
-            (str(data.get("op") or node_type), str(role)), frozenset()
+        # The table holds strings; a list constant (a shape) is not one and
+        # is not hashable: ``left * right`` with a shape constant raised
+        # ``TypeError: unhashable type: 'list'`` here and broke every reverse
+        # compile (tests/test_llvm_training_runtime, 2026-11-22, case
+        # 9f272724).
+        contract_value = _constant_value(parent_data)
+        if isinstance(contract_value, str) and contract_value in (
+            _OPERATOR_CONTRACT_STRING_KEYWORDS.get(
+                (str(data.get("op") or node_type), str(role)), frozenset()
+            )
         ):
             continue
         # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
@@ -30166,6 +30170,25 @@ def _tensor_descriptor_rule(
                 }
                 and int(parent) in graph.G
             ), None)
+            # Program: backward_registry ``expand_to``:
+            # ``AbstractTensor.broadcast_to(G, shape)`` with G (1, 1) and the
+            # literal shape (2, 1).  Wrong record: the static form binds the
+            # tensor as ``arg:0``, so no operand was found and the result had
+            # no descriptor; ``expand_reduction``, ``bw_mean`` and the training
+            # motion's call then carried none (host-scalar freeze;
+            # tests/test_llvm_training_runtime, 2026-11-22, case 9f272724).
+            # Rule, as the reduction law reads it: with no receiver-form
+            # operand, the static form's ``arg:0`` IS the operand, and it is
+            # not one of the operator's arguments.
+            static_operand = None
+            if source_id is None:
+                static_operand = next((
+                    int(parent)
+                    for parent, role in parents
+                    if str(role).casefold() in {"arg:0", "arg0"}
+                    and int(parent) in graph.G
+                ), None)
+                source_id = static_operand
 
             def _axis_literal(candidate: int) -> Any:
                 node = graph.G.nodes[int(candidate)]
@@ -30179,6 +30202,7 @@ def _tensor_descriptor_rule(
                 for parent, role in parents
                 if str(role).casefold().startswith("arg:")
                 and int(parent) in graph.G
+                and int(parent) != static_operand
             ]
             declared_axis = _attribute_axis(data)
             if declared_axis is not None:
@@ -36055,6 +36079,19 @@ def _fold_callsite_structural_values(
                         and _ast_source_signature(record["expression"])
                         == control_signature
                     )
+                    # Program: ``bw_matmul``'s ``A.reshape((1, A.shape[0]))
+                    # if a_vector else A`` specialized for a rank-2 matmul
+                    # (tests/test_llvm_training_runtime, parameter groups).
+                    # Wrong record: this fold posted {selected 'orelse',
+                    # rejected 'body'} and aliased the IfExp, but left the
+                    # body's ``A.reshape`` (node 11) resident; the next
+                    # concordance read (control_activity.memberships) refused
+                    # it as resident in the rejected arm.  Rule, as for the
+                    # If fold below: the rejected compartment is exactly the
+                    # nodes the concordance places in this control's rejected
+                    # arm, read before the control is marked specialized, and
+                    # a proven fold removes them (2026-11-22, case 9f272724).
+                    arm_memberships = _branch_compartments(graph)
                     specialized = list(graph.G.graph.get(
                         "structurally_specialized_conditional_node_ids", ()
                     ))
@@ -36092,13 +36129,37 @@ def _fold_callsite_structural_values(
                                 ),
                                 "predicate_value_id": parents.get("test"),
                                 "selected_role": selected_role,
+                                # The record names both branches, as the
+                                # writer of the same row below does:
+                                # control_activity.memberships reads
+                                # ``rejected_role`` and raised KeyError on
+                                # this row (tests/test_llvm_training_runtime,
+                                # 2026-11-22, case 9f272724).
+                                "rejected_role": (
+                                    "orelse" if selected_role == "body"
+                                    else "body"
+                                ),
                                 "proof": "structural_constant_predicate",
                             },
                             parents.get("test"),
                             predicate_known=predicate is not unresolved,
                         ))
+                    rejected_arm = (
+                        int(node_id),
+                        "orelse" if selected_role == "body" else "body",
+                    )
+                    rejected_nodes = () if predicate is unresolved else tuple(
+                        int(member)
+                        for member, guards in arm_memberships.items()
+                        if rejected_arm in guards
+                    )
+                else:
+                    rejected_nodes = ()
                 replace_alias(node_id, value.source_id)
                 known.pop(node_id, None)
+                for rejected_id in sorted(rejected_nodes, reverse=True):
+                    remove_node(rejected_id)
+                    known.pop(rejected_id, None)
                 iteration_mutations.append((
                     "structural-alias", int(node_id), int(value.source_id),
                 ))
@@ -37214,6 +37275,146 @@ def _apply_callsite_aggregate_descriptors(
         )
 
 
+def _publish_call_result_class(
+    caller: Any, call_id: int, specialized: Any, output_ids: tuple,
+) -> None:
+    """Give a call result the class its specialized callee returns.
+
+    Program: the palette scorer's training graph, ``bw_mul(g=<bw_add call
+    result>, ...)``.  Wrong record: a graph-native caller is never reduced,
+    so the reducer's "resolved call result" rule never classed its call
+    results; the next callsite's ``g`` had no class, its copy's operator
+    results had none, and the ``unbroadcast`` copy they fed had no
+    ``value_type_abi``.  Rule: when the callee copy's returned value has a
+    class row in the copy's numeric scope and the call result has none in
+    the caller's, the call result has that class, DERIVED from the returned
+    class cell and the call node's identity cell.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _concord_source_value_class, _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+    from .identity_concordance import Derived, current_identity_book
+
+    returned = next((
+        int(candidate) for candidate in reversed(tuple(output_ids))
+        if int(candidate) in specialized.G
+    ), None)
+    if returned is None or int(call_id) not in caller.G:
+        return
+    book = current_identity_book()
+    page = book.page(SOURCE_VALUE_CLASS)
+    callee_scope = _source_numeric_scope(specialized.G)
+    returned_value = int(specialized.G.nodes[returned].get("value_id", returned))
+    returned_cell = book.latest_ref(
+        SOURCE_VALUE_CLASS, (callee_scope, returned_value),
+    )
+    if returned_cell is None:
+        return
+    caller_scope = _source_numeric_scope(caller.G)
+    call_value = int(caller.G.nodes[int(call_id)].get("value_id", call_id))
+    if page.latest((caller_scope, call_value)) is not None:
+        return
+    fact = page.cell(returned_cell.row, returned_cell.column)
+    _concord_source_value_class(
+        caller_scope, call_value, str(fact[0]),
+        precision_limbs=int(fact[1]),
+        source="resolved call result",
+        provenance=Derived(tuple(cell for cell in (
+            returned_cell, node_identity_cell(caller, int(call_id)),
+        ) if cell is not None)),
+    )
+
+
+def _declared_backward_helper(graph: Any) -> tuple[tuple[str, str], Any] | None:
+    """The ``backward_registry`` helper a function graph declares itself to
+    be, and the cell that declares it; ``None`` for any other function.
+
+    Program: the training motion's ``bw_mul`` calls ``unbroadcast(g * y,
+    x.shape)``.  The rule graph compiles the helper from the generated rule
+    text, so its ``authored_function_identity`` is ``('<string:10bcb0...>',
+    'unbroadcast')``.  Wrong record: the expansion below compared that
+    spelling's module with ``backward_registry.__name__`` and never matched,
+    so every callsite copy lowered the helper's Python loop and the emitter
+    refused its ``sum`` ("dynamic reduction lacks a typed source span").
+    Rule: the helper is identified by its declaration.  Generated source: the
+    definition's ``source_span`` is DERIVED from the ``backward_rule_definition``
+    root ``(module, qualname)`` it was generated from.  Authored file: the
+    definition's own identity is ``(module, qualname)``.
+    """
+
+    from ..common.tensors import backward_registry
+    from .concordance_declarations import BACKWARD_RULE_DEFINITION, SOURCE_SPAN
+    from .identity_concordance import current_identity_book
+
+    identity = graph.G.graph.get("authored_function_identity")
+    if not identity or len(tuple(identity)) != 2:
+        return None
+    module, qualname = map(str, tuple(identity))
+    book = current_identity_book()
+    span = book.latest_ref(SOURCE_SPAN, (module, qualname, ()))
+    if module == backward_registry.__name__:
+        return ((module, qualname), span) if span is not None else None
+    if span is None:
+        return None
+    for source, _stage in book.edges_into(span):
+        if (
+            source.page == BACKWARD_RULE_DEFINITION
+            and tuple(source.row)[:1] == (backward_registry.__name__,)
+        ):
+            return tuple(map(str, tuple(source.row))), source
+    return None
+
+
+def _static_shape_parameters(graph: Any) -> tuple[str, ...]:
+    """The declared static-shape formals of a function graph, posted as
+    ``static_shape_parameter`` rows DERIVED from the helper's declaration."""
+
+    declared = _declared_backward_helper(graph)
+    if declared is None:
+        return ()
+    from ..common.tensors import backward_registry
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, STATIC_SHAPE_PARAMETER,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    (registry, name), declaration_cell = declared
+    parameters = tuple(
+        backward_registry.HELPER_STATIC_SHAPE_PARAMETERS.get(name, ())
+    )
+    book = current_identity_book()
+    for parameter in parameters:
+        book.post(
+            STATIC_SHAPE_PARAMETER, (registry, name, str(parameter)), True,
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived((declaration_cell,)),
+            mode=Mode.CONCORD,
+        )
+    return parameters
+
+
+def _require_static_shape_literals(
+    caller: Any, node_id: int, callee: Any, specializations: Mapping[str, Any],
+) -> None:
+    """Refuse a callsite whose declared static-shape actual is not a literal.
+
+    The helper has no generic form (``static_shape_parameter``), so a
+    callsite that cannot fold the formal has nothing to lower."""
+
+    for parameter in _static_shape_parameters(callee):
+        literal = specializations.get(parameter)
+        if not isinstance(literal, (tuple, list)):
+            raise ValueError(
+                "static-shape parameter has no literal at its callsite: "
+                f"{callee.G.graph.get('authored_function_identity')!r} "
+                f"formal {parameter!r} called from "
+                f"{caller.G.graph.get('function_name')!r} node {int(node_id)}"
+                f" (actual {literal!r}); its value is the result type"
+            )
+
+
 def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     """Lower the authored ``unbroadcast`` helper to canonical tensor nodes.
 
@@ -37227,10 +37428,10 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     # own ``def unbroadcast(G, target_shape)`` was rewritten to sum/reshape.
     from ..common.tensors import backward_registry
 
-    identity = graph.G.graph.get("authored_function_identity")
-    if not identity or tuple(identity)[1:2] != ("unbroadcast",):
-        return False
-    if str(tuple(identity)[0]) != backward_registry.__name__:
+    declared = _declared_backward_helper(graph)
+    if declared is None or declared[0] != (
+        backward_registry.__name__, "unbroadcast",
+    ):
         return False
     descriptors = graph.G.graph.get("planner_tensor_descriptors") or {}
     specializations = graph.G.graph.get("planner_specializations") or {}
@@ -37240,6 +37441,16 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
         return False
     source_shape = tuple(map(int, source_descriptor.get("shape") or ()))
     target_shape = tuple(map(int, target_shape))
+    # The helper's own branches (backward_registry.unbroadcast): a scalar
+    # gradient is broadcast to the target (``ones(target) * G``), which is no
+    # sum/reshape chain -- leave the authored body, whose branches fold on
+    # the literal shapes.  Equal shapes return ``G`` itself (below).
+    # Program: tests/test_native_scalar_loss_adjoint.py, ``unbroadcast(g, ())``
+    # of a scalar loss.  Wrong record: the chain appended a reshape () -> ()
+    # the helper never performs, and lowering refused it as a runtime view
+    # with no shape proof.
+    if not source_shape and target_shape:
+        return False
     input_id = next((
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
@@ -37258,15 +37469,25 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     # scalar shape proof for id 1 then replaced the explicit (2, 3) result.
     # New operations are new values and derive from this call's two formals.
     next_id = max(map(int, graph.G.nodes), default=-1) + 1
-    source_cells = [node_identity_cell(graph, input_id)]
-    shape_input_id = next((
-        int(node_id)
-        for node_id, data in graph.G.nodes(data=True)
-        if data.get("type") == "Input"
-        and (data.get("attributes") or {}).get("binding_name") == "target_shape"
-    ), None)
-    if shape_input_id is not None:
-        source_cells.append(node_identity_cell(graph, shape_input_id))
+    # Data lineage is ``G``.  ``target_shape`` contributes structure only: its
+    # proof is this copy's ``planner_specialization`` row, not the formal's
+    # value.  Program: linear-MSE training, ``bw_mul``'s
+    # ``unbroadcast(g * y, x.shape)``.  Wrong record: deriving the reshape
+    # from both Input cells gave it the activity bindings of two formals, and
+    # ``control_activity`` refused node 67 as ambiguously owned.
+    from .concordance_declarations import PLANNER_SPECIALIZATION_PAGE
+    from .identity_concordance import current_identity_book
+
+    shape_proof = current_identity_book().latest_ref(
+        PLANNER_SPECIALIZATION_PAGE,
+        (tuple(graph.G.graph.get("lexical_read_scope") or ()), "target_shape"),
+    )
+    if shape_proof is None:
+        raise ValueError(
+            "specialized unbroadcast has no planner_specialization row for "
+            f"target_shape={target_shape!r}"
+        )
+    source_cells = [node_identity_cell(graph, input_id), shape_proof]
     metadata = copy.deepcopy(dict(graph.G.graph))
     input_data = copy.deepcopy(dict(graph.G.nodes[input_id]))
     graph.G.clear()
@@ -37320,11 +37541,16 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
                 "sum", {"dim": axis, "keepdim": True},
                 tuple(current_shape),
             )
-    append("reshape", {"shape": target_shape}, target_shape)
+    # ``G.reshape(target)`` of a value already of that shape is that value
+    # (palette scorer: (64, 1) summed to () then reshaped () -> (), refused
+    # as a runtime view with no shape proof).
+    if tuple(current_shape) != target_shape:
+        append("reshape", {"shape": target_shape}, target_shape)
     graph.roots = [current]
-    identities = copy.deepcopy(metadata.get("identity_table") or {})
-    identities["G"] = (input_id,)
-    identities["result_0"] = (current,)
+    # The graph was cleared: only ``G`` and the new chain exist.  Keeping the
+    # authored table left ``target_shape -> (3,)`` naming a removed node, and
+    # the emitter committed its tuple contract with no frame cell.
+    identities = {"G": (input_id,), "result_0": (current,)}
     graph.G.graph.update({
         "identity_table": identities,
         "function_outputs": ("result_0",),
@@ -38708,6 +38934,34 @@ def _callsite_specialized_shell_type(
     fallback: type,
     max_nodes_per_dispatch: int,
 ) -> type:
+    """Plan one literal callsite once, before its shell is instantiated.
+
+    A callee that declares a static-shape formal has no generic shell to
+    fall back to: a callsite that keeps ``fallback`` is refused."""
+
+    planned = _callsite_literal_shell_type(
+        owner, node_id, reference, fallback, max_nodes_per_dispatch,
+    )
+    caller = owner.process_graph
+    function_table = getattr(caller, "function_table", None)
+    if planned is fallback and function_table is not None:
+        try:
+            callee = function_table.entry(int(reference)).graph
+        except (KeyError, TypeError, ValueError):
+            # The same unresolved reference the planner keeps generic.
+            callee = None
+        if callee is not None:
+            _require_static_shape_literals(caller, int(node_id), callee, {})
+    return planned
+
+
+def _callsite_literal_shell_type(
+    owner: Any,
+    node_id: int,
+    reference: int,
+    fallback: type,
+    max_nodes_per_dispatch: int,
+) -> type:
     """Plan one literal callsite once, before its shell is instantiated."""
 
     from .work_contract import active_contract, expansion_policy
@@ -39223,6 +39477,9 @@ def _callsite_specialized_shell_type(
             return
         identities = specialized_graph.G.graph.get("identity_table") or {}
         output_ids = tuple(identities.get(str(outputs[0]), ()))
+        _publish_call_result_class(
+            caller, int(node_id), specialized_graph, output_ids,
+        )
         descriptor = None
         inspected = []
         for candidate in reversed(output_ids):
@@ -39449,6 +39706,9 @@ def _callsite_specialized_shell_type(
             source_fact,
             source_cells,
         )
+    _require_static_shape_literals(
+        caller, int(node_id), original, specializations,
+    )
     if not _expand_specialized_unbroadcast_identity(specialized):
         _fold_callsite_structural_values(specialized)
     planned = strategize_shell_deployment(
