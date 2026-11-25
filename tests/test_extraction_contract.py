@@ -459,10 +459,9 @@ def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
     # Control for the guard above (review 87abc6dc, comments 544 and 546):
     # the shell-file-result rule is keyed to source outputs that are the
     # broker call's own value.  A broker result consumed by arithmetic is not
-    # such an output and must not be classified as one.  At a197419d this
-    # program is still refused, by final concordance on the broker value
-    # (job e74ff1de); that separate defect stays on ticket b043a7c9, so this
-    # test checks only the classification, whether or not it lowers.
+    # such an output and must not be classified as one.  It is refused
+    # instead as consumed-file-broker-result, naming the operation, callsite
+    # and consumer (ticket b043a7c9, case 6b7d429f).
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = (
@@ -471,15 +470,48 @@ def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
         "        n: int = f.write(b'ab')\n"
         "    return n + 1\n"
     )
-    try:
+    with pytest.raises(Exception) as refused:
         with contextlib.redirect_stdout(io.StringIO()):
             lower_ast_source_to_ssa(
                 source, "entry", name="file_result_arithmetic",
                 extraction_contract=ExtractionContract(CONTRACT),
                 progress=lambda _message: None, progress_bars=False,
             )
+    message = str(refused.value)
+    assert "shell-file-result" not in message
+    # Job e74ff1de: final concordance refused this program on "value 8:
+    # dtype=int64 accounting_keys=[...]" without naming the broker or the
+    # consumer.  The named shortfall now comes first.
+    assert "consumed-file-broker-result" in message
+    assert re.search(
+        r"file-broker operation 'write' at callsite \d+ "
+        r"is consumed by Add node \d+",
+        message,
+    )
+    assert "final concordance" not in message
+
+
+def test_effect_only_file_broker_write_is_not_a_consumed_result():
+    # Control for the consumed-file-broker-result rule: a write whose value
+    # nothing reads, and the write reading open's handle, stay inside the
+    # broker plan and must not be classified as consumed.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = (
+        "def entry(p):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        f.write(b'ab')\n"
+        "    return 1\n"
+    )
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            lower_ast_source_to_ssa(
+                source, "entry", name="file_write_effect_only",
+                extraction_contract=ExtractionContract(CONTRACT),
+                progress=lambda _message: None, progress_bars=False,
+            )
     except Exception as refused:  # noqa: BLE001 - only the class is checked
-        assert "shell-file-result" not in str(refused)
+        assert "consumed-file-broker-result" not in str(refused)
 
 
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():

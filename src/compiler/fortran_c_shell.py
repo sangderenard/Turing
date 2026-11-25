@@ -34161,6 +34161,45 @@ def _class_surface_ssa_program(
                 for value_id in source_output_value_ids
                 if value_id in shell_file_result_ids
             )
+            # Program: ``with open(p, 'wb') as f: n: int = f.write(b'ab')``
+            # then ``return n + 1`` (ticket b043a7c9, case 6b7d429f, job
+            # e74ff1de).  Wrong record: the broker plan runs after the
+            # backend entry (see plan C above), so the entry's ``Add`` reads
+            # a value nothing in the entry produces, and the first finding
+            # was final concordance's "value 8: dtype=int64
+            # accounting_keys=[...]", which names neither the operation nor
+            # the consumer.  Rule: a node outside the broker plan that reads
+            # a file-broker call's value is a lowering shortfall naming the
+            # operation, the callsite and the consumer.  Broker calls that
+            # read another broker call (``f.write`` reads ``open``'s handle)
+            # stay inside the plan and are untouched, as is a broker call
+            # whose value nothing reads (an effect-only ``f.write``).
+            lowering_failures.extend(
+                (
+                    symbol,
+                    SSALoweringShortfall(
+                        "control",
+                        "consumed-file-broker-result",
+                        symbol,
+                        f"value {int(parent_id)} of file-broker operation "
+                        f"{shell_file_result_ids[int(parent_id)][1]!r} at "
+                        f"callsite {shell_file_result_ids[int(parent_id)][0]}"
+                        f" is consumed by {consumer_op} node {consumer_id} "
+                        f"as {role!s}",
+                    ),
+                )
+                for consumer_id, consumer_data in sorted(
+                    graph_obj.nodes(data=True), key=lambda item: int(item[0])
+                )
+                if not (consumer_data.get("attributes") or {}).get(
+                    "shell_boundary"
+                )
+                for consumer_op in (str(
+                    consumer_data.get("op") or consumer_data.get("type") or ""
+                ),)
+                for parent_id, role in consumer_data.get("parents") or ()
+                if int(parent_id) in shell_file_result_ids
+            )
             lowered_source_value_ids = set(
                 _lowered_source_control_ids(control.root)
             )
