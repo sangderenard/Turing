@@ -31176,6 +31176,18 @@ def _tensor_descriptor_rule(
                     return normalized
         if operation in _ELEMENTWISE_UNARY_OPERATIONS or operation in {
             "clone", "copy", "identity", "real", "imag", "conj",
+            # ``detach`` is a fundamental operator (operator_catalog's value
+            # lifecycle operators): its result is its operand's value, so it
+            # has its operand's descriptor.  Program: backward_registry
+            # ``tanh``'s VJP, ``y = x.detach().tanh(); return g * (1 - y*y)``,
+            # in a two-layer tanh network trained through
+            # ``lower_ast_source_to_ssa``.  Wrong record: with no rule here
+            # ``x.detach()`` of the (64, 3) formal answered None, the rule's
+            # call result row (callsite_return_specialization) was
+            # ``(None,)``, the bias ``add`` rule's ``g`` had no descriptor, and
+            # its ``unbroadcast`` copies kept the authored loop, whose ``gs``
+            # the planner refused as an unclassed host scalar.
+            "detach",
             # A prefix scan is not a reduction: it emits one element per
             # input element, so it keeps its operand's shape exactly.  With
             # no rule here it answered nothing, its result was never proven,

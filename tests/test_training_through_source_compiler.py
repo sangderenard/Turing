@@ -154,3 +154,119 @@ def test_training_graph_descends_natively_through_the_source_compiler(tmp_path):
         weight = weight - 0.1 * grad_weight
         bias = bias - 0.1 * grad_bias
     assert losses == sorted(losses, reverse=True) and losses[-1] < losses[0] / 100
+
+
+TANH_SHAPES = {
+    "features": (8, 3), "targets": (8, 2), "input_weight": (3, 4),
+    "hidden_bias": (1, 4), "output_weight": (4, 2), "output_bias": (1, 2),
+}
+TANH_PARAMETERS = ("input_weight", "hidden_bias", "output_weight", "output_bias")
+
+
+def test_two_layer_tanh_step_with_its_update_compiles_through_the_source_compiler(tmp_path):
+    """Forward, loss, graph reverse and the SGD update in one compiled program.
+
+    The host calls the training function in the recorded program's argument
+    order (the motion's formals follow it, not topological order), and the
+    ``tanh`` rule's ``x.detach()`` keeps its operand's descriptor, so both
+    bias gradients are unbroadcast to their (1, n) shapes."""
+
+    program = SSATensorProgram("tanh_mse")
+    inputs = {
+        name: SSATensorOperations.input(program, shape)
+        for name, shape in TANH_SHAPES.items()
+    }
+    prediction = ((inputs["features"] @ inputs["input_weight"] + inputs["hidden_bias"]).tanh()
+                  @ inputs["output_weight"] + inputs["output_bias"]).tanh()
+    error = prediction - inputs["targets"]
+    loss = (error * error).mean()
+    recipe = training_function_recipe(
+        loss, bindings=inputs,
+        wrt=tuple(int(inputs[name].data.value.id) for name in TANH_PARAMETERS),
+        function_name="tanh_motion",
+        observed_outputs={"prediction": int(prediction.data.value.id)},
+    )
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "values": [
+            *({"function": "train_step", "parameter": name, "storage": "span",
+               "dtype": "float64", "rank": 2, "shape": list(shape),
+               "python_type": "src.common.tensors.abstraction.AbstractTensor"}
+              for name, shape in TANH_SHAPES.items()),
+            {"function": "train_step", "parameter": "learning_rate",
+             "storage": "scalar", "dtype": "float64", "mutable": False,
+             "python_type": "builtins.float"},
+        ],
+        "records": {}, "bindings": [],
+    })
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def train_step(features: AbstractTensor, targets: AbstractTensor,\n"
+        "               input_weight: AbstractTensor, hidden_bias: AbstractTensor,\n"
+        "               output_weight: AbstractTensor, output_bias: AbstractTensor,\n"
+        "               learning_rate: float):\n"
+        "    prediction, loss, g1, gb1, g2, gb2 = tanh_motion(\n"
+        "        features, targets, input_weight, hidden_bias, output_weight, output_bias)\n"
+        "    return (prediction, loss, input_weight - g1 * learning_rate,\n"
+        "            hidden_bias - gb1 * learning_rate, output_weight - g2 * learning_rate,\n"
+        "            output_bias - gb2 * learning_rate)\n",
+        "train_step", name="tanh_host",
+        linked_process_graphs={"tanh_motion": recipe},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=contract,
+        python_bindings={"AbstractTensor": AbstractTensor},
+        progress=lambda _message: None,
+    )
+    report = concordance_report(module)
+    assert report.splitlines()[0].endswith("0 finding(s)"), report
+
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    from src.compiler.vehicle_python_compilation import _managed_native_feeds_by_id
+
+    root = module.functions[exports[0]]
+    assert [tuple(value.shape or ()) for value in outputs[root.name]] == [
+        (8, 2), (), (3, 4), (1, 4), (4, 2), (1, 2),
+    ]
+    artifact = emit_ssa_function_to_llvm(module, root.name)
+    assert artifact.complete, artifact.shortfalls
+    artifact = compile_artifact(artifact, directory=tmp_path, optimization="O3")
+
+    rng = np.random.default_rng(3)
+    x = rng.normal(0.0, 1.0, TANH_SHAPES["features"])
+    target = rng.uniform(-1.0, 1.0, TANH_SHAPES["targets"])
+    weights = {
+        "input_weight": rng.normal(0.0, 0.3, (3, 4)), "hidden_bias": np.zeros((1, 4)),
+        "output_weight": rng.normal(0.0, 0.3, (4, 2)), "output_bias": np.zeros((1, 2)),
+    }
+    learning_rate = 0.05
+    for _step in range(3):
+        w1, b1, w2, b2 = (weights[name] for name in TANH_PARAMETERS)
+        hidden = np.tanh(x @ w1 + b1)
+        expected_prediction = np.tanh(hidden @ w2 + b2)
+        residual = expected_prediction - target
+        d_out = (2.0 / residual.size) * residual * (1.0 - expected_prediction ** 2)
+        d_hidden = (d_out @ w2.T) * (1.0 - hidden ** 2)
+        expected = {
+            "input_weight": w1 - (x.T @ d_hidden) * learning_rate,
+            "hidden_bias": b1 - d_hidden.sum(axis=0, keepdims=True) * learning_rate,
+            "output_weight": w2 - (hidden.T @ d_out) * learning_rate,
+            "output_bias": b2 - d_out.sum(axis=0, keepdims=True) * learning_rate,
+        }
+        feeds = _managed_native_feeds_by_id(
+            SimpleNamespace(module=module, root_name=root.name),
+            {"features": x, "targets": target, "learning_rate": learning_rate, **weights},
+        )
+        execution = prepare_artifact_execution(artifact, feeds)
+        execution.run()
+        result = [
+            np.array(execution.buffers[value.id], dtype=float).reshape(value.shape or ())
+            for value in outputs[root.name]
+        ]
+        assert np.allclose(result[0], expected_prediction, rtol=0, atol=1e-15)
+        assert abs(float(result[1]) - float((residual * residual).mean())) <= 1e-15
+        weights = dict(zip(TANH_PARAMETERS, result[2:]))
+        for name in TANH_PARAMETERS:
+            assert np.allclose(weights[name], expected[name], rtol=0, atol=1e-14), name
