@@ -28,6 +28,7 @@ import importlib
 import hashlib
 import textwrap
 import time
+import warnings
 from typing import Any, Collection, Iterable, Mapping, Sequence
 from typing import Callable
 
@@ -64813,6 +64814,14 @@ def _linked_piece_interface_module(piece):
         end_identity_book(token)
 
 
+class UntypedEntryParameterWarning(UserWarning):
+    """An entry parameter with no annotation and no contract binding.
+
+    A vague type means every type: the compiler compiles the type matrix.
+    An author who did not mean that states the type in the code or contract.
+    """
+
+
 def _lower_ast_source_to_ssa_impl(
     source: str,
     entrypoint: str | None = None,
@@ -67278,6 +67287,59 @@ def _lower_ast_source_to_ssa_impl(
                 # Copying every schema for every catalogue function made the
                 # ownership step O(functions * schema size), twice per lower.
                 function_graph.graph["program_abi"] = program_abi_receipt
+    # Program: ``def root(n, x): return fsum(n, x)`` over a declared SymPy
+    # Sum. ``x`` has no annotation and no contract binding, so nothing states
+    # its physical type; region 6's ``Mul(k, x)`` then had no scalar operand
+    # to lower. Owner's rule (2026-11-25): a vague type means every type --
+    # the compiler compiles the type matrix. If that is not what the author
+    # meant, the author must state the type, in the code or in the contract.
+    # Say so loudly, at the entry, by name. The entry's own definition and the
+    # contract's bindings for it are the two places a type can be stated.
+    if entrypoint is not None and source_language == "python":
+        try:
+            _entry_tree = ast.parse(source)
+        except SyntaxError:
+            _entry_tree = None
+        _entry_defs = tuple(
+            node for node in (_entry_tree.body if _entry_tree is not None else ())
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == str(entrypoint)
+        )
+        if len(_entry_defs) == 1:
+            _entry_arguments = _entry_defs[0].args
+            _entry_contracted = set()
+            if extraction_policy is not None:
+                _entry_contracted |= set(map(str, extraction_policy.program_abi.values_for_function(
+                    str(entrypoint), method_owner=None,
+                )))
+                _entry_contracted |= set(map(str, extraction_policy.program_abi.records_for_function(
+                    str(entrypoint), method_owner=None,
+                    parameters=tuple(argument.arg for argument in (
+                        *_entry_arguments.posonlyargs, *_entry_arguments.args,
+                        *_entry_arguments.kwonlyargs,
+                    )),
+                )))
+            _entry_untyped = tuple(
+                argument.arg for argument in (
+                    *_entry_arguments.posonlyargs, *_entry_arguments.args,
+                    *((_entry_arguments.vararg,) if _entry_arguments.vararg else ()),
+                    *_entry_arguments.kwonlyargs,
+                    *((_entry_arguments.kwarg,) if _entry_arguments.kwarg else ()),
+                )
+                if argument.annotation is None
+                and argument.arg not in _entry_contracted
+            )
+            if _entry_untyped:
+                _entry_message = (
+                    f"entry {str(entrypoint)!r} parameter(s) "
+                    f"{', '.join(map(repr, _entry_untyped))} have NO declared type "
+                    "(no annotation, no extraction-contract binding). A vague "
+                    "type means EVERY type: the compiler compiles the type "
+                    "matrix for them. If that is not what you meant, state the "
+                    "type in the code (an annotation) or in the contract."
+                )
+                report(f"WARNING: {_entry_message}")
+                warnings.warn(UntypedEntryParameterWarning(_entry_message), stacklevel=2)
     graph.G.graph["compile_targets"] = tuple(dict.fromkeys(compile_targets))
     for intrinsic_graph in (
         graph,
