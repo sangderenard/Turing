@@ -473,6 +473,15 @@ NAME_BINDING_CAPTURE = declare_page("name_binding_capture", (
     RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
     RowField("version", K.INDEX),
 ), tuple)  # (source binding, source version, owning loop or None); CONCORD
+#: The loop whose body executes one name binding: ``(read scope, name,
+#: version)`` -> the loop's node id, or None for a binding no loop owns.
+#: CONCORD, DERIVED(the binding's ``name_binding`` cell, the loop's node
+#: cell).  A record a loop's own body binds is a fresh object each
+#: iteration of that loop (``record_built_in_loop``).
+NAME_BINDING_LOOP_OWNER = declare_page("name_binding_loop_owner", (
+    RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
+    RowField("version", K.INDEX),
+), object)
 SOURCE_CLOSURE_FREE_NAMES = declare_page("source_closure_free_names", (
     RowField("owner_scope", K.SCOPE), RowField("function_ref", K.INDEX),
 ), tuple)  # (definition span, function address, direct names, transported names)
@@ -2421,6 +2430,28 @@ AGGREGATE_PASSTHROUGH_REBINDING = declare_page("aggregate_passthrough_rebinding"
 DEAD_STRUCTURAL_RETIREMENT = declare_page("dead_structural_retirement", (
     RowField("function", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)
+#: ``ir_identities.drop_dead_pure_region_calls``: a pure call whose results
+#: nothing reads is removed from its block.  One row per removed call
+#: ``((function scope, function), block, call site)`` -> ``(callee, operand
+#: ids, result id or None)``.  CONCORD, DERIVED(the block's prior
+#: ``ssa_block_geometry`` cell and the call's operand ``ssa_value`` cells).
+#: The block's next geometry derives from this row: the removal is the
+#: changed cause of the shorter instruction list.
+PURE_CALL_RETIREMENT = declare_page("pure_call_retirement", (
+    RowField("function", K.SCOPE), RowField("block", K.NAME),
+    RowField("call_site", K.NAME),
+), tuple)
+#: ``ssa_aggregate_abi.retire_passthrough_aggregate_outputs``: a callee Ret
+#: slot every caller rebound to its own actual leaves the Ret.  One row per
+#: retired slot ``((function scope, function), block, position)`` -> the
+#: retired member's value id.  CONCORD, DERIVED(every call's
+#: ``aggregate_passthrough_rebinding`` cell for the slot, the member's
+#: identity cells, the Ret block's prior ``ssa_block_geometry`` cell).  The
+#: block's next geometry derives from these rows.
+PASSTHROUGH_OUTPUT_RETIREMENT = declare_page("passthrough_output_retirement", (
+    RowField("function", K.SCOPE), RowField("block", K.NAME),
+    RowField("position", K.INDEX),
+), object)
 #: ``precompile_to_ssa._phi_initial_binding``: the version that stood before a
 #: merge or a loop, as the lowering holds it.  The graph names that version by
 #: its planning spelling (a graph id, a planning alias, a literal's node); the

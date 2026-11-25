@@ -1674,6 +1674,40 @@ def evaporate_unrolled_loops(
                         if cell is not None
                     )),
                 )
+            # Program: ``def peek(r: vec2) -> 'float32'`` called as
+            # ``t = t + r.x + peek(r)`` in a ``range(3)`` loop that builds
+            # ``r = vec2(t, 2.0)`` each iteration (Studio ``trace_bounce``
+            # passes its per-bounce records to helpers the same way).  Wrong
+            # record: the authored call's result shape (the callee's return,
+            # posted by the callsite edge as ``call_result``) is on the book
+            # before unrolling, but an iteration's copy of the call had no
+            # shape row; a record actual gives the call no value class to
+            # copy either, so the region refused the copy ("region value 17
+            # has no settled dtype").  Rule: a copy of a call is the same
+            # call of the same callee; its result shape is its source's,
+            # transformed from the source's state cell to the copy.
+            if str(cloned.get("op") or cloned.get("type") or "").casefold() == "call":
+                from .identity_concordance import (
+                    concordant_shape_transformation_state,
+                    record_shape_transformation, shape_scope_of,
+                )
+
+                shape_scope = shape_scope_of(graph)
+                source_value = int(
+                    graph.G.nodes[int(source_id)].get("value_id", source_id)
+                )
+                result_state = concordant_shape_transformation_state(
+                    shape_scope, source_value,
+                )
+                if result_state is not None:
+                    record_shape_transformation(
+                        shape_scope, source_value, shape_scope, int(clone_id),
+                        stage="loop_body_clone",
+                        operation="loop_body_clone",
+                        source_state=result_state,
+                        target_state=result_state,
+                        source_cells=(clone_cell,),
+                    )
             points, activity_cell = binding(
                 graph, int(source_id), book=activity_book,
             )

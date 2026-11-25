@@ -6677,6 +6677,29 @@ def _build_shell_hierarchy_plan(
                         # which source value selected this specialized body.
                         argument_bindings.append((parent, child_input))
                         continue
+                    # Program: the same global read with GLSL value copies:
+                    # ``def begin(d, recorded): recorded = vec3(d.x, d.y,
+                    # d.z)``.  ``recorded`` is dead on entry and the graph
+                    # has no Input for it: its first identity version is the
+                    # constructor.  Wrong record: the caller's ``recorded``
+                    # was bound to that constructor, whose members are
+                    # ``d``'s, so the frame link found ``d.x`` bound to two
+                    # caller values.  Rule: an actual binds only to what the
+                    # book records as an ingested Input (``ingestion_value``,
+                    # read through the version's canonical cell), or the
+                    # literal a callsite specialization folded the formal
+                    # into (above); a first version the callee computes is
+                    # no formal.
+                    from .control_activity import _ingested_kind
+
+                    try:
+                        child_input_kind = _ingested_kind(
+                            child.process_graph, int(child_input),
+                        )
+                    except ValueError:
+                        child_input_kind = None
+                    if child_input_kind not in (None, "Input"):
+                        continue
                     argument_bindings.append((parent, child_input))
                     child_leaves = _authored_aggregate_leaves(
                         child.process_graph, child_input,

@@ -1429,6 +1429,9 @@ class _ASTStatementReader(_ASTExpressionParser):
                 value, prelude = _zero_value(self.context, declared, name), []
             elif declarator[1].text == "=" and len(declarator) > 2:
                 value, prelude = self.expression(declarator[2:])
+                # A declaration initialized from existing storage is a
+                # copy of it, as an assignment is (_value_copy).
+                value = _copied_read(self.context, value, name)
             else:
                 raise _ExpressionError(name, "Expected '=' or ',' after declaration name")
             if self.context is not None:
@@ -1513,6 +1516,8 @@ class _ASTStatementReader(_ASTExpressionParser):
             op = "="
         target.ctx=ast.Store()
         if op=="=":
+            # GLSL assignment copies a vector, struct or array (_value_copy).
+            value = _copied_read(self.context, value, token)
             return target_prelude + prelude + [ast.Assign(targets=[target],value=value)]
         return target_prelude + prelude + [ast.AugAssign(target=target,op=_BINARY_AST[op[:-1]](),value=value)]
 
@@ -2460,6 +2465,88 @@ def _python_identifiers(module):
     return module
 
 
+def _value_copy(context, value, glsl_type, token):
+    """``value`` as a new object of its GLSL type, member by member.
+
+    Program: the Studio tracer's ``studio_response_begin`` does
+    ``studio_response_direction = direction`` and ``studio_boundary_step``
+    returns its ``inout vec3 rd``; and ``vec3 a = b; a.x = 9.0;``.  Wrong
+    record: GLSL assigns, passes and returns vectors, structs and arrays BY
+    VALUE, but the reader spelled each as a Python binding of the same
+    object.  As Python, ``a.x = 9.0`` then also wrote ``b.x`` (a silent
+    wrong value), and every record a helper returned or rebound was an
+    escape of its caller's object, so the tracer's ``rd.x`` was refused
+    (record_stored_by_call).  Rule: where GLSL copies, the Python names a
+    new object: a record is its constructor over its copied members, a
+    fixed array the list of its copied elements.  A scalar is a value; a
+    resource handle (buffer, image, sampler) is not copied by GLSL either.
+    """
+
+    if glsl_type is None or glsl_type in _SCALAR_TYPES:
+        return value
+    array = _array_type(glsl_type)
+    if array is not None:
+        element, extent = array
+        members = []
+        for index in range(extent):
+            position = ast.Constant(value=index)
+            position._glsl_raw_literal = True
+            members.append(_value_copy(context, _typed(ast.Subscript(
+                value=copy.deepcopy(value), slice=position, ctx=ast.Load(),
+            ), element), element, token))
+        return _typed(ast.List(elts=members, ctx=ast.Load()), glsl_type)
+    record = context.types.record(glsl_type)
+    if record is None:
+        return value
+    return _typed(_call(record, [
+        _value_copy(context, _typed(ast.Attribute(
+            value=copy.deepcopy(value), attr=field, ctx=ast.Load(),
+        ), member), member, token)
+        for field, member in context.types.fields(glsl_type)
+    ]), glsl_type)
+
+
+def _copied_read(context, value, token, glsl_type=None):
+    """A GLSL value read from existing storage (a name, field or element),
+    copied as GLSL copies it on assignment and return.  A value computed
+    here (a constructor, call or operator result) is already its own
+    object."""
+
+    if context is None or not isinstance(
+        value, (ast.Name, ast.Attribute, ast.Subscript),
+    ):
+        return value
+    return _value_copy(
+        context, value, _type_of(value) if glsl_type is None else glsl_type,
+        token,
+    )
+
+
+def _stored_roots(statements):
+    """Names whose fields or elements ``statements`` store into."""
+
+    roots = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []
+            )
+            for target in targets:
+                for element in (
+                    target.elts if isinstance(target, ast.Tuple) else [target]
+                ):
+                    if not isinstance(element, (ast.Attribute, ast.Subscript)):
+                        continue
+                    root = element
+                    while isinstance(root, (ast.Attribute, ast.Subscript)):
+                        root = root.value
+                    if isinstance(root, ast.Name):
+                        roots.add(root.id)
+    return roots
+
+
 def _helper_definition(context, name, signature, statements, token):
     """One helper as a Python function; out/inout values become results.
 
@@ -2472,12 +2559,74 @@ def _helper_definition(context, name, signature, statements, token):
     carried = signature.carried_parameters
     outputs = [carried[i] for i in signature.outputs]
     body = list(statements)
+
+    class ReturnCopies(ast.NodeTransformer):
+        """A returned vector, struct or array is a copy (_value_copy)."""
+
+        def visit_Return(self, node):
+            if node.value is not None:
+                node.value = _copied_read(
+                    context, node.value, token,
+                    _type_of(node.value) or signature.result_type,
+                )
+            return node
+
+        def visit_FunctionDef(self, node):
+            return node
+
+    body = [ReturnCopies().visit(statement) for statement in body]
+    # An ``in``/``inout`` parameter is the helper's own copy of its actual:
+    # one whose fields or elements the helper stores into starts as a copy,
+    # so the caller's object is never written (_value_copy).  The copy is a
+    # block-to-open spelling change: it gets its own Python name
+    # (``d__glsl_scope_N``, as a redeclared block local does) and the body
+    # uses that name, so the parameter itself is only ever read.  A mutable
+    # global array is the caller's storage by design (carried, not a
+    # parameter) and is written in place.
+    stored = _stored_roots(body)
+    copies = {
+        parameter: (kind, context.temporaries.fresh().replace(
+            "__glsl_value_", f"{parameter}__glsl_scope_"))
+        for qualifier, kind, parameter in signature.parameters
+        if qualifier != "out" and parameter in stored
+        and not (kind in _SCALAR_TYPES or (
+            _array_type(kind) is None and context.types.record(kind) is None
+        ))
+    }
+
+    class CopyNames(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if node.id in copies:
+                node.id = copies[node.id][1]
+            return node
+
+        def visit_FunctionDef(self, node):
+            return node
+
+    body = [CopyNames().visit(statement) for statement in body]
+    body = [
+        ast.AnnAssign(
+            target=ast.Name(id=local, ctx=ast.Store()),
+            annotation=_value_annotation(context, kind),
+            value=_value_copy(
+                context, _typed(_name(parameter), kind), kind, token,
+            ),
+            simple=1,
+        )
+        for parameter, (kind, local) in copies.items()
+    ] + body
     if outputs:
         entry = [ast.AnnAssign(target=ast.Name(id=parameter, ctx=ast.Store()),
                                annotation=context.types.annotation(kind),
                                value=_zero_value(context, kind, token), simple=1)
                  for qualifier, kind, parameter in outputs if qualifier == "out"]
-        names = [_name(parameter) for _, _, parameter in outputs]
+        # Each out/inout value goes back to the caller as GLSL copies it.
+        names = [
+            _value_copy(context, _typed(_name(
+                copies[parameter][1] if parameter in copies else parameter
+            ), kind), kind, token)
+            for _, kind, parameter in outputs
+        ]
 
         class OutputReturns(ast.NodeTransformer):
             def visit_Return(self, node):

@@ -33100,6 +33100,27 @@ def _class_surface_ssa_program(
         from .source_comprehension_capacity import publish_source_comprehension_capacity
         publish_source_comprehension_capacity(graph_obj, control)
 
+        # The kind each version of a parameter's name was ingested as, read
+        # from the book (``ingestion_value``, through the version's canonical
+        # cell): ``_is_parameter_entry`` admits only an ingested Input as a
+        # parameter's entry value, never a value the function computes.
+        from .control_activity import _ingested_kind
+        parameter_entry_kinds = {}
+        for parameter_name in graph_obj.graph.get("function_parameters") or ():
+            for value_id in (graph_obj.graph.get("identity_table") or {}).get(
+                str(parameter_name), ()
+            ):
+                if int(value_id) not in graph_obj:
+                    continue
+                try:
+                    kind = _ingested_kind(_GraphView(G=graph_obj), int(value_id))
+                except ValueError:
+                    # A version with no identity row: the book states no
+                    # kind for it, and no rule is drawn from one.
+                    continue
+                if kind is not None:
+                    parameter_entry_kinds[int(value_id)] = kind
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -33163,6 +33184,11 @@ def _class_surface_ssa_program(
                         } if (data.get("attributes") or {}).get(
                             "program_abi_optional_presence_value_id"
                         ) is not None else {}),
+                        # The ingested kind of a parameter name's version, as
+                        # the book records it (``_is_parameter_entry``).
+                        **({
+                            "ingested_kind": parameter_entry_kinds[int(node_id)],
+                        } if int(node_id) in parameter_entry_kinds else {}),
                         # The parameter an Input is the entry value of, as
                         # the graph declares it (``_is_parameter_entry``).
                         **({

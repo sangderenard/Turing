@@ -1683,9 +1683,13 @@ def retire_passthrough_aggregate_outputs(functions: Mapping[str, Function]) -> i
     unused-formal prune.  Returns the number of retired members.
     """
 
-    from .concordance_declarations import AGGREGATE_PASSTHROUGH_REBINDING
-    from .identity_concordance import current_identity_book
-    from .ssa_record_return_state import function_scope_of
+    from .concordance_declarations import (
+        AGGREGATE_ABI_LEGALIZATION, AGGREGATE_PASSTHROUGH_REBINDING,
+        PASSTHROUGH_OUTPUT_RETIREMENT, SSA_BLOCK_GEOMETRY,
+    )
+    from .identity_concordance import Mode, current_identity_book
+    from .precompile_to_ssa import _post_derived_or_raw
+    from .ssa_record_return_state import function_scope_of, identity_cells
 
     book = current_identity_book()
     returns = {"Ret", "ret", "Return", "return"}
@@ -1718,6 +1722,7 @@ def retire_passthrough_aggregate_outputs(functions: Mapping[str, Function]) -> i
             continue
         formal_ids = {int(formal.id) for formal in callee.args}
         retire: list[int] = []
+        rebinding_cells: dict[int, list] = {}
         for position in range(arity):
             member_ids = {int(ret.args[position].id) for ret in rets}
             if len(member_ids) != 1:
@@ -1744,17 +1749,46 @@ def retire_passthrough_aggregate_outputs(functions: Mapping[str, Function]) -> i
                     and int(binding[2]) == member_id
                     and str(binding[4]) == "exact_callee_output_formal"
                 )
-                if position in selected or len(bindings) != 1 or book.latest_ref(
-                    AGGREGATE_PASSTHROUGH_REBINDING,
-                    (function_scope_of(caller), int(bindings[0][1])),
-                ) is None:
+                rebinding = None if position in selected or len(bindings) != 1 else (
+                    book.latest_ref(
+                        AGGREGATE_PASSTHROUGH_REBINDING,
+                        (function_scope_of(caller), int(bindings[0][1])),
+                    )
+                )
+                if rebinding is None:
                     folded_everywhere = False
                     break
+                rebinding_cells.setdefault(position, []).append(rebinding)
             if folded_everywhere:
                 retire.append(position)
         if not retire:
             continue
         retired = set(retire)
+        # The retirement is this pass's decision: one book row per retired
+        # Ret slot, DERIVED from every call's passthrough rebinding of it,
+        # the member's identity and the Ret block's prior geometry.  The
+        # block's next geometry derives from these rows
+        # (``_post_ssa_block_geometry``), as it does from a removed pure call.
+        callee_scope = function_scope_of(callee)
+        for label, block in callee.blocks.items():
+            if not any(instruction.op in returns for instruction in block.instrs):
+                continue
+            prior_geometry = book.latest_ref(
+                SSA_BLOCK_GEOMETRY, (callee_scope, str(callee.name), str(label)),
+            )
+            for position in sorted(retire):
+                member = rets[0].args[position]
+                _post_derived_or_raw(
+                    book, PASSTHROUGH_OUTPUT_RETIREMENT,
+                    ((callee_scope, str(callee.name)), str(label), int(position)),
+                    int(member.id),
+                    tuple(dict.fromkeys((
+                        *rebinding_cells.get(position, ()),
+                        *identity_cells(callee, member),
+                        *(() if prior_geometry is None else (prior_geometry,)),
+                    ))),
+                    stage=AGGREGATE_ABI_LEGALIZATION, mode=Mode.CONCORD,
+                )
         retired_ids = {int(rets[0].args[position].id) for position in retire}
         retired_members = tuple(
             (int(position), int(rets[0].args[position].id))
@@ -1769,6 +1803,18 @@ def retire_passthrough_aggregate_outputs(functions: Mapping[str, Function]) -> i
                 value for index, value in enumerate(ret.args)
                 if index not in retired
             ]
+        # Program: GLSL ``begin(vec3 d){ recorded = d; hits += 1; }`` read
+        # with value copies returns ``(vec3(d.x, d.y, d.z), hits)``: ONE
+        # source output (the copied record) spread over three Ret slots by
+        # its record return layout, every one of them a retired formal.
+        # Wrong record: the source outputs were trimmed only when they
+        # matched the Ret one to one, so the copy stayed a source output
+        # with no Ret slot ("source-output-arity-short").  Rule: each source
+        # output occupies its record layout's slots (one slot otherwise); an
+        # output all of whose slots retired leaves with them.
+        from .ssa_record_return_state import record_return_layouts
+
+        layouts = record_return_layouts(callee)
         for key in ("semantic_output_ids", "source_output_value_ids", "ssa_aggregate_outputs"):
             values = tuple(callee.metadata.get(key, ()) or ())
             if len(values) == arity:
@@ -1776,6 +1822,19 @@ def retire_passthrough_aggregate_outputs(functions: Mapping[str, Function]) -> i
                     value for index, value in enumerate(values)
                     if index not in retired
                 )
+                continue
+            try:
+                widths = [len(layouts.get(int(value), ())) or 1 for value in values]
+            except (TypeError, ValueError):
+                continue
+            if not values or sum(widths) != arity:
+                continue
+            kept, start = [], 0
+            for value, width in zip(values, widths):
+                if not all(slot in retired for slot in range(start, start + width)):
+                    kept.append(value)
+                start += width
+            callee.metadata[key] = tuple(kept)
         if callee.metadata.get("named_outputs"):
             callee.metadata["named_outputs"] = tuple(
                 (name, value_id)

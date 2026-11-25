@@ -6562,9 +6562,20 @@ class _ControlSSABuilder(TiledObject):
         carried as ``input_binding``); a value that is no Input is not
         claimed here."""
 
-        binding = self.source_value_descriptions.get(int(value_id), {}).get(
-            "input_binding",
-        )
+        description = self.source_value_descriptions.get(int(value_id), {})
+        binding = description.get("input_binding")
+        # Program: the same global read with GLSL value copies: ``def
+        # begin(d, recorded): recorded = vec3(d.x, d.y, d.z)``.  ``recorded``
+        # is dead on entry; its only identity version is the constructor
+        # call.  Wrong record: that call result was named the formal
+        # ``recorded`` and the call site was refused for a caller value no
+        # one binds.  Rule: only a value the book records as an ingested
+        # Input (``ingested_kind``, read from ``ingestion_value``) is a
+        # parameter's entry value; one the callee computes never is.
+        if binding is None and description.get("ingested_kind") not in (
+            None, "Input",
+        ):
+            return False
         return binding is None or str(binding) == str(name)
 
     def _value_from_meta(
@@ -25913,13 +25924,25 @@ def _post_ssa_block_geometry(book, scope, function):
     are refused, rather than given a diagnostic-only root or guessed edge.
     """
     from .concordance_declarations import (
-        CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING, SSA_BLOCK_GEOMETRY,
-        SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
+        CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING,
+        PASSTHROUGH_OUTPUT_RETIREMENT, PURE_CALL_RETIREMENT,
+        SSA_BLOCK_GEOMETRY, SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
         TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_CALL_BINDING,
         TENSOR_METADATA_RESULT_BINDING,
     )
     from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL
     result = {}
+    # A pure call ``drop_dead_pure_region_calls`` removed: its row is the
+    # cause of the block's shorter geometry.
+    # So is a Ret slot ``retire_passthrough_aggregate_outputs`` retired.
+    retired = {}
+    for retirement_page in (PURE_CALL_RETIREMENT, PASSTHROUGH_OUTPUT_RETIREMENT):
+        for row in book.page(retirement_page).scope_rows(
+            (scope, str(function.name))
+        ):
+            cell = book.latest_ref(retirement_page, row)
+            if cell is not None:
+                retired.setdefault(str(row[1]), []).append(cell)
     moved = {}
     for row in book.page(SSA_CONSTANT_HOIST).scope_rows((scope, str(function.name))):
         cell = book.latest_ref(SSA_CONSTANT_HOIST, row)
@@ -26069,6 +26092,7 @@ def _post_ssa_block_geometry(book, scope, function):
         sources = tuple(dict.fromkeys(cell for cell in (
             book.latest_ref(SSA_BLOCK, (scope, str(function.name), str(label))),
             *moved.get(label, ()),
+            *retired.get(str(label), ()),
             *rebound.get(str(label), ()),
             *materialized.get(str(label), ()),
             *metadata_bindings.get(str(label), ()),
