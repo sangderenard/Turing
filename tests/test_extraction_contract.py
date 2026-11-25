@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -441,7 +442,37 @@ def test_returned_file_broker_result_is_refused_with_a_named_shortfall():
     message = str(refused.value)
     assert "shell-file-result" in message
     assert "file-broker operation 'write'" in message
+    # The callsite is part of the diagnostic contract (review 87abc6dc,
+    # comments 544 and 546): dropping it from the message must fail here.
+    assert re.search(r"file-broker operation 'write' at callsite \d+", message)
     assert "returns none" not in message
+
+
+def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
+    # Control for the guard above (review 87abc6dc, comments 544 and 546):
+    # the shell-file-result rule is keyed to source outputs that are the
+    # broker call's own value.  A broker result consumed by arithmetic is not
+    # such an output and must not be classified as one.  At a197419d this
+    # program is still refused, by final concordance on the broker value
+    # (job e74ff1de); that separate defect stays on ticket b043a7c9, so this
+    # test checks only the classification, whether or not it lowers.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = (
+        "def entry(p):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        n: int = f.write(b'ab')\n"
+        "    return n + 1\n"
+    )
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            lower_ast_source_to_ssa(
+                source, "entry", name="file_result_arithmetic",
+                extraction_contract=ExtractionContract(CONTRACT),
+                progress=lambda _message: None, progress_bars=False,
+            )
+    except Exception as refused:  # noqa: BLE001 - only the class is checked
+        assert "shell-file-result" not in str(refused)
 
 
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
