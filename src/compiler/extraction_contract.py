@@ -15,7 +15,7 @@ import sysconfig
 import threading
 from typing import Any, Iterable, Mapping
 import types
-from importlib.machinery import BuiltinImporter
+from importlib.machinery import BuiltinImporter, FrozenImporter
 import yaml
 
 
@@ -1558,6 +1558,15 @@ class ExtractionContract:
             getattr(module_spec, "origin", None) == "built-in"
             and getattr(module_spec, "loader", None) is BuiltinImporter
         )
+        # A frozen standard-library module (genericpath, ntpath, os, ...)
+        # reports a pseudo-filename such as "<frozen genericpath>". That is
+        # not a path: resolved against the working directory it lands inside
+        # the repository root and the definition was classified as
+        # repository_python with no source. The loaded spec is the evidence.
+        frozen_stdlib_module = (
+            getattr(module_spec, "origin", None) == "frozen"
+            and getattr(module_spec, "loader", None) is FrozenImporter
+        )
 
         resolved = Path(origin).resolve() if origin else None
         if module == "builtins":
@@ -1570,6 +1579,8 @@ class ExtractionContract:
             classification = "native_extension"
         elif not origin and native_builtin_module:
             classification = "native_extension"
+        elif frozen_stdlib_module:
+            classification = "stdlib_python"
         elif (
             resolved is not None
             and self.declared_sources.get(resolved) is not None

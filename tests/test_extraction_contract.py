@@ -343,6 +343,23 @@ def test_clock_readings_return_an_inline_float64_scalar(target, rule_id):
     assert decision.parameters["runtime_owner"] == "shell"
 
 
+def test_frozen_stdlib_definition_is_stdlib_not_repository_source():
+    # os.path.exists is genericpath.exists, whose origin is the pseudo-file
+    # "<frozen genericpath>". Resolved as a path it fell inside the
+    # repository root (ticket b043a7c9, case 6b7d429f).
+    import genericpath
+    from importlib.machinery import FrozenImporter
+
+    spec = genericpath.__spec__
+    if spec.origin != "frozen" or spec.loader is not FrozenImporter:
+        pytest.skip("this interpreter does not freeze genericpath")
+    decision = ExtractionContract(CONTRACT).decide(genericpath.exists)
+
+    assert decision.subject.classification == "stdlib_python"
+    assert decision.rule_id == "default:stdlib_python"
+    assert decision.action is ExtractionAction.USE_NATIVE
+
+
 def test_wall_clock_return_is_supplied_by_the_native_callsite_as_float64():
     # Ticket b043a7c9 / case 6b7d429f: the contract's result_dtype must reach
     # the lowered program, not stop at ExtractionContract.decide().
