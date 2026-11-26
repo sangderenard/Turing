@@ -576,6 +576,15 @@ def _propagate_scalar_dtypes(functions) -> None:
                 for spelling in (dtype_of.get(int(value.id)),)
             ))
 
+        # Latch conversions the SSA builder declared to follow their loop
+        # header (``_carried_integer_narrowing``): result id -> header id.
+        header_following = {
+            int(instruction.res.id): int(instruction.attributes["carried_header_id"])
+            for instruction in instructions
+            if instruction.op == "Cast" and instruction.res is not None
+            and instruction.attributes.get("carried_header_id") is not None
+        }
+
         for _ in range(max(1, len(instructions))):
             changed = False
             for instruction in instructions:
@@ -614,6 +623,31 @@ def _propagate_scalar_dtypes(functions) -> None:
                         inferred = None
                 elif instruction.op == "Cast":
                     inferred = instruction.attributes.get("target_dtype")
+                    # A latch conversion declared by the SSA builder
+                    # (``carried_header_id``) targets its header's width,
+                    # not a width of its own: it follows the settled header.
+                    header_id = instruction.attributes.get("carried_header_id")
+                    header_dtype = (
+                        None if header_id is None
+                        else dtype_of.get(int(header_id))
+                    )
+                    if header_dtype in integers and header_dtype != inferred:
+                        from .ssa_call_input_adapters import (
+                            _numeric_conversion_attributes,
+                        )
+
+                        instruction.attributes.update(
+                            target_dtype=header_dtype,
+                            **_numeric_conversion_attributes(
+                                dtype_of.get(
+                                    int(instruction.args[0].id),
+                                    instruction.args[0].dtype,
+                                ),
+                                header_dtype,
+                            ),
+                        )
+                        width_decisions.pop(result_id, None)
+                        inferred = header_dtype
                 elif instruction.op in {"Phi", "phi"}:
                     # A merge is storage selection, not numeric promotion.
                     # Metrics.hard_failure's incoming bool slots settle after
@@ -624,7 +658,17 @@ def _propagate_scalar_dtypes(functions) -> None:
                     incoming = instruction.attributes.get("incoming")
                     incoming_values = (tuple(value for _, value in incoming)
                                        if incoming else tuple(instruction.args))
-                    incoming_types = {dtype_of.get(int(value.id)) for value in incoming_values}
+                    # A latch Cast that follows this header carries the
+                    # header's own width back; the header is decided by
+                    # its other incomings (its seed), as it was minted.
+                    seeded = tuple(
+                        value for value in incoming_values
+                        if header_following.get(int(value.id)) != result_id
+                    )
+                    incoming_types = {
+                        dtype_of.get(int(value.id))
+                        for value in (seeded or incoming_values)
+                    }
                     if len(incoming_types) == 1 and None not in incoming_types:
                         inferred = next(iter(incoming_types))
                 elif instruction.op == "Load" and instruction.args:

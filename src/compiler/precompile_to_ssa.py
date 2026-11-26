@@ -1869,11 +1869,18 @@ def _runtime_rank_physical(
 
         shape, dtype, rank, _metadata, _row_shape = state
         layout = resolve(dtype)
+        # Python's ``int``/``float`` spell a value whose width scalar
+        # settlement decides (an inferred integer widens to int64), not a
+        # physical layout. Program: the authored broadcast kernel's
+        # ``compatible = rank - rank`` in its break arm was minted physical
+        # ``int`` (int32) while the same expression's loop seed, minted with
+        # no physical dtype, settled int64; the exit Phi then merged i64 and
+        # i32 and LLVM refused it.
         if (
             layout is not None
             and layout.kind in {"bool", "int", "uint", "float"}
             and str(dtype) == str(value.dtype)
-            and str(dtype) != "opaque_ref"
+            and str(dtype) not in {"opaque_ref", "int", "float"}
             and rank == len(shape)
             and tuple(shape) == tuple(value.shape or ())
         ):
@@ -11110,6 +11117,15 @@ class _ControlSSABuilder(TiledObject):
         ``integer_narrowing`` (``trap`` reports ``INT_OVERFLOW`` for a value
         the header's width does not hold).  Same width, a non-integer or a
         shaped value is returned as is.
+
+        The conversion's target is the header's width, not a width of its
+        own: ``carried_header_id`` declares that the Cast follows its header,
+        so scalar settlement moves both together.  Program: the authored
+        broadcast kernel's ``axis = rank - rank`` header was minted int32
+        from its seed's planning row; settlement widened the inferred seed
+        to int64 but left this Cast at int32, so the header received int64
+        and int32 and its one carried identity fed int64 and int32 into the
+        same region formal.
         """
 
         if header is None:
@@ -11132,6 +11148,7 @@ class _ControlSSABuilder(TiledObject):
             Handler.Cast, [update], narrowed,
             attributes={
                 "target_dtype": target,
+                "carried_header_id": int(header.id),
                 **_numeric_conversion_attributes(source, target),
             },
         )

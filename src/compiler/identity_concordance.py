@@ -8529,8 +8529,10 @@ class CorrelationTable:
                 narrow_fact = posted_ssa_value_fact(function, narrow, book=book)
                 result_fact = posted_ssa_value_fact(function, row[2], book=book)
                 valid = (
-                    c_tensor_opcode(operation) is not None
-                    and c_tensor_opcode(operation)[0] == "binary"
+                    (operation == "where" or (
+                        c_tensor_opcode(operation) is not None
+                        and c_tensor_opcode(operation)[0] == "binary"
+                    ))
                     and left != right and {wide, narrow} == {left, right}
                     and all(item is not None for item in (
                         left_desc, right_desc, wide_desc, narrow_desc,
@@ -8860,8 +8862,18 @@ class CorrelationTable:
                     and opcode_def.attributes.get("constant") == signature[1]
                     and result_fact.physical_dtype == "float64"
                 )
+                # A selection broadcasts its two span arms and stays the
+                # instruction (``tensor_ssa_lowering``): each arm is the
+                # typed broadcast of its own element; the third arm is rank 0.
+                selection = (
+                    operation == "where"
+                    and source is not None and source.op != "Call"
+                    and str(source.attributes.get("tensor_operation")
+                            or source.op) == "where"
+                    and len(source.args) == 3
+                )
                 valid = valid and (
-                    (raw_int64 or float_call)
+                    (raw_int64 or float_call or selection)
                     and helper_call is not None
                     and helper_call.attributes.get("callee") == helper_name
                     and len(helper_call.args) == 5
@@ -8958,12 +8970,37 @@ class CorrelationTable:
                     # an unrelated result must not discharge this row.
                     broadcast_calls = tuple(
                         definition(int(value.id), "Call")
-                        for value in source.args[:2]
+                        for value in (
+                            tuple(value for value in source.args
+                                  if definition(int(value.id), "Call")
+                                  is not None)
+                            if selection else source.args[:2]
+                        )
                     )
-                    valid = all(call is not None for call in broadcast_calls)
+                    valid = len(broadcast_calls) == 2 and all(
+                        call is not None for call in broadcast_calls
+                    )
+                    if valid and selection:
+                        # Each arm's kernel is its own element's.
+                        arm_kernels = {
+                            "bool": "broadcast_bool",
+                            "int64": "broadcast_int64",
+                            "float64": "broadcast_double",
+                        }
+                        valid = all(
+                            call.attributes.get("callee") == arm_kernels.get(
+                                str(getattr(posted_ssa_value_fact(
+                                    function, operand_id, book=book,
+                                ), "physical_dtype", None))
+                            )
+                            for call, operand_id in zip(
+                                broadcast_calls, (left, right), strict=True,
+                            )
+                        )
                     if valid:
                         broadcast_callee = (
-                            "broadcast_double" if float_call
+                            None if selection
+                            else "broadcast_double" if float_call
                             else "broadcast_int64"
                         )
                         input_geometry = tuple(
@@ -8973,7 +9010,8 @@ class CorrelationTable:
                             for operand_id in (left, right)
                         )
                         valid = all(
-                            call.attributes.get("callee") == broadcast_callee
+                            (selection
+                             or call.attributes.get("callee") == broadcast_callee)
                             and call.attributes.get("ssa_output_argument") == 1
                             and len(call.args) >= 6
                             and exact_broadcast_input(
@@ -10271,13 +10309,29 @@ class CorrelationTable:
                         and binding[0] == int(carried_id)
                     )
 
+                # The aggregate fold (``legalize_aggregate_output_views``)
+                # removes a passthrough slot from the Call's outputs and keeps
+                # each retained slot's Ret position in ``output_positions``;
+                # the callee Ret keeps every slot. Program: declared Sum over
+                # a tensor; region 6 returns the mask's input geometry
+                # (folded onto the caller's actuals) beside the term's
+                # computed geometry (projected): Ret 8, Call outputs 5.
+                positions = tuple(map(int, call.attributes.get(
+                    "output_positions", range(len(callee_ids)),
+                )))
                 valid = valid and len(returned) == 1 and len(
-                    returned[0].args
-                ) == len(callee_ids) and all(
-                    exact_return_carrier(value, carried_id)
-                    for value, carried_id in zip(
-                        returned[0].args, callee_ids
-                    )
+                    positions
+                ) == len(callee_ids) and len(set(positions)) == len(
+                    positions
+                ) and all(
+                    0 <= position < len(returned[0].args)
+                    for position in positions
+                ) and (
+                    len(returned[0].args) == len(callee_ids)
+                    or call.attributes.get("aggregate_output_passthrough_bindings")
+                ) and all(
+                    exact_return_carrier(returned[0].args[position], carried_id)
+                    for position, carried_id in zip(positions, callee_ids)
                 )
                 projections = [instruction for block in caller.blocks.values()
                                for instruction in block.instrs
@@ -10298,12 +10352,12 @@ class CorrelationTable:
                         if int(projection.res.id) == actual_id
                         and projection.attributes.get("source_output_id") == actual_id
                         and projection.attributes.get("aggregate_index")
-                        == caller_ids.index(actual_id)
+                        == positions[caller_ids.index(actual_id)]
                         and len(projection.args) == 1
                         and int(projection.args[0].id) in addresses
                         and addresses[int(projection.args[0].id)].attributes.get(
                             "aggregate_index"
-                        ) == caller_ids.index(actual_id)
+                        ) == positions[caller_ids.index(actual_id)]
                     ) == 1
                     for actual_id in fact[2]
                 )
@@ -12351,6 +12405,22 @@ class CorrelationTable:
                     expected_rank = (
                         None if rank is None else rank if keepdim else rank - 1
                     )
+                    # A static result (its posted fact states every extent):
+                    # the kernel reads the source's runtime shape, and no
+                    # runtime output geometry is consumed.
+                    static_result_desc = bool(
+                        result_desc is not None and result_fact is not None
+                        and expected_rank is not None and expected_rank > 0
+                        and result_fact.storage == "span"
+                        and len(tuple(result_fact.shape or ())) == expected_rank
+                        and all(int(extent) > 0 for extent in result_fact.shape)
+                        and result_desc.metadata_state == "static"
+                        and tuple(result_desc.shape) == tuple(result_fact.shape)
+                        and (result_desc.shape_value_id,
+                             result_desc.rank_value_id,
+                             result_desc.element_count_value_id)
+                        == (None, None, None)
+                    )
                     valid = (
                         source_desc is not None and result_desc is not None
                         and source_fact is not None and result_fact is not None
@@ -12376,6 +12446,10 @@ class CorrelationTable:
                                    result_desc.rank_value_id,
                                    result_desc.element_count_value_id)
                               == (output_shape, output_rank, output_count))
+                             # A result whose posted fact states every
+                             # extent (the runtime axis was the reduced one)
+                             # is static: its descriptor is that shape.
+                             or static_result_desc
                              or (source_fact.physical_dtype == "int64"
                                  and expected_rank == 0
                                  and result_fact.storage == "scalar"
@@ -12472,7 +12546,7 @@ class CorrelationTable:
                                  rank_value.attributes.get("constant") == 0)
                         )
                     else:
-                        valid = (
+                        valid = static_result_desc or (
                             output_vector is not None
                             and tuple(output_vector.attributes.get("values", ()))
                             == (0,) * expected_rank
@@ -12480,7 +12554,7 @@ class CorrelationTable:
                             and rank_value.attributes.get("constant")
                             == expected_rank
                         )
-                if valid:
+                if valid and not static_result_desc:
                     dimension_ids = []
                     for source_axis in range(rank):
                         if source_axis == axis and not keepdim:

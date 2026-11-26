@@ -555,6 +555,40 @@
         free(output_stride);
     }
 
+    /* A Boolean span is one byte per element (uint8_t storage, LLVM i1 in
+       memory).  The same row-major singleton-axis broadcast as
+       broadcast_int64, over that element; used where a selection's mask is
+       narrower than its arms. */
+    void broadcast_bool(
+        const uint8_t* input, uint8_t* output, const int* input_shape,
+        int input_ndim, const int* output_shape, int output_ndim) {
+        int total = 1;
+        int* input_stride = (int*)malloc(input_ndim * sizeof(int));
+        int* output_stride = (int*)malloc(output_ndim * sizeof(int));
+        for (int i = 0; i < output_ndim; ++i) total *= output_shape[i];
+        input_stride[input_ndim - 1] = 1;
+        output_stride[output_ndim - 1] = 1;
+        for (int i = input_ndim - 2; i >= 0; --i)
+            input_stride[i] = input_stride[i + 1] * input_shape[i + 1];
+        for (int i = output_ndim - 2; i >= 0; --i)
+            output_stride[i] = output_stride[i + 1] * output_shape[i + 1];
+        int offset = output_ndim - input_ndim;
+        for (int flat = 0; flat < total; ++flat) {
+            int remaining = flat;
+            int input_flat = 0;
+            for (int axis = 0; axis < output_ndim; ++axis) {
+                int coordinate = remaining / output_stride[axis];
+                remaining %= output_stride[axis];
+                int input_axis = axis - offset;
+                if (input_axis >= 0 && input_shape[input_axis] != 1)
+                    input_flat += coordinate * input_stride[input_axis];
+            }
+            output[flat] = input[input_flat];
+        }
+        free(input_stride);
+        free(output_stride);
+    }
+
     void cumsum_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim) {

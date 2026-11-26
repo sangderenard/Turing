@@ -1010,6 +1010,7 @@ def link_process_graph_functions(
         table.resolve_graph(reference, callee)
         references[function_name] = int(reference.address)
 
+    bound_callers: list[Any] = []
     for graph in _graphs(root):
         # Source lowering registers linked functions before it ingests the
         # caller.  In that phase the root has no callsites to inspect.  Avoid
@@ -1020,6 +1021,11 @@ def link_process_graph_functions(
         for node_id, data in tuple(graph.G.nodes(data=True)):
             if data.get("op") not in {"Call", "call"}:
                 continue
+            if (data.get("attributes") or {}).get(
+                "callee_resolution"
+            ) == "linked-process-graph":
+                # Bound by an earlier pass of this idempotent link.
+                bound_callers.append(graph)
             parents = tuple(data.get("parents") or ())
             matched = None
             for parent_id, role in parents:
@@ -1067,6 +1073,32 @@ def link_process_graph_functions(
                 record for record in unresolved
                 if str(record.get("name")) != binding_name
             )
+            bound_callers.append(graph)
+    # Program: ``def root(n, x: AbstractTensor): return fsum(n, x)`` over a
+    # declared SymPy Sum whose result is a static (3,) tensor. Wrong record:
+    # this link binds the source call after topology reduction, so the
+    # reducer's pursuit never posted its ``source_function_reachability``
+    # row, and the callsite refused the static return ("no exact source call
+    # reachability authority"). Rule: a call bound here is a call of a table
+    # entry like any other; its caller graph posts the same row the
+    # graph-native admission posts for its own calls (CONCORD with the
+    # reducer's writer when both run).
+    from .concordance_declarations import GRAPH_FUNCTION_SPLICE_STAGE
+
+    # A call may reach a linked graph through this pass or through the
+    # reducer's own name resolution of the registered table entry; either
+    # way its callee_ref names a linked address.
+    linked_addresses = set(references.values())
+    for graph in _graphs(root):
+        if graph is root and not graph.node_map:
+            continue
+        if any(
+            (data.get("attributes") or {}).get("callee_ref") in linked_addresses
+            for _node_id, data in graph.G.nodes(data=True)
+        ):
+            bound_callers.append(graph)
+    for graph in {id(graph): graph for graph in bound_callers}.values():
+        _admit_graph_call_reachability(graph, stage=GRAPH_FUNCTION_SPLICE_STAGE)
     return references
 
 

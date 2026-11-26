@@ -30190,10 +30190,35 @@ def _tensor_descriptor_rule(
                                 else first + source_rank + 1
                             )
                             if 0 <= position <= source_rank:
+                                # A runtime span whose only unknown extent
+                                # is its leading one (``sequence_row_shape``:
+                                # rank = 1 + len(row)) keeps that form when
+                                # the new unit axis lands after the leading
+                                # axis. Program: a declared Sum's index axis
+                                # ``arange(count).unsqueeze(-1)`` is
+                                # (count, 1), not a rank-2 span of unknown
+                                # extents; its trailing 1 is what lets
+                                # ``(count, 1) * x[3]`` be (count, 3).
+                                base_row = tuple(map(
+                                    int, base.get("sequence_row_shape") or (),
+                                ))
+                                leading_only = (
+                                    str(base.get("metadata_state") or "")
+                                    == "dynamic"
+                                    and source_rank == 1 + len(base_row)
+                                )
                                 return {
                                     "shape": (), "dtype": dtype,
                                     "rank": source_rank + 1,
                                     "metadata_state": "dynamic",
+                                    **(
+                                        {"sequence_row_shape": (
+                                            base_row[:position - 1] + (1,)
+                                            + base_row[position - 1:]
+                                        )}
+                                        if leading_only and position >= 1
+                                        else {}
+                                    ),
                                 }
                         else:
                             position = (
@@ -30539,6 +30564,105 @@ def _tensor_descriptor_rule(
                             "dtype": dtype,
                             "rank": len(broadcast),
                         }
+                # Program: declared Sum(k*x, (k, 1, n)) over a tensor x[3].
+                # The index axis is (count, 1): a runtime span whose only
+                # unknown extent is its leading one (``sequence_row_shape``).
+                # Wrong record: any runtime side made the whole broadcast an
+                # unsettled span, so (count, 1) * x[3] lost its static 3,
+                # the axis-0 sum lost its static (3,) result, and the root
+                # was asked to return a runtime-sized tensor whose size is
+                # known when compiling. Rule: the broadcast law per axis,
+                # right-aligned. Equal static extents survive, a static 1
+                # yields, a static k != 1 beside the unknown extent is k (the
+                # runtime broadcast guard checks the unknown one), and the
+                # unknown extent survives only where nothing states one. The
+                # result is static when every axis is stated, keeps the
+                # leading-unknown form when only its first axis is unknown,
+                # and otherwise falls through to the runtime-span law below.
+                if all(side is not None for side in sides):
+                    def _stated_extents(side):
+                        if descriptor_states_a_shape(side):
+                            return tuple(map(int, side.get("shape") or ()))
+                        row = side.get("sequence_row_shape")
+                        if (
+                            row is not None
+                            and str(side.get("metadata_state") or "")
+                            == "dynamic"
+                            and int(side.get("rank", 0) or 0)
+                            == 1 + len(tuple(row))
+                        ):
+                            return (None, *map(int, row))
+                        return None
+
+                    stated = [_stated_extents(side) for side in sides]
+                    if (
+                        all(extents is not None for extents in stated)
+                        and any(None in extents for extents in stated)
+                        and any(
+                            extent is not None
+                            for extents in stated for extent in extents
+                        )
+                    ):
+                        width = max(len(extents) for extents in stated)
+                        axes_out: list[int | None] = []
+                        compatible = True
+                        for axis in range(width):
+                            column = [
+                                extents[axis - (width - len(extents))]
+                                for extents in stated
+                                if axis - (width - len(extents)) >= 0
+                            ]
+                            fixed = {
+                                extent for extent in column
+                                if extent is not None and extent != 1
+                            }
+                            if len(fixed) > 1:
+                                compatible = False
+                                break
+                            axes_out.append(
+                                next(iter(fixed)) if fixed
+                                else None if None in column
+                                else 1
+                            )
+                        leading_only = (
+                            compatible and axes_out and axes_out[0] is None
+                            and all(extent is not None
+                                    for extent in axes_out[1:])
+                        )
+                        all_stated = compatible and all(
+                            extent is not None for extent in axes_out
+                        )
+                        if leading_only or all_stated:
+                            stated_dtypes = tuple(
+                                str(side.get("dtype"))
+                                for side in (_promoting_sides(
+                                    graph, operands[1:], sides[1:],
+                                ) if selection and len(sides) == 3
+                                    else _promoting_sides(graph, operands, sides))
+                                if str(side.get("dtype") or "unknown")
+                                != "unknown"
+                            )
+                            stated_dtype = (
+                                "bool"
+                                if operation in _ELEMENTWISE_PREDICATE_OPERATIONS
+                                else _operand_result_dtype(stated_dtypes)
+                                if stated_dtypes else "unknown"
+                            )
+                            if all_stated:
+                                return {
+                                    "shape": tuple(map(int, axes_out)),
+                                    "dtype": stated_dtype,
+                                    "rank": len(axes_out),
+                                }
+                            return {
+                                "shape": (),
+                                "dtype": stated_dtype,
+                                "rank": len(axes_out),
+                                "metadata_state": "dynamic",
+                                "sequence_row_shape": tuple(
+                                    map(int, axes_out[1:])
+                                ),
+                            }
                 # Program: ``def f(x, y): return x * y`` with x and y
                 # declared ``storage: span, rank: 1`` and no ``shape``.
                 # Wrong record: both operands answered a dynamic rank-1

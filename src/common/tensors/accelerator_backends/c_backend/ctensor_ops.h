@@ -260,6 +260,9 @@ void binary_scalar_int64(
 void broadcast_int64(
     const int64_t* input, int64_t* output, const int* input_shape,
     int input_ndim, const int* output_shape, int output_ndim);
+void broadcast_bool(
+    const uint8_t* input, uint8_t* output, const int* input_shape,
+    int input_ndim, const int* output_shape, int output_ndim);
 void cast_int64_to_double_values(
     const int64_t* input, double* output, int n);
 void cast_double_to_int64_values(
