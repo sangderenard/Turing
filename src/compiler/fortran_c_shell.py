@@ -6003,6 +6003,192 @@ def _publish_host_callback_formals(
     control.metadata["host_callbacks"] = tuple(published)
 
 
+def _lower_shell_pre_entry_results_graph(
+    graph_obj: Any, entry_references: Iterable[int],
+) -> int:
+    """Make each consumed pre-entry broker result a named entry input.
+
+    Program: ``with open(p, 'wb') as f: n: int = f.write(b'ab')`` then
+    ``return n + 1`` (ticket b043a7c9, case 6b7d429f, piece P2).  The broker
+    plan is a shell boundary plan, not SSA (python_special_cases.visit_With),
+    so ``Add`` read a value nothing in the entry produced and lowering refused
+    it as consumed-file-broker-result.  A plan whose phase is ``pre_entry``
+    can run before the entry, so each of its results that a node outside the
+    plan reads becomes an int64 entry input named by the plan result, exactly
+    as ``_lower_host_callback_field_calls_graph`` makes a host-supplied value
+    an entry input.  Only the compile entry's own plans are promoted
+    (``plan["function"]``, and the graph's ``function_ref`` among the
+    deployment's activation roots): a called helper's plan never runs before
+    the entry, so its consumed result keeps the shortfall.  The shell must
+    fill the input before the entry runs; until it does,
+    ``_native_shell_boundary_lines`` refuses such a plan.
+    """
+
+    from types import SimpleNamespace as _Namespace
+
+    from ..common.tensors.topological_reducer import (
+        _set_operands, node_identity_cell, post_derived_node_identity,
+    )
+    from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
+    from .process_graph_value_ids import next_process_value_id
+
+    graph = graph_obj
+    if graph.graph.get("shell_pre_entry_inputs") is not None:
+        return 0
+    reference = graph.graph.get("function_ref")
+    function_name = graph.graph.get("function_name")
+    if (
+        reference is None
+        or function_name is None
+        or int(reference) not in {int(item) for item in entry_references}
+    ):
+        return 0
+    plans = {
+        str(plan.get("scope")): plan
+        for plan in tuple(graph.graph.get("shell_file_contexts") or ())
+        if plan.get("phase") == "pre_entry"
+        and plan.get("function") == function_name
+    }
+    if not plans:
+        return 0
+    view = _Namespace(G=graph)
+    records = []
+    for node_id, data in sorted(
+        tuple(graph.nodes(data=True)), key=lambda item: int(item[0]),
+    ):
+        attributes = data.get("attributes") or {}
+        if not attributes.get("shell_boundary"):
+            continue
+        context = dict(attributes.get("shell_file_context") or {})
+        plan = plans.get(str(context.get("scope")))
+        if plan is None or context.get("sequence") is None:
+            continue
+        sequence = int(context["sequence"])
+        operation = next((
+            dict(item) for item in plan.get("operations") or ()
+            if int(item.get("sequence", -1)) == sequence
+        ), None)
+        consumers = tuple(sorted({
+            int(child) for child in graph.successors(node_id)
+            if not (graph.nodes[child].get("attributes") or {}).get(
+                "shell_boundary"
+            )
+            and any(
+                int(parent) == int(node_id)
+                for parent, _role in graph.nodes[child].get("parents") or ()
+            )
+        }))
+        if not consumers:
+            continue
+        result = None if operation is None else operation.get("result")
+        if not result:
+            raise ValueError(
+                f"pre-entry file-broker operation at callsite {node_id} of "
+                f"{function_name!r} is consumed but its plan names no result"
+            )
+        new = next_process_value_id(graph)
+        graph.add_node(
+            new, label=f"{result}.__shell_pre_entry", type="Input",
+            op="input", expr_obj=None, parents=[], children=[],
+            attributes={}, value_id=new,
+            tensor={"shape": (), "dtype": "int64"},
+        )
+        # The input is the broker call's own value, so it derives from that
+        # call alone: adding the consumers' cells gives it two control
+        # activities (job fd3d785b: "ambiguous control-activity ownership").
+        post_derived_node_identity(
+            view, new, (node_identity_cell(view, node_id),),
+            stage=PLANNER_STRUCTURAL_FOLD,
+        )
+        _set_operands(view, new, [], cause="shell_pre_entry_input")
+        graph.nodes[new]["attributes"] = {
+            "binding_kind": "parameter",
+            "binding_name": str(result),
+            "shell_pre_entry_result": {
+                "scope": str(context["scope"]),
+                "sequence": sequence,
+                "operation": str(operation.get("operation") or ""),
+            },
+        }
+        for child in consumers:
+            _set_operands(view, child, [
+                (new if int(parent) == int(node_id) else parent, role)
+                for parent, role in graph.nodes[child].get("parents") or ()
+            ], cause="shell_pre_entry_input")
+        records.append({
+            "scope": str(context["scope"]),
+            "sequence": sequence,
+            "operation": str(operation.get("operation") or ""),
+            "result": str(result),
+            "callsite": int(node_id),
+            "value_id": int(new),
+        })
+    graph.graph["shell_pre_entry_inputs"] = tuple(records)
+    return len(records)
+
+
+def _publish_shell_pre_entry_formals(
+    graph_obj: Any, control: Any, function_name: str,
+) -> None:
+    """Name each pre-entry broker result formal of the lowered entry.
+
+    ``_lower_shell_pre_entry_results_graph`` made each consumed pre-entry
+    broker result an entry input; the shell fills it, so the entry must name
+    the formal by the plan result (as ``_publish_host_callback_formals``
+    names a callback formal).  A promoted result that is no formal of the
+    entry would leave the consumer reading caller storage: refuse it.
+    """
+
+    records = tuple(graph_obj.graph.get("shell_pre_entry_inputs") or ())
+    if not records:
+        return
+    if control is None:
+        raise FortranEmissionError(
+            f"{function_name!r} has pre-entry shell results but no lowered "
+            "entry"
+        )
+    formals = {int(formal.id): formal for formal in control.args}
+    names = list(control.metadata.get("parameter_names", ()))
+    # The shell feeds caller inputs by source name.  A promoted result named
+    # like an authored parameter, even one lowering dropped as dead, or like
+    # another entry formal, would make that name ambiguous (review 0514bd27,
+    # comments 647 to 650): refuse it by name.
+    authored = {
+        str(name) for name in graph_obj.graph.get("function_parameters") or ()
+    }
+    published = {str(name) for name, _value_id in names}
+    for record in records:
+        value_id = int(record["value_id"])
+        result = str(record["result"])
+        if result in authored or result in published:
+            raise FortranEmissionError(
+                f"pre-entry shell result {result!r} of {function_name!r} "
+                "has the name of "
+                + (
+                    "an authored entry parameter" if result in authored
+                    else "another entry formal"
+                )
+                + "; the shell would fill an entry input that a caller "
+                f"also supplies as {result!r}"
+            )
+        published.add(result)
+        formal = formals.get(value_id)
+        if formal is None:
+            raise FortranEmissionError(
+                f"pre-entry shell result {record['result']!r} of "
+                f"{function_name!r} has no entry formal"
+            )
+        formal.accounting = {
+            **dict(formal.accounting or {}),
+            "shell_pre_entry_result": str(record["result"]),
+        }
+        names.append((str(record["result"]), value_id))
+    control.metadata["parameter_names"] = tuple(names)
+    control.metadata["shell_pre_entry_inputs"] = tuple(
+        dict(record) for record in records
+    )
+
+
 def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     """Give each optional record field one explicit presence identity.
 
@@ -9559,9 +9745,36 @@ def _native_shell_boundary_lines(
         return f"(const uint8_t *)slots[{data_slot}]", length_expression
 
     for plan in plans:
-        function_name = plan.get("function")
+        # A lowered plan carries its entry's qualified ``symbol``; its
+        # ``function`` is the source name, which no compiled entry has.
+        function_name = plan.get("symbol") or plan.get("function")
         if function_name not in {None, "", entry.name, entry.symbol}:
             continue
+        if plan.get("phase") == "pre_entry":
+            # Ticket b043a7c9, case 6b7d429f, piece P2: a consumed result of
+            # a pre-entry plan is an entry input
+            # (_lower_shell_pre_entry_results_graph).  These actions still
+            # run after the entry, so the entry would read caller storage and
+            # return a silent wrong value.  Refuse until the shell emits a
+            # pre-entry plan before the entry (piece P3).
+            promoted = sorted({
+                str(item.get("result"))
+                for item in plan.get("operations") or ()
+                if item.get("result")
+                and any(
+                    str(parameter.role) == "input"
+                    for parameter in parameters_by_source.get(
+                        str(item.get("result")), ()
+                    )
+                )
+            })
+            if promoted:
+                raise ValueError(
+                    "native shell cannot yet run a pre-entry boundary plan "
+                    "before the entry; its result(s) "
+                    + ", ".join(repr(name) for name in promoted)
+                    + " are entry inputs the shell would leave unfilled"
+                )
         operations = tuple(sorted(
             (dict(item) for item in plan.get("operations", ())),
             key=lambda item: int(item.get("sequence", -1)),
@@ -25018,6 +25231,9 @@ def _class_surface_ssa_program(
         _lower_optional_record_presence_graph(planned_graph)
         _raise_host_callback_refusal(planned_graph)
         _lower_host_callback_field_calls_graph(planned_graph)
+        _lower_shell_pre_entry_results_graph(
+            planned_graph, public_activation_references,
+        )
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
             value_bindings = _contract_input_binding_names(planned_graph)
             selected_values = {
@@ -33637,6 +33853,9 @@ def _class_surface_ssa_program(
         lowered_control = module_ir.functions.get(symbol)
         _publish_host_callback_formals(
             graph_obj, module_ir, lowered_control, str(function_name),
+        )
+        _publish_shell_pre_entry_formals(
+            graph_obj, lowered_control, str(function_name),
         )
         if lowered_control is not None:
             linked_contracts = dict(
@@ -68601,8 +68820,20 @@ def _lower_ast_source_to_ssa_impl(
                 shell_io_metadata["boundary_plan_schema"] = (
                     "turing.shell-boundary-plan.v1"
                 )
+                # The plan names its source function; the compiled entry is
+                # the module-qualified symbol (as for the loop-interchange
+                # decisions below).  The shell matches a plan to its entry by
+                # this symbol, so a lowered entry's plan is not skipped as
+                # another function's (ticket b043a7c9, case 6b7d429f).
                 shell_io_metadata["boundary_plans"] = tuple(
-                    context for context in shell_contexts
+                    {
+                        **context,
+                        "symbol": (
+                            f"{artifact_name}__"
+                            f"{_identifier(context['function'])}"
+                        ),
+                    } if context.get("function") else context
+                    for context in shell_contexts
                     if str(context.get("execution") or "file_broker")
                     == "file_broker"
                 )

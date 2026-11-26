@@ -3880,7 +3880,7 @@ def _native_shell_write_plan():
     }
 
 
-def _native_shell_write_module():
+def _native_shell_write_module(phase=None, count_role="output"):
     source = """
 module native_shell_write_fortran
   use, intrinsic :: iso_c_binding
@@ -3915,7 +3915,7 @@ end module native_shell_write_fortran
             "value", source_name="payload_length", source_transform="sequence_length",
         ),
         Parameter(
-            "count", "output", "i64", "int64_t", "c_int64",
+            "count", count_role, "i64", "int64_t", "c_int64",
             "reference", source_name="count",
         ),
     )
@@ -3927,7 +3927,10 @@ end module native_shell_write_fortran
         metadata={
             "shell_io": {
                 "boundary_plan_schema": "turing.shell-boundary-plan.v1",
-                "boundary_plans": (_native_shell_write_plan(),),
+                "boundary_plans": (
+                    _native_shell_write_plan() if phase is None
+                    else {**_native_shell_write_plan(), "phase": phase},
+                ),
             },
         },
     )
@@ -3935,6 +3938,30 @@ end module native_shell_write_fortran
         api, ShellIOManifest((ShellIORequest.create("files"),)),
     )
     return FortranModule("native_shell_write_fortran", source, api=api)
+
+
+def test_native_shell_refuses_pre_entry_result_promoted_to_entry_input():
+    # Ticket b043a7c9, case 6b7d429f, piece P2: a consumed pre-entry broker
+    # result becomes an entry input named by the plan result.  The shell
+    # still runs the plan after the entry, so the entry would read caller
+    # storage for it: a silent wrong value.  Until the shell runs pre-entry
+    # plans before the entry (piece P3), it must refuse by name.
+    module = _native_shell_write_module(phase="pre_entry", count_role="input")
+
+    with pytest.raises(ValueError, match=r"pre-entry boundary plan.*'count'"):
+        emit_fortran_c_shell_source(module)
+
+
+def test_native_shell_keeps_pre_entry_plan_whose_result_is_an_output():
+    # Control for the refusal above: a pre-entry plan whose result publishes
+    # to an output slot promotes no input, so the post-entry plan still
+    # renders as before.
+    source = emit_fortran_c_shell_source(
+        _native_shell_write_module(phase="pre_entry"),
+    )
+
+    assert "turing_shell_file_write(" in source
+    assert "return turing_shell_file_fail(11);" in source
 
 
 def test_native_shell_consumes_file_boundary_plan_outside_backend_entry():

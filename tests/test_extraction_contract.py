@@ -529,14 +529,59 @@ def test_returned_file_broker_result_is_refused_with_a_named_shortfall():
     assert "returns none" not in message
 
 
-def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
-    # Control for the guard above (review 87abc6dc, comments 544 and 546):
-    # the shell-file-result rule is keyed to source outputs that are the
-    # broker call's own value.  A broker result consumed by arithmetic is not
-    # such an output and must not be classified as one.  It is refused
-    # instead as consumed-file-broker-result, naming the operation, callsite
-    # and consumer (ticket b043a7c9, case 6b7d429f).
+def _lower_file_fixture(source, name):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        return lower_ast_source_to_ssa(
+            source, "entry", name=name,
+            extraction_contract=ExtractionContract(CONTRACT),
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+
+def test_pre_entry_broker_result_consumed_by_arithmetic_is_an_entry_input():
+    # Ticket b043a7c9, case 6b7d429f, piece P2 (invariants 10 to 13).  The
+    # with-scope is the entry's body[0] and reads only a parameter and a
+    # literal, so its plan is pre_entry (P1).  Its consumed write count is
+    # then an int64 entry input named by the plan result `n`, so the `Add`
+    # reads a formal.  Before P2 this fixture was refused as
+    # consumed-file-broker-result (job e74ff1de; fail-before receipt on the
+    # review).  The shell refuses to run such a plan until P3 emits it before
+    # the entry (test_native_shell_refuses_pre_entry_result_promoted_...).
+    source = (
+        "def entry(p):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        n: int = f.write(b'ab')\n"
+        "    return n + 1\n"
+    )
+    module, _outputs, _exports = _lower_file_fixture(
+        source, "file_result_arithmetic",
+    )
+
+    (entry,) = (
+        function for function in module.functions.values()
+        if function.metadata.get("shell_pre_entry_inputs")
+    )
+    (record,) = entry.metadata["shell_pre_entry_inputs"]
+    assert (record["operation"], record["result"]) == ("write", "n")
+    names = dict(entry.metadata["parameter_names"])
+    formal = {int(arg.id): arg for arg in entry.args}[names["n"]]
+    assert formal.dtype == "int64"
+    assert formal.accounting["shell_pre_entry_result"] == "n"
+    (plan,) = module.metadata["shell_io"]["boundary_plans"]
+    assert (plan["function"], plan["phase"]) == ("entry", "pre_entry")
+
+
+def test_lowered_pre_entry_input_reaches_the_shell_and_is_refused_by_name():
+    # codex, review 0514bd27, comment 644: the shell refusal must be proved on
+    # the real lowered fixture, not on a hand-built ABI.  Job 2d0a56f4 showed
+    # the formal does reach the API as input source_name 'n', but the shell
+    # skipped the plan (plan function 'entry', entry symbol 'fra__entry') and
+    # emitted without refusing.  The published plan now carries the entry's
+    # qualified symbol, and the shell matches on it.
+    from src.compiler.fortran_c_shell import emit_fortran_c_shell_source
+    from src.compiler.ssa_fortran_backend import emit_module
 
     source = (
         "def entry(p):\n"
@@ -544,25 +589,88 @@ def test_broker_result_consumed_by_arithmetic_is_not_a_shell_file_result():
         "        n: int = f.write(b'ab')\n"
         "    return n + 1\n"
     )
+    module, _outputs, exports = _lower_file_fixture(
+        source, "file_result_shell",
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        artifact = emit_module(
+            module, name="file_result_shell", progress=lambda _event: None,
+        )
+    assert artifact.complete, artifact.shortfalls
+    entry = artifact.api.entry_point(exports[0])
+    assert [
+        parameter.source_name for parameter in entry.parameters
+        if parameter.role == "input"
+    ].count("n") == 1
+    (plan,) = artifact.api.metadata["shell_io"]["boundary_plans"]
+    assert (plan["function"], plan["symbol"]) == ("entry", exports[0])
+
+    with pytest.raises(ValueError, match=r"pre-entry boundary plan.*'n'"):
+        emit_fortran_c_shell_source(artifact, entrypoint=exports[0])
+
+
+def test_pre_entry_result_named_like_an_authored_parameter_is_refused():
+    # operator-gpt, review 0514bd27, comment 647; codex comment 649.  The
+    # authored `n` is overwritten before any read, so lowering drops it as
+    # dead (job 2d0a56f4: the only API input named `n` was the promoted
+    # result), so the guard keys on authored names, not on formals.  The shell
+    # feeds caller inputs by source name, so the promoted result must not
+    # take an authored parameter's name either way.
+    control = (
+        "def entry(n, p):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        m: int = f.write(b'ab')\n"
+        "    return m + 1\n"
+    )
+    module, _outputs, _exports = _lower_file_fixture(
+        control, "file_result_authored_control",
+    )
+    (entry,) = (
+        function for function in module.functions.values()
+        if function.metadata.get("shell_pre_entry_inputs")
+    )
+    assert "n" in entry.metadata["authored_parameters"]
+    assert dict(entry.metadata["parameter_names"]).keys() == {"m"}
+
+    source = control.replace("m: int", "n: int").replace("m + 1", "n + 1")
     with pytest.raises(Exception) as refused:
-        with contextlib.redirect_stdout(io.StringIO()):
-            lower_ast_source_to_ssa(
-                source, "entry", name="file_result_arithmetic",
-                extraction_contract=ExtractionContract(CONTRACT),
-                progress=lambda _message: None, progress_bars=False,
-            )
+        _lower_file_fixture(source, "file_result_authored_collision")
+
     message = str(refused.value)
-    assert "shell-file-result" not in message
-    # Job e74ff1de: final concordance refused this program on "value 8:
-    # dtype=int64 accounting_keys=[...]" without naming the broker or the
-    # consumer.  The named shortfall now comes first.
-    assert "consumed-file-broker-result" in message
     assert re.search(
-        r"file-broker operation 'write' at callsite \d+ "
-        r"is consumed by Add node \d+ as lhs",
+        r"pre-entry shell result 'n' of '\w*entry' has the name of an "
+        r"authored entry parameter",
         message,
     )
-    assert "final concordance" not in message
+
+
+def test_only_the_entry_plan_is_promoted_to_an_entry_input():
+    # Required by codex (review 301e340f, comment 615): a called helper whose
+    # body[0] is its own file scope also records a pre_entry plan, but that
+    # plan never runs before the entry.  Only the entry's plan is promoted;
+    # the helper's consumed count keeps the consumed-file-broker-result
+    # shortfall, and the entry's does not appear in it.
+    from src.compiler.precompile_to_ssa import SSALoweringIncompleteError
+
+    source = (
+        "def helper(q):\n"
+        "    with open(q, 'wb') as g:\n"
+        "        m: int = g.write(b'xyz')\n"
+        "    return m + 2\n"
+        "\n"
+        "\n"
+        "def entry(p, q):\n"
+        "    with open(p, 'wb') as f:\n"
+        "        n: int = f.write(b'ab')\n"
+        "    return n + 1 + helper(q)\n"
+    )
+    with pytest.raises(SSALoweringIncompleteError) as refused:
+        _lower_file_fixture(source, "file_result_helper")
+
+    message = str(refused.value)
+    assert message.count("consumed-file-broker-result") == 1
+    assert "__helper::consumed-file-broker-result" in message
+    assert "__entry::consumed-file-broker-result" not in message
 
 
 def test_effect_only_file_broker_write_is_not_a_consumed_result():
