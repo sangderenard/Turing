@@ -156,6 +156,89 @@ def test_training_graph_descends_natively_through_the_source_compiler(tmp_path):
     assert losses == sorted(losses, reverse=True) and losses[-1] < losses[0] / 100
 
 
+MASK_SHAPES = {"x": (4, 1), "mask": (4, 1), "weight": (1, 2), "bias": (1, 2), "target": (4, 2)}
+
+
+def test_masked_rows_contribute_no_gradient_through_the_source_compiler(tmp_path):
+    """``(r * r * mask).sum()``: the loss rule's call result is classed.
+
+    ``bw_sum`` returns ``expand_reduction(...)``, which returns ``expand_to``;
+    their callsites are planned after the motion's call reads its result
+    class, so the reader waits on that row and is re-run when it is posted.
+    Without the class the outer ``mul``'s ``g * x`` had none, its
+    ``unbroadcast`` copy to the mask's (4, 1) had no ``value_type_abi``, and
+    its ``sum`` was refused.  Padded rows (mask 0) give no gradient."""
+
+    program = SSATensorProgram("masked_linear")
+    inputs = {
+        name: SSATensorOperations.input(program, shape)
+        for name, shape in MASK_SHAPES.items()
+    }
+    residual = inputs["x"] @ inputs["weight"] + inputs["bias"] - inputs["target"]
+    loss = (residual * residual * inputs["mask"]).sum()
+    recipe = training_function_recipe(
+        loss, bindings=inputs,
+        wrt=(int(inputs["weight"].data.value.id), int(inputs["bias"].data.value.id)),
+        function_name="masked_motion",
+    )
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "values": [
+            {"function": "train_step", "parameter": name, "storage": "span",
+             "dtype": "float64", "rank": 2, "shape": list(shape),
+             "python_type": "src.common.tensors.abstraction.AbstractTensor"}
+            for name, shape in MASK_SHAPES.items()
+        ],
+        "records": {}, "bindings": [],
+    })
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "def train_step(x: AbstractTensor, mask: AbstractTensor, weight: AbstractTensor,\n"
+        "               bias: AbstractTensor, target: AbstractTensor):\n"
+        "    return masked_motion(x, mask, weight, bias, target)\n",
+        "train_step", name="masked_host",
+        linked_process_graphs={"masked_motion": recipe},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=contract,
+        python_bindings={"AbstractTensor": AbstractTensor},
+        progress=lambda _message: None,
+    )
+    report = concordance_report(module)
+    assert report.splitlines()[0].endswith("0 finding(s)"), report
+
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    from src.compiler.vehicle_python_compilation import _managed_native_feeds_by_id
+
+    root = module.functions[exports[0]]
+    artifact = emit_ssa_function_to_llvm(module, root.name)
+    assert artifact.complete, artifact.shortfalls
+    artifact = compile_artifact(artifact, directory=tmp_path, optimization="O3")
+
+    x = np.array([[1.0], [2.0], [7.0], [-3.0]])
+    target = np.array([[3.0, 1.0], [5.0, -1.0], [40.0, 9.0], [-8.0, 2.0]])
+    mask = np.array([[1.0], [1.0], [0.0], [0.0]])     # the last two rows are padding
+    weight = np.array([[0.5, -0.25]])
+    bias = np.array([[0.25, 0.5]])
+    feeds = _managed_native_feeds_by_id(
+        SimpleNamespace(module=module, root_name=root.name),
+        {"x": x, "mask": mask, "weight": weight, "bias": bias, "target": target},
+    )
+    execution = prepare_artifact_execution(artifact, feeds)
+    execution.run()
+    loss_value, grad_weight, grad_bias = (
+        np.array(execution.buffers[value.id], dtype=float).reshape(value.shape or ())
+        for value in outputs[root.name]
+    )
+    live = slice(0, 2)
+    residual = x[live] @ weight + bias - target[live]
+    assert float(loss_value) == float((residual * residual).sum())
+    assert np.array_equal(grad_weight, x[live].T @ (2.0 * residual))
+    assert np.array_equal(grad_bias, (2.0 * residual).sum(axis=0, keepdims=True))
+
+
 TANH_SHAPES = {
     "features": (8, 3), "targets": (8, 2), "input_weight": (3, 4),
     "hidden_bias": (1, 4), "output_weight": (4, 2), "output_bias": (1, 2),

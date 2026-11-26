@@ -27823,6 +27823,8 @@ def release_compile_planning_state(book: Any) -> dict[str, int]:
     ]
     for key in shells:
         del _CALLSITE_SHELL_TYPE_CACHE[key]
+    for key in [key for key in _CALL_RESULT_CLASS_READERS if key[0] == book_id]:
+        del _CALL_RESULT_CLASS_READERS[key]
     children = 0
     held = _CHILD_SIGNATURE_RESULTS.get(book_id)
     if held is not None and held[0] is book:
@@ -37287,6 +37289,13 @@ def _apply_callsite_aggregate_descriptors(
         )
 
 
+#: Readers of a returned value's class row that ran before the row existed,
+#: keyed ``(book id, callee numeric scope, returned value)``; the post of that
+#: row re-runs them (``_publish_call_result_class``).  Released with the
+#: compile's other planning state (``release_compile_planning_state``).
+_CALL_RESULT_CLASS_READERS: dict[tuple[int, Any, int], list[tuple]] = {}
+
+
 def _publish_call_result_class(
     caller: Any, call_id: int, specialized: Any, output_ids: tuple,
 ) -> None:
@@ -37323,6 +37332,24 @@ def _publish_call_result_class(
         SOURCE_VALUE_CLASS, (callee_scope, returned_value),
     )
     if returned_cell is None:
+        # Program: a masked loss ``(r * r * mask).sum()`` trained through
+        # ``lower_ast_source_to_ssa``: the motion calls ``bw_sum``, which
+        # returns ``expand_reduction(...)``, which returns ``expand_to(...)``.
+        # Wrong record: ``strategize_shell_deployment`` returns a shell type
+        # and the copy's own callsites are planned only when that shell is
+        # built (``plan_callsites``), so this reader ran for the motion's
+        # ``bw_sum`` call while ``bw_sum``'s returned ``expand_reduction``
+        # call had no class yet.  The class arrived later (``expand_to``'s
+        # ``broadcast_to`` result, then ``expand_reduction``'s call) and no
+        # reader asked again: the motion's call result (``bw_mul``'s ``g``)
+        # stayed unclassed, ``g * x`` had no class, its ``unbroadcast`` copy
+        # had no ``value_type_abi`` and its ``sum`` was refused.  Rule: the
+        # writer of a returned value's class row owns the transition; a
+        # reader that finds the row absent waits on that exact row, and the
+        # post below re-runs the readers waiting on the row it writes.
+        _CALL_RESULT_CLASS_READERS.setdefault(
+            (id(book), callee_scope, returned_value), [],
+        ).append((caller, int(call_id), specialized, tuple(output_ids)))
         return
     caller_scope = _source_numeric_scope(caller.G)
     call_value = int(caller.G.nodes[int(call_id)].get("value_id", call_id))
@@ -37337,6 +37364,10 @@ def _publish_call_result_class(
             returned_cell, node_identity_cell(caller, int(call_id)),
         ) if cell is not None)),
     )
+    for waiting in _CALL_RESULT_CLASS_READERS.pop(
+        (id(book), caller_scope, call_value), (),
+    ):
+        _publish_call_result_class(*waiting)
 
 
 def _declared_backward_helper(graph: Any) -> tuple[tuple[str, str], Any] | None:
