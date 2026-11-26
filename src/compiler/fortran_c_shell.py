@@ -27995,6 +27995,35 @@ def _class_surface_ssa_program(
                             changed = True
                     continue
                 if key not in existing:
+                    if (
+                        key == "storage"
+                        and "shape" not in source
+                        and str(value) == "scalar"
+                        and int(source.get("rank", 0) or 0) == 0
+                    ):
+                        # Program: a masked loss ``sum(e*e*mask) /
+                        # (mask.sum() * 3.0)`` trained through the source
+                        # compiler.  ``bw_mul`` has three copies: two whose
+                        # ``g`` is (64, 3) and the divisor's, whose ``g`` is a
+                        # scalar.  Wrong record: the class settlement had
+                        # already created each formal's contract
+                        # (``python_type`` only), so the scalar copy's edge
+                        # was a merge, and a merge stated a shape only when
+                        # its source carried a ``shape`` key; a scalar
+                        # contract carries none.  The scalar copy stated
+                        # nothing, the (64, 3) copies looked unanimous,
+                        # ``value_shape ('bw_mul', 0)`` became (64, 3), and
+                        # the scalar copy's SSA formals read it (LLVM refused
+                        # its Mul).  Rule: a formal's first physical
+                        # statement is recorded whether or not a contract
+                        # already held its class; an exact scalar states
+                        # rank 0, which disagrees with a span.
+                        note_shape(callee_graph, int(callee_id), (
+                            f"merged from "
+                            f"{caller_graph.graph.get('function_name')}"
+                            f" value {int(caller_id)}",
+                            (), str(source.get("dtype") or ""), "scalar",
+                        ), source=(caller_graph, int(caller_id)))
                     if key == "shape":
                         # A shape arriving on a formal that already had a
                         # contract is the event worth seeing; only the first

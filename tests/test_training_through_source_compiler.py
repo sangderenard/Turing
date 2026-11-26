@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -159,7 +160,8 @@ def test_training_graph_descends_natively_through_the_source_compiler(tmp_path):
 MASK_SHAPES = {"x": (4, 1), "mask": (4, 1), "weight": (1, 2), "bias": (1, 2), "target": (4, 2)}
 
 
-def test_masked_rows_contribute_no_gradient_through_the_source_compiler(tmp_path):
+@pytest.mark.parametrize("form", ["sum", "live_mean"])
+def test_masked_rows_contribute_no_gradient_through_the_source_compiler(tmp_path, form):
     """``(r * r * mask).sum()``: the loss rule's call result is classed.
 
     ``bw_sum`` returns ``expand_reduction(...)``, which returns ``expand_to``;
@@ -167,7 +169,13 @@ def test_masked_rows_contribute_no_gradient_through_the_source_compiler(tmp_path
     class, so the reader waits on that row and is re-run when it is posted.
     Without the class the outer ``mul``'s ``g * x`` had none, its
     ``unbroadcast`` copy to the mask's (4, 1) had no ``value_type_abi``, and
-    its ``sum`` was refused.  Padded rows (mask 0) give no gradient."""
+    its ``sum`` was refused.  Padded rows (mask 0) give no gradient.
+
+    ``live_mean`` divides by the live count, ``mask.sum() * 2.0``: the
+    adopted ``bw_div`` keeps one ``eps()`` result identity across the rule
+    and host tables, its scalar ``bw_mul`` copy states its own rank-0 shape,
+    and ``bw_matmul``'s ``gA`` is not typed from the callee's unrelated
+    value of the caller's id."""
 
     program = SSATensorProgram("masked_linear")
     inputs = {
@@ -176,6 +184,8 @@ def test_masked_rows_contribute_no_gradient_through_the_source_compiler(tmp_path
     }
     residual = inputs["x"] @ inputs["weight"] + inputs["bias"] - inputs["target"]
     loss = (residual * residual * inputs["mask"]).sum()
+    if form == "live_mean":
+        loss = loss / (inputs["mask"].sum() * 2.0)
     recipe = training_function_recipe(
         loss, bindings=inputs,
         wrt=(int(inputs["weight"].data.value.id), int(inputs["bias"].data.value.id)),
@@ -234,9 +244,18 @@ def test_masked_rows_contribute_no_gradient_through_the_source_compiler(tmp_path
     )
     live = slice(0, 2)
     residual = x[live] @ weight + bias - target[live]
-    assert float(loss_value) == float((residual * residual).sum())
-    assert np.array_equal(grad_weight, x[live].T @ (2.0 * residual))
-    assert np.array_equal(grad_bias, (2.0 * residual).sum(axis=0, keepdims=True))
+    if form == "sum":
+        assert float(loss_value) == float((residual * residual).sum())
+        assert np.array_equal(grad_weight, x[live].T @ (2.0 * residual))
+        assert np.array_equal(grad_bias, (2.0 * residual).sum(axis=0, keepdims=True))
+        return
+    count = float(mask.sum() * 2.0)
+    assert float(loss_value) == float((residual * residual).sum() / count)
+    # The authored ``bw_div`` rule's numerator gradient is ``g / (y + eps())``.
+    seed = 1.0 / (count + 1e-12)
+    assert np.allclose(grad_weight, x[live].T @ (2.0 * residual) * seed, rtol=0, atol=1e-15)
+    assert np.allclose(grad_bias, (2.0 * residual).sum(axis=0, keepdims=True) * seed,
+                       rtol=0, atol=1e-15)
 
 
 TANH_SHAPES = {
