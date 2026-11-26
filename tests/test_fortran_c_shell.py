@@ -2713,6 +2713,7 @@ def test_sequence_of_authored_records_projects_fields_inside_loop():
 
 def test_filtered_authored_record_sequence_keeps_row_provenance():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import CorrelationTable
     from src.compiler.project_compilation_product import (
         _unexplained_root_argument_ids,
     )
@@ -2748,10 +2749,38 @@ def test_filtered_authored_record_sequence_keeps_row_provenance():
         in function.metadata["record_sequence_projection_fields"]
     }
 
+    # A ``str`` field is a borrowed span (dc1096f8): its value is a selected
+    # row view whose producers name the projected id, not a scalar result.
+    span_fields = {
+        int(binding[1])
+        for binding in function.metadata["record_sequence_projection_bindings"]
+        if isinstance(binding[3], tuple) and binding[3][0] == "record_span"
+    }
+    span_views = {
+        int(instruction.attributes["source_value_id"])
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "selected_child_row_view"
+    }
+    # The filter predicate is the fixture's only sequence equality; it must
+    # consume the projected ``kind`` span, not some other valid span.
+    sequence_equals = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "equal"
+    ]
+
     assert set(projected_fields.values()) == {"kind", "value"}
-    assert set(projected_fields).issubset(definitions)
+    assert {projected_fields[value_id] for value_id in span_fields} == {"kind"}
+    (kind_id,) = span_fields
+    assert span_fields.issubset(span_views)
+    assert len(sequence_equals) == 1
+    assert int(sequence_equals[0].attributes["left_sequence_id"]) == kind_id
+    assert (set(projected_fields) - span_fields).issubset(definitions)
     assert not set(projected_fields).intersection(unexplained)
     assert unexplained == ()
+    assert CorrelationTable.build(module).findings(module) == []
 
 
 def test_local_record_sequence_expands_linked_record_return_into_typed_row():
