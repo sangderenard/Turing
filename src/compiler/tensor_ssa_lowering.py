@@ -11234,6 +11234,43 @@ def lower_tensor_calls_to_repository_ssa(
                             rewritten.extend((*prefix, *emitted))
                             continue
 
+                # Program: a declared Integral's quadrature rule,
+                # ``get_tensor((n0, ..., n4))`` (owner, 2026-11-25).  Wrong
+                # record: the constructor reached every backend as an
+                # operation none spells ("no repository LLVM emission").
+                # Rule: ``AbstractTensor.get_tensor(data)`` of a static
+                # constant span of the result's own shape and dtype IS that
+                # data -- an identity, lowered as the copy every lane spells;
+                # the decision is its book row.
+                if (
+                    operation == "get_tensor" and len(args) == 1
+                    and result is not None
+                    and tuple(args[0].shape or ())
+                    and tuple(args[0].shape) == tuple(result.shape or ())
+                    and str(args[0].dtype) == str(result.dtype)
+                    # Only an immutable literal: a live tensor's get_tensor
+                    # keeps its storage identity (a copy would sever the
+                    # aliasing a training update relies on).
+                    and any(
+                        candidate.op == "Const" and candidate.res is not None
+                        and int(candidate.res.id) == int(args[0].id)
+                        for candidate_block in function.blocks.values()
+                        for candidate in candidate_block.instrs
+                    )
+                ):
+                    _concord_scalar_kernel_operand(
+                        module, function,
+                        (str(function_name), int(result.id)),
+                        ("tensor_identity", "get_tensor"),
+                        (result, args[0]),
+                    )
+                    rewritten.append(Instr(
+                        "clone", [args[0]], result,
+                        attributes={"lowered_from": "get_tensor"},
+                        source_span=instruction.source_span,
+                    ))
+                    continue
+
                 # Shape-only operations do not exist at runtime. Preserve the
                 # result's shape/dtype annotation while aliasing its storage.
                 if operation in _VIEW_OPERATIONS and args:
