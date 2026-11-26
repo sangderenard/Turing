@@ -5,13 +5,16 @@ replaces them. From your home folder, in cmd (the SSH default) or PowerShell:  .
   status    read-only: Apache, the listeners, what would move, the agents, Llama, the condition card
   backup    snapshot the state root (Backup-State.ps1; safe while live)
   merge     move each live checkout to what landed (Update-LiveCheckouts.ps1; pages republish if turing moved)
-  publish   merge, and republish the pages even if nothing moved (Update-LiveCheckouts.ps1 -ExportWeb)
+  publish   merge, and republish the pages even if nothing moved (Update-LiveCheckouts.ps1 -ExportWeb); then the same
+            on the Oracle host (speaktome.dev) over SSH: its checkouts move to what landed, its pages re-export, the
+            landed oracle-front.conf is installed if it changed, and its Apache reloads, which restarts ORACLE's
+            instances (never this machine's). -NoOracle skips it; an unreachable Oracle warns, home's publish stands.
   restart   stop Llama, restart the stack, then start Llama and the OpenAI MCP tunnel (if it is not running);
             refused while a photo exposure runs unless -Force
   stop      shut it all down: the OpenAI MCP tunnel, Llama (task and model listener), then Apache and the stack it
             supervises; refused while a photo exposure runs unless -Force
   start     bring it all back after stop: Apache and its stack, Llama, then the tunnel
-  full      backup, then publish, then shows the table and asks before restart
+  full      backup, then publish (Oracle included), then shows the table and asks before restarting this machine
   llama     restart the hosted Llama runner (its scheduled task)
   agents    re-register the agent ticks (Start-AgentDay.ps1 -Register)
   agent     external API agents declared on /operator-control.html (Install-ExternalAgent.ps1):
@@ -30,7 +33,7 @@ param([Parameter(Position = 0)][ValidateSet('status', 'backup', 'merge', 'publis
       [string]$Command = 'help',
       [Parameter(Position = 1)][ValidateSet('list', 'install', 'key', 'run', 'withdraw')][string]$Action = 'list',
       [Parameter(Position = 2)][string]$Name = '',
-      [switch]$Force, [switch]$MoveIdentical)
+      [switch]$Force, [switch]$MoveIdentical, [switch]$NoOracle)
 $Move = @(if ($MoveIdentical) { 'MoveIdenticalUntracked' })
 $ErrorActionPreference = 'Stop'
 $Deploy = 'C:\dev\Powershell\turing\examples\meowdoku\deploy'
@@ -161,6 +164,38 @@ function Start-Tunnel {
     Write-Host "Started the tunnel (pid $($process.Id))."
     & $tunnel runtimes status speaktome-guest | Out-Host
 }
+# The Oracle A1 host (project ARM cloud-ready): Apache there fronts speaktome.dev and its subdomains
+# (deploy/apache/oracle-front.conf) and owns its own stack (deploy/apache/oracle-stack.conf). It is reached over SSH
+# as ubuntu with this machine's key; `oracle.speaktome.dev` is its DNS name (Cloudflare A record, DNS only).
+# What a publish has to do there, in order:
+#   1. as nodus (owner of /srv/powershell and its checkouts): deploy/linux/stm.sh publish --export-web
+#      -- each live checkout fast-forwards to what landed (publish.sh; a shallow clone is deepened first), and the
+#      pages re-export into turing/build/meowdoku/web, which Oracle's instance serves.
+#   2. as root: deploy/linux/stm.sh front -- the landed oracle-front.conf replaces the served one if it differs (the
+#      old one is kept as .previous and put back if configtest fails), then a graceful reload. The reload restarts the
+#      piped supervisor, so Oracle's instances restart on the moved code.
+# Both run the operator gate on Oracle's state root: the one its installed oracle-stack.conf names
+# (SPEAKTOME_STACK_STATE), read on the host so this script never guesses it, with that state's operator account.
+$OracleHost = 'ubuntu@oracle.speaktome.dev'
+$OracleKey = Join-Path $HOME '.ssh\oracle_nodus'
+$OracleOperator = 'claude'   # the operator account whose credentials Oracle's state root holds
+function Invoke-OraclePublish {
+    if ($NoOracle) { Write-Host "`nOracle skipped (-NoOracle)." -ForegroundColor Yellow; return }
+    Write-Host "`n>> Oracle ($OracleHost): stm.sh publish --export-web, then stm.sh front" -ForegroundColor Cyan
+    $script = @"
+set -euo pipefail
+stm=/srv/powershell/turing/examples/meowdoku/deploy/linux/stm.sh
+[ -f "`$stm" ] || { echo "REFUSED no `$stm: Oracle's turing checkout predates the Linux deploy scripts"; exit 2; }
+state=`$(sed -n 's/^Define SPEAKTOME_STACK_STATE *"\(.*\)"/\1/p' /etc/apache2/conf-available/oracle-stack.conf)
+[ -n "`$state" ] || { echo 'REFUSED oracle-stack.conf names no SPEAKTOME_STACK_STATE'; exit 2; }
+op=$OracleOperator
+sudo -u nodus env MEOWDOKU_OPERATOR="`$op" MEOWDOKU_STATE_DIR="`$state" bash "`$stm" publish --export-web
+sudo env MEOWDOKU_OPERATOR="`$op" MEOWDOKU_STATE_DIR="`$state" bash "`$stm" front
+"@ -replace "`r", ''
+    $global:LASTEXITCODE = 0
+    $script | & ssh -i $OracleKey -o ConnectTimeout=20 -o BatchMode=yes $OracleHost 'bash -s' | Out-Host
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Oracle publish did not finish (exit $LASTEXITCODE); home's publish stands." }
+}
 
 switch ($Command) {
     'help'    { $t = Get-Content -Raw $PSCommandPath; Write-Host $t.Substring(2, $t.IndexOf('#>') - 2).Trim() }
@@ -174,7 +209,7 @@ switch ($Command) {
     }
     'backup'  { Step 'Backup-State.ps1' }
     'merge'   { Step 'Update-LiveCheckouts.ps1' $Move }
-    'publish' { Step 'Update-LiveCheckouts.ps1' (@('ExportWeb') + $Move) }
+    'publish' { Step 'Update-LiveCheckouts.ps1' (@('ExportWeb') + $Move); Invoke-OraclePublish }
     'restart' { Invoke-Restart }
     'stop'    { Invoke-Stop }
     'start'   { Invoke-Start }
@@ -182,6 +217,7 @@ switch ($Command) {
         Need-Elevation; Assert-NoPhoto
         Step 'Backup-State.ps1'
         Step 'Update-LiveCheckouts.ps1' (@('ExportWeb') + $Move)
+        Invoke-OraclePublish
         Write-Host "`nRead the table above. A 'skipped', 'ahead', 'diverged', 'blocked' or 'failed' repository did not move." -ForegroundColor Yellow
         if ((Read-Host 'Restart the stack now? (y/n)') -eq 'y') { Invoke-Restart } else { Write-Host 'Not restarted; the moved code loads at the next restart.' }
     }
