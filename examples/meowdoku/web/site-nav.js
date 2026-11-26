@@ -879,7 +879,7 @@ async function main() {
     link("Connected services", "/connected-services.html"),
     link("My files", "/files.html", caps.has("message")),
     link("Paper markets", "/markets.html", caps.has("message")),
-    link("Browse the site", "/browse"),
+    link("Browse the site", "/browse", caps.has("dev_ui")),                        // /browse answers 403 without dev_ui (server.py _browse_get)
     link("Help: the manual", "/manual/", caps.has("view_site")),
     link("Repository world map", "/worldmap.html", caps.has("dev_ui")),
     link("Math lab", "/mathlab.html", caps.has("compile_submit")),
