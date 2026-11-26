@@ -16,7 +16,7 @@ h2 { font-size: 1.4rem; letter-spacing: -.025em; margin: 0; }
 .section-head p { color: #afbed1; margin: 0; }
 .count { color: var(--palette-accent, #9fc8ff); font-size: .85rem; font-weight: 700; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 17.5rem), 1fr)); gap: 1rem; }
-.card { overflow: hidden; min-width: 0; margin: 0; padding: 0; background: #1b2839; border: 1px solid var(--palette-edge, #384d67); border-radius: 1.25rem; box-shadow: 0 .6rem 2rem #050a1480; }
+.card { overflow: hidden; min-width: 0; margin: 0; padding: 0; background: #1b2839; border: 1px solid var(--palette-edge, #384d67); border-radius: 1.25rem; box-shadow: var(--palette-bevel, 0 0 0 transparent), var(--palette-shadow, 0 .6rem 2rem #050a1480); }
 .poster { display: flex; align-items: end; min-height: 10rem; padding: 1rem; background: radial-gradient(circle at 78% 20%, #6c85bb88, transparent 45%), linear-gradient(145deg, #29486b, #1a2639 65%); color: #f4f7ff; text-decoration: none; }
 .poster[data-kind="bundle"] { background: radial-gradient(circle at 78% 20%, #84d4c288, transparent 45%), linear-gradient(145deg, #27585b, #192b3b 65%); }
 .poster-mark { display: grid; place-items: center; width: 3.4rem; height: 3.4rem; border: 1px solid #ffffff66; border-radius: 1rem; background: #10172255; font-size: 1.55rem; font-weight: 700; }
