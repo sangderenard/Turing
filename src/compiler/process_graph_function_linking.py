@@ -208,11 +208,69 @@ def adopt_function_references(
                 graph.function_table = host_table
                 graph.G.graph["function_ref"] = int(mapping[address])
                 rebind_function_references(graph, mapping)
+                _revise_call_result_addresses(graph, host_table, mapping)
         if entry.python_callable is not None and target.python_callable is None:
             host_table.resolve_callable(mapping[address], entry.python_callable)
         for name, implementation in entry.implementations.items():
             target.implementations.setdefault(name, implementation)
     return mapping
+
+
+def _revise_call_result_addresses(
+    graph: Any, host_table: Any, mapping: Mapping[int, int],
+) -> None:
+    """Revise the adopted ``graph``'s call-result identities to host addresses.
+
+    Program: a masked training loss ``(e*e*mask).sum() / (mask.sum()*3.0)``
+    links ``bw_div`` (``ys = y + eps(); ...``).  The rule table was reduced
+    first and posted ``source_call_result_identity`` row (bw_div scope, call
+    ``eps()``) with ``eps``'s rule-table address 8.  Adoption declares ``eps``
+    in the host table at address 7 and moves the graph; the host's reduction
+    of the same row then proposed 7, and the reducer raised a disagreement.
+    One callee, two table-local numbers.
+
+    Rule: adoption is the renumbering.  As ``rebind_function_references``
+    revises each moved call's ``call_binding``, each result-identity row of the
+    moved graph whose callee address adoption changed is revised to the host
+    address, DERIVED from the incumbent cell and the host's
+    ``function_address`` cell.
+    """
+
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from ..transmogrifier.function_table import function_address_identity
+    from .concordance_declarations import (
+        FUNCTION_ADDRESS, REDUCTION, SOURCE_CALL_RESULT_IDENTITY,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    book = current_identity_book()
+    page = book.pages.get(SOURCE_CALL_RESULT_IDENTITY.name)
+    if page is None:
+        return
+    scope = _source_numeric_scope(graph)
+    for row in tuple(page.rows()):
+        if row[0] != scope:
+            continue
+        cell = book.latest_ref(SOURCE_CALL_RESULT_IDENTITY, row)
+        if cell is None:
+            continue
+        fact = tuple(page.cell(cell.row, cell.column))
+        old = int(fact[0])
+        new = int(mapping.get(old, old))
+        if new == old:
+            continue
+        address = book.latest_ref(
+            FUNCTION_ADDRESS,
+            (function_address_identity(host_table.entry(new)),),
+        )
+        book.post(
+            SOURCE_CALL_RESULT_IDENTITY, row, (new, *fact[1:]),
+            stage=REDUCTION,
+            provenance=Derived(tuple(
+                c for c in (cell, address) if c is not None
+            )),
+            mode=Mode.REVISE,
+        )
 
 
 def _copy_argument_role_rows(

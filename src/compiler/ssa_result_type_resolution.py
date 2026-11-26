@@ -277,8 +277,51 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             return None
         return cell
 
-    def semantic_view_output(callee, caller_id, physical):
-        """Read a computed view's exact result, distinct from its Ret carrier."""
+    def callee_view_ids(caller, callee, instruction, ids):
+        """The callee's own value id for each call output, or ``None``.
+
+        A view row is keyed by a value of the CALLEE, so it is read by the
+        callee's id for the output.  Two records name that value:
+
+        - one graph copy (a planned region or shell carved from its owner
+          states shapes in the owner's ``shape_scope``): caller and callee
+          share one numbering, so the call's own ``output_ids`` ARE the
+          callee's semantic values.  ``expand_reduction``'s region returns
+          its scalar carrier (Ret 0) for semantic output 57; its
+          ``callee_output_ids`` names that carrier, and only 57 reaches the
+          (1, 1) view (``static_view_proof``).
+        - two copies: ids are function-local.  ``callee_output_ids`` (kept
+          current through renames by the aggregate ABI and the frame
+          linker) is the declared correspondence.  Program: the masked
+          training loss linked as ``masked_motion``; its
+          ``bw_matmul(g, x, W)`` call declares ``output_ids`` (108, 109)
+          and ``callee_output_ids`` (88, 90) over Rets (79, 84).  Wrong
+          record: the caller's id was looked up in the callee, where it
+          named ``T(A)`` (1, 4); both layouts hold four elements, so the
+          static view proof accepted it and gA was typed (1, 4) against
+          its own (4, 1) ``value_shape`` row.
+
+        With neither, no callee value is named: the Ret carrier is the output.
+        """
+        from .identity_concordance import shape_scope_of
+
+        if shape_scope_of(caller) == shape_scope_of(callee):
+            return tuple(ids)
+        declared = tuple(map(int, instruction.attributes.get('callee_output_ids', ())))
+        if len(declared) == len(ids):
+            return declared
+        return (None,) * len(ids)
+
+    def semantic_view_output(callee, callee_id, physical):
+        """Read a computed view's exact result, distinct from its Ret carrier.
+
+        ``callee_id`` is the callee's own value for this output
+        (``callee_view_ids``); ``None`` means the call names none and the
+        Ret carrier is the output.
+        """
+        if callee_id is None:
+            return physical, None
+        caller_id = callee_id
         book = current_identity_book()
         row = (function_scope_of(callee), callee.name, int(caller_id))
         reshape = book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY, row)
@@ -426,6 +469,9 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         instruction.attributes.get("output_positions", ()),
                     ))
                     selected = tuple(map(int, instruction.attributes.get('callee_output_ids', ())))
+                    slot_of_position = {
+                        int(position): slot for slot, position in enumerate(positions)
+                    }
                     if positions:
                         # The linker correlates caller aggregate members with
                         # the callee's physical Ret ABI by position.  That is
@@ -454,8 +500,11 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     elif len(ids) != len(outputs):
                         continue
                     output_pairs = tuple(
-                        semantic_view_output(callee, value_id, source)
-                        for value_id, source in zip(ids, outputs)
+                        semantic_view_output(callee, callee_id, source)
+                        for callee_id, source in zip(
+                            callee_view_ids(caller, callee, instruction, ids),
+                            outputs,
+                        )
                     )
                     # A per-arm region call (``union_arm_dispatch``) types
                     # its own loads; the joined id is the merge of every
@@ -476,8 +525,26 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                             if len(candidates) != 1:
                                 continue
                             source, proof = candidates[0]
-                        elif isinstance(position, int) and 0 <= position < len(output_pairs):
-                            source, proof = output_pairs[position]
+                        elif isinstance(position, int):
+                            # ``aggregate_index`` is the PHYSICAL Ret ABI
+                            # slot.  When the linker declares
+                            # ``output_positions`` the outputs above were
+                            # selected by them, so the slot reaches its pair
+                            # through that declaration, never by indexing the
+                            # selected list.  Program: late_record_alias_frame,
+                            # make_metrics's 26 outputs; aggregate
+                            # reconciliation retired the two dead ones and
+                            # kept positions 2..25.  Wrong record: the Load at
+                            # slot 2 (max_flux, Ret value 1, float64) read the
+                            # selected list's third pair (Ret slot 4, a bool),
+                            # so two writers claimed one field.
+                            slot = (
+                                slot_of_position.get(position) if positions
+                                else position
+                            )
+                            if slot is None or not 0 <= slot < len(output_pairs):
+                                continue
+                            source, proof = output_pairs[slot]
                         else:
                             continue
                         yield caller, target, callee, source, proof
@@ -532,11 +599,39 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 yield region, target, owner, source, None
 
     exact_values = set()
+    # Rule (bounded_fixed_point.py): every ``while changed:`` compiler loop
+    # ends by construction.  Program: tests/test_process_graph_function_linking
+    # late_record_result_rebinds_aliased_fields_in_following_call_frame.
+    # Wrong record: this loop had no guard; one call result was published
+    # bool by its call edge and float64 by another writer every round, so
+    # ``changed`` never cleared and the loop ran 412 CPU minutes (16,031
+    # rounds) with each post rescanning a growing history.  The state is
+    # every value this loop has decided, with the type it holds now and the
+    # priority of its retained ledger decision: a flip between two writers
+    # revisits a completed state and is refused naming the ids, instead of
+    # spinning.
+    from .bounded_fixed_point import BoundedFixedPoint, bound_for
+
+    published = {}
+    settle_guard = BoundedFixedPoint(
+        "call-result-type-settlement",
+        bound_for(
+            "abi", functions=len(functions),
+            call_operands=sum(
+                1 for function in functions.values()
+                for block in function.blocks.values()
+                for item in block.instrs
+                if item.op in {'Call', 'call', 'Load'} and item.res is not None
+            ),
+        ),
+        scope=("whole-program",), state=(),
+    )
     changed = True
     rounds = 0
     while changed:
         changed = False
         rounds += 1
+        changed_ids = []
         # Indexed's element type and the call result that publishes it are
         # one connected type constraint, not two unrelated late passes.
         # The compiler heap micro-test settled its int64 base after region
@@ -577,6 +672,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 winner = ledger.incumbent_target(identity)
                 if _publish_type(owner, target, winner, ledger.decision_cell(identity)):
                     changed = True
+                    changed_ids.append(identity)
+                published[identity] = (_type(target), ledger.incumbent_priority(identity))
                 # Rule: accounting is a view of the posted winner.  Program:
                 # an addressed element whose winner posted no physical dtype.
                 # Wrong record: the base's accounting dtype was copied onto
@@ -596,10 +693,52 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             )
             if source_type[0] in {None, '', 'unknown'} and not source_type[1] and source_type[2] is None:
                 continue
-            if _publish_type(caller, target, source_type, source_cell,
-                             source_physical,
+            # Rule: a call edge's type is a PROPOSAL to the ledger, decided
+            # with every other claim on the same value (rules above:
+            # callee_output 2, physical_storage / addressed_element 3), and
+            # the resident takes the ledger's incumbent.  Program:
+            # late_record_result_rebinds_aliased_fields_in_following_call_frame.
+            # Wrong record: bd7e7d05 replaced this proposal with a direct
+            # publish of the callee's type, so the edge and the
+            # addressed_element rule each wrote the same record-field Loads
+            # every round (bool, then float64) and the fixed point never
+            # settled; the guard refused it as a repeated state.
+            identity = (caller.name, int(target.id))
+            source_priority = ledger.incumbent_priority((callee.name, int(source.id))) or 1
+            rule = 'physical_storage' if source_priority == 3 else 'callee_output'
+            previous_priority = ledger.incumbent_priority(identity)
+            source_cells = _value_cells((callee, source), (caller, target))
+            accepted = ledger.propose(
+                identity, rule, (callee.name, int(source.id), source_type),
+                before=_recorded_type(caller, target), after=source_type,
+                sources=(source_cell, *source_cells[1:])
+                + capture_planning_cells.get(id(target), ()) + tuple(
+                    cell for cell in (
+                        ledger.decision_cell((callee.name, int(source.id))),
+                        view_proof,
+                    ) if cell is not None
+                ),
+                revision_source=source_cell,
+            )
+            winner = ledger.incumbent_target(identity)
+            if accepted:
+                carried_physical[identity] = source_physical
+            if _publish_type(caller, target, winner, ledger.decision_cell(identity),
+                             carried_physical.get(identity),
                              () if view_proof is None else (view_proof,)):
                 changed = True
+                changed_ids.append(identity)
+            if ledger.incumbent_priority(identity) != previous_priority:
+                changed = True
+                changed_ids.append(identity)
+            # The guard's state is the value's type AND its retained decision:
+            # a round that only changes the decision is progress.
+            published[identity] = (_type(target), ledger.incumbent_priority(identity))
+            if not (accepted or winner == source_type):
+                # A rejected proposal: the incumbent need not have a callee
+                # origin, and only an accepted or equal binding lets
+                # consumers propagate one.
+                continue
             target.accounting = {**dict(target.accounting or {}),
                 'ssa_call_result_from': (
                     callee.name,
@@ -614,12 +753,16 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             # source's accounting dtype with no row behind it is not
             # copied onto the target.
             physical_dtype = _row_physical(caller, target).get('physical_dtype')
-            if physical_dtype is not None:
+            if physical_dtype is not None and previous_priority != 3:
                 target.accounting['physical_dtype'] = physical_dtype
                 target.accounting['physical_dtype_provenance'] = (
                     'callee_output', callee.name,
                     int(source.id))
             exact_values.add(id(target))
+        changed = settle_guard.round(
+            changed, changed_ids=changed_ids,
+            state=tuple(sorted(published.items(), key=repr)),
+        )
 
     _refresh_scope_occurrences(functions)
     conflicts = tuple(dict(caller=caller.name, value_id=int(target.id),
