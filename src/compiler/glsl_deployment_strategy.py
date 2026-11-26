@@ -24534,10 +24534,15 @@ def _publish_callsite_return_members(
         from ..common.tensors.topological_reducer import (
             _posted_node_identity_cell,
         )
+        # The graph copy is named by its book-minted scope, never by the
+        # Python object's ``id``: an id is reused once the object is freed,
+        # and a later graph would then read this copy's rows.
+        from .identity_concordance import shape_scope_of as _shape_scope_of
+
         projection_scope = (
             caller_name,
             int(node_id),
-            id(caller.G),
+            _shape_scope_of(caller),
         )
         for index, (stale_id, replacement_id) in enumerate(zip(
             incumbent_leaves, leaves,
@@ -25920,6 +25925,22 @@ def _propagate_callsite_tensor_specializations(
                         function_name, int(value_id), "leaves",
                         tuple(map(int, leaves)),
                     ))
+                # Program: the Studio response shader's ``studio_sphere_hit``
+                # call.  Wrong record: its returned members are scalars, so
+                # republishing them changed no leaf tensor, only the call's
+                # ``tensor_output_descriptors``; the round reported a change
+                # and the digest (which did not read that ledger) equalled
+                # the seed: "repeated a completed state at round 1".  Rule,
+                # as for the leaf ledger above: the output-descriptor ledger
+                # is state this loop writes, so the digest reads it.
+                output_descriptors = (node.get("attributes") or {}).get(
+                    "tensor_output_descriptors"
+                )
+                if output_descriptors:
+                    facts.append((
+                        function_name, int(value_id), "output_descriptors",
+                        repr(output_descriptors),
+                    ))
         # A generated VJP can publish formal shapes after every graph
         # descriptor has settled.  Those exact ledger rows are state written
         # by this loop, so the guard must read them before judging a round
@@ -26979,10 +27000,14 @@ def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
             from ..common.tensors.topological_reducer import (
                 _posted_node_identity_cell,
             )
+            # The graph copy's book-minted scope, as the publisher keys it
+            # (``_publish_callsite_return_members``); never ``id(graph.G)``.
+            from .identity_concordance import shape_scope_of as _shape_scope_of
+
             projection_scope = (
                 str(graph.G.graph.get("function_name") or ""),
                 int(node_id),
-                id(graph.G),
+                _shape_scope_of(graph),
             )
             replacement_by_stale = dict(replaced)
             for index, stale_id in enumerate(leaves):
