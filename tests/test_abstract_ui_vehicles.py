@@ -1046,7 +1046,7 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert 'button.textContent=label' in script
     assert "rebuildPortableSceneMesh({dynamicOnly:true})" in script
     assert "removeVehicleInventoryItem" in script
-    assert 'event.code==="KeyV"' in script
+    assert '"vehicle-mount-toggle": () => {' in script
     assert "viewportControls.yaw=state.yaw" not in script
     assert 'reportRuntimeFault("vehicle-step"' in script
     assert 'type: "player-jump"' in script

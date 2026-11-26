@@ -1,0 +1,33 @@
+# Input binding contract: the mechanical creature game, layered on the
+# first-person base. Everything here is specific to the car game; removing this
+# layer leaves the first-person interface (configs/input/first_person.yaml).
+schema: input-binding-contract-v0
+identity: creature-game
+extends: first_person.yaml
+
+policy:
+  rates:
+    move_speed: 1.65   # the living map's quarter-scale embodiment walks slower
+
+actions:
+  front-differential-brake-toggle: {inputs: ["keyboard:KeyZ", "gamepad:button-4"]}
+  rear-differential-brake-toggle:  {inputs: ["keyboard:KeyX", "gamepad:button-4"]}
+  vehicle-headlights-toggle: {inputs: ["keyboard:KeyL"]}
+  vehicle-horn:              {inputs: ["keyboard:KeyH"]}
+  vehicle-ignition-toggle:   {inputs: ["keyboard:KeyK"]}
+  vehicle-starter:           {inputs: ["keyboard:KeyI"]}
+  tool-mode-cycle:
+    inputs: ["keyboard:KeyM"]
+    edge: press
+    routes: [game, projected-pointer]
+  vehicle-mount-toggle:
+    inputs: ["keyboard:KeyV"]
+    edge: press
+    routes: [game, projected-pointer]
+
+# The vehicle's shell controls (abstract_ui_vehicles.VEHICLE_CONTROL_RECORD);
+# its other 33 controls are worker state and are not bound to devices.
+controls:
+  throttle: "+move-forward -move-backward"
+  steering: "+strafe-right -strafe-left"
+  brake: jump

@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 
 import sympy
 
+from .abstract_ui_input_contract import load_input_contract
 from .abstract_ui_world import WorldWasmPlugin
 from .ssa_wasm_backend import SSAWasmArtifact, emit_ssa_function_to_wasm
 from .ssa_c_backend import CFunctionArtifact, emit_ssa_function_to_c
@@ -43,13 +44,20 @@ WHEEL_NAMES = ("front_left", "front_right", "rear_left", "rear_right")
 #: (docs/COMMON_CONTROL_RECORD_2026-11-05.md).  The order is the positional
 #: array the page and worker agreed on by hand before; it is kept so that no
 #: published program changes meaning, and it is now written once.
+#: The three shell controls are bound in the page's input contract
+#: (``configs/input/creature_game.yaml`` ``controls``), not here; the other 33
+#: slots are worker state and bind to no device.
+_SHELL_CONTROLS = load_input_contract().controls
+if set(_SHELL_CONTROLS) != {"throttle", "steering", "brake"}:
+    raise ValueError("the input contract binds exactly the vehicle's shell controls "
+                     f"throttle, steering and brake, not {sorted(_SHELL_CONTROLS)}")
 VEHICLE_CONTROL_RECORD: tuple[tuple[str, str | None], ...] = (
     # Axis controls are signed sums of semantic actions
     # (``abstract_ui_viewports.control_terms``): the page samples each
     # action and sums, it composes nothing by hand.
-    ("throttle", "+move-forward -move-backward"),
-    ("steering", "+strafe-right -strafe-left"),
-    ("brake", "jump"),
+    ("throttle", _SHELL_CONTROLS["throttle"]),
+    ("steering", _SHELL_CONTROLS["steering"]),
+    ("brake", _SHELL_CONTROLS["brake"]),
     ("forward_gear_ratio", None), ("reverse_gear_ratio", None), ("transfer_case_ratio", None),
     ("front_differential_lock", None), ("drive_direction", None),
     *((f"brake_lock_{wheel}", None) for wheel in WHEEL_NAMES),

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import {
   createLivingMapWalkController, createLivingMapControlState,
-  LIVING_MAP_VIEWPORT_BINDINGS, LIVING_MAP_VIEWPORT_POLICY_DEFAULTS,
+  LIVING_MAP_VIEWPORT_BINDINGS, LIVING_MAP_VIEWPORT_POLICY_DEFAULTS, LIVING_MAP_INPUT_CONTRACT,
   LIVING_MAP_WALK_SOURCE_FUNCTIONS, LIVING_MAP_WALK_REQUIRED_CALLBACKS,
   LIVING_MAP_WALK_REQUIRED_STATE,
 } from "../examples/meowdoku/web/living_map_walk_controls.js";
@@ -42,7 +42,8 @@ function fixture() {
   canvas.requestPointerLock = () => { doc.pointerLockElement = canvas; };
   const model = {viewer: {camera: {eye_height: 1.15, collision_radius: .25},
     control_policy: {identity: "world/controls", actor: "player", ...structuredClone(LIVING_MAP_VIEWPORT_POLICY_DEFAULTS),
-      bindings: structuredClone(LIVING_MAP_VIEWPORT_BINDINGS)}}, document_geometry: {}};
+      bindings: structuredClone(LIVING_MAP_VIEWPORT_BINDINGS)}}, document_geometry: {},
+    input_contract: structuredClone(LIVING_MAP_INPUT_CONTRACT)};
   const context = {model, viewportControls: createLivingMapControlState(model),
     shaderViewer: {element, canvas, mapElement: null, colliders: [], geometry: [],
       inhabitedCameraFacing: [1, 0, 0]},

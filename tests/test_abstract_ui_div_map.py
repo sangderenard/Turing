@@ -378,7 +378,8 @@ def test_hotbar_projects_inventory_slots_and_equips_ball_gun_by_default():
     assert hotbar["slots"][-1]["key"] == "Digit0"
     assert hotbar["active_slot"] == 7
     assert "function renderHotbar(hotbar)" in projection.script
-    assert 'selectHotbarSlot(hotbarSlot[1] === "0" ? 10' in projection.script
+    assert '"select-slot": () => selectHotbarSlot(argument)' in projection.script
+    assert projection.model["input_contract"]["commands"][0]["keys"]["Digit0"] == 10
     tool = projection.model["tools"][0]
     assert tool["identity"] == inventory["items"][0]["entity"]
     assert [hook["action"] for hook in tool["hooks"]] == [
@@ -693,7 +694,7 @@ def test_crosshair_context_form_menu_edits_the_shared_mesh_and_document():
     assert 'issueViewportAction("secondary-action","release",held)' in script
     assert 'firePhysicsBall(exitScale)' in script
     assert "function cycleActiveToolMode()" in script
-    assert 'event.code==="KeyM"' in script
+    assert '"tool-mode-cycle": () => cycleActiveToolMode()' in script
     assert "function updateHeldToolSecondary(dt)" in script
     assert "function beginViewportPrimary(position=null,source=" in script
     assert "function updateHeldToolPrimary(dt)" in script

@@ -22,6 +22,7 @@ from .abstract_ui import AbstractUI, AbstractUIPacket, javascript_with_system_ro
 from .abstract_ui_actions import system_action_mezzanine_model
 from .abstract_ui_control_focus import ControlFocusPolicy
 from .abstract_ui_dynamics import DeviceMonitor, viewport_dynamics_space
+from .abstract_ui_input_contract import DEFAULT_INPUT_CONTRACT, load_input_contract
 from .abstract_ui_entities import (
     EntityMezzanine,
     entity_mezzanine_model,
@@ -375,12 +376,21 @@ def world_div_map_model(
     *,
     entity_mezzanine: EntityMezzanine | None = None,
     static_only: bool = False,
+    input_contract: str = DEFAULT_INPUT_CONTRACT,
 ) -> dict[str, Any]:
-    """Return the JSON-safe data graph consumed by the div renderer."""
+    """Return the JSON-safe data graph consumed by the div renderer.
+
+    ``input_contract`` names the page's input binding contract in
+    ``configs/input/``: every key, binding, focus rule and widget of the page
+    comes from it, and the page lists it in its Contracts section.
+    """
 
     if static_only and entity_mezzanine is not None:
         raise ValueError("A static map cannot attach an entity/game mezzanine")
+    contract = load_input_contract(input_contract)
     model = world_div_map_graph(world)
+    model["input_contract"] = contract.to_data()
+    model["page_contracts"] = [contract.page_contract()]
     if entity_mezzanine is not None:
         model["entity_mezzanine"] = entity_mezzanine_model(entity_mezzanine)
         model["navigation"] = navigation_model(
@@ -406,11 +416,7 @@ def world_div_map_model(
         eye_height=0.2875,
         collision_radius=0.0625,
     )
-    control_policy = ViewportControlPolicy(
-        f"{world.identity}/viewport-controls",
-        pointer_identity,
-        move_speed=1.65,
-    )
+    control_policy = contract.viewport_policy(f"{world.identity}/viewport-controls", pointer_identity)
     pluck_phong = _pluck_phong_shader_choice(world.identity)
     material_catalog = _pluck_material_catalog() if pluck_phong is not None else None
     viewer = ShaderViewport(
@@ -421,11 +427,11 @@ def world_div_map_model(
         camera,
         DIV_MAP_PALETTE,
         control_policy=control_policy,
-        device_monitor=DeviceMonitor.from_bindings(
+        device_monitor=(DeviceMonitor.from_bindings(
             f"{world.identity}/device-monitor",
             pointer_identity,
             control_policy.bindings,
-        ),
+        ) if contract.widget("device-monitor") is not None else None),
         dynamics_space=viewport_dynamics_space(world.identity, pointer_identity),
         shader_choices=(() if pluck_phong is None else (pluck_phong,)),
         default_shader=(
@@ -902,8 +908,9 @@ def world_div_map_model(
             "cycle": projectile_system["cycle"],
         })
         model["inventory"] = inventory.to_data()
-        model["hotbar"] = Hotbar.from_inventory(inventory).to_data()
-        model["control_focus"] = ControlFocusPolicy(
+        if contract.widget("hotbar") is not None:
+            model["hotbar"] = Hotbar.from_inventory(inventory).to_data()
+        model["control_focus"] = contract.focus_policy(
             f"{world.identity}/control-focus", pointer_identity,
         ).to_data()
         model["persistence"] = {
@@ -1298,6 +1305,11 @@ line-height:1.35;white-space:pre-line;overflow-wrap:anywhere;box-shadow:0 6px 18
 .viewer-port.controls-captured{box-shadow:0 0 0 1px var(--active) inset,0 0 24px #e9b87233}
 .viewer-port.controls-captured .viewer-readout{color:var(--active)}
 .device-monitor{display:flex;align-items:stretch;gap:7px;margin-top:8px;overflow-x:auto}
+.page-contracts{margin-top:8px;border:1px solid var(--line);border-radius:6px;padding:6px 8px;
+font-size:11px;color:var(--muted)}.page-contracts-title{color:var(--ink);margin-bottom:4px}
+.page-contract summary{cursor:pointer;color:var(--ink)}.page-contract-file{margin-top:6px;color:var(--active)}
+.page-contract-text{margin:3px 0 0;max-height:240px;overflow:auto;white-space:pre;font-size:10px;
+background:var(--void);border:1px solid var(--line);border-radius:4px;padding:5px}
 .device-group{display:flex;align-items:center;gap:5px;min-width:max-content;padding:5px 7px;
 border:1px solid var(--line);border-radius:7px;background:var(--void)}
 .device-name{color:var(--muted);font-size:9px;letter-spacing:.09em;text-transform:uppercase}
@@ -6566,47 +6578,52 @@ function initializeVehicleFirstExperience() {
 }
 
 function viewportKeyboardInput(event) {
-  if (event.type === "keydown" && event.code === "Escape" && shaderViewer.shaderOnly) {
-    event.preventDefault();
-    setShaderOnlyMode(false);
+  // Every key this page answers is declared in its input contract
+  // (model.input_contract, resolved from configs/input/*.yaml by
+  // abstract_ui_input_contract). A command (edge "press") runs once per key
+  // press through the handler of its name, in the focus routes it names;
+  // "back" tries its declared steps in order and the first that applies runs.
+  // A held action fills viewportControls.keys through the policy bindings,
+  // which are the contract's held actions.
+  const command = model.input_contract.commands.find(item => event.code in item.keys);
+  const capturing = Boolean(viewportControls.policy?.captures.includes("keyboard"));
+  if (command?.action === "back") {
+    if (event.type !== "keydown") return;
+    const steps = {
+      "exit-shader-only": () => shaderViewer.shaderOnly && (setShaderOnlyMode(false), true),
+      "close-dialogue": () => capturing && controlFocus.dialogue && (closeToolDialogue(), true),
+      "release-capture": () => capturing && viewportControls.highlighted && (closeSceneContextMenu(),
+        setViewportControlHighlight(false), shaderViewer.element?.blur(), true),
+    };
+    if (command.resolves.some(step => steps[step]())) event.preventDefault();
     return;
   }
-  if (!viewportControls.policy?.captures.includes("keyboard")) return;
-  if (controlFocus.dialogue && event.type === "keydown" && event.code === "Escape") {
-    event.preventDefault(); closeToolDialogue(); return;
-  }
-  const hotbarSlot = /^Digit([0-9])$/.exec(event.code);
-  if (hotbarSlot && viewportControls.highlighted && controlFocus.mode !== "dialogue") {
+  if (!capturing) return;
+  if (command) {
+    if (!viewportControls.highlighted || !command.routes.includes(controlFocus.mode)) return;
     event.preventDefault();
-    if (event.type === "keydown" && !event.repeat) {
-      selectHotbarSlot(hotbarSlot[1] === "0" ? 10 : Number(hotbarSlot[1]));
-    }
+    if (event.type !== "keydown" || event.repeat) return;
+    const argument = command.keys[event.code];
+    const handlers = {
+      "select-slot": () => selectHotbarSlot(argument),
+      "tool-mode-cycle": () => cycleActiveToolMode(),
+      "vehicle-mount-toggle": () => {
+        if (vehicleRuntime.active) clearActiveVehicle();
+        else if (vehicleRuntime.parkedState) {
+          setActiveVehicle(model.vehicle_slot.vehicles[0].identity, {placeAtActor: false});
+        }
+      },
+    };
+    handlers[command.action]();
     return;
-  }
-  if(event.code==="KeyM"&&viewportControls.highlighted&&controlFocus.mode!=="dialogue"){
-    event.preventDefault();if(event.type==="keydown"&&!event.repeat)cycleActiveToolMode();return;
-  }
-  if(event.code==="KeyV"&&viewportControls.highlighted&&controlFocus.mode!=="dialogue"){
-    event.preventDefault();if(event.type==="keydown"&&!event.repeat){
-      if(vehicleRuntime.active)clearActiveVehicle();
-      else if(vehicleRuntime.parkedState)setActiveVehicle(model.vehicle_slot.vehicles[0].identity,{placeAtActor:false});
-    }return;
   }
   const mapped = viewportControls.policy.bindings.some(binding =>
     binding.inputs.includes(`keyboard:${event.code}`));
-  if (!mapped && event.code !== "Escape") return;
-  if (mapped) {
-    if (event.type === "keydown") viewportControls.observedKeys.add(event.code);
-    else viewportControls.observedKeys.delete(event.code);
-  }
+  if (!mapped) return;
+  if (event.type === "keydown") viewportControls.observedKeys.add(event.code);
+  else viewportControls.observedKeys.delete(event.code);
   if (!viewportControls.highlighted) return;
   event.preventDefault();
-  if (event.code === "Escape") {
-    closeSceneContextMenu();
-    setViewportControlHighlight(false);
-    shaderViewer.element?.blur();
-    return;
-  }
   if (event.type === "keydown") viewportControls.keys.add(event.code);
   else viewportControls.keys.delete(event.code);
 }
@@ -6623,15 +6640,20 @@ function viewportPointerLook(event) {
 // One control of the vehicle's control record, sampled by its hookup: a
 // single semantic action, or an axis "+action -action" summed over the live
 // value of each (abstract_ui_viewports.control_terms is the grammar).  The
-// on-screen joystick is one more device for the four movement actions.
+// on-screen joystick is one more device: its contract widget names the action
+// each of its four directions drives.
 function vehicleControlValue(control, gamepad) {
   const tokens = String(control).trim().split(/\s+/);
   const terms = tokens.length === 1 && !/^[+-]/.test(tokens[0])
     ? [[1, tokens[0]]] : tokens.map(token => [token[0] === "-" ? -1 : 1, token.slice(1)]);
-  const mobile = {"move-forward": Math.max(0, -mobileControlState.move[1]),
-    "move-backward": Math.max(0, mobileControlState.move[1]),
-    "strafe-right": Math.max(0, mobileControlState.move[0]),
-    "strafe-left": Math.max(0, -mobileControlState.move[0])};
+  const direction = {up: Math.max(0, -mobileControlState.move[1]),
+    down: Math.max(0, mobileControlState.move[1]),
+    right: Math.max(0, mobileControlState.move[0]),
+    left: Math.max(0, -mobileControlState.move[0])};
+  const joystick = Object.values(model.input_contract.widgets)
+    .find(widget => widget.kind === "on-screen-joystick");
+  const mobile = {};
+  Object.entries(joystick?.drives || {}).forEach(([way, action]) => { mobile[action] = direction[way]; });
   return terms.reduce((sum, [sign, action]) =>
     sum + sign * Math.max(viewportInputValue(action, gamepad), mobile[action] || 0), 0);
 }
@@ -10548,6 +10570,36 @@ function renderDeviceMonitor(monitor) {
   return strip;
 }
 
+// Every contract active on this page: the files that declare it, as written,
+// and the settings the page resolved from them, so a developer reads the
+// project's settings where its widgets are.
+function renderPageContracts(contracts) {
+  const section = div("page-contracts");
+  section.dataset.nodeId = `${model.identity || "page"}/contracts`;
+  section.append(div("page-contracts-title", `Contracts · ${contracts.length} active`));
+  contracts.forEach(contract => {
+    const item = document.createElement("details");
+    item.className = "page-contract";
+    item.dataset.contractKind = contract.kind;
+    const summary = document.createElement("summary");
+    summary.textContent = `${contract.kind} · ${contract.identity} · ` +
+      contract.files.map(file => file.path).join(" + ");
+    item.append(summary);
+    contract.files.forEach(file => {
+      const text = document.createElement("pre");
+      text.className = "page-contract-text";
+      text.textContent = file.text;
+      item.append(div("page-contract-file", file.path), text);
+    });
+    const resolved = document.createElement("pre");
+    resolved.className = "page-contract-text";
+    resolved.textContent = JSON.stringify(contract.resolved, null, 2);
+    item.append(div("page-contract-file", "resolved settings"), resolved);
+    section.append(item);
+  });
+  return section;
+}
+
 function renderDynamicsSpace(space) {
   index.set(space.identity, space);
   const root = div("dynamics-space");
@@ -11130,9 +11182,13 @@ function renderShaderViewport() {
   placementOverlay.hidden = true;
   placementOverlay.append(div("placement-bbox-label"), div("placement-gizmo-x"),
     div("placement-gizmo-z"), div("placement-gizmo-origin"));
-  const mobileControls = renderMobileControls(),vehicleContactMonitor=renderVehicleContactMonitor();
+  // A widget the input contract does not declare is not rendered.
+  const declaredWidget = kind => Object.values(model.input_contract.widgets).some(widget => widget.kind === kind);
+  const vehicleContactMonitor=renderVehicleContactMonitor();
   port.append(head, musicButton, musicLoadButton, musicFileInput, canvas, focusTooltip,
-    placementOverlay, mobileControls, vehicleContactMonitor);
+    placementOverlay);
+  if (declaredWidget("on-screen-joystick")) port.append(renderMobileControls());
+  port.append(vehicleContactMonitor);
   if (model.navigation) {
     const navigationStatus = div("navigation-status", "loading navigation assembly…");
     navigationStatus.setAttribute("aria-live", "polite");
@@ -11146,6 +11202,7 @@ function renderShaderViewport() {
     }).catch(error => navigationStatus.textContent = `navigation unavailable · ${error.message}`);
   }
   if (viewer.device_monitor) port.append(renderDeviceMonitor(viewer.device_monitor));
+  if (declaredWidget("contract-list")) port.append(renderPageContracts(model.page_contracts));
   if (viewer.dynamics_space) port.append(renderDynamicsSpace(viewer.dynamics_space));
   if (model.hotbar) port.append(renderHotbar(model.hotbar));
   const placementPanel = renderPlacementPanel();
@@ -11405,6 +11462,7 @@ def project_world_to_div_map(
     title: str = "Mechanical Creature · living meta-object map",
     entity_mezzanine: EntityMezzanine | None = None,
     static_only: bool = False,
+    input_contract: str = DEFAULT_INPUT_CONTRACT,
 ) -> AbstractUI:
     """Compile a world into one portable HTML/CSS/JavaScript document."""
 
@@ -11413,7 +11471,8 @@ def project_world_to_div_map(
     active_mezzanine = None if static_only else entity_mezzanine or spawn_world_player(
         system_root=world.identity,
     )
-    model = world_div_map_model(world, entity_mezzanine=active_mezzanine, static_only=static_only)
+    model = world_div_map_model(world, entity_mezzanine=active_mezzanine, static_only=static_only,
+                                input_contract=input_contract)
     # Escaping '<' prevents model strings from terminating the data script.
     model_json = json.dumps(model, ensure_ascii=False, separators=(",", ":"))
     model_json = model_json.replace("<", "\\u003c")
@@ -11497,6 +11556,7 @@ def project_class_to_div_map(
     depth_up: int = 0,
     depth_down: int = 0,
     seed: str = "abstract-ui",
+    input_contract: str = DEFAULT_INPUT_CONTRACT,
 ) -> AbstractUI:
     """Convenience path from a Python/SSA class directly to a page."""
 
@@ -11506,6 +11566,7 @@ def project_class_to_div_map(
     subject_name = getattr(subject, "__name__", None) or str(subject.identity).split(".")[-1]
     return project_world_to_div_map(
         world, title=title or f"{subject_name} · living data map",
+        input_contract=input_contract,
     )
 
 

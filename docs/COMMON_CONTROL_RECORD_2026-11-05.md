@@ -343,3 +343,41 @@ its own parity check.
 
 Left for the car game: the boost composition into the law, with its parity
 check, and the worker-state slots staying worker-owned by design.
+
+## 9. Step 4 (2026-11-26): the input binding contract
+
+Owner direction: remove the page's control bindings into a generic,
+human-readable input binding contract with widget contracts for page controls
+and HUD parts, the first layer pulled off the creature game toward the basic
+first-person dev page; the page lists every active contract in its DOM.
+
+- `configs/input/first_person.yaml` is the base: viewport policy and rates,
+  focus routes, the ten held first-person actions, the commands `select-slot`
+  (Digit1..Digit9, Digit0) and `back` (Escape, resolving
+  exit-shader-only, close-dialogue, release-capture in that order), and the
+  widgets hotbar, on-screen joystick, device monitor and contract list. Its
+  header documents the format.
+- `configs/input/creature_game.yaml` extends it with the car: six vehicle
+  actions, the commands `tool-mode-cycle` (KeyM) and `vehicle-mount-toggle`
+  (KeyV), the walking rate 1.65, and the vehicle's three shell `controls`.
+- `src/compiler/abstract_ui_input_contract.py` resolves a file and its
+  `extends` chain and refuses what the page cannot honour (a command without a
+  page handler, a command on a non-keyboard input, a key shared with a command,
+  a control naming no held action, an unknown widget). Every other record is a
+  view of it: `DEFAULT_VIEWPORT_CONTROL_BINDINGS`, the page's
+  `ViewportControlPolicy` and `ControlFocusPolicy`, the device monitor, the
+  hotbar, and `VEHICLE_CONTROL_RECORD`'s three hookups.
+- The page: `viewportKeyboardInput` answers commands from
+  `model.input_contract.commands`, with no key literal left; the joystick's
+  directions come from its widget's `drives`; a widget the contract does not
+  declare is not rendered; the Contracts section beside the device monitor
+  shows each contract's files as written and its resolved settings.
+  `project_class_to_div_map(..., input_contract=)` names the file.
+- `living_map_walk_controls.js` carries the same two functions and exports the
+  resolved contract as `LIVING_MAP_INPUT_CONTRACT`.
+
+Behaviour notes: Escape now acts on key press only (it also released capture
+on key up before, a repeat of the key-press release). The binding table's
+order is base then layer, so the six vehicle actions follow
+`secondary-action`. Editing `abstract_ui_vehicles.py` changes the vehicle
+symbolic cache key, so the next page build rebuilds the vehicle equations once.

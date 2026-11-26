@@ -7,6 +7,7 @@ import math
 from typing import Any, Mapping
 
 from .abstract_ui_dynamics import DeviceMonitor, DynamicsSpace
+from .abstract_ui_input_contract import load_input_contract
 from .abstract_ui_primitives import UIBBox, UIPalette
 
 
@@ -138,23 +139,12 @@ class ViewportControlBinding:
         return {"action": self.action, "inputs": list(self.inputs)}
 
 
-DEFAULT_VIEWPORT_CONTROL_BINDINGS = (
-    ViewportControlBinding("move-forward", ("keyboard:KeyW", "gamepad:left-y-negative")),
-    ViewportControlBinding("move-backward", ("keyboard:KeyS", "gamepad:left-y-positive")),
-    ViewportControlBinding("strafe-left", ("keyboard:KeyA", "gamepad:left-x-negative")),
-    ViewportControlBinding("strafe-right", ("keyboard:KeyD", "gamepad:left-x-positive")),
-    ViewportControlBinding("run", ("keyboard:ShiftLeft", "keyboard:ShiftRight")),
-    ViewportControlBinding("jump", ("keyboard:Space",)),
-    ViewportControlBinding("respawn", ("keyboard:KeyR", "gamepad:button-3")),
-    ViewportControlBinding("front-differential-brake-toggle", ("keyboard:KeyZ", "gamepad:button-4")),
-    ViewportControlBinding("rear-differential-brake-toggle", ("keyboard:KeyX", "gamepad:button-4")),
-    ViewportControlBinding("vehicle-headlights-toggle", ("keyboard:KeyL",)),
-    ViewportControlBinding("vehicle-horn", ("keyboard:KeyH",)),
-    ViewportControlBinding("vehicle-ignition-toggle", ("keyboard:KeyK",)),
-    ViewportControlBinding("vehicle-starter", ("keyboard:KeyI",)),
-    ViewportControlBinding("look", ("pointer:relative-motion", "gamepad:right-stick")),
-    ViewportControlBinding("primary-action", ("pointer:button-0", "gamepad:button-0")),
-    ViewportControlBinding("secondary-action", ("pointer:button-2", "gamepad:button-1")),
+#: The held actions of the default input contract (configs/input/
+#: creature_game.yaml over first_person.yaml). The binding table is a view of
+#: that file; edit the file, not this module.
+DEFAULT_VIEWPORT_CONTROL_BINDINGS = tuple(
+    ViewportControlBinding(action, inputs)
+    for action, inputs in load_input_contract().held_bindings()
 )
 
 

@@ -78,6 +78,27 @@ export const LIVING_MAP_VIEWPORT_BINDINGS = freezeData([
     ]
   },
   {
+    "action": "look",
+    "inputs": [
+      "pointer:relative-motion",
+      "gamepad:right-stick"
+    ]
+  },
+  {
+    "action": "primary-action",
+    "inputs": [
+      "pointer:button-0",
+      "gamepad:button-0"
+    ]
+  },
+  {
+    "action": "secondary-action",
+    "inputs": [
+      "pointer:button-2",
+      "gamepad:button-1"
+    ]
+  },
+  {
     "action": "front-differential-brake-toggle",
     "inputs": [
       "keyboard:KeyZ",
@@ -114,27 +135,6 @@ export const LIVING_MAP_VIEWPORT_BINDINGS = freezeData([
     "inputs": [
       "keyboard:KeyI"
     ]
-  },
-  {
-    "action": "look",
-    "inputs": [
-      "pointer:relative-motion",
-      "gamepad:right-stick"
-    ]
-  },
-  {
-    "action": "primary-action",
-    "inputs": [
-      "pointer:button-0",
-      "gamepad:button-0"
-    ]
-  },
-  {
-    "action": "secondary-action",
-    "inputs": [
-      "pointer:button-2",
-      "gamepad:button-1"
-    ]
   }
 ]);
 
@@ -156,6 +156,12 @@ export const LIVING_MAP_VIEWPORT_POLICY_DEFAULTS = freezeData({
   "jump_speed": 3.6,
   "look_sensitivity": 0.0025
 });
+
+// The page's resolved input contract (configs/input/creature_game.yaml over
+// first_person.yaml, abstract_ui_input_contract.InputContract.to_data()).
+// viewportKeyboardInput reads its commands; vehicleControlValue its joystick.
+// The owner's model carries it as model.input_contract.
+export const LIVING_MAP_INPUT_CONTRACT = freezeData({"schema":"input-binding-contract-v0","identity":"creature-game","sources":["configs/input/first_person.yaml","configs/input/creature_game.yaml"],"policy":{"activation":"highlight","release":["escape","focus-loss"],"captures":["keyboard","pointer","gamepad"],"pointer_mode":"relative-when-available","gamepad_selection":"first-connected","rates":{"move_speed":1.65,"run_multiplier":2.0,"jump_speed":3.6,"look_sensitivity":0.0025}},"focus":{"initial":"game","routes":["game","projected-pointer","dialogue"],"switch_action":"secondary-action","dialogue":{"priority":100,"return_rule":"resume-previous"}},"actions":[{"action":"move-forward","inputs":["keyboard:KeyW","gamepad:left-y-negative"],"edge":"held"},{"action":"move-backward","inputs":["keyboard:KeyS","gamepad:left-y-positive"],"edge":"held"},{"action":"strafe-left","inputs":["keyboard:KeyA","gamepad:left-x-negative"],"edge":"held"},{"action":"strafe-right","inputs":["keyboard:KeyD","gamepad:left-x-positive"],"edge":"held"},{"action":"run","inputs":["keyboard:ShiftLeft","keyboard:ShiftRight"],"edge":"held"},{"action":"jump","inputs":["keyboard:Space"],"edge":"held"},{"action":"respawn","inputs":["keyboard:KeyR","gamepad:button-3"],"edge":"held"},{"action":"look","inputs":["pointer:relative-motion","gamepad:right-stick"],"edge":"held"},{"action":"primary-action","inputs":["pointer:button-0","gamepad:button-0"],"edge":"held"},{"action":"secondary-action","inputs":["pointer:button-2","gamepad:button-1"],"edge":"held"},{"action":"select-slot","inputs":["keyboard:Digit1","keyboard:Digit2","keyboard:Digit3","keyboard:Digit4","keyboard:Digit5","keyboard:Digit6","keyboard:Digit7","keyboard:Digit8","keyboard:Digit9","keyboard:Digit0"],"edge":"press","argument":"slot","routes":["game","projected-pointer"]},{"action":"back","inputs":["keyboard:Escape"],"edge":"press","resolves":["exit-shader-only","close-dialogue","release-capture"]},{"action":"front-differential-brake-toggle","inputs":["keyboard:KeyZ","gamepad:button-4"],"edge":"held"},{"action":"rear-differential-brake-toggle","inputs":["keyboard:KeyX","gamepad:button-4"],"edge":"held"},{"action":"vehicle-headlights-toggle","inputs":["keyboard:KeyL"],"edge":"held"},{"action":"vehicle-horn","inputs":["keyboard:KeyH"],"edge":"held"},{"action":"vehicle-ignition-toggle","inputs":["keyboard:KeyK"],"edge":"held"},{"action":"vehicle-starter","inputs":["keyboard:KeyI"],"edge":"held"},{"action":"tool-mode-cycle","inputs":["keyboard:KeyM"],"edge":"press","routes":["game","projected-pointer"]},{"action":"vehicle-mount-toggle","inputs":["keyboard:KeyV"],"edge":"press","routes":["game","projected-pointer"]}],"commands":[{"action":"select-slot","keys":{"Digit1":1,"Digit2":2,"Digit3":3,"Digit4":4,"Digit5":5,"Digit6":6,"Digit7":7,"Digit8":8,"Digit9":9,"Digit0":10},"routes":["game","projected-pointer"],"resolves":[]},{"action":"back","keys":{"Escape":null},"routes":[],"resolves":["exit-shader-only","close-dialogue","release-capture"]},{"action":"tool-mode-cycle","keys":{"KeyM":null},"routes":["game","projected-pointer"],"resolves":[]},{"action":"vehicle-mount-toggle","keys":{"KeyV":null},"routes":["game","projected-pointer"],"resolves":[]}],"controls":{"throttle":"+move-forward -move-backward","steering":"+strafe-right -strafe-left","brake":"jump"},"widgets":{"hotbar":{"kind":"hotbar","slots":10,"select_action":"select-slot"},"joystick":{"kind":"on-screen-joystick","drives":{"up":"move-forward","down":"move-backward","left":"strafe-left","right":"strafe-right"}},"lamps":{"kind":"device-monitor"},"contracts":{"kind":"contract-list"}}});
 
 export const LIVING_MAP_WALK_REQUIRED_STATE = Object.freeze([
   "model", "viewportControls", "shaderViewer", "entityState", "physicsRuntime",
@@ -325,47 +331,52 @@ function requestViewportControls() {
 }
 
 function viewportKeyboardInput(event) {
-  if (event.type === "keydown" && event.code === "Escape" && shaderViewer.shaderOnly) {
-    event.preventDefault();
-    setShaderOnlyMode(false);
+  // Every key this page answers is declared in its input contract
+  // (model.input_contract, resolved from configs/input/*.yaml by
+  // abstract_ui_input_contract). A command (edge "press") runs once per key
+  // press through the handler of its name, in the focus routes it names;
+  // "back" tries its declared steps in order and the first that applies runs.
+  // A held action fills viewportControls.keys through the policy bindings,
+  // which are the contract's held actions.
+  const command = model.input_contract.commands.find(item => event.code in item.keys);
+  const capturing = Boolean(viewportControls.policy?.captures.includes("keyboard"));
+  if (command?.action === "back") {
+    if (event.type !== "keydown") return;
+    const steps = {
+      "exit-shader-only": () => shaderViewer.shaderOnly && (setShaderOnlyMode(false), true),
+      "close-dialogue": () => capturing && controlFocus.dialogue && (closeToolDialogue(), true),
+      "release-capture": () => capturing && viewportControls.highlighted && (closeSceneContextMenu(),
+        setViewportControlHighlight(false), shaderViewer.element?.blur(), true),
+    };
+    if (command.resolves.some(step => steps[step]())) event.preventDefault();
     return;
   }
-  if (!viewportControls.policy?.captures.includes("keyboard")) return;
-  if (controlFocus.dialogue && event.type === "keydown" && event.code === "Escape") {
-    event.preventDefault(); closeToolDialogue(); return;
-  }
-  const hotbarSlot = /^Digit([0-9])$/.exec(event.code);
-  if (hotbarSlot && viewportControls.highlighted && controlFocus.mode !== "dialogue") {
+  if (!capturing) return;
+  if (command) {
+    if (!viewportControls.highlighted || !command.routes.includes(controlFocus.mode)) return;
     event.preventDefault();
-    if (event.type === "keydown" && !event.repeat) {
-      selectHotbarSlot(hotbarSlot[1] === "0" ? 10 : Number(hotbarSlot[1]));
-    }
+    if (event.type !== "keydown" || event.repeat) return;
+    const argument = command.keys[event.code];
+    const handlers = {
+      "select-slot": () => selectHotbarSlot(argument),
+      "tool-mode-cycle": () => cycleActiveToolMode(),
+      "vehicle-mount-toggle": () => {
+        if (vehicleRuntime.active) clearActiveVehicle();
+        else if (vehicleRuntime.parkedState) {
+          setActiveVehicle(model.vehicle_slot.vehicles[0].identity, {placeAtActor: false});
+        }
+      },
+    };
+    handlers[command.action]();
     return;
-  }
-  if(event.code==="KeyM"&&viewportControls.highlighted&&controlFocus.mode!=="dialogue"){
-    event.preventDefault();if(event.type==="keydown"&&!event.repeat)cycleActiveToolMode();return;
-  }
-  if(event.code==="KeyV"&&viewportControls.highlighted&&controlFocus.mode!=="dialogue"){
-    event.preventDefault();if(event.type==="keydown"&&!event.repeat){
-      if(vehicleRuntime.active)clearActiveVehicle();
-      else if(vehicleRuntime.parkedState)setActiveVehicle(model.vehicle_slot.vehicles[0].identity,{placeAtActor:false});
-    }return;
   }
   const mapped = viewportControls.policy.bindings.some(binding =>
     binding.inputs.includes(`keyboard:${event.code}`));
-  if (!mapped && event.code !== "Escape") return;
-  if (mapped) {
-    if (event.type === "keydown") viewportControls.observedKeys.add(event.code);
-    else viewportControls.observedKeys.delete(event.code);
-  }
+  if (!mapped) return;
+  if (event.type === "keydown") viewportControls.observedKeys.add(event.code);
+  else viewportControls.observedKeys.delete(event.code);
   if (!viewportControls.highlighted) return;
   event.preventDefault();
-  if (event.code === "Escape") {
-    closeSceneContextMenu();
-    setViewportControlHighlight(false);
-    shaderViewer.element?.blur();
-    return;
-  }
   if (event.type === "keydown") viewportControls.keys.add(event.code);
   else viewportControls.keys.delete(event.code);
 }
@@ -383,10 +394,14 @@ function vehicleControlValue(control, gamepad) {
   const tokens = String(control).trim().split(/\s+/);
   const terms = tokens.length === 1 && !/^[+-]/.test(tokens[0])
     ? [[1, tokens[0]]] : tokens.map(token => [token[0] === "-" ? -1 : 1, token.slice(1)]);
-  const mobile = {"move-forward": Math.max(0, -mobileControlState.move[1]),
-    "move-backward": Math.max(0, mobileControlState.move[1]),
-    "strafe-right": Math.max(0, mobileControlState.move[0]),
-    "strafe-left": Math.max(0, -mobileControlState.move[0])};
+  const direction = {up: Math.max(0, -mobileControlState.move[1]),
+    down: Math.max(0, mobileControlState.move[1]),
+    right: Math.max(0, mobileControlState.move[0]),
+    left: Math.max(0, -mobileControlState.move[0])};
+  const joystick = Object.values(model.input_contract.widgets)
+    .find(widget => widget.kind === "on-screen-joystick");
+  const mobile = {};
+  Object.entries(joystick?.drives || {}).forEach(([way, action]) => { mobile[action] = direction[way]; });
   return terms.reduce((sum, [sign, action]) =>
     sum + sign * Math.max(viewportInputValue(action, gamepad), mobile[action] || 0), 0);
 }

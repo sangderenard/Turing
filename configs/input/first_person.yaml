@@ -1,0 +1,81 @@
+# Input binding contract: the first-person interface every dev page starts from.
+#
+# Read by src/compiler/abstract_ui_input_contract.py. A page names one contract
+# file; a file may extend another (`extends:` names a file in this folder) and
+# then adds or replaces actions, controls and widgets by name.
+#
+# actions   a semantic action and the device inputs that may express it.
+#           Inputs are `device:signal` (keyboard:<KeyboardEvent.code>,
+#           pointer:button-N | relative-motion, gamepad:...). A keyboard range
+#           `keyboard:Digit1..Digit9` expands to each code in between.
+#   held    (default) the action has a value while an input is down; the page
+#           samples it every frame (viewportInputValue).
+#   edge: press
+#           a command: it runs once per key press, through the page handler of
+#           the same name. Only names the page generator implements are allowed.
+#   argument  for a command whose inputs each carry a value: {name: ordinal}
+#           gives each expanded input its 1-based position.
+#   routes  the focus routes in which the command is answered.
+#   resolves  for `back`: steps tried in order; the first that applies runs.
+# policy    capture and rates of the viewport (ViewportControlPolicy).
+# focus     the control focus routes (ControlFocusPolicy).
+# controls  program inputs filled from actions, in control_terms grammar:
+#           one action, or an axis of signed actions "+a -b".
+# widgets   page controls and HUD parts the page renders; a widget that is not
+#           declared is not rendered.
+schema: input-binding-contract-v0
+identity: first-person
+
+policy:
+  activation: highlight
+  release: [escape, focus-loss]
+  captures: [keyboard, pointer, gamepad]
+  pointer_mode: relative-when-available
+  gamepad_selection: first-connected
+  rates:
+    move_speed: 3.2
+    run_multiplier: 2.0
+    jump_speed: 3.6
+    look_sensitivity: 0.0025
+
+focus:
+  initial: game
+  routes: [game, projected-pointer, dialogue]
+  switch_action: secondary-action
+  dialogue:
+    priority: 100
+    return_rule: resume-previous
+
+actions:
+  move-forward:  {inputs: ["keyboard:KeyW", "gamepad:left-y-negative"]}
+  move-backward: {inputs: ["keyboard:KeyS", "gamepad:left-y-positive"]}
+  strafe-left:   {inputs: ["keyboard:KeyA", "gamepad:left-x-negative"]}
+  strafe-right:  {inputs: ["keyboard:KeyD", "gamepad:left-x-positive"]}
+  run:           {inputs: ["keyboard:ShiftLeft", "keyboard:ShiftRight"]}
+  jump:          {inputs: ["keyboard:Space"]}
+  respawn:       {inputs: ["keyboard:KeyR", "gamepad:button-3"]}
+  look:             {inputs: ["pointer:relative-motion", "gamepad:right-stick"]}
+  primary-action:   {inputs: ["pointer:button-0", "gamepad:button-0"]}
+  secondary-action: {inputs: ["pointer:button-2", "gamepad:button-1"]}
+  select-slot:
+    inputs: ["keyboard:Digit1..Digit9", "keyboard:Digit0"]
+    edge: press
+    argument: {slot: ordinal}
+    routes: [game, projected-pointer]
+  back:
+    inputs: ["keyboard:Escape"]
+    edge: press
+    resolves: [exit-shader-only, close-dialogue, release-capture]
+
+widgets:
+  hotbar:
+    kind: hotbar
+    slots: 10
+    select_action: select-slot
+  joystick:
+    kind: on-screen-joystick
+    drives: {up: move-forward, down: move-backward, left: strafe-left, right: strafe-right}
+  lamps:
+    kind: device-monitor
+  contracts:
+    kind: contract-list
