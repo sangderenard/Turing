@@ -252,7 +252,8 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                 try:
                     if which == "clean":         # the worker performs the cleaning as the policy's cleanup account, and
                         acting = {"apply": bool(policy["apply"]), "actor": policy["cleaner"]}    # as no other
-                        done = gate.clean_worktrees(policy, db, **acting) + gate.clean(policy, db, **acting)
+                        done = (gate.carry_closures(policy, db, **acting) + gate.clean_worktrees(policy, db, **acting)
+                                + gate.clean(policy, db, **acting))
                     else:                # a one-off request may name the reviews to land (the landing queue's "land now")
                         only = request.get("reviews") if isinstance(request, dict) else None
                         only = [str(r) for r in only] if isinstance(only, list) and only else None

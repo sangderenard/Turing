@@ -518,6 +518,53 @@ def test_a_policy_written_for_a_newer_version_is_still_read(world):
     assert read["unknown"] == ["a_key_from_the_future"] and read["repositories"] and "a_key_from_the_future" not in read
 
 
+def test_branches_closed_out_of_a_bundle_are_removed_by_the_cleaner_as_their_closer_decided(world):
+    from meowdoku import review_bundles
+    work, db, policy = world["work"], world["db"], world["policy"]
+    trees = work.parent / "trees"
+    heads = {}
+    for name in ("dead", "gone", "kept"):
+        run(work, "worktree", "add", "-q", "-b", name, str(trees / name), "main")
+        heads[name] = commit(trees / name, f"{name}.txt")
+        run(work, "push", "-q", "origin", name)
+        branch_review.register(db, user_id=ANN, username="ann", repository="work", branch=name, known=["work"], now=10.0)
+    unpushed = commit(trees / "dead", "unpushed.txt")                 # a commit only this computer has
+    (trees / "dead" / "scratch.txt").write_text("uncommitted in dead", encoding="utf-8")
+    (trees / "gone" / "scratch.txt").write_text("uncommitted in gone", encoding="utf-8")
+    db.execute("CREATE TABLE checkouts (repository TEXT, branch TEXT, username TEXT, base TEXT, created_at REAL)")
+    db.execute("INSERT INTO checkouts VALUES ('work', 'dead', 'ann', 'main', 10.0)")
+    made = review_bundles.flag(db, user_id=ADMIN, username="admin", repository="work", branches=["dead", "gone", "kept"],
+                               reason="old work", known=["work"], now=20.0)["bundle"]
+    review_bundles.close(db, made["id"], "dead", user_id=ADMIN, username="admin", reason="abandoned on purpose",
+                         remove=True, work="archive", now=30.0)
+    review_bundles.close(db, made["id"], "gone", user_id=ADMIN, username="admin", reason="a dead end",
+                         remove=True, work="discard", now=30.0)
+    review_bundles.close(db, made["id"], "kept", user_id=ADMIN, username="admin", reason="needs a continuation report",
+                         now=30.0)
+    dry = {e["branch"]: e for e in branch_gate.carry_closures(policy, db, apply=False, log=lambda line: None)}
+    assert set(dry) == {"dead", "gone"} and dry["dead"]["action"] == "would remove"
+    assert (trees / "dead").exists()
+    with pytest.raises(branch_gate.GateError, match="only"):
+        branch_gate.carry_closures(policy, db, apply=True, actor="ann", log=lambda line: None)
+    done = {e["branch"]: e for e in branch_gate.carry_closures(policy, db, apply=True, actor=CLEANER, log=lambda line: None)}
+    assert done["dead"]["action"] == "removed" and done["gone"]["action"] == "removed"
+    assert not (trees / "dead").exists() and not (trees / "gone").exists() and (trees / "kept").exists()
+    assert remote_has(world, "dead") is None and remote_has(world, "gone") is None and remote_has(world, "kept")
+    assert not run(work, "branch", "--list", "dead") and not run(work, "branch", "--list", "gone")
+    archived = remote_has(world, "archive/dead")
+    assert archived and run(world["remote"], "merge-base", "--is-ancestor", unpushed, archived) == ""
+    assert "scratch.txt" in run(world["remote"], "show", "--stat", "--format=", archived)
+    assert remote_has(world, "archive/gone") is None
+    assert "discarded" in done["gone"]["reason"] and "central checkout closed" in done["dead"]["reason"]
+    assert db.execute("SELECT COUNT(*) FROM checkouts").fetchone()[0] == 0
+    notices = {n["branch"]: n for n in branch_review.removed(db)}
+    assert notices["dead"]["removed_by"] == CLEANER and "abandoned on purpose" in notices["dead"]["reason"]
+    assert notices["dead"]["head"] == archived
+    assert branch_review.owner(db, "work", "dead") is None and branch_review.owner(db, "work", "kept") is not None
+    assert review_bundles.removals_pending(db) == []
+    assert branch_gate.carry_closures(policy, db, apply=True, actor=CLEANER, log=lambda line: None) == []
+
+
 def test_a_dirty_worktree_waits_for_a_reviewers_verdict(world):
     import time
     work, db, policy = world["work"], world["db"], world["policy"]

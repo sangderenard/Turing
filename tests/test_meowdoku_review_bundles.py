@@ -120,6 +120,53 @@ def test_redelegating_a_review_opens_a_ticket_of_paths(db):
     assert branch_review.get(db, again["id"], now=700.0)["standing"] == "accepted"
 
 
+def test_a_branch_is_closed_out_of_its_bundle_with_a_reason(db):
+    first = submit(db, ALICE, "alice", "a", "a" * 40)
+    second = submit(db, BOB, "bob", "b", "b" * 40)
+    made = bundle(db)["bundle"]
+    with pytest.raises(branch_review.ReviewError, match="work is archive or discard"):
+        review_bundles.close(db, made["id"], "b", user_id=OPERATOR, username="operator", reason="gone", remove=True)
+    with pytest.raises(branch_review.ReviewError, match="only to a branch that is to be removed"):
+        review_bundles.close(db, made["id"], "b", user_id=OPERATOR, username="operator", reason="x", work="archive")
+    with pytest.raises(branch_review.ReviewError) as denied:
+        review_bundles.close(db, made["id"], "b", user_id=ALICE, username="alice", reason="not mine to close")
+    assert denied.value.status == 403
+    with pytest.raises(branch_review.ReviewError, match="is not a branch of bundle"):
+        review_bundles.close(db, made["id"], "other", user_id=OPERATOR, username="operator", reason="x")
+    told = review_bundles.close(db, made["id"], "b", user_id=OPERATOR, username="operator",
+                                reason="abandoned on purpose", remove=True, work="archive", now=200.0)
+    assert told["tell"] == ["alice", "bob"]
+    closed = {m["branch"]: m["closed"] for m in told["bundle"]["members"]}
+    assert closed["a"] is None and closed["b"]["reason"] == "abandoned on purpose" and closed["b"]["remove"]
+    assert "Closed out of this bundle" in told["bundle"]["notice"] and "abandoned on purpose" in told["bundle"]["notice"]
+    assert branch_review.get(db, second["id"], now=500.0)["standing"] == "withdrawn"
+    assert "abandoned on purpose" in branch_review.get(db, second["id"], now=500.0)["note"]
+    assert branch_review.get(db, first["id"], now=500.0)["standing"] == "consolidating"
+    with pytest.raises(branch_review.ReviewError, match="already closed"):
+        review_bundles.close(db, made["id"], "b", user_id=OPERATOR, username="operator", reason="again")
+    assert [(p["branch"], p["work"]) for p in review_bundles.removals_pending(db)] == [("b", "archive")]
+    # The meta review now has to contain only the branches still open.
+    meta = submit(db, ALICE, "alice", "a", "d" * 40, now=600.0)
+    done = review_bundles.consolidate(db, made["id"], meta["id"], user_id=ALICE, username="alice",
+                                      contains=lambda repository, branch, head: branch == "a", now=610.0)
+    assert done["bundle"]["status"] == "merged"
+    # A closed branch is no longer held by the bundle: it may be bundled again.
+    rows = {row["branch"]: row for row in review_bundles.checked_out(db)}
+    assert rows["b"]["bundle"] is None
+    review_bundles.mark_carried(db, made["id"], "b", "removed", now=700.0)
+    assert review_bundles.removals_pending(db) == []
+
+
+def test_the_owner_closes_their_own_branch_and_closing_every_branch_dissolves(db):
+    made = bundle(db)["bundle"]
+    review_bundles.close(db, made["id"], "a", user_id=ALICE, username="alice", reason="needs a continuation report")
+    assert review_bundles.get(db, made["id"])["status"] == "consolidating"
+    review_bundles.close(db, made["id"], "b", user_id=ADMIN, username="admin", reason="superseded")
+    settled = review_bundles.get(db, made["id"])
+    assert settled["status"] == "dissolved" and settled["settle_note"] == "every branch was closed"
+    assert review_bundles.removals_pending(db) == []
+
+
 def test_redelegating_a_bundle_settles_it(db):
     first = submit(db, ALICE, "alice", "a", "a" * 40)
     made = bundle(db)["bundle"]

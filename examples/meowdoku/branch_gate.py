@@ -8,6 +8,7 @@ whoever holds the Git credential (an operator, or a worker started by one), neve
     ... sync-loan <repository> <branch> --for <borrower> [--apply]
     ... land  [--apply]        fast-forward each accepted change onto its default branch, then remove or keep it
     ... clean [--apply]        remove branches that have been fully merged for the grace period
+    ... closures [--apply]     remove the branches closed out of a bundle for removal, as their closer decided
     ... check-push <repository>    the pre-push hook: refuse a push to a default branch that no review accepts
     ... install-hook / remove-hook
 
@@ -239,8 +240,8 @@ def remove_branch(path, branch, head, *, remote, delete_remote, local, skipped=N
     """Remove one branch at exactly ``head``; each side is left alone if it has moved.
 
     ``local`` is what is known of the local branch: "free" (at ``head``, checked out nowhere), "checked out", or
-    "absent" (no local branch at ``head``). ``skipped`` is a list that receives the reason when a rule of the remote
-    forbids the removal there.
+    "absent" (no local branch at ``head``), or None when the caller handles the local branch itself. ``skipped`` is a
+    list that receives the reason when a rule of the remote forbids the removal there.
     """
     done = []
     remote_head = git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{branch}", check=False)
@@ -255,7 +256,9 @@ def remove_branch(path, branch, head, *, remote, delete_remote, local, skipped=N
         else:
             git(path, "push", f"--force-with-lease=refs/heads/{branch}:{head}", remote, f":refs/heads/{branch}")
             done.append("removed on the remote")
-    if local == "checked out":
+    if local is None:
+        pass
+    elif local == "checked out":
         done.append("local branch kept: it is checked out")
     elif local == "absent":
         done.append("no local branch at that commit")
@@ -488,6 +491,109 @@ def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> li
     for entry in actions:
         if entry["action"] != "keep":
             log(f"[worktrees] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
+    return actions
+
+
+def carry_closures(policy, db, *, apply, actor=None, now=None, log=print) -> list:
+    """Remove the branches closed out of a bundle for removal (review_bundles.close with remove=True).
+
+    The closer has decided, with a reason, so no age or idle rule applies. In order, for each such branch:
+    archive (work=archive) commits any uncommitted work in its worktree and pushes the branch's final commit to
+    ``archive/<branch>`` on the remote, so the work outlives the branch; discard lets it go. Then its worktrees go,
+    its central checkout row and branch-server loan end, the remote branch is removed where the remote's rules allow
+    it (``remove_branch``; a forbidding rule keeps it and says so), and the local branch is removed. The notice of
+    removal names the bundle, the closer and the reason. A protected branch, one under a new review, one locked or
+    unreadable, or one the repository's own checkout is on is left, and the reason is said; it is tried again at the
+    next run. Looking, without ``apply``, says what would happen."""
+    try:
+        from meowdoku import branch_servers, review_bundles
+    except ImportError:                          # run as a plain script: the package is one folder up
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from meowdoku import branch_servers, review_bundles
+    signer = cleaner(policy, db, actor, apply)
+    now = time.time() if now is None else now
+    remote = policy["remote"]
+    actions = []
+    for closure in review_bundles.removals_pending(db):
+        name, branch = closure["repository"], closure["branch"]
+        why = f"closed out of bundle {closure['bundle_id'][:8]} by {closure['closed_by']}: {closure['reason']}"
+        entry = {"repository": name, "branch": branch, "head": None}
+        actions.append(entry)
+        declared = policy["repositories"].get(name)
+        if declared is None or not Path(declared["path"], ".git").exists():
+            entry.update(action="keep", reason=f"{why}; there is no checkout of {name} here")
+            continue
+        path = declared["path"]
+        if protected(policy, name, branch):
+            entry.update(action="keep", reason=f"{why}; it is protected by the policy, so it is not removed")
+            continue
+        if branch_review.in_review(db, name, branch):
+            entry.update(action="keep", reason=f"{why}; a review of it is in play again")
+            continue
+        if git(path, "symbolic-ref", "-q", "HEAD", check=False) == f"refs/heads/{branch}":
+            entry.update(action="keep", reason=f"{why}; the repository's own checkout is on it")
+            continue
+        git(path, "fetch", "--quiet", remote, check=False)
+        trees = [tree for tree in side_worktrees(path, remote) if tree["branch"] == branch]
+        stuck = [tree for tree in trees if tree["locked"] or tree["state"] == "unreadable"]
+        if stuck:
+            entry.update(action="keep", reason=f"{why}; its worktree {stuck[0]['path']} is "
+                                                f"{'locked' if stuck[0]['locked'] else 'unreadable to this account'}")
+            continue
+        local = git(path, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False)
+        remote_head = git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{branch}", check=False)
+        entry["head"] = local or remote_head or None
+        dirty = sum(tree["dirty"] for tree in trees)
+        if not apply:
+            entry.update(action="would remove", reason=f"{why}; {len(trees)} worktree(s), {dirty} uncommitted file(s), "
+                                                       f"work {closure['work']}")
+            continue
+        try:
+            done = []
+            head = local or remote_head
+            if closure["work"] == "archive":
+                for tree in trees:
+                    if tree["exists"] and tree["dirty"]:
+                        git(tree["path"], "add", "-A")
+                        git(tree["path"], "commit", "-q", "--no-verify", "-m",
+                            f"Archive of uncommitted work at closure by {closure['closed_by']}")
+                        head = git(tree["path"], "rev-parse", "HEAD")
+                        done.append(f"uncommitted work committed as {head[:12]}")
+                if head:
+                    git(path, "push", remote, f"{head}:refs/heads/archive/{branch}")
+                    done.append(f"final commit {head[:12]} archived as {remote}/archive/{branch}")
+            elif dirty:
+                done.append(f"{dirty} uncommitted file(s) discarded")
+            for tree in trees:
+                if tree["exists"]:
+                    git(path, "worktree", "remove", "--force", tree["path"])
+                    done.append(f"worktree {tree['path']} removed")
+            git(path, "worktree", "prune", check=False)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'checkouts'").fetchone():
+                if db.execute("DELETE FROM checkouts WHERE repository = ? AND branch = ?", (name, branch)).rowcount:
+                    done.append("central checkout closed")
+            port = branch_servers.release(db, name, branch)
+            if port is not None:
+                done.append(f"branch server loan on port {port} ended")
+            skips = []
+            if remote_head:
+                done.append(remove_branch(path, branch, remote_head, remote=remote,
+                                          delete_remote=bool(policy["delete_remote"]), local=None, skipped=skips))
+                if skips:
+                    entry["remote_skipped"] = skips[0]
+            local_now = git(path, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False)
+            if local_now:
+                git(path, "update-ref", "-d", f"refs/heads/{branch}", local_now)
+                git(path, "config", "--remove-section", f"branch.{branch}", check=False)
+                done.append("local branch removed")
+            detail = "; ".join(done) or "nothing of it was left here"
+            branch_review.record_removed(db, name, branch, head or "", f"{why}; {detail}", now, removed_by=signer)
+            review_bundles.mark_carried(db, closure["bundle_id"], branch, detail, now)
+            entry.update(action="removed", reason=f"{why}; {detail}")
+        except GateError as error:
+            entry.update(action="failed", reason=f"{why}; {error}")
+    for entry in actions:
+        log(f"[closures] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
     return actions
 
 
@@ -900,7 +1006,7 @@ def main(argv=None) -> int:
     parser.add_argument("--as", dest="actor", default=None, help="the account this run acts as (removals need the policy's cleaner)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
-    for name in ("land", "clean", "worktrees"):
+    for name in ("land", "clean", "worktrees", "closures"):
         sub.add_parser(name).add_argument("--apply", action="store_true")
     sync = sub.add_parser("sync-loan", help="merge the current default into an owner's open loan checkout")
     sync.add_argument("repository")
@@ -985,7 +1091,8 @@ def main(argv=None) -> int:
                 return 0
             apply = bool(args.apply or policy["apply"])
             extra = {} if args.command == "land" else {"actor": args.actor}
-            done = {"land": land, "clean": clean, "worktrees": clean_worktrees}[args.command](policy, db, apply=apply, **extra)
+            done = {"land": land, "clean": clean, "worktrees": clean_worktrees,
+                    "closures": carry_closures}[args.command](policy, db, apply=apply, **extra)
             print(json.dumps({"applied": apply, "count": len(done),
                               "remote_skipped": sum(1 for e in done if e.get("remote_skipped")),
                               "by_action": {a: sum(1 for e in done if e["action"] == a) for a in sorted({e["action"] for e in done})}}))

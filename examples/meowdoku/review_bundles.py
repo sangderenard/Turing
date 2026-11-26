@@ -12,6 +12,16 @@ current tip of every bundled branch, so the branches have been merged across eac
 ``merged``; the other members' open reviews are withdrawn as consolidated into it; the meta review goes on through the
 ordinary review. An operator or admin may instead dissolve a bundle (``dissolve``): its reviews flow again as before.
 
+**Closing a branch, item by item.** Some bundled work was abandoned on purpose, or only needs a continuation report.
+An operator or admin (or the branch's own owner) closes one branch of a bundle with a reason (``close``): it leaves
+the consolidation, its reviews in play are withdrawn with that reason, and the meta review no longer has to contain it.
+With ``remove`` the branch is also to be removed, and ``work`` says what happens to its unlanded work: ``archive``
+commits any uncommitted work and pushes the branch's final commit to ``archive/<branch>`` on the remote first;
+``discard`` lets it go. Nothing is removed here: this records the decision, and the cleanup account carries it out at
+its next run (``branch_gate.carry_closures``: the worktree, the central checkout and its loan, the local branch and,
+where the remote's rules allow, the remote branch), writing the notice of removal with the closer and the reason.
+When every branch of a bundle is closed the bundle is dissolved.
+
 **Redelegation (the redelegation queue).** An operator or an admin turns a review, or a bundle, into one issue ticket
 that names the separate paths the work should take instead (``redelegate``). The source then stands ``redelegated``:
 the review (or every review of the bundle's branches made before the redelegation) never lands. The work comes back as
@@ -25,6 +35,8 @@ Rows (accounts database, beside ``branch_reviews``; the DDL is branch_review's):
     review_bundle_members   bundle_id, repository, branch, owner_name, flagged_at
     review_redelegations    id, source_kind (review | bundle), source_id, repository, created_at, created_by, note,
                             paths (JSON list of {title, detail}), ticket_id
+    review_bundle_closures  bundle_id, repository, branch, closed_at, closed_by, reason, remove, work (archive |
+                            discard), carried_at, carried      one row per branch closed out of a bundle
 """
 from __future__ import annotations
 
@@ -42,6 +54,8 @@ MAX_PATHS = 12
 MAX_TITLE = 200
 MAX_DETAIL = 2000
 BUNDLE_STATUSES = ("consolidating", "merged", "dissolved", "redelegated")
+CLOSE_WORK = ("archive", "discard")
+_CLOSURE_COLUMNS = ("closed_at", "closed_by", "reason", "remove", "work", "carried_at", "carried")
 _BUNDLE_COLUMNS = ("id", "repository", "created_at", "created_by", "reason", "status", "meta_review_id", "settled_at",
                    "settled_by", "settle_note")
 
@@ -77,7 +91,8 @@ def checked_out(db, now=None) -> list:
     consolidating = {
         (repository, branch): bundle_id for bundle_id, repository, branch in db.execute(
             "SELECT m.bundle_id, m.repository, m.branch FROM review_bundle_members m JOIN review_bundles b "
-            "ON b.id = m.bundle_id WHERE b.status = 'consolidating'")}
+            "ON b.id = m.bundle_id WHERE b.status = 'consolidating' AND NOT EXISTS (SELECT 1 FROM "
+            "review_bundle_closures c WHERE c.bundle_id = m.bundle_id AND c.branch = m.branch)")}
     in_play = {}
     for record in branch_review.listing(db, now, limit=1000):
         if record["standing"] not in ("landed", "withdrawn", "rejected"):
@@ -109,7 +124,13 @@ def get(db, bundle_id, now=None) -> dict:
         if latest is not None:
             record = branch_review.get(db, latest[0], now)
             review = {"id": record["id"], "head": record["head"], "standing": record["standing"]}
-        members.append({"branch": branch, "owner": owner_name, "flagged_at": flagged_at, "review": review})
+        closed = db.execute(f"SELECT {', '.join(_CLOSURE_COLUMNS)} FROM review_bundle_closures WHERE bundle_id = ? "
+                            "AND branch = ?", (bundle["id"], branch)).fetchone()
+        if closed is not None:
+            closed = dict(zip(_CLOSURE_COLUMNS, closed))
+            closed["remove"] = bool(closed["remove"])
+        members.append({"branch": branch, "owner": owner_name, "flagged_at": flagged_at, "review": review,
+                        "closed": closed})
     bundle["members"] = members
     bundle["owners"] = sorted({member["owner"] for member in members if member["owner"]})
     bundle["notice"] = notice(bundle)
@@ -132,12 +153,22 @@ def notice(bundle) -> str:
                    "dissolved": "dissolved", "redelegated": "redelegated into a ticket"}[bundle["status"]]
         return (f"Bundle {bundle['id'][:8]} ({bundle['repository']}: {', '.join(branches)}) is {settled}. "
                 "Nothing more is asked of its branches by this bundle.")
-    listed = "\n".join(f"  - {member['branch']} ({member['owner'] or 'unregistered'})" for member in bundle["members"])
+    open_members = [member for member in bundle["members"] if member["closed"] is None]
+    listed = "\n".join(f"  - {member['branch']} ({member['owner'] or 'unregistered'})" for member in open_members)
+    closed = [member for member in bundle["members"] if member["closed"] is not None]
+    closed_lines = [
+        f"  - {member['branch']} ({member['owner'] or 'unregistered'}): closed by {member['closed']['closed_by']}: "
+        f"{member['closed']['reason']}"
+        + (f"; to be removed, its work {'archived' if member['closed']['work'] == 'archive' else 'discarded'}"
+           + (f" ({member['closed']['carried']})" if member["closed"]["carried_at"] else " at the cleanup's next run")
+           if member["closed"]["remove"] else "; kept")
+        for member in closed]
     return "\n".join([
         f"NOTICE: your work was flagged for consolidation (bundle {bundle['id']}, by {bundle['created_by']}).",
         f"Reason: {bundle['reason']}",
         f"These branches of {bundle['repository']} are to be resolved together into a single merge:",
         listed,
+        *(["Closed out of this bundle (no longer part of the merge):", *closed_lines] if closed else []),
         "Until they are, every review of these branches stands 'consolidating': it is not accepted by silence and does "
         "not land.",
         "What to do:",
@@ -205,8 +236,8 @@ def consolidate(db, bundle_id, review_id, *, user_id, username, contains, now=No
         raise ReviewError("the meta review must be in the bundle's repository", 409)
     if meta["standing"] in ("landed", "withdrawn", "rejected", "redelegated"):
         raise ReviewError(f"review {meta['id'][:8]} is {meta['standing']}; only a review in play is a meta review", 409)
-    missing = [member["branch"] for member in bundle["members"]
-               if not contains(bundle["repository"], member["branch"], meta["head"])]
+    missing = [member["branch"] for member in bundle["members"] if member["closed"] is None
+               and not contains(bundle["repository"], member["branch"], meta["head"])]
     if missing:
         raise ReviewError(f"the meta review's commit {meta['head'][:12]} does not contain the current tip of: "
                           + ", ".join(missing), 409)
@@ -216,7 +247,7 @@ def consolidate(db, bundle_id, review_id, *, user_id, username, contains, now=No
                    "settle_note = ? WHERE id = ? AND status = 'consolidating'",
                    (meta["id"], now, str(username), f"resolved by {meta['branch']} at {meta['head'][:12]}", bundle["id"]))
         for member in bundle["members"]:
-            if member["branch"] == meta["branch"]:
+            if member["branch"] == meta["branch"] or member["closed"] is not None:
                 continue
             db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = ? WHERE repository = ? "
                        "AND branch = ? AND status IN ('open', 'approved') AND landed_at IS NULL",
@@ -241,6 +272,63 @@ def dissolve(db, bundle_id, *, user_id, username, reason, now=None) -> dict:
                "WHERE id = ? AND status = 'consolidating'", (now, str(username), reason, bundle["id"]))
     bundle = get(db, bundle["id"], now)
     return {"bundle": bundle, "tell": sorted(set(bundle["owners"]) - {str(username)})}
+
+
+def close(db, bundle_id, branch, *, user_id, username, reason, remove=False, work=None, now=None) -> dict:
+    """Close one branch of a bundle with a reason: it leaves the consolidation and its reviews in play are withdrawn.
+    With ``remove`` it is also to be removed by the cleanup account (``branch_gate.carry_closures``), its unlanded work
+    archived or discarded as ``work`` says. The caller is the branch's owner, or an operator or admin. Answers the
+    bundle and who is to be told (the bundle's owners, but the caller)."""
+    branch_review._account(user_id)
+    reason = _reason(reason)
+    if not isinstance(remove, bool):
+        raise ReviewError("remove must be true or false")
+    if remove and work not in CLOSE_WORK:
+        raise ReviewError("a branch to be removed says what happens to its unlanded work: work is archive or discard")
+    if not remove and work is not None:
+        raise ReviewError("work applies only to a branch that is to be removed")
+    now = time.time() if now is None else now
+    bundle = _consolidating(db, bundle_id, now)
+    member = next((item for item in bundle["members"] if item["branch"] == branch), None)
+    if member is None:
+        raise ReviewError(f"{branch} is not a branch of bundle {bundle['id'][:8]}", 404)
+    if member["closed"] is not None:
+        raise ReviewError(f"{branch} was already closed by {member['closed']['closed_by']}", 409)
+    if str(username) != member["owner"] and not branch_review.may_moderate(db, user_id):
+        raise ReviewError("the branch's owner, or an operator or admin, closes a bundled branch", 403)
+    still_open = [item for item in bundle["members"] if item["closed"] is None and item["branch"] != branch]
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("INSERT INTO review_bundle_closures (bundle_id, repository, branch, closed_at, closed_by, reason, "
+                   "remove, work) VALUES (?,?,?,?,?,?,?,?)",
+                   (bundle["id"], bundle["repository"], branch, now, str(username), reason, int(remove), work))
+        db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = ? WHERE repository = ? "
+                   "AND branch = ? AND status IN ('open', 'approved') AND landed_at IS NULL",
+                   (now, f"closed out of bundle {bundle['id']} by {username}: {reason}", bundle["repository"], branch))
+        if not still_open:
+            db.execute("UPDATE review_bundles SET status = 'dissolved', settled_at = ?, settled_by = ?, settle_note = ? "
+                       "WHERE id = ? AND status = 'consolidating'",
+                       (now, str(username), "every branch was closed", bundle["id"]))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    bundle = get(db, bundle["id"], now)
+    return {"bundle": bundle, "tell": sorted(set(bundle["owners"]) - {str(username)})}
+
+
+def removals_pending(db) -> list:
+    """The closed branches the cleanup account is still to remove, oldest first."""
+    branch_review.ensure(db)
+    return [dict(zip(("bundle_id", "repository", "branch", "closed_at", "closed_by", "reason", "work"), row))
+            for row in db.execute("SELECT bundle_id, repository, branch, closed_at, closed_by, reason, work FROM "
+                                  "review_bundle_closures WHERE remove = 1 AND carried_at IS NULL ORDER BY closed_at")]
+
+
+def mark_carried(db, bundle_id, branch, carried, now=None) -> None:
+    """The cleanup account's receipt for one closed branch: what it removed and kept."""
+    db.execute("UPDATE review_bundle_closures SET carried_at = ?, carried = ? WHERE bundle_id = ? AND branch = ? "
+               "AND carried_at IS NULL", (time.time() if now is None else now, str(carried)[:500], bundle_id, branch))
 
 
 def _paths(paths) -> list:

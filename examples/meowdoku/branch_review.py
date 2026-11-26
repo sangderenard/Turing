@@ -111,6 +111,13 @@ DDL = (
     "CREATE TABLE IF NOT EXISTS review_redelegations (id TEXT PRIMARY KEY, source_kind TEXT NOT NULL CHECK(source_kind "
     "IN ('review','bundle')), source_id TEXT NOT NULL, repository TEXT NOT NULL, created_at REAL NOT NULL, "
     "created_by TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', paths TEXT NOT NULL, ticket_id TEXT NOT NULL)",
+    # A bundled branch closed item by item, with its reason (review_bundles.close): it leaves the consolidation; with
+    # remove=1 the cleanup account removes it at its next run (branch_gate.carry_closures), keeping or discarding its
+    # unlanded work as ``work`` says, and records when (carried_at) and what it did (carried).
+    "CREATE TABLE IF NOT EXISTS review_bundle_closures (bundle_id TEXT NOT NULL, repository TEXT NOT NULL, "
+    "branch TEXT NOT NULL, closed_at REAL NOT NULL, closed_by TEXT NOT NULL, reason TEXT NOT NULL, "
+    "remove INTEGER NOT NULL CHECK(remove IN (0,1)), work TEXT CHECK(work IN ('archive','discard')), "
+    "carried_at REAL, carried TEXT, PRIMARY KEY(bundle_id, branch))",
 )
 READY = ("approved", "accepted", "landed")     # a companion in one of these lets its set land
 MAX_TOGETHER = 20
@@ -217,7 +224,8 @@ def _record(db, row) -> dict:
     # Flagged by hand only (review_bundles.py): a branch in a bundle still consolidating, and a review redelegated
     # itself or through its bundle (a review of that branch made before the redelegation).
     bundle = db.execute("SELECT b.id FROM review_bundles b JOIN review_bundle_members m ON m.bundle_id = b.id "
-                        "WHERE b.status = 'consolidating' AND m.repository = ? AND m.branch = ?",
+                        "WHERE b.status = 'consolidating' AND m.repository = ? AND m.branch = ? AND NOT EXISTS "
+                        "(SELECT 1 FROM review_bundle_closures c WHERE c.bundle_id = b.id AND c.branch = m.branch)",
                         (record["repository"], record["branch"])).fetchone()
     record["consolidating"] = None if bundle is None else bundle[0]
     redelegated = db.execute(
@@ -964,6 +972,9 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         POST /api/reviews/bundles         {repository, branches: [...], reason}   an operator or admin bundles branches
         POST /api/reviews/bundles/consolidate  {bundle, id}     the meta review (id) resolves its bundle
         POST /api/reviews/bundles/dissolve     {bundle, reason} an operator or admin releases a bundle
+        POST /api/reviews/bundles/close        {bundle, branch, reason, remove?, work?}   close one branch of a
+                                          bundle (its owner, an operator or admin); remove=true with work archive|discard
+                                          has the cleanup account remove it at its next run
         POST /api/reviews/redelegate      {kind: review|bundle, id, paths: [{title, detail}], note?}   into one ticket
     ``notify_bundle(usernames, text, bundle_id)`` tells a bundle's owners; ``open_ticket(title, description,
     diagnostics)`` opens the redelegation's issue ticket as the caller and answers its id.
@@ -1037,7 +1048,7 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         if not isinstance(body, dict):
             return self._json({"error": "a JSON object is required"}, 400)
         if path in ("/api/reviews/bundles", "/api/reviews/bundles/consolidate", "/api/reviews/bundles/dissolve",
-                    "/api/reviews/redelegate"):
+                    "/api/reviews/bundles/close", "/api/reviews/redelegate"):
             from meowdoku import review_bundles
             if path == "/api/reviews/bundles":
                 told = review_bundles.flag(db, **who, repository=body.get("repository"), branches=body.get("branches"),
@@ -1049,6 +1060,10 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
                 text = told["bundle"]["notice"]
             elif path == "/api/reviews/bundles/dissolve":
                 told = review_bundles.dissolve(db, body.get("bundle"), **who, reason=body.get("reason"))
+                text = told["bundle"]["notice"]
+            elif path == "/api/reviews/bundles/close":
+                told = review_bundles.close(db, body.get("bundle"), body.get("branch"), **who, reason=body.get("reason"),
+                                            remove=body.get("remove", False), work=body.get("work"))
                 text = told["bundle"]["notice"]
             else:
                 told = review_bundles.redelegate(db, kind=body.get("kind"), source_id=body.get("id"),

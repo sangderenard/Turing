@@ -473,6 +473,39 @@ function renderFlagForm(rows, repositories) {
   };
 }
 
+// Close one branch of a bundle, with its reason (review_bundles.close): its owner, an operator or an admin. Removing
+// it is carried out by the cleanup account at its next run; archive keeps the branch's final commit as archive/<branch>.
+function closeMemberBox(bundle, member) {
+  const box = el("details", null, "close-member");
+  box.append(el("summary", "Close"));
+  const key = `${bundle.id}-${member.branch}`.replace(/[^A-Za-z0-9_-]/g, "-");
+  const reason = document.createElement("input"); reason.id = `close-reason-${key}`; reason.size = 40;
+  reason.placeholder = "why: abandoned on purpose, superseded, needs a continuation report…";
+  const reasonLabel = el("label", "Reason"); reasonLabel.htmlFor = reason.id;
+  const what = document.createElement("select"); what.id = `close-what-${key}`;
+  for (const [value, text] of [["keep", "close, keep the branch"], ["archive", "close and remove, archive its work"],
+                               ["discard", "close and remove, discard its work"]]) {
+    const option = el("option", text); option.value = value; what.append(option);
+  }
+  const whatLabel = el("label", "Branch"); whatLabel.htmlFor = what.id;
+  const go = el("button", "Close this branch"); go.type = "button";
+  const feedback = el("small", null, "muted"); feedback.setAttribute("role", "status");
+  go.onclick = async () => {
+    if (!reason.value.trim()) { feedback.textContent = "Say why it is closed."; return; }
+    const remove = what.value !== "keep";
+    if (remove && !confirm(`Remove ${member.branch}? The cleanup account removes its worktree, checkout and branch at `
+      + `its next run${what.value === "archive" ? ", keeping its final commit as archive/" + member.branch : ""}.`)) return;
+    try {
+      await request("/api/reviews/bundles/close", { bundle: bundle.id, branch: member.branch, reason: reason.value,
+        remove, ...(remove ? { work: what.value } : {}) });
+      status(`${member.branch} closed.`);
+      await load();
+    } catch (error) { feedback.textContent = error.message; }
+  };
+  box.append(reasonLabel, reason, whatLabel, what, go, feedback);
+  return box;
+}
+
 function bundleItem(bundle, mayFlag) {
   const item = el("div", null, "bundle");
   const head = el("div");
@@ -483,6 +516,15 @@ function bundleItem(bundle, mayFlag) {
   for (const member of bundle.members) {
     const li = el("li", `${member.branch} — ${member.owner || "unregistered"}`);
     if (member.review) li.append(" · review ", el("code", member.review.id.slice(0, 8)), badge(member.review.standing));
+    if (member.closed) {
+      const closed = member.closed;
+      li.append(badge("closed"), el("small", ` by ${closed.closed_by} ${when(closed.closed_at)}: ${closed.reason}`
+        + (closed.remove ? ` · to be removed, work ${closed.work === "archive" ? "archived" : "discarded"}`
+          + (closed.carried_at ? ` · done ${when(closed.carried_at)}: ${closed.carried}` : " · at the cleanup's next run")
+          : " · branch kept"), "muted"));
+    } else if (bundle.status === "consolidating") {
+      li.append(closeMemberBox(bundle, member));
+    }
     members.append(li);
   }
   const copy = el("button", "Copy notice"); copy.type = "button";
@@ -496,7 +538,8 @@ function bundleItem(bundle, mayFlag) {
   if (bundle.status !== "consolidating") return item;
   const feedback = el("p", null, "muted"); feedback.setAttribute("role", "status");
   const meta = document.createElement("input"); meta.id = `meta-${bundle.id}`; meta.placeholder = "meta review id"; meta.size = 34;
-  const metaLabel = el("label", "Meta review (its commit must contain every branch above)"); metaLabel.htmlFor = meta.id;
+  const metaLabel = el("label", "Meta review (its commit must contain every branch above that is not closed)");
+  metaLabel.htmlFor = meta.id;
   const resolve = el("button", "Resolve with this meta review", "approve"); resolve.type = "button";
   resolve.onclick = async () => {
     try {
