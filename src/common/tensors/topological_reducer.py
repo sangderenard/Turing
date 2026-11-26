@@ -8048,6 +8048,7 @@ def _normalize_lexical_values(
         ownership_frontier.extend((child, child_owner) for child in ast.iter_child_nodes(member))
     ingestion_definitions: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     loop_target_bindings_by_ast: dict[int, int] = {}
+    comprehension_iterator_values: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
     first_class_function_nodes: dict[int, int] = {}
     # StaticReference node -> the definition cell its row derives from; every
@@ -12062,6 +12063,61 @@ def _normalize_lexical_values(
                             "materializer_node_id": node_id,
                         })
                         attributes["loop_iteration_outputs"] = tuple(outputs)
+                # Issue c2a20f27.  Program: ``selected = [row for row in rows
+                # if row.kind == 'keep']`` then ``for row in selected:
+                # result += row.value``.  A comprehension whose element is
+                # its own loop target emits the iterated elements unchanged,
+                # so its result carries the iterable's declared element class
+                # from the same annotation cell.  Any other element
+                # expression, or an iterable with no declared element class,
+                # publishes nothing here.
+                if (
+                    isinstance(expression, (ast.ListComp, ast.SetComp))
+                    and isinstance(expression.elt, ast.Name)
+                    and isinstance(value_id, int)
+                    and node_id in graph.G
+                ):
+                    for generator in reversed(expression.generators):
+                        if not (
+                            isinstance(generator.target, ast.Name)
+                            and generator.target.id == expression.elt.id
+                        ):
+                            continue
+                        iterated = comprehension_iterator_values.get(
+                            id(generator)
+                        )
+                        if (
+                            loop_target_bindings_by_ast.get(
+                                id(generator.target)
+                            ) == int(value_id)
+                            and iterated is not None
+                            and iterated in graph.G
+                        ):
+                            iterated_attributes = (
+                                graph.G.nodes[iterated].get("attributes")
+                                or {}
+                            )
+                            element_class = iterated_attributes.get(
+                                "sequence_element_class_ref"
+                            )
+                            element_cell = iterated_attributes.get(
+                                "sequence_element_annotation_cell"
+                            )
+                            if (
+                                element_class is not None
+                                and element_cell is not None
+                            ):
+                                graph.G.nodes[node_id].setdefault(
+                                    "attributes", {}
+                                ).update({
+                                    "sequence_element_class_ref": str(
+                                        element_class
+                                    ),
+                                    "sequence_element_annotation_cell": (
+                                        element_cell
+                                    ),
+                                })
+                        break
             for name in comprehension_target_names:
                 if name in shadowed_bindings:
                     environment[name] = shadowed_bindings[name]
@@ -12268,6 +12324,10 @@ def _normalize_lexical_values(
             return node_id if node_id in graph.G else None
         if isinstance(expression, ast.comprehension):
             iterator_value = resolve_expression(expression.iter)
+            if isinstance(iterator_value, int):
+                comprehension_iterator_values[id(expression)] = int(
+                    iterator_value
+                )
             bind_loop_target(expression.target)
             concord_iterated_target_class(
                 iterator_value, expression.target,
