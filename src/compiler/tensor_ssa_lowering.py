@@ -11264,6 +11264,10 @@ def lower_tensor_calls_to_repository_ssa(
                         ("tensor_identity", "get_tensor"),
                         (result, args[0]),
                     )
+                    # The copy is a static tensor of the literal's own shape;
+                    # its descriptor is what a consuming region's formal is
+                    # proven from (Fortran refused it as unresolved).
+                    register_tensor(result, storage="temporary")
                     rewritten.append(Instr(
                         "clone", [args[0]], result,
                         attributes={"lowered_from": "get_tensor"},
