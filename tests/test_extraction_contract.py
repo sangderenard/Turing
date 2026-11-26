@@ -571,6 +571,23 @@ def test_pre_entry_broker_result_consumed_by_arithmetic_is_an_entry_input():
     assert formal.accounting["shell_pre_entry_result"] == "n"
     (plan,) = module.metadata["shell_io"]["boundary_plans"]
     assert (plan["function"], plan["phase"]) == ("entry", "pre_entry")
+    # codex, review 2262238a, comment 656: the source `Add` must read the
+    # promoted formal (the consumer operand rewrite in
+    # _lower_shell_pre_entry_results_graph).  The planner moves the Add into a
+    # region the entry calls (job 3a872a2e), so the entry's call must feed
+    # exactly the formal's value id and the region's Add must take that id
+    # as its lhs.
+    (call,) = (
+        instruction for block in entry.blocks.values()
+        for instruction in block.instrs if instruction.op == "Call"
+    )
+    assert tuple(call.attributes["feed_ids"]) == (int(formal.id),)
+    region = module.functions[call.attributes["callee"]]
+    (add,) = (
+        instruction for block in region.blocks.values()
+        for instruction in block.instrs if instruction.op == "Add"
+    )
+    assert int(add.args[add.arg_roles.index("lhs")].id) == int(formal.id)
 
 
 def test_lowered_pre_entry_input_reaches_the_shell_and_is_refused_by_name():
