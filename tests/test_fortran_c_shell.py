@@ -132,7 +132,9 @@ def test_structured_while_operand_region_moves_from_flat_schedule_to_condition()
 
 
 def test_plan_call_uses_exact_comprehension_loop_owner_without_source_span():
-    import networkx as nx
+    import ast
+    import contextlib
+    import io
 
     from src.compiler.control_source import (
         ControlProgram,
@@ -141,38 +143,63 @@ def test_plan_call_uses_exact_comprehension_loop_owner_without_source_span():
         StatementBlock,
     )
     from src.compiler.hierarchical_plan import PlanCall, PlanClosure
+    from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
-    graph = SimpleNamespace(G=nx.DiGraph())
-    graph.G.add_node(9, source_span={
-        "line": 13, "column": 19, "end_line": 13, "end_column": 35,
-    })
+    # Since #1207 (cf57b8c1) conditional ownership is read from ingestion,
+    # not syntax: the placer's _branch_compartments refuses a graph that
+    # build_from_ast never ingested (issue c2a20f27, test 1).  Build the
+    # graph through ingestion so the call, its comprehension and the
+    # comprehension's loop control are real ingested nodes.
+    graph = ProcessGraph()
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse(
+            "def helper(x):\n"
+            "    return x + 1\n"
+            "\n"
+            "def root(n: int):\n"
+            "    return sum([helper(i) for i in range(n)])\n"
+        ))
+
+    def ingested(predicate):
+        (node_id,) = [
+            node_id for node_id, data in graph.G.nodes(data=True)
+            if predicate(data.get("expr_obj"))
+        ]
+        return int(node_id)
+
+    call_id = ingested(lambda expr: (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "helper"
+    ))
+    comprehension_id = ingested(lambda expr: isinstance(expr, ast.ListComp))
+    loop_id = ingested(lambda expr: isinstance(expr, ast.comprehension))
     # Persisted comprehension controls can lack an AST source span entirely.
-    graph.G.add_node(68, expr_obj=object())
-    graph.G.add_node(67, source_span={
-        "line": 13, "column": 8, "end_line": 13, "end_column": 35,
-    })
+    assert graph.G.nodes[loop_id].get("source_span") is None
+    assert graph.G.nodes[call_id].get("source_span") is not None
+
     loop = LoopBlock(
-        induction="iteration_68",
+        induction=f"iteration_{loop_id}",
         start="0",
         stop="4",
         step="1",
         body=SequenceBlock((
             StatementBlock(("__scheduled_region_0__",)),
         )),
-        source_loop_node_id=68,
+        source_loop_node_id=loop_id,
     )
     control = ControlProgram(loop, region_indices=(0,))
     plan = PlanClosure(
         "root",
         (),
         (PlanCall(
-            9,
+            call_id,
             PlanClosure("scalar", (), ()),
-            enclosing_loop_ids=(68,),
+            enclosing_loop_ids=(loop_id,),
         ),),
     )
     region = SimpleNamespace(G=SimpleNamespace(graph={
-        "deployment_nodes": (67,),
+        "deployment_nodes": (comprehension_id,),
     }))
 
     placed = _place_plan_callsites_lexically(
@@ -182,7 +209,7 @@ def test_plan_call_uses_exact_comprehension_loop_owner_without_source_span():
     assert isinstance(placed.root, LoopBlock)
     assert any(
         isinstance(block, StatementBlock)
-        and block.lines == ("__plan_callsite_9__",)
+        and block.lines == (f"__plan_callsite_{call_id}__",)
         for block in placed.root.body.blocks
     )
 
@@ -2754,8 +2781,14 @@ def test_qualified_iterator_of_authored_records_is_refused():
 
     # Issue c2a20f27 (b) control: the qualified lookup resolves
     # ``typing.Iterator`` too, but only ``Sequence`` publishes the row
-    # element class, so this loop stays unsettled and is refused.
-    with pytest.raises(ValueError, match="has no settled dtype"):
+    # element class, so the loop's accumulation stays unsettled and is
+    # refused.  The match pins that refusal to the Add in ``total``
+    # (measured: "region value 7 (Add in function 'total') has no settled
+    # dtype"), leaving the SSA value id free.
+    with pytest.raises(
+        ValueError,
+        match=r"\(Add in function 'total'\) has no settled dtype",
+    ):
         lower_ast_source_to_ssa(
             "from dataclasses import dataclass\n"
             "import typing\n"
