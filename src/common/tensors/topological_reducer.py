@@ -9362,6 +9362,31 @@ def _normalize_lexical_values(
                 parameter_sequence_element_classes[argument.arg] = str(
                     element_identity
                 )
+        # Issue c2a20f27.  Program: ``def total(rows: Sequence[Row])`` then
+        # ``for row in rows: result += row.value``.  ``typing.Sequence`` has
+        # origin ``collections.abc.Sequence``, which names no concrete
+        # aggregate, so no aggregate_kind is claimed (the record-sequence
+        # ABI owns the storage).  Its element annotation is still the exact
+        # authority for the class of each iterated value: publish it when it
+        # names one known class.  Optional, union or unknown elements, and
+        # any other protocol, publish nothing.
+        if (
+            aggregate_kind is None
+            and isinstance(aggregate_annotation, ast.Subscript)
+            and isinstance(aggregate_annotation.value, ast.Name)
+            and isinstance(aggregate_annotation.slice, ast.Name)
+            and aggregate_annotation.slice.id in known_class_identities
+        ):
+            from collections.abc import Sequence as abc_sequence
+            from typing import get_origin
+
+            protocol = (static_bindings or {}).get(
+                aggregate_annotation.value.id
+            )
+            if (get_origin(protocol) or protocol) is abc_sequence:
+                parameter_sequence_element_classes[argument.arg] = str(
+                    aggregate_annotation.slice.id
+                )
     if statement.args.vararg is not None:
         # ``def _header(*values: int)`` declares one tuple-valued formal;
         # the annotation describes each packed argument, not the tuple
@@ -10240,6 +10265,16 @@ def _normalize_lexical_values(
                     "mapping_value_class_ref": str(value_class),
                     "mapping_value_annotation_cell": annotation_cell,
                 })
+        elif parameter_sequence_element_classes.get(name) is not None:
+            # A protocol-annotated sequence (``Sequence[Row]``) declares its
+            # element class without an aggregate kind; the loop binding
+            # projects SOURCE_VALUE_CLASS from this cell.
+            attributes.update({
+                "sequence_element_class_ref": str(
+                    parameter_sequence_element_classes[name]
+                ),
+                "sequence_element_annotation_cell": annotation_cell,
+            })
         scalar_parameters = tuple(
             graph.G.graph.get("scalar_parameters") or ()
         )
