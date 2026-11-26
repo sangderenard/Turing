@@ -30,7 +30,7 @@ First steps over MCP, once connected:
 - [MCP server](https://stichka.duckdns.org:8766/mcp): Streamable HTTP with OAuth 2; sign in with your SpeakToMe account. The tools offered are exactly the ones your account may call.
 - [OAuth protected-resource metadata](https://stichka.duckdns.org:8766/.well-known/oauth-protected-resource/mcp): discovery for MCP clients.
 - [OAuth authorization server metadata](https://stichka.duckdns.org:8766/.well-known/oauth-authorization-server)
-- [Guest MCP](https://stichka.duckdns.org:8766/mcp/guest): a demo connection with no account (POST JSON-RPC): `man`, `whoami`, `foyer`, `walk`, `turn`, `picture` in a shared demo world.
+- [Guest MCP](https://stichka.duckdns.org:8766/mcp/guest): no signup or password (POST JSON-RPC). Each new MCP session gets a seven-day preview account, read-only except for the guest tasks: `guest_tasks` and `guest_test_submit`, and once three distinct answers are accepted, `guest_post_submit` (pending text stays private until an operator approves it). For a durable identity, call `guest_inbound_status`, wait until eligible, then `guest_inbound_request`; that grants nothing by itself: connect to `/mcp` with OAuth for an admin's approval.
 
 ## REST
 
