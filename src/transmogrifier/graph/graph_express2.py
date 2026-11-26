@@ -3071,6 +3071,12 @@ def _import_ast_bindings(tree, bindings, package=None):
             for imported in statement.names:
                 try:
                     value = importlib.import_module(imported.name)
+                    if imported.asname is None and "." in imported.name:
+                        # ``import a.b`` binds the top package ``a``
+                        # (issue fe9ac0db); ``import a.b as c`` binds ``b``.
+                        value = importlib.import_module(
+                            imported.name.split(".")[0]
+                        )
                 except Exception:
                     continue
                 resolved[imported.asname or imported.name.split(".")[0]] = value

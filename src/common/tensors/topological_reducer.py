@@ -25952,10 +25952,25 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         imported_name,
                     )
                 elif requirement["kind"] == "import":
-                    static_bindings[local_name] = importlib.import_module(
+                    imported_module = importlib.import_module(
                         qualified_name,
                         package=python_package,
                     )
+                    top_package = qualified_name.split(".")[0]
+                    if (
+                        "." in qualified_name
+                        and local_name == top_package
+                        and any(
+                            tuple(entry) == (imported_name, None)
+                            for entry in requirement.get("names") or ()
+                        )
+                    ):
+                        # ``import a.b`` without ``as`` binds the top
+                        # package ``a``; the attribute chain reaches ``b``.
+                        imported_module = importlib.import_module(
+                            top_package
+                        )
+                    static_bindings[local_name] = imported_module
             except (ImportError, AttributeError, TypeError, ValueError):
                 # The contextual requirement remains available to deployment even
                 # when it cannot be resolved in the compiler's current process.

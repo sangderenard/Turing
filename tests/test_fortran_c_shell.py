@@ -2774,6 +2774,82 @@ def test_qualified_sequence_of_authored_records_projects_fields_inside_loop():
     assert projected_fields == {"kind", "value"}
 
 
+def test_dotted_import_sequence_of_authored_records_projects_fields():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    # Issue fe9ac0db: ``import collections.abc`` binds ``collections`` (the
+    # top package), so ``collections.abc.Sequence[Row]`` resolves the same
+    # element contract as ``typing.Sequence[Row]``.
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "import collections.abc\n"
+        "@dataclass\n"
+        "class Row:\n"
+        "    kind: str\n"
+        "    value: int\n"
+        "def total(rows: collections.abc.Sequence[Row]) -> int:\n"
+        "    result = 0\n"
+        "    for row in rows:\n"
+        "        if row.kind == 'keep':\n"
+        "            result += row.value\n"
+        "    return result\n",
+        "total",
+        name="dotted_import_record_row_projection",
+        extraction_contract=CONTRACT,
+    )
+    function = module.functions["dotted_import_record_row_projection__total"]
+
+    assert _unexplained_root_argument_ids(function) == ()
+    projected_fields = {
+        field_name
+        for _value_id, field_name, _dtype
+        in function.metadata["record_sequence_projection_fields"]
+    }
+    assert projected_fields == {"kind", "value"}
+
+
+def test_aliased_dotted_import_sequence_of_authored_records_projects_fields():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    # Control for issue fe9ac0db: ``import collections.abc as collections``
+    # binds the submodule even though its local name equals the package
+    # name, so ``collections.Sequence[Row]`` must still resolve.
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "import collections.abc as collections\n"
+        "@dataclass\n"
+        "class Row:\n"
+        "    kind: str\n"
+        "    value: int\n"
+        "def total(rows: collections.Sequence[Row]) -> int:\n"
+        "    result = 0\n"
+        "    for row in rows:\n"
+        "        if row.kind == 'keep':\n"
+        "            result += row.value\n"
+        "    return result\n",
+        "total",
+        name="aliased_dotted_import_record_row_projection",
+        extraction_contract=CONTRACT,
+    )
+    function = module.functions[
+        "aliased_dotted_import_record_row_projection__total"
+    ]
+
+    assert _unexplained_root_argument_ids(function) == ()
+    projected_fields = {
+        field_name
+        for _value_id, field_name, _dtype
+        in function.metadata["record_sequence_projection_fields"]
+    }
+    assert projected_fields == {"kind", "value"}
+
+
 def test_qualified_iterator_of_authored_records_is_refused():
     import pytest
 
