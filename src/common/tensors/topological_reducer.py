@@ -9371,19 +9371,34 @@ def _normalize_lexical_values(
         # authority for the class of each iterated value: publish it when it
         # names one known class.  Optional, union or unknown elements, and
         # any other protocol, publish nothing.
+        # The protocol may be spelled qualified, ``typing.Sequence[Row]``:
+        # resolve the attribute chain from its root name in the static
+        # bindings, one getattr per segment.  An unbound root or a missing
+        # attribute resolves to nothing and publishes nothing.
+        def static_annotation_object(node: ast.AST) -> Any:
+            if isinstance(node, ast.Name):
+                return (static_bindings or {}).get(node.id)
+            if isinstance(node, ast.Attribute):
+                owner = static_annotation_object(node.value)
+                return (
+                    None if owner is None
+                    else getattr(owner, node.attr, None)
+                )
+            return None
+
         if (
             aggregate_kind is None
             and isinstance(aggregate_annotation, ast.Subscript)
-            and isinstance(aggregate_annotation.value, ast.Name)
+            and isinstance(
+                aggregate_annotation.value, (ast.Name, ast.Attribute)
+            )
             and isinstance(aggregate_annotation.slice, ast.Name)
             and aggregate_annotation.slice.id in known_class_identities
         ):
             from collections.abc import Sequence as abc_sequence
             from typing import get_origin
 
-            protocol = (static_bindings or {}).get(
-                aggregate_annotation.value.id
-            )
+            protocol = static_annotation_object(aggregate_annotation.value)
             if (get_origin(protocol) or protocol) is abc_sequence:
                 parameter_sequence_element_classes[argument.arg] = str(
                     aggregate_annotation.slice.id

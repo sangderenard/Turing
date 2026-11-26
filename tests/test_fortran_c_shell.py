@@ -2711,6 +2711,70 @@ def test_sequence_of_authored_records_projects_fields_inside_loop():
     assert projected_fields == {"kind", "value"}
 
 
+def test_qualified_sequence_of_authored_records_projects_fields_inside_loop():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    # Issue c2a20f27 (b): ``typing.Sequence[Row]`` carries the same element
+    # contract as ``from typing import Sequence``.
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "import typing\n"
+        "@dataclass\n"
+        "class Row:\n"
+        "    kind: str\n"
+        "    value: int\n"
+        "def total(rows: typing.Sequence[Row]) -> int:\n"
+        "    result = 0\n"
+        "    for row in rows:\n"
+        "        if row.kind == 'keep':\n"
+        "            result += row.value\n"
+        "    return result\n",
+        "total",
+        name="qualified_record_row_projection",
+        extraction_contract=CONTRACT,
+    )
+    function = module.functions["qualified_record_row_projection__total"]
+
+    assert _unexplained_root_argument_ids(function) == ()
+    projected_fields = {
+        field_name
+        for _value_id, field_name, _dtype
+        in function.metadata["record_sequence_projection_fields"]
+    }
+    assert projected_fields == {"kind", "value"}
+
+
+def test_qualified_iterator_of_authored_records_is_refused():
+    import pytest
+
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    # Issue c2a20f27 (b) control: the qualified lookup resolves
+    # ``typing.Iterator`` too, but only ``Sequence`` publishes the row
+    # element class, so this loop stays unsettled and is refused.
+    with pytest.raises(ValueError, match="has no settled dtype"):
+        lower_ast_source_to_ssa(
+            "from dataclasses import dataclass\n"
+            "import typing\n"
+            "@dataclass\n"
+            "class Row:\n"
+            "    kind: str\n"
+            "    value: int\n"
+            "def total(rows: typing.Iterator[Row]) -> int:\n"
+            "    result = 0\n"
+            "    for row in rows:\n"
+            "        if row.kind == 'keep':\n"
+            "            result += row.value\n"
+            "    return result\n",
+            "total",
+            name="qualified_record_iterator_refusal",
+            extraction_contract=CONTRACT,
+        )
+
+
 def test_filtered_authored_record_sequence_keeps_row_provenance():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.project_compilation_product import (
