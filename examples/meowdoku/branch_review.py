@@ -12,6 +12,8 @@ review names, for any reviewer (GET /api/reviews/diff), through ``branch_gate.gi
     decide(db, review_id, user_id=, username=, head=, decision="approved" | "rejected", note="")   an admin
     withdraw(db, review_id, user_id=)                                                   the author
     standing(row, now)        waiting | objected | accepted | approved | rejected | withdrawn | landed
+                              | held | revoked | consolidating | redelegated (the last two only when flagged by hand:
+                              review_bundles.py)
     landable(db, now)         the rows that may land now
     mark_landed(db, review_id, detail)
 
@@ -99,6 +101,16 @@ DDL = (
     "actor TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('hold','release')), reason TEXT NOT NULL)",
     # Reviews that land together: one row per member (together(), submit(together_with=)).
     "CREATE TABLE IF NOT EXISTS branch_review_sets (review_id TEXT PRIMARY KEY, set_id TEXT NOT NULL)",
+    # The consolidation and redelegation queues: only work an operator or admin flagged (review_bundles.py).
+    "CREATE TABLE IF NOT EXISTS review_bundles (id TEXT PRIMARY KEY, repository TEXT NOT NULL, created_at REAL NOT NULL, "
+    "created_by TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN "
+    "('consolidating','merged','dissolved','redelegated')), meta_review_id TEXT, settled_at REAL, settled_by TEXT, "
+    "settle_note TEXT)",
+    "CREATE TABLE IF NOT EXISTS review_bundle_members (bundle_id TEXT NOT NULL, repository TEXT NOT NULL, "
+    "branch TEXT NOT NULL, owner_name TEXT, flagged_at REAL NOT NULL, PRIMARY KEY(bundle_id, branch))",
+    "CREATE TABLE IF NOT EXISTS review_redelegations (id TEXT PRIMARY KEY, source_kind TEXT NOT NULL CHECK(source_kind "
+    "IN ('review','bundle')), source_id TEXT NOT NULL, repository TEXT NOT NULL, created_at REAL NOT NULL, "
+    "created_by TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', paths TEXT NOT NULL, ticket_id TEXT NOT NULL)",
 )
 READY = ("approved", "accepted", "landed")     # a companion in one of these lets its set land
 MAX_TOGETHER = 20
@@ -202,6 +214,18 @@ def _record(db, row) -> dict:
         (record["id"],))]
     record["remarks"] = [{"username": r[0], "verdict": r[1], "note": r[2], "at": r[3]} for r in db.execute(
         "SELECT username, verdict, note, at FROM branch_review_remarks WHERE review_id = ? ORDER BY at", (record["id"],))]
+    # Flagged by hand only (review_bundles.py): a branch in a bundle still consolidating, and a review redelegated
+    # itself or through its bundle (a review of that branch made before the redelegation).
+    bundle = db.execute("SELECT b.id FROM review_bundles b JOIN review_bundle_members m ON m.bundle_id = b.id "
+                        "WHERE b.status = 'consolidating' AND m.repository = ? AND m.branch = ?",
+                        (record["repository"], record["branch"])).fetchone()
+    record["consolidating"] = None if bundle is None else bundle[0]
+    redelegated = db.execute(
+        "SELECT r.id, r.ticket_id FROM review_redelegations r WHERE (r.source_kind = 'review' AND r.source_id = ?) "
+        "OR (r.source_kind = 'bundle' AND r.created_at >= ? AND EXISTS (SELECT 1 FROM review_bundle_members m "
+        "WHERE m.bundle_id = r.source_id AND m.repository = ? AND m.branch = ?)) ORDER BY r.created_at LIMIT 1",
+        (record["id"], record["created_at"], record["repository"], record["branch"])).fetchone()
+    record["redelegated"] = None if redelegated is None else {"id": redelegated[0], "ticket_id": redelegated[1]}
     return record
 
 
@@ -308,6 +332,12 @@ def standing(record: dict, now: float) -> str:
     """Where one change stands. The one rule everything else reads."""
     if record["landed_at"] is not None:
         return "landed"
+    if record["status"] in ("withdrawn", "rejected"):
+        return record["status"]
+    if record.get("redelegated") is not None:
+        return "redelegated"                     # turned into a ticket's separate paths: never accepted, never landed
+    if record.get("consolidating") is not None:
+        return "consolidating"                   # its branch is bundled: it waits for the bundle's one meta review
     if record["status"] != "open":
         return record["status"]
     if record.get("held_at") is not None:
@@ -425,6 +455,9 @@ def decide(db, review_id, *, user_id, username, head, decision, note="", now=Non
     if not is_admin(db, user_id):
         raise ReviewError("an admin decides a review", 403)
     now = time.time() if now is None else now
+    flagged = get(db, review_id, now)["standing"]
+    if flagged in ("consolidating", "redelegated"):
+        raise ReviewError(f"this change is {flagged}: its bundle or redelegation settles it first", 409)
     done = db.execute("UPDATE branch_reviews SET status = ?, reviewed_at = ?, reviewer_id = ?, reviewer_name = ?, note = ? "
                       "WHERE id = ? AND status = 'open' AND landed_at IS NULL AND held_at IS NULL AND head = ?",
                       (decision, now, user_id, username, note, str(review_id), head))
@@ -880,8 +913,24 @@ def advice(policy, repository, head=None) -> str:
     ])
 
 
+def _contains(policy):
+    """``contains(repository, branch, head)``: ``head`` contains the current tip of ``branch`` (Git, read-only)."""
+    import subprocess
+
+    def contains(repository, branch, head) -> bool:
+        from meowdoku import branch_gate
+        repo = policy["repositories"][repository]["path"]
+        tip = branch_gate.git(repo, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False)
+        if not tip:
+            tip = branch_gate.git(repo, "rev-parse", "-q", "--verify",
+                                  f"refs/remotes/{policy.get('remote', 'origin')}/{branch}", check=False)
+        return bool(tip) and subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", tip, head],
+                                            capture_output=True).returncode == 0
+    return contains
+
+
 def http_route(self, path, method, *, policy, accounts_db, land_request=None, landing_schedule_path=None,
-               notify=None):
+               notify=None, notify_bundle=None, open_ticket=None):
     """The reviews over REST. ``self`` is the host's request handler; ``policy`` the loaded branch policy.
 
         GET  /api/reviews                 the changes in play and the recent settled ones (dev_ui, signed in), and the
@@ -909,6 +958,15 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         POST /api/reviews/identity        {name, email}             declare it (each account its own)
         GET  /api/reviews/removed         the notices of removal: what left this computer, at which commit, by whom
         GET  /api/reviews/standing?repository=NAME&head=COMMIT      open: {"accepted", "lock", "advice"}
+
+    The consolidation and redelegation queues (review_bundles.py; only work flagged by hand is held by them):
+        GET  /api/reviews/bundles         the bundles, every branch checked out, the redelegations
+        POST /api/reviews/bundles         {repository, branches: [...], reason}   an operator or admin bundles branches
+        POST /api/reviews/bundles/consolidate  {bundle, id}     the meta review (id) resolves its bundle
+        POST /api/reviews/bundles/dissolve     {bundle, reason} an operator or admin releases a bundle
+        POST /api/reviews/redelegate      {kind: review|bundle, id, paths: [{title, detail}], note?}   into one ticket
+    ``notify_bundle(usernames, text, bundle_id)`` tells a bundle's owners; ``open_ticket(title, description,
+    diagnostics)`` opens the redelegation's issue ticket as the caller and answers its id.
 
     ``standing`` is what the required check on GitHub asks. It answers one yes or no about one commit and nothing
     else, so it needs no account. Everything else takes the caller from the authenticated session.
@@ -947,6 +1005,12 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             except comments.CommentError as error:
                 return self._json({"error": error.message}, error.status)
             return self._json({"threads": threads(db, tail), "tail": tail})
+        if method == "GET" and path == "/api/reviews/bundles":
+            from meowdoku import review_bundles
+            return self._json({"bundles": review_bundles.listing(db), "checked_out": review_bundles.checked_out(db),
+                               "redelegations": review_bundles.redelegations(db),
+                               "may_flag": may_moderate(db, principal.user_id),
+                               "repositories": sorted(known)})
         if method == "GET" and path == "/api/reviews/attention":
             return self._json({"attention": attention(db, username=principal.username)})
         if method == "GET" and path == "/api/reviews/diff":
@@ -967,11 +1031,39 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
             return self._json({"error": "JSON only"}, 415)
-        body = self._body_json(8192)
+        body = self._body_json(65536 if path == "/api/reviews/redelegate" else 8192)   # a ticket's paths
         if body is None:
             return
         if not isinstance(body, dict):
             return self._json({"error": "a JSON object is required"}, 400)
+        if path in ("/api/reviews/bundles", "/api/reviews/bundles/consolidate", "/api/reviews/bundles/dissolve",
+                    "/api/reviews/redelegate"):
+            from meowdoku import review_bundles
+            if path == "/api/reviews/bundles":
+                told = review_bundles.flag(db, **who, repository=body.get("repository"), branches=body.get("branches"),
+                                           reason=body.get("reason"), known=list(known))
+                text = told["bundle"]["notice"]
+            elif path == "/api/reviews/bundles/consolidate":
+                told = review_bundles.consolidate(db, body.get("bundle"), body.get("id"), **who,
+                                                  contains=_contains(policy))
+                text = told["bundle"]["notice"]
+            elif path == "/api/reviews/bundles/dissolve":
+                told = review_bundles.dissolve(db, body.get("bundle"), **who, reason=body.get("reason"))
+                text = told["bundle"]["notice"]
+            else:
+                told = review_bundles.redelegate(db, kind=body.get("kind"), source_id=body.get("id"),
+                                                 paths=body.get("paths"), note=body.get("note", ""), **who,
+                                                 open_ticket=open_ticket)
+                made = told["redelegation"]
+                text = (f"{principal.username} redelegated {made['source_kind']} {made['source_id'][:8]} into ticket "
+                        f"{made['ticket_id']}: " + "; ".join(path_["title"] for path_ in made["paths"])
+                        + ". It does not land; the work comes back as one branch and review per path.")
+            subject = told["bundle"]["id"] if "bundle" in told else told["redelegation"]["source_id"]
+            if notify_bundle is not None and told["tell"]:
+                notify_bundle(told["tell"], text, subject)
+            print(f"[reviews] {principal.username} {path.rsplit('/', 1)[1]} {subject[:12]} -> told "
+                  f"{len(told['tell'])}", flush=True)
+            return self._json(told)
         if path == "/api/reviews":
             repository = body.get("repository")
             hours = body.get("timeout_hours", policy["review_timeout_hours"])

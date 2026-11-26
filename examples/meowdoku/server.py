@@ -2586,8 +2586,28 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
             notify = None if sessions.system_notify is None else (
                 lambda names, text, review_id: sessions.system_notify(names, text, "review", review_id))
+            notify_bundle = None if sessions.system_notify is None else (
+                lambda names, text, subject: sessions.system_notify(names, text, "review_bundle", subject))
+
+            def open_ticket(title, description, diagnostics):
+                """A redelegation's issue ticket, opened by the caller's own account (issue_tickets.py)."""
+                import uuid
+                from http.cookies import SimpleCookie
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                token = (self.headers["Authorization"][7:] if self._oauth_internal else
+                         self.headers["Authorization"][8:] if self._mcp_preview_internal else
+                         jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
+                try:
+                    made = issue_tickets_mod.Service(sessions.accounts, sessions.oauth_mcp).create(token, {
+                        "title": title, "description": description, "diagnostics": diagnostics,
+                        "client_key": uuid.uuid4().hex})
+                except issue_tickets_mod.IssueError as error:
+                    raise branch_review.ReviewError(f"the ticket could not be opened: {error}",
+                                                    getattr(error, "status", 400)) from None
+                return made["id"]
             return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
                                             land_request=sessions.land_request, notify=notify,
+                                            notify_bundle=notify_bundle, open_ticket=open_ticket,
                                             landing_schedule_path=sessions.state.jobs_dir / "cron" / "cron.table")
 
         def _orientation_route(self, path: str, method: str) -> None:

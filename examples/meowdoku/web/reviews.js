@@ -3,7 +3,7 @@
 // HAND-AUTHORED. createElement/textContent only. The server enforces every capability; this only decides what to show.
 const byId = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
-const OPEN = new Set(["waiting", "objected", "accepted", "revoked", "held"]);
+const OPEN = new Set(["waiting", "objected", "accepted", "revoked", "held", "consolidating"]);
 const DIFF_LINES = 6000;
 let who = null, caps = new Set(), reviews = [], selected = null, detailGeneration = 0;
 let landing = { queue: [], updater: false, apply: true, schedule: null, clockOffset: 0 };
@@ -156,6 +156,7 @@ async function load({quiet = false} = {}) {
     byId("approve-all").hidden = who.role !== "admin" || !approvable.length;
     byId("approve-all").textContent = `Approve all ${approvable.length} waiting`;
     render();
+    loadBundles();
     loadThreads();
     loadRoom();
     if (selected && reviews.some(r => r.id === selected) && (!quiet || priorStanding !== reviews.find(r => r.id === selected).standing)) show(selected);
@@ -394,6 +395,158 @@ function controls(review, detail) {
   }
   box.append(noteLabel, note, buttons, feedback);
   detail.append(box);
+  if (moderator() && review.standing !== "redelegated")
+    detail.append(redelegateBox("review", review.id, `${review.repository} ${review.branch}`));
+}
+
+// The consolidation and redelegation queues (review_bundles.py): only flagged work is held there.
+let bundleState = { bundles: [], checked_out: [], redelegations: [], may_flag: false, repositories: [] };
+const picked = new Set();          // "repository branch" keys ticked for a new bundle, kept across refreshes
+
+// "title: detail", one separate path per line.
+function pathsFrom(text) {
+  return text.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+    const at = line.indexOf(":");
+    return at > 0 ? { title: line.slice(0, at).trim(), detail: line.slice(at + 1).trim() } : { title: line, detail: "" };
+  });
+}
+
+function redelegateBox(kind, id, label) {
+  const box = el("div", null, "decide");
+  const area = document.createElement("textarea"); area.rows = 4; area.maxLength = 30000;
+  area.id = `redelegate-${kind}-${id}`;
+  const areaLabel = el("label", "Separate paths, one per line (title: detail)"); areaLabel.htmlFor = area.id;
+  const why = document.createElement("textarea"); why.rows = 2; why.maxLength = 2000; why.id = `${area.id}-why`;
+  const whyLabel = el("label", "Why (optional)"); whyLabel.htmlFor = why.id;
+  const feedback = el("p", null, "muted"); feedback.setAttribute("role", "status");
+  const go = el("button", `Redelegate ${label} into a ticket`); go.type = "button";
+  go.onclick = async () => {
+    const paths = pathsFrom(area.value);
+    if (paths.length < 2) { feedback.textContent = "Name at least two separate paths."; return; }
+    if (!confirm(`Redelegate ${label}? It will not land; one issue ticket names its ${paths.length} paths.`)) return;
+    try {
+      const { redelegation } = await request("/api/reviews/redelegate", { kind, id, paths, note: why.value });
+      status(`Redelegated into ticket ${redelegation.ticket_id}.`);
+      await load();
+    } catch (error) { feedback.textContent = error.message; }
+  };
+  const actions = el("div", null, "actions");
+  actions.append(go);
+  box.append(el("h3", "Redelegate"), areaLabel, area, whyLabel, why, actions, feedback);
+  return box;
+}
+
+function renderFlagForm(rows, repositories) {
+  const select = byId("bundle-repo"), chosen = select.value || rows[0]?.repository || repositories[0] || "";
+  select.replaceChildren(...repositories.map(name => { const option = el("option", name); option.value = name; return option; }));
+  select.value = chosen;
+  select.onchange = renderBundles;
+  const picks = byId("bundle-picks");
+  picks.replaceChildren();
+  for (const row of rows.filter(r => r.repository === select.value)) {
+    const key = `${row.repository} ${row.branch}`;
+    const label = el("label"), box = document.createElement("input");
+    box.type = "checkbox"; box.checked = picked.has(key); box.disabled = Boolean(row.bundle);
+    box.onchange = () => { if (box.checked) picked.add(key); else picked.delete(key); };
+    const text = `${row.branch} — ${row.owner || "unregistered"}` + (row.checked_out ? "" : " (registered, not checked out)")
+      + (row.review ? ` · review ${row.review.id.slice(0, 8)} ${row.review.standing}` : "")
+      + (row.bundle ? ` · in bundle ${row.bundle.slice(0, 8)}` : "");
+    label.append(box, el("span", text));
+    picks.append(label);
+  }
+  if (!picks.children.length) picks.append(el("p", "No branch of this repository is checked out.", "muted"));
+  byId("bundle-make").onclick = async () => {
+    const prefix = select.value + " ";
+    const branches = [...picked].filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length));
+    const feedback = byId("bundle-feedback");
+    if (branches.length < 2) { feedback.textContent = "Tick at least two branches."; return; }
+    if (!byId("bundle-reason").value.trim()) { feedback.textContent = "Say why they are to be merged together."; return; }
+    try {
+      const { bundle, tell } = await request("/api/reviews/bundles",
+        { repository: select.value, branches, reason: byId("bundle-reason").value });
+      branches.forEach(branch => picked.delete(prefix + branch));
+      byId("bundle-reason").value = "";
+      feedback.textContent = `Bundle ${bundle.id.slice(0, 8)} made; told ${tell.join(", ") || "nobody else"}. `
+        + "Copy its notice below into each conversation working on these branches.";
+      await load();
+    } catch (error) { feedback.textContent = error.message; }
+  };
+}
+
+function bundleItem(bundle, mayFlag) {
+  const item = el("div", null, "bundle");
+  const head = el("div");
+  head.append(el("strong", `${bundle.repository} · bundle ${bundle.id.slice(0, 8)}`), badge(bundle.status));
+  item.append(head, el("small", `by ${bundle.created_by} ${when(bundle.created_at)} · ${bundle.reason}`
+    + (bundle.settle_note ? ` · ${bundle.settle_note}` : ""), "muted"));
+  const members = el("ul", null, "commits");
+  for (const member of bundle.members) {
+    const li = el("li", `${member.branch} — ${member.owner || "unregistered"}`);
+    if (member.review) li.append(" · review ", el("code", member.review.id.slice(0, 8)), badge(member.review.standing));
+    members.append(li);
+  }
+  const copy = el("button", "Copy notice"); copy.type = "button";
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(bundle.notice); status("Notice copied."); }
+    catch (error) { status("Select the notice and copy it."); }
+  };
+  const copyRow = el("div", null, "actions");
+  copyRow.append(copy);
+  item.append(members, el("div", bundle.notice, "notice-text"), copyRow);
+  if (bundle.status !== "consolidating") return item;
+  const feedback = el("p", null, "muted"); feedback.setAttribute("role", "status");
+  const meta = document.createElement("input"); meta.id = `meta-${bundle.id}`; meta.placeholder = "meta review id"; meta.size = 34;
+  const metaLabel = el("label", "Meta review (its commit must contain every branch above)"); metaLabel.htmlFor = meta.id;
+  const resolve = el("button", "Resolve with this meta review", "approve"); resolve.type = "button";
+  resolve.onclick = async () => {
+    try {
+      await request("/api/reviews/bundles/consolidate", { bundle: bundle.id, id: meta.value.trim() });
+      status(`Bundle ${bundle.id.slice(0, 8)} resolved.`);
+      await load();
+    } catch (error) { feedback.textContent = error.message; }
+  };
+  const actions = el("div", null, "actions");
+  actions.append(resolve);
+  if (mayFlag) {
+    const dissolve = el("button", "Dissolve"); dissolve.type = "button";
+    dissolve.onclick = async () => {
+      const reason = prompt("Why is this bundle dissolved?");
+      if (!reason) return;
+      try { await request("/api/reviews/bundles/dissolve", { bundle: bundle.id, reason }); await load(); }
+      catch (error) { feedback.textContent = error.message; }
+    };
+    actions.append(dissolve);
+  }
+  item.append(metaLabel, meta, actions, feedback);
+  if (mayFlag) item.append(redelegateBox("bundle", bundle.id, `bundle ${bundle.id.slice(0, 8)}`));
+  return item;
+}
+
+function renderBundles() {
+  const { bundles, checked_out: rows, redelegations, may_flag: mayFlag, repositories } = bundleState;
+  byId("bundle-flag").hidden = !mayFlag;
+  if (mayFlag) renderFlagForm(rows, repositories);
+  const list = byId("bundle-list");
+  list.replaceChildren(...bundles.map(bundle => bundleItem(bundle, mayFlag)));
+  if (!bundles.length) list.append(el("p", "No bundle. Nothing is waiting for consolidation.", "muted"));
+  const done = byId("redelegation-list");
+  done.replaceChildren();
+  for (const made of redelegations) {
+    const item = el("div", null, "bundle");
+    item.append(el("strong", `${made.repository} · ${made.source_kind} ${made.source_id.slice(0, 8)} → ticket ${made.ticket_id.slice(0, 8)}`),
+      el("small", ` by ${made.created_by} ${when(made.created_at)}` + (made.note ? ` · ${made.note}` : ""), "muted"));
+    const paths = el("ol");
+    for (const path of made.paths) paths.append(el("li", path.detail ? `${path.title} — ${path.detail}` : path.title));
+    const link = el("a", "Open the issue tickets"); link.href = "/issues.html";
+    item.append(paths, link);
+    done.append(item);
+  }
+  if (!redelegations.length) done.append(el("p", "No redelegation yet.", "muted"));
+}
+
+async function loadBundles() {
+  try { bundleState = await request("/api/reviews/bundles"); renderBundles(); }
+  catch (error) { byId("bundle-list").replaceChildren(el("p", `Could not read the bundles: ${error.message}`, "muted")); }
 }
 
 async function show(id) {
