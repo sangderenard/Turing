@@ -5499,6 +5499,26 @@ def emit_ssa_module_to_c(
                     instruction.attributes.get("tensor_operation")
                     or instruction.op
                 )
+                if op == "ExceptionPending":
+                    # A protected failure site's exit test: read the native
+                    # error slot the site's operator reports to.  The source
+                    # contract is the reducer's ``source_failure_site`` row.
+                    from .concordance_declarations import C_FAILURE_EXIT
+                    from .identity_concordance import Derived, Mode
+                    site = instruction.attributes.get("failure_site_cell")
+                    if site is None:
+                        shortfalls.append(CEmissionShortfall(op, "failure exit has no failure-site contract"))
+                        continue
+                    result_id = int(instruction.res.id)
+                    body.append(f"        uint8_t t{result_id} = turing_validation_error_pending() != 0u;")
+                    expressions[result_id] = f"t{result_id}"
+                    policy_cell = emission.post(C_FAILURE_EXIT, (site, fn, result_id),
+                        (op, (), "native_error_slot"), stage=EMISSION_C,
+                        provenance=Derived((site,)), mode=Mode.CONCORD)
+                    span.take(UnitKind.STATEMENT, result=instruction.res, args=instruction.args,
+                              instruction=instruction, extra_cells=(policy_cell,))
+                    span.pending = None
+                    continue
                 if op.startswith("Exception"):
                     from .concordance_declarations import SOURCE_EXCEPTION_OPERATION, C_EXCEPTION_OPERATION
                     from .identity_concordance import Derived, Mode

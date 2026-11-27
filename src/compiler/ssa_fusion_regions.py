@@ -20,7 +20,7 @@ CONTROL_BARRIERS = frozenset({
 })
 EFFECT_BARRIERS = frozenset({
     "ExceptionNone", "ExceptionMake", "ExceptionTake", "ExceptionActive", "ExceptionMatch", "ExceptionRaise",
-    "ExceptionIndexType", "ExceptionLength",
+    "ExceptionIndexType", "ExceptionLength", "ExceptionPending",
     "ThreadCreate", "ThreadStart", "ThreadJoin", "ThreadIsAlive",
     "ConditionCreate", "ConditionAcquire", "ConditionRelease", "ConditionWait",
     "ConditionNotify", "ConditionNotifyAll", "EventCreate", "EventSet", "EventClear",
