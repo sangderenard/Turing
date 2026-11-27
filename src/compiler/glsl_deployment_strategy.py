@@ -37483,11 +37483,9 @@ def _publish_call_result_class(
     class cell and the call node's identity cell.
     """
 
-    from ..common.tensors.topological_reducer import (
-        _concord_source_value_class, _source_numeric_scope, node_identity_cell,
-    )
+    from ..common.tensors.topological_reducer import _source_numeric_scope
     from .concordance_declarations import SOURCE_VALUE_CLASS
-    from .identity_concordance import Derived, current_identity_book
+    from .identity_concordance import current_identity_book
 
     returned = next((
         int(candidate) for candidate in reversed(tuple(output_ids))
@@ -37496,42 +37494,61 @@ def _publish_call_result_class(
     if returned is None or int(call_id) not in caller.G:
         return
     book = current_identity_book()
-    page = book.page(SOURCE_VALUE_CLASS)
     callee_scope = _source_numeric_scope(specialized.G)
     returned_value = int(specialized.G.nodes[returned].get("value_id", returned))
-    returned_cell = book.latest_ref(
+    # Program: a masked loss ``(r * r * mask).sum()`` trained through
+    # ``lower_ast_source_to_ssa``: the motion calls ``bw_sum``, which
+    # returns ``expand_reduction(...)``, which returns ``expand_to(...)``.
+    # Wrong record: ``strategize_shell_deployment`` returns a shell type
+    # and the copy's own callsites are planned only when that shell is
+    # built (``plan_callsites``), so this reader ran for the motion's
+    # ``bw_sum`` call while ``bw_sum``'s returned ``expand_reduction``
+    # call had no class yet.  The class arrived later (``expand_to``'s
+    # ``broadcast_to`` result, then ``expand_reduction``'s call) and no
+    # reader asked again: the motion's call result (``bw_mul``'s ``g``)
+    # stayed unclassed, ``g * x`` had no class, its ``unbroadcast`` copy
+    # had no ``value_type_abi`` and its ``sum`` was refused.  Rule: the
+    # writer of a returned value's class row owns the transition; a
+    # reader that finds the row absent waits on that exact row, and the
+    # post of that row re-runs it.
+    #
+    # The wait is the book's (``IdentityBook.await_row``), so ANY post
+    # of the row wakes it -- this function's own, or one of the
+    # reducer's other class writers (a callee returning an operator
+    # result directly), or a writer that classed the caller's call
+    # result before this function did (the early return in
+    # ``_class_call_result``).  ``await_row`` looks for the row and, if it
+    # is absent, registers the reader in one transaction with ``post``,
+    # and hands the reader the cell it found or the post wrote: this
+    # function never looks the row up itself, so no post can fall between
+    # a look and a wait (ticket 53cc36f3).  The book holds the reader, so
+    # it ends with the book: no ``id(book)`` key a later book could reuse.
+    book.await_row(
         SOURCE_VALUE_CLASS, (callee_scope, returned_value),
+        lambda returned_cell: _class_call_result(
+            book, caller, int(call_id), returned_cell,
+        ),
     )
-    if returned_cell is None:
-        # Program: a masked loss ``(r * r * mask).sum()`` trained through
-        # ``lower_ast_source_to_ssa``: the motion calls ``bw_sum``, which
-        # returns ``expand_reduction(...)``, which returns ``expand_to(...)``.
-        # Wrong record: ``strategize_shell_deployment`` returns a shell type
-        # and the copy's own callsites are planned only when that shell is
-        # built (``plan_callsites``), so this reader ran for the motion's
-        # ``bw_sum`` call while ``bw_sum``'s returned ``expand_reduction``
-        # call had no class yet.  The class arrived later (``expand_to``'s
-        # ``broadcast_to`` result, then ``expand_reduction``'s call) and no
-        # reader asked again: the motion's call result (``bw_mul``'s ``g``)
-        # stayed unclassed, ``g * x`` had no class, its ``unbroadcast`` copy
-        # had no ``value_type_abi`` and its ``sum`` was refused.  Rule: the
-        # writer of a returned value's class row owns the transition; a
-        # reader that finds the row absent waits on that exact row, and the
-        # post of that row re-runs it.
-        #
-        # The wait is the book's (``IdentityBook.await_row``), so ANY post
-        # of the row wakes it -- this function's own, or one of the
-        # reducer's other class writers (a callee returning an operator
-        # result directly), or a writer that classed the caller's call
-        # result before this function did (the early return below).  The
-        # book holds the reader, so it ends with the book: no ``id(book)``
-        # key that a later book could reuse (ticket 53cc36f3).
-        waiting = (caller, int(call_id), specialized, tuple(output_ids))
-        book.await_row(
-            SOURCE_VALUE_CLASS, (callee_scope, returned_value),
-            lambda: _publish_call_result_class(*waiting),
-        )
+
+
+def _class_call_result(
+    book: Any, caller: Any, call_id: int, returned_cell: Any,
+) -> None:
+    """Class ``caller``'s call result from the callee's returned class cell.
+
+    ``returned_cell`` is the Ref ``IdentityBook.await_row`` hands over; it
+    is used as given and not looked up again.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _concord_source_value_class, _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+    from .identity_concordance import Derived
+
+    if int(call_id) not in caller.G:
         return
+    page = book.page(SOURCE_VALUE_CLASS)
     caller_scope = _source_numeric_scope(caller.G)
     call_value = int(caller.G.nodes[int(call_id)].get("value_id", call_id))
     if page.latest((caller_scope, call_value)) is not None:

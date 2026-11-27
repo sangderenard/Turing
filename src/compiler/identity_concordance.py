@@ -20777,9 +20777,24 @@ class IdentityBook:
         walked here -- a refusal is also control flow for some callers -- but
         by ``annotate_failure_with_neighborhood`` where the failure reports.
 
-        A successful post re-runs the readers waiting on its row
-        (``await_row``), whichever writer made it.
+        A successful post hands its cell to the readers waiting on its row
+        (``await_row``), whichever writer made it.  The row is committed
+        before any reader runs; every reader taken runs, and if any raised,
+        the first error is raised once all have run (the others as notes).
         """
+        target, readers = self._post_taking_readers(
+            page, row, fact, stage=stage, provenance=provenance, mode=mode,
+        )
+        _run_row_readers(readers, target)
+        return target
+
+    def _post_taking_readers(
+        self, page: Page, row: tuple, fact: Any, *, stage: Stage,
+        provenance: Derived | Novel | Unsourced, mode: Mode,
+    ) -> tuple[Ref, list]:
+        """Commit one post and take the readers waiting on its row, as one
+        transaction (``_ConcurrentIdentityBook`` holds the publication lock
+        across both, the same lock ``_await_or_latest`` holds)."""
         try:
             target = self._post(
                 page, row, fact, stage=stage, provenance=provenance,
@@ -20791,27 +20806,39 @@ class IdentityBook:
             )
             raise
         readers = self.__dict__.get("_row_readers")
-        if readers:
-            # Popped before any reader runs: a reader that posts this row
-            # again, or waits on it again, does not see itself here.
-            for reader in readers.pop((page.name, target.row), ()):
-                reader()
-        return target
+        # Taken before any reader runs: a reader that posts this row again,
+        # or waits on it again, does not see itself here.
+        taken = readers.pop((page.name, target.row), []) if readers else []
+        return target, taken
 
     def await_row(self, page: Page, row: tuple, reader: Any) -> None:
-        """Run ``reader()`` once, after the next post of ``row`` on ``page``.
+        """Run ``reader(ref)`` once with the cell of ``row`` on ``page``.
 
-        For a reader that found the row absent and must ask again when it is
-        written.  The writer owns the transition: ``post`` is the one
-        sanctioned writer, so every writer of the row wakes its readers, not
-        only the one the reader expected.  The readers are held by this book
-        and end with it: a later book that reuses its address never sees
-        them, and a copy or pickle of the book carries none (they hold live
-        graphs, not facts).
+        If the row has a cell, ``reader`` runs now with its latest Ref;
+        otherwise it runs with the Ref of the next post of the row.  The
+        look and the registration are one transaction with ``post``'s
+        commit (``_await_or_latest``), so no post falls between them, and
+        the reader is handed the cell itself: it never looks the row up
+        again (ticket 53cc36f3).  The writer owns the transition: ``post``
+        is the one sanctioned writer, so every writer of the row wakes its
+        readers, not only the one the reader expected.  The readers are
+        held by this book and end with it: a later book that reuses its
+        address never sees them, and a copy or pickle of the book carries
+        none (they hold live graphs, not facts).
         """
+        present = self._await_or_latest(page, row, reader)
+        if present is not None:
+            reader(present)
+
+    def _await_or_latest(self, page: Page, row: tuple, reader: Any) -> Ref | None:
+        """The row's latest Ref, or None after registering ``reader`` on it."""
+        present = self.latest_ref(page, tuple(row))
+        if present is not None:
+            return present
         self.__dict__.setdefault("_row_readers", {}).setdefault(
             (page.name, tuple(row)), [],
         ).append(reader)
+        return None
 
     def _post(
         self,
@@ -21551,6 +21578,30 @@ class IdentityBook:
         return None
 
 
+def _run_row_readers(readers: list, target: Ref) -> None:
+    """Run every reader with ``target``; then raise the first error, if any.
+
+    One reader's failure must not cancel the others: they are already off
+    the book and would never be woken again.  The row is committed, so the
+    error is the reader's, not the write's.
+    """
+    failures = []
+    for reader in readers:
+        try:
+            reader(target)
+        except Exception as error:  # every reader runs; re-raised below
+            failures.append(error)
+    if not failures:
+        return
+    first = failures[0]
+    for later in failures[1:]:
+        first.add_note(
+            f"another reader of {target.page.name} row {target.row!r} also "
+            f"failed: {type(later).__name__}: {later}"
+        )
+    raise first
+
+
 class _ConcurrentIdentityBook(IdentityBook):
     """The same authority while isolated deployment workers publish to it.
 
@@ -21582,7 +21633,7 @@ def _concurrent_book_operation(operation):
     return locked
 
 
-for _operation in ("post", "latest_ref", "mint_scope", "_source_stamp",
+for _operation in ("_post_taking_readers", "_await_or_latest", "latest_ref", "mint_scope", "_source_stamp",
                    "derive_current", "current_ref", "stale_derivations", "settle_derivations", "import_cell",
                    "_materialise_row", "_preserve_fork_snapshots", "register_read_through",
                    "register_scope_projection", "edges_into", "edges_out_of", "mint_of"):
