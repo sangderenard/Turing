@@ -5201,6 +5201,18 @@ def _emit_repository_call_module(
                             "call integer storage requires explicit conversion: "
                             + repr(call_type_disagreements)))
                         continue
+                    from .ssa_call_operand_extents import (
+                        undersized_call_message, undersized_call_operands,
+                    )
+                    undersized = undersized_call_operands(
+                        module, name, symbol, semantic_arguments,
+                    )
+                    if undersized:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol,
+                            undersized_call_message(symbol, undersized),
+                        ))
+                        continue
                     required_positions = callee_aggregate_parameter_positions.get(
                         symbol, ()
                     )

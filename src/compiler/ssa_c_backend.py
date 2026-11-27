@@ -1415,6 +1415,10 @@ class CModuleArtifact:
     linked_libraries: tuple[tuple[str, str], ...] = ()
     linked_objects: tuple[tuple[str, str], ...] = ()
     needs_validation_runtime: bool = False
+    #: Root formals this artifact allocates as its own frame storage (zeroed
+    #: or relocated, never a public buffer).  A caller value fed for one of
+    #: them would be silently discarded, so ``prepare_execution`` refuses it.
+    private_root_formals: tuple[int, ...] = ()
     #: Declared externals this module calls through its exported slot table
     #: (``external_functions.external_slot_rows``); the host fills them at
     #: load with ``external_functions.bind_external_slots``.
@@ -1722,6 +1726,21 @@ class CModuleArtifact:
         import numpy as np
 
         feed_values = {int(key): value for key, value in dict(feeds or {}).items()}
+        # Program: ``def root(a: int64)`` while ``a`` was misjoined to a
+        # record view.  Wrong record: ``a`` became zero-filled private frame
+        # storage, the fed 5 was dropped without a word, and root returned
+        # 1.  Rule: zero-filling a formal nobody passes is the frame's own
+        # business; a value the caller hands is never discarded for it.
+        discarded = sorted(
+            value_id for value_id in feed_values
+            if value_id in set(self.private_root_formals)
+        )
+        if discarded:
+            raise ValueError(
+                f"root formal(s) {discarded} of {self.name} are private frame "
+                "storage of this artifact, not public buffers; the fed "
+                "value(s) would be discarded and the frame zero-filled"
+            )
         shape_overrides = {
             int(key): tuple(map(int, value))
             for key, value in dict(shapes or {}).items()
@@ -7604,6 +7623,17 @@ def emit_ssa_module_to_c(
                             f"call to {callee!r} has an unbound native formal",
                         ))
                         continue
+                    from .ssa_call_operand_extents import (
+                        undersized_call_message, undersized_call_operands,
+                    )
+                    undersized = undersized_call_operands(
+                        module, fn, callee, instruction.args,
+                    )
+                    if undersized:
+                        shortfalls.append(CEmissionShortfall(
+                            "Call", undersized_call_message(callee, undersized),
+                        ))
+                        continue
                     if callee in extent_users:
                         rendered_args.append("extents")
                     invocation = (
@@ -9727,6 +9757,11 @@ def emit_ssa_module_to_c(
             )), stage=EMISSION_C,
         )
     return CModuleArtifact(
+        private_root_formals=tuple(
+            int(formal.id) for formal in root.args
+            if int(formal.id) in owned_storage_names
+            and int(formal.id) not in buffer_order
+        ),
         external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
         linked_libraries=tuple(linked_libraries),
