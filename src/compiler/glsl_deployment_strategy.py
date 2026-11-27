@@ -3725,8 +3725,23 @@ def _planned_scalar_dtypes_from_graph(
             if str(identity) != "builtins.NoneType"
         )
         if dtype in {"", "int"} and len(payload_types) == 1:
-            dtype = classes.get(
-                payload_types[0].removeprefix("builtins."), dtype,
+            # Program: GLSL ``(z < 0.0 ? 2u : 3u) == 0u``.  Wrong record:
+            # the conditional's contract names only its class, while its
+            # one physical arm states uint32; the class default (int64)
+            # was seeded first, so the merge's uint32 never settled and the
+            # comparison's region was fed int64 from the uint32 Phi.  Rule:
+            # the class proves the KIND; the payload's physical arm, when it
+            # states a width, is the width.  The class default applies only
+            # to an arm that states none.
+            arm_dtype = next((
+                str(getattr(arm, "dtype", "") or "")
+                for identity, arm in tuple(
+                    (contract or {}).get("python_type_abis") or ()
+                )
+                if str(identity) == payload_types[0]
+            ), "")
+            dtype = arm_dtype if arm_dtype not in {"", "int", "unknown"} else (
+                classes.get(payload_types[0].removeprefix("builtins."), dtype)
             )
         if dtype not in {"int64", "float64", "bool"}:
             continue
@@ -8013,8 +8028,24 @@ def _build_shell_hierarchy_plan(
                         )
                     ):
                         logical = (len(literal),)
+                    # Program: GLSL ``(z < 0.0 ? 2u : 3u) == 0u``, the literals
+                    # read as ``__glsl_literal_N: 'uint32' = 2``.  Wrong record:
+                    # the literal's Python value spelled its width (int64)
+                    # over its declared uint32, so the conditional's merge
+                    # record was int64 and the comparison's region was fed
+                    # int64 from the uint32 Phi.  Rule: a literal bound to an
+                    # annotated fixed-width local has the declared width
+                    # (``_declared_local_scalar_descriptor``); the value's own
+                    # width applies only to an undeclared literal.
+                    declared_local = _declared_local_scalar_descriptor(
+                        graph, int(current),
+                    )
                     if isinstance(literal, bool):
                         dtype = "bool"
+                    elif declared_local is not None and isinstance(
+                        literal, (int, float),
+                    ):
+                        dtype = str(declared_local["dtype"])
                     elif isinstance(literal, int):
                         # PlanClosure is a projection of the exact graph value
                         # into the region feed view.  Use the shared layout
@@ -28171,6 +28202,44 @@ def _source_primitive_scalar_descriptor(graph: Any, node_id: int):
     )))
 
 
+def _declared_local_scalar_descriptor(graph: Any, node_id: int):
+    """The declared width of a value bound to an annotated fixed-width local.
+
+    Program: GLSL ``(z < 0.0 ? 2u : 3u) == 0u``, read as ``__glsl_literal_N:
+    'uint32' = 2``.  Wrong record: the literal's declared width was read only
+    through its class receipt, which the structural fold had not posted yet,
+    so the literal answered nothing; the conditional over it then took its
+    own class default (int64) and the ``== 0u`` region was fed int64 from a
+    uint32 value ("incompatible final physical call inputs").  Rule: the
+    declaration proves kind and width (its ANNOTATION_DECLARATION cell), so a
+    value bound to a fixed-width local is rank-0 of the declared width with
+    or without a class receipt.
+    """
+
+    local_declaration = (
+        graph.G.nodes[int(node_id)].get("attributes") or {}
+    ).get("local_scalar_annotation")
+    if local_declaration is None:
+        return None
+    from .concordance_declarations import ANNOTATION_DECLARATION
+    from .identity_concordance import current_identity_book
+    from ..transmogrifier.dtype_layout import (
+        resolve as _declared_layout,
+        source_annotation_dtype as _declared_dtype,
+    )
+
+    width, annotation_cell = local_declaration
+    fact = current_identity_book().page(ANNOTATION_DECLARATION).cell(
+        annotation_cell.row, annotation_cell.column,
+    )
+    if (
+        _declared_dtype(fact.annotation) != width
+        or _declared_layout(str(width)) is None
+    ):
+        return None
+    return {"shape": (), "dtype": str(width), "rank": 0}
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -29773,8 +29842,56 @@ def _tensor_descriptor_rule(
                         tuple(str(side["dtype"]) for side in sides)
                     ),
                 }
+        if scalar_descriptor is not None and descriptor_operation in {
+            "phi", "ifexp",
+        }:
+            # Program: GLSL ``(z < 0.0 ? 2u : 3u) == 0u``.  Wrong record:
+            # the conditional's class (builtins.int) answered first with its
+            # class default int64 before the branch-merge law read its
+            # uint32 arms, so the comparison's region was fed int64 from the
+            # uint32 Phi.  Rule: the class proves the KIND; when every value
+            # arm is a rank-0 scalar of that kind with one width, the merge
+            # has that width (the merge law below).  Otherwise the class
+            # receipt stands.
+            from ..transmogrifier.dtype_layout import resolve as _kind_layout
+
+            class_layout = _kind_layout(scalar_descriptor.get("dtype"))
+            arm_ids = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role).casefold() not in {
+                    "test", "predicate", "condition", "cond",
+                } and int(parent) in graph.G
+            )
+            arm_sides = [
+                _tensor_descriptor(graph, arm, seen) for arm in arm_ids
+            ]
+            arm_layouts = [
+                None if not isinstance(side, Mapping)
+                or tuple(side.get("shape") or ()) != ()
+                else _kind_layout(side.get("dtype"))
+                for side in arm_sides
+            ]
+            arm_dtypes = {
+                str(side["dtype"]) for side in arm_sides
+                if isinstance(side, Mapping)
+            }
+            if (
+                class_layout is not None
+                and arm_ids
+                and None not in arm_layouts
+                and len(arm_dtypes) == 1
+                and all(
+                    layout.kind == class_layout.kind
+                    or {layout.kind, class_layout.kind} <= {"int", "uint"}
+                    for layout in arm_layouts
+                )
+            ):
+                return {**scalar_descriptor, "dtype": next(iter(arm_dtypes))}
         if scalar_descriptor is not None:
             return scalar_descriptor
+        declared_local = _declared_local_scalar_descriptor(graph, int(node_id))
+        if declared_local is not None:
+            return declared_local
     if "shape" not in tensor:
         operation = descriptor_operation
         collection_expression = data.get("expr_obj")
