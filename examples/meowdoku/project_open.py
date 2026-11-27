@@ -39,6 +39,9 @@ from pathlib import PurePosixPath
 from meowdoku import branch_review, central_checkout
 
 MAX_CONTRACT = 64_000
+# The REST body carries the contract as a JSON string, where an escape (\uXXXX) takes at most 6 bytes per UTF-8
+# byte of the text; the rest is slack for the envelope. _parse keeps MAX_CONTRACT as the one size rule (413).
+MAX_BODY = 6 * MAX_CONTRACT + 4096
 COPY_WAITS = ("the 'branch-copy' placement needs refresh and accept between a branch and its copy "
               "(research case d442be8d), which are not built yet")
 DDL = (
@@ -230,7 +233,7 @@ def http_route(self, path, method, *, policy, accounts_db, root, space=None):
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
             return self._json({"error": "JSON only"}, 415)
-        body = self._body_json(2 * MAX_CONTRACT)
+        body = self._body_json(MAX_BODY)
         if body is None:
             return
         if not isinstance(body, dict):

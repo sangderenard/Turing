@@ -188,33 +188,43 @@ def test_an_open_whose_row_is_lost_before_recording_its_head_is_not_reported_as_
     assert head in refused.value.message, "the commit that stands is named"
 
 
-def test_rest_needs_dev_ui_and_takes_the_account_from_the_session(world):
-    class Handler:
-        def __init__(self, path, body, user, username, caps=("dev_ui",)):
-            raw = json.dumps(body).encode("utf-8")
-            self.path, self.headers, self._raw, self.sent = path, {"Content-Type": "application/json"}, raw, None
-            self._user, self._username, self._capset = user, username, set(caps)
+class Handler:
+    """A request as server.py's handler presents it to http_route: _body_json refuses a body over its limit (400)."""
 
-        def _principal(self):
-            from types import SimpleNamespace
-            return SimpleNamespace(user_id=self._user, username=self._username)
+    def __init__(self, path, body, user, username, caps=("dev_ui",)):
+        raw = json.dumps(body).encode("utf-8")
+        self.path, self.headers, self._raw, self.sent = path, {"Content-Type": "application/json"}, raw, None
+        self._user, self._username, self._capset = user, username, set(caps)
 
-        def _caps(self):
-            return self._capset
+    def _principal(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(user_id=self._user, username=self._username)
 
-        def _body_json(self, limit):
-            return json.loads(self._raw)
+    def _caps(self):
+        return self._capset
 
-        def _json(self, payload, status=200):
-            self.sent = (status, payload)
+    def _body_json(self, limit):
+        if not 0 < len(self._raw) <= limit:
+            self._json({"error": "body size is invalid"}, 400)
+            return None
+        return json.loads(self._raw)
 
+    def _json(self, payload, status=200):
+        self.sent = (status, payload)
+
+
+def sender(world):
     db_file = world["db"].execute("PRAGMA database_list").fetchone()[2]
 
     def send(path, method="POST", body=None, user=ANN, username="ann", caps=("dev_ui",)):
         handler = Handler(path, body or {}, user, username, caps)
         project_open.http_route(handler, path, method, policy=world["policy"], accounts_db=db_file, root=world["root"])
         return handler.sent
+    return send
 
+
+def test_rest_needs_dev_ui_and_takes_the_account_from_the_session(world):
+    send = sender(world)
     assert send("/api/projects/open", body={"text": contract()}, caps=())[0] == 403
     assert send("/api/projects/open", body={"text": contract()}, user=None, username=None)[0] == 401
     assert send("/api/projects/open", body={"text": contract(identity="bob/garden")})[0] == 403
@@ -223,3 +233,33 @@ def test_rest_needs_dev_ui_and_takes_the_account_from_the_session(world):
     status, answer = send("/api/projects", "GET")
     assert status == 200 and [p["identity"] for p in answer["projects"]] == ["ann/garden"]
     assert send("/api/projects/elsewhere")[0] == 404
+
+
+def padded(fill, size):
+    """A valid contract padded with a YAML comment of `fill` to exactly `size` UTF-8 bytes."""
+    base = contract() + "# "
+    room = size - len(base.encode("utf-8")) - 1
+    width = len(fill.encode("utf-8"))
+    return base + fill * (room // width) + "x" * (room % width) + "\n"
+
+
+def test_a_contract_within_its_size_limit_passes_the_route_body_limit(world):
+    """Issue 193d26f9: JSON writes a non-ASCII character as a 6-byte escape, so the body is several times the text."""
+    text = padded("é", project_open.MAX_CONTRACT)
+    assert len(text.encode("utf-8")) == project_open.MAX_CONTRACT
+    assert len(json.dumps({"text": text}).encode("utf-8")) > 2 * project_open.MAX_CONTRACT, "the old limit refused it"
+    status, answer = sender(world)("/api/projects/open", body={"text": text})
+    assert status == 200 and answer["identity"] == "ann/garden"
+
+
+def test_the_contract_size_rule_still_refuses_one_byte_over_through_the_route(world):
+    text = padded("a", project_open.MAX_CONTRACT + 1)
+    assert len(text.encode("utf-8")) == project_open.MAX_CONTRACT + 1
+    status, answer = sender(world)("/api/projects/open", body={"text": text})
+    assert status == 413, answer
+    assert project_open.projects_of(world["db"], ANN) == []
+
+
+def test_the_body_limit_holds_the_worst_escape_of_a_full_contract():
+    worst = json.dumps({"text": "\x01" * project_open.MAX_CONTRACT}).encode("utf-8")
+    assert len(worst) <= project_open.MAX_BODY
