@@ -790,6 +790,75 @@ def law_value_axis_free(graph: Any, node_id: int) -> bool:
     return bool(getattr(fact, "axis_free", False))
 
 
+#: The source class a law scalar's stamped element kind states: the class a
+#: source ``x: float`` (or ``int``, ``bool``) value carries.
+_LAW_SCALAR_CLASSES = {
+    "bool": "builtins.bool",
+    "int": "builtins.int",
+    "uint": "builtins.int",
+    "float": "builtins.float",
+}
+
+
+def post_law_scalar_class(graph: Any, node_id: int):
+    """Post the ``source_value_class`` of one value of the law.
+
+    Program: tests/test_graph_function_splicing.py finite sum,
+    ``Le(k_axis, n - 1)``.  Wrong record: the elementwise law took the rank-0
+    side ``n - 1`` (every SymPy node carries a ``tensor`` stamp) for an
+    unsettled placeholder and dropped it.  Owner decision (2026-11-27): a law
+    scalar is declared settled the way a source scalar is, by its class row,
+    and the law reads that row for SymPy and source values alike.  Rule: a
+    value whose ``law_value_axes`` row says no declared reduction axis is
+    among its causes, that is no declared tensor operation, and whose stamp
+    states rank 0 is one value of the law; its class is the one its stamped
+    element kind states (``builtins.float``; an integer structural constant
+    ``builtins.int``; a predicate ``builtins.bool``).  DERIVED from the
+    value's identity cell, its ``law_value_axes`` row and, for a constant,
+    its ``constant_role`` row (which decides its dtype).  ``None`` when the
+    value is not a law scalar.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _concord_source_value_class, _source_numeric_scope, node_identity_cell,
+    )
+    from ..transmogrifier.dtype_layout import resolve as resolve_dtype
+    from .concordance_declarations import CONSTANT_ROLE, LAW_VALUE_AXES
+    from .identity_concordance import Derived, current_identity_book
+
+    book = current_identity_book()
+    scope = graph.G.graph.get("ingestion_value_scope")
+    if scope is None:
+        return None
+    axes = book.latest_ref(LAW_VALUE_AXES, (tuple(scope), int(node_id)))
+    if axes is None or not book.page(LAW_VALUE_AXES).cell(
+        axes.row, axes.column,
+    ).axis_free:
+        return None
+    if declared_tensor_operation(graph, int(node_id)) is not None:
+        return None
+    stamp = graph.G.nodes[int(node_id)].get("tensor") or {}
+    if "shape" not in stamp or tuple(stamp["shape"] or ()) != ():
+        return None
+    layout = resolve_dtype(stamp.get("dtype"))
+    class_identity = None if layout is None else _LAW_SCALAR_CLASSES.get(
+        str(layout.kind),
+    )
+    if class_identity is None:
+        return None
+    sources = [node_identity_cell(graph, int(node_id)), axes]
+    role = book.latest_ref(CONSTANT_ROLE, (tuple(scope), int(node_id)))
+    if role is not None:
+        sources.append(role)
+    return _concord_source_value_class(
+        _source_numeric_scope(graph.G), int(node_id), class_identity,
+        source="law scalar",
+        provenance=Derived(tuple(dict.fromkeys(
+            cell for cell in sources if cell is not None
+        ))),
+    )
+
+
 #: The ``symbolic_transform`` kind a declared Sum posts on its index axis:
 #: ``arange(count)`` with end None, step 1 and no dtype, by declaration.
 REDUCTION_INDEX_AXIS = "reduction_index_axis"

@@ -832,6 +832,16 @@ def admit_process_graph_function(graph: Any, *, stage: Any) -> Any:
             provenance=Derived((node_identity_cell(graph, value_id),)),
             mode=Mode.CONCORD,
         )
+    # Each value of a law is declared settled by its class row, as a source
+    # scalar is (owner, 2026-11-27).  Posted here, under the numeric scope
+    # the authored identity above fixes: rows the envelope stamp posted
+    # earlier sat under a synthetic scope no later reader looks in.  It runs
+    # before the tensor-class admission, so a law scalar is not taken for an
+    # AbstractTensor; spliced copies carry their own law_value_axes rows.
+    from .symbolic_process_graph import post_law_scalar_class
+
+    for node_id in tuple(graph.G.nodes):
+        post_law_scalar_class(graph, int(node_id))
     _admit_graph_tensor_classes(graph)
     _admit_graph_call_reachability(graph, stage=stage)
     return scope

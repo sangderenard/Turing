@@ -30934,13 +30934,28 @@ def _tensor_descriptor_rule(
                     # ``Add(1, k_axis)`` the rank-0 side was taken for an
                     # ingestion placeholder and dropped, the runtime-span law
                     # below declined, and the result answered the graph
-                    # domain's scalar default.  Rule: a side whose
-                    # ``law_value_axes`` row says no declared reduction axis
-                    # is among its causes is one settled value of the law.
+                    # domain's scalar default.  Rule (owner, 2026-11-27): a
+                    # rank-0 side whose ``source_value_class`` row states a
+                    # scalar class is one settled value, as a source
+                    # ``x: float`` is; a law scalar's row is posted from its
+                    # ``law_value_axes`` row (``post_law_scalar_class``).
                     if int(side.get("rank", 0)) == 0:
-                        from .symbolic_process_graph import law_value_axis_free
+                        from ..common.tensors.topological_reducer import (
+                            _source_numeric_scope as _side_scope,
+                        )
+                        from .concordance_declarations import (
+                            SOURCE_VALUE_CLASS as _SIDE_CLASS,
+                        )
+                        from .identity_concordance import (
+                            current_identity_book as _side_book,
+                        )
 
-                        if law_value_axis_free(graph, int(operand)):
+                        side_class = _side_book().page(_SIDE_CLASS).latest((
+                            _side_scope(graph.G), int(operand),
+                        ))
+                        if isinstance(side_class, tuple) and side_class and str(
+                            side_class[0]
+                        ) in {"builtins.float", "builtins.int", "builtins.bool"}:
                             continue
                     if (
                         node.get("tensor")
