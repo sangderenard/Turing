@@ -313,14 +313,14 @@ def http_route(self, path, method, *, space, accounts_db):
         return self._json({"error": "not found"}, 404)
     if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
         return self._json({"error": "JSON only"}, 415)
-    body = self._body_json(3 * central_checkout.MAX_FILE_BYTES)
+    operation = path[len("/api/projects/space/"):]
+    body = self._body_json(central_checkout.body_limit(operation))
     if body is None:
         return
     if not isinstance(body, dict):
         return self._json({"error": "a JSON object is required"}, 400)
     db = sqlite3.connect(accounts_db, timeout=10, isolation_level=None)
     try:
-        operation = path[len("/api/projects/space/"):]
         result = space.run(db, user_id=principal.user_id, username=principal.username, operation=operation, body=body)
         print(f"[project-space] {principal.username} {operation} {body.get('identity')}", flush=True)
         return self._json(result)

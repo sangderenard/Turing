@@ -49,6 +49,7 @@ from pathlib import Path
 from meowdoku import branch_gate, branch_review, branch_servers
 
 MAX_FILE_BYTES = 10_000_000
+ENVELOPE_BYTES = 65_536                 # room beside the text for path, repository, branch, message and count
 MAX_LISTING = 2000
 MAX_DIFF_BYTES = 400_000
 MAX_MESSAGE = 5000
@@ -221,6 +222,19 @@ def read(row, path) -> dict:
         return {"path": path, "text": data.decode("utf-8"), "bytes": len(data)}
     except UnicodeDecodeError:
         raise CheckoutError("that file is not UTF-8 text", 415) from None
+
+
+def body_limit(operation=None) -> int:
+    """The REST body limit for one operation: its full-size texts in their worst JSON escape, plus the envelope.
+
+    A JSON client may write a control character as a six-byte u-escape, so a full file can be six times its
+    UTF-8 size on the wire. edit carries two texts (old and new, each up to MAX_FILE_BYTES); every other
+    operation carries at most one (write's text, or edit's patch, which edit caps at MAX_FILE_BYTES). The
+    per-file rule (413) stays the one size rule; this limit only keeps the transport from refusing (400) a
+    request that rule allows. It is read at call time, so it follows MAX_FILE_BYTES and ENVELOPE_BYTES.
+    """
+    texts = 2 if operation == "edit" else 1
+    return texts * 6 * MAX_FILE_BYTES + ENVELOPE_BYTES
 
 
 def write(row, path, text) -> dict:
@@ -685,12 +699,12 @@ def http_route(self, path, method, *, policy, accounts_db, root):
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
             return self._json({"error": "JSON only"}, 415)
-        body = self._body_json(3 * MAX_FILE_BYTES)
+        operation = path[len("/api/checkouts/"):]
+        body = self._body_json(body_limit(operation))
         if body is None:
             return
         if not isinstance(body, dict):
             return self._json({"error": "a JSON object is required"}, 400)
-        operation = path[len("/api/checkouts/"):]
         result = run(db, policy, root, user_id=principal.user_id, username=principal.username, operation=operation, body=body)
         print(f"[checkout] {principal.username} {operation} {body.get('repository')} {body.get('branch')}", flush=True)
         return self._json(result)
