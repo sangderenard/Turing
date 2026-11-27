@@ -1648,6 +1648,28 @@ def _retain_literal_widths(function):
             reference=ast.Name(id=name,ctx=ast.Load())
             reference._glsl_source_location=getattr(node,"_glsl_source_location",None)
             return reference
+        def visit_UnaryOp(self,node):
+            # GLSL ``-1`` is an int constant and ``-0.5`` a float one.
+            # Program: the Studio response shader's ``(... > 0.0 ? 1 : -1)``.
+            # Read as ``-__glsl_literal_97`` over ``'int32' = 1``, the
+            # compiler's structural fold made the bare Python literal -1,
+            # which settled as the int class (int64) beside the int32 arm.
+            # The negated literal is itself the declared literal.  An
+            # unsigned literal keeps its operator (``-1u`` wraps).
+            operand=node.operand
+            if (isinstance(node.op,ast.USub) and isinstance(operand,ast.Constant)
+                    and not getattr(operand,"_glsl_raw_literal",False)
+                    and type(operand.value) in (int,float)
+                    and getattr(operand,"_glsl_scalar_dtype",
+                        "float32" if type(operand.value) is float else "int32")
+                    in {"int32","float32"}):
+                negated=ast.Constant(value=-operand.value)
+                negated._glsl_scalar_dtype=getattr(operand,"_glsl_scalar_dtype",None)
+                negated._glsl_source_location=getattr(operand,"_glsl_source_location",None)
+                if negated._glsl_scalar_dtype is None:
+                    del negated._glsl_scalar_dtype
+                return self.visit_Constant(negated)
+            return self.generic_visit(node)
         def visit_AnnAssign(self,node):
             # A declared type annotation is not a value; only the assigned
             # value carries literals.

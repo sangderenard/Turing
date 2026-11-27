@@ -34604,6 +34604,43 @@ def _fold_callsite_structural_values(
             *length_fold_sources.get(int(node_id), ()),
             *concordant_literal_sources.get(int(node_id), ()),
         )))
+        # Program: GLSL ``2 * 3`` or ``-1`` over declared int32 literals
+        # (``__glsl_literal_N: 'int32' = 2``).  Wrong record: the fold made
+        # a bare Python literal, which settled as its class default (int64,
+        # float64) beside the declared int32/float32 values it was computed
+        # from.  Rule: a folded scalar whose operands are all values of
+        # annotated fixed-width locals of ONE width keeps that width (the
+        # declaration of its first operand is the cited cause), when the
+        # value is of that layout's kind and, for an integer, lies in it.
+        # Otherwise the literal law applies as before.
+        operand_declaration = None
+        operand_declarations = [
+            (graph.G.nodes.get(int(parent), {}).get("attributes") or {}).get(
+                "local_scalar_annotation"
+            )
+            for parent, _role in data.get("parents") or ()
+        ]
+        if (
+            operand_declarations
+            and None not in operand_declarations
+            and len({str(item[0]) for item in operand_declarations}) == 1
+            and type(value) in (int, float)
+        ):
+            from ..transmogrifier.dtype_layout import resolve as _fold_layout
+
+            width = str(operand_declarations[0][0])
+            layout = _fold_layout(width)
+            if layout is not None and (
+                (type(value) is float and layout.kind == "float")
+                or (type(value) is int and layout.kind in {"int", "uint"} and (
+                    (0 if layout.kind == "uint"
+                     else -(1 << (8 * int(layout.byte_size) - 1)))
+                    <= int(value)
+                    < (1 << (8 * int(layout.byte_size)
+                             - (0 if layout.kind == "uint" else 1)))
+                ))
+            ):
+                operand_declaration = operand_declarations[0]
         # The folded node reads nothing any more: its positions retire
         # through the one writer (edges and ``children`` with them).
         _set_operands(graph, int(node_id), [], cause=_CALLSITE_FOLD_LITERAL)
@@ -34658,6 +34695,8 @@ def _fold_callsite_structural_values(
             # retaining that producer identity makes sequence lowering
             # demand a fill from members the fold deliberately retired.
             attributes.pop("producer_kind")
+        if operand_declaration is not None:
+            attributes.setdefault("local_scalar_annotation", operand_declaration)
         attributes.update({
             "value": copy.deepcopy(value),
             "structural_specialization": True,
