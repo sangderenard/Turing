@@ -64826,9 +64826,11 @@ def _linked_piece_interface_module(piece):
 class UntypedEntryParameterWarning(UserWarning):
     """An entry parameter with no annotation and no contract binding.
 
-    A vague type means every type: ``lower_ast_source_type_matrix`` compiles
-    one copy per member of the type matrix.  An author who did not mean that
-    states the type in the code or contract.
+    A vague type means every type, and every type is a kernel library.  The
+    compiler never builds it by default: ``lower_ast_source_type_matrix``
+    compiles it only under the contract's informed consent
+    (``program_abi.kernel_libraries`` with the exact version counts).  An
+    author who did not mean that states the type in the code or contract.
     """
 
 
@@ -67366,15 +67368,25 @@ def _lower_ast_source_to_ssa_impl(
             book=current_identity_book(),
         )
         if _entry_untyped:
+            _entry_versions = type_matrix_versions(len(_entry_untyped))
             _entry_message = (
                 f"entry {str(entrypoint)!r} parameter(s) "
                 f"{', '.join(map(repr, _entry_untyped))} have NO declared type "
                 "(no annotation, no extraction-contract binding, no root-call "
-                "record). A vague type means EVERY type: "
-                "lower_ast_source_type_matrix compiles one copy per member of "
-                "the type matrix. This lowering compiles one copy and has no "
-                "type for them. If one type is what you meant, state it in "
-                "the code (an annotation) or in the contract."
+                "record). A vague type means every type, and every type is "
+                "a kernel library of "
+                + ", ".join(
+                    f"{count} versions on {lane}"
+                    for lane, count in _entry_versions.items()
+                )
+                + ". The compiler does not build that by default. If that "
+                "number of versions is really what you want, state informed "
+                "consent in the contract, "
+                + kernel_library_consent_spelling(str(entrypoint), _entry_versions)
+                + ", and compile with lower_ast_source_type_matrix. Otherwise "
+                "state each parameter's type in the code (an annotation) or "
+                "in the contract. This lowering compiles one copy and has no "
+                "type for them."
             )
             report(f"WARNING: {_entry_message}")
             warnings.warn(UntypedEntryParameterWarning(_entry_message), stacklevel=2)
@@ -68731,6 +68743,32 @@ def type_matrix_members(lane: str, members: Sequence[str] = TYPE_MATRIX) -> dict
     return result
 
 
+def type_matrix_versions(
+    untyped_count: int, members: Sequence[str] = TYPE_MATRIX,
+    lanes: Sequence[str] = tuple(_LANE_SPELLING_FIELD),
+) -> dict[str, int]:
+    """How many copies the matrix requires per lane for ``untyped_count``
+    untyped formals: the lane's distinct compiled dtypes to that power."""
+
+    return {
+        str(lane): len({
+            dtype for dtype in type_matrix_members(lane, members).values()
+            if dtype is not None
+        }) ** int(untyped_count)
+        for lane in lanes
+    }
+
+
+def kernel_library_consent_spelling(entrypoint: str, versions: Mapping[str, int]) -> str:
+    """The contract entry that states informed consent for ``versions``."""
+
+    counts = ", ".join(f"{lane}: {count}" for lane, count in versions.items())
+    return (
+        "program_abi: {kernel_libraries: [{function: "
+        f"{entrypoint}, versions: {{{counts}}}}}]}}"
+    )
+
+
 def lower_ast_source_type_matrix(
     source: str, entrypoint: str, *, lane: str,
     members: Sequence[str] = TYPE_MATRIX, **kwargs,
@@ -68741,7 +68779,10 @@ def lower_ast_source_type_matrix(
     untyped formals (``untyped_entry_parameters``) each range over the
     lane's matrix members (``type_matrix_members``); every combination is
     one root-call record, and ``lower_ast_source_by_signature`` lowers one
-    exact-typed copy per distinct signature.  Returns ``{"lane", "members",
+    exact-typed copy per distinct signature.  Owner's rule (2026-11-26): it
+    is never a default; the contract's ``program_abi.kernel_libraries``
+    must state, for this entry and lane, exactly the number of versions the
+    matrix requires, or the call is refused.  Returns ``{"lane", "members",
     "formals", "copies"}``: ``members`` maps each member to the dtype its
     copy is compiled at (bool -> int8 where the lane has no true bool), and
     ``copies`` is ``lower_ast_source_by_signature``'s result.
@@ -68766,6 +68807,35 @@ def lower_ast_source_type_matrix(
     dtypes = tuple(dict.fromkeys(
         dtype for dtype in compiled.values() if dtype is not None
     ))
+    if formals:
+        # Owner's rule (2026-11-26): the whole matrix is never a default.
+        # Compiling it is a kernel library, and the contract must state
+        # informed consent with the exact number of versions it builds.
+        required = len(dtypes) ** len(formals)
+        consent = (
+            None if policy is None
+            else policy.program_abi.kernel_library_for(str(entrypoint))
+        )
+        stated = None if consent is None else consent.versions.get(str(lane))
+        if stated != required:
+            every_lane = type_matrix_versions(len(formals), members)
+            raise ValueError(
+                f"entry {str(entrypoint)!r} parameter(s) {list(formals)!r} have "
+                f"no declared type: the type matrix requires {required} "
+                f"versions on {lane} ({len(dtypes)} types ** {len(formals)} "
+                "untyped parameter(s)). "
+                + (
+                    "The contract states no kernel-library consent for it. "
+                    if consent is None else
+                    f"The contract's kernel-library consent states {stated!r} "
+                    f"for {lane}, not {required}. "
+                )
+                + "If that kernel library is what you want, state it in the "
+                "contract: "
+                + kernel_library_consent_spelling(str(entrypoint), every_lane)
+                + "; otherwise state each parameter's type in the code or "
+                "the contract."
+            )
     rows = [
         {formal: ScalarClass(dtype) for formal, dtype in zip(formals, combination)}
         for combination in itertools.product(dtypes, repeat=len(formals))
