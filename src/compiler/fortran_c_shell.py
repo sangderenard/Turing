@@ -68682,7 +68682,10 @@ def type_matrix_members(lane: str, members: Sequence[str] = TYPE_MATRIX) -> dict
     backend has a true bool.  A lane whose bool storage is spelled as one of
     its integer storages (the C module lane stores bool as ``uint8_t``) has
     no true bool: there the bool member is the 8-bit member, ``int8``.  A
-    member with no declared dtype layout is a named refusal, never skipped.
+    member the lane naturally has no form for maps to ``None`` and gets no
+    copy there: no lane spelling (float16 on Fortran), or an unsigned
+    integer on a Fortran compiler without native unsigned (-funsigned).  A
+    member with no declared dtype layout at all is a named refusal.
     """
 
     from ..transmogrifier.dtype_layout import DTYPES, resolve
@@ -68703,25 +68706,28 @@ def type_matrix_members(lane: str, members: Sequence[str] = TYPE_MATRIX) -> dict
         getattr(layout, field) for layout in DTYPES.values()
         if layout.kind in {"int", "uint"} and getattr(layout, field)
     }
-    result: dict[str, str] = {}
-    unspelled: list[str] = []
+    # Owner (2026-11-26): where a lane naturally has no form for a member,
+    # the lane simply has no copy for it.  ``None`` marks that member.
+    native_unsigned = True
+    if str(lane) == "fortran":
+        from .fortran_toolchain import fortran_supports_native_unsigned
+        from .ssa_fortran_backend import fortran_compiler
+
+        native_unsigned = fortran_supports_native_unsigned(fortran_compiler())
+    result: dict[str, str | None] = {}
     for member in members:
         layout = resolve(str(member))
-        compiled = layout.name
+        compiled: str | None = layout.name
         if layout.kind == "bool" and (
             not getattr(layout, field)
             or getattr(layout, field) in integer_spellings
         ):
             compiled = "int8"
         elif not getattr(layout, field):
-            unspelled.append(layout.name)
+            compiled = None
+        elif layout.kind == "uint" and not native_unsigned:
+            compiled = None
         result[layout.name] = compiled
-    if unspelled:
-        raise ValueError(
-            f"type matrix member(s) {unspelled!r} have no {lane} spelling "
-            f"(dtype_layout.{field} is empty): the {lane} lane has no native "
-            "form for them"
-        )
     return result
 
 
@@ -68756,7 +68762,10 @@ def lower_ast_source_type_matrix(
         policy = ExtractionContract(policy)
     formals = untyped_entry_parameters(source, str(entrypoint), policy)
     compiled = type_matrix_members(lane, members)
-    dtypes = tuple(dict.fromkeys(compiled.values()))
+    absent = tuple(member for member, dtype in compiled.items() if dtype is None)
+    dtypes = tuple(dict.fromkeys(
+        dtype for dtype in compiled.values() if dtype is not None
+    ))
     rows = [
         {formal: ScalarClass(dtype) for formal, dtype in zip(formals, combination)}
         for combination in itertools.product(dtypes, repeat=len(formals))
@@ -68767,8 +68776,8 @@ def lower_ast_source_type_matrix(
         if rows else {(): ({}, lower_ast_source_to_ssa(source, entrypoint, **kwargs))}
     )
     return {
-        "lane": str(lane), "members": compiled, "formals": formals,
-        "copies": copies,
+        "lane": str(lane), "members": compiled, "absent": absent,
+        "formals": formals, "copies": copies,
     }
 
 

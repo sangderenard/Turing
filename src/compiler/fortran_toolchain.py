@@ -80,6 +80,27 @@ def native_fortran_flags(
             f"selected compiler is {compiler!r}"
         )
     enabled = tuple(flags) + (() if "-funsigned" in flags else ("-funsigned",))
+    supported, diagnostic = _native_unsigned_probe(compiler, enabled)
+    if not supported:
+        raise ValueError(
+            "selected Fortran compiler/flags do not support exact native unsigned "
+            f"ISO C storage with -funsigned: {compiler!r}: {diagnostic}"
+        )
+    return enabled
+
+
+_NATIVE_UNSIGNED_PROBES: dict[tuple[str, tuple[str, ...]], tuple[bool, str]] = {}
+
+
+def _native_unsigned_probe(
+    compiler: str, flags: tuple[str, ...],
+) -> tuple[bool, str]:
+    """Compile the exact unsigned probe once per (compiler, flags)."""
+
+    key = (str(compiler), tuple(flags))
+    known = _NATIVE_UNSIGNED_PROBES.get(key)
+    if known is not None:
+        return known
     environment = dict(os.environ)
     environment["PATH"] = str(Path(compiler).resolve().parent) + os.pathsep + environment.get("PATH", "")
     with tempfile.TemporaryDirectory(prefix="turing-fortran-unsigned-") as directory:
@@ -92,15 +113,26 @@ def native_fortran_flags(
             "end subroutine\n", encoding="utf-8",
         )
         completed = subprocess.run(
-            [compiler, *enabled, "-c", str(probe), "-o", str(probe.with_suffix(".o"))],
+            [compiler, *flags, "-c", str(probe), "-o", str(probe.with_suffix(".o"))],
             capture_output=True, text=True, env=environment,
         )
-    if completed.returncode != 0:
-        raise ValueError(
-            "selected Fortran compiler/flags do not support exact native unsigned "
-            f"ISO C storage with -funsigned: {compiler!r}: {completed.stderr.strip()}"
-        )
-    return enabled
+    result = (completed.returncode == 0, completed.stderr.strip())
+    _NATIVE_UNSIGNED_PROBES[key] = result
+    return result
+
+
+def fortran_supports_native_unsigned(compiler: str | None) -> bool:
+    """Whether this Fortran compiler has a native unsigned integer.
+
+    GNU spells it ``unsigned(c_intN_t)`` under -funsigned (gfortran 15 on);
+    an older compiler, or one of another family, has no native form.
+    """
+
+    if not compiler or not is_gnu_fortran(compiler):
+        return False
+    return _native_unsigned_probe(
+        compiler, aggressive_fortran_flags(compiler) + ("-funsigned",),
+    )[0]
 
 
 def aggressive_c_flags(fortran_compiler: str) -> tuple[str, ...]:
