@@ -17,6 +17,14 @@ The records, following the owner's design (2026-11-10/12):
   * an import between two lots of the unit is a track; an import that leaves the unit is a track to the room at the
     other end, which the navigator can name but not enter until the unit holding it is loaded
     (``UnitIndex.unit_of``). Each such track carries ``label`` = the other end's unit address.
+
+A view (dev pages ticket 3/8, research case 810bfd48; ``repo_world_units.project_view``) is built by the same
+function from the same records: its courtyard's identity is the view's address, its lots are the selected files
+under their real identities, and it has no way out. Each lot has a door home instead: an island door into its real
+folder's island, opening on the window that shows it there, and a ``home`` track to that window for the navigator.
+A view is its own island (``world:view:…``), so it has its own place in the wilderness.
+
+``measure_unit`` gives a unit's size (items, tracks, openings, graph bytes) before any HTML is rendered (gap E).
 """
 
 from __future__ import annotations
@@ -64,8 +72,8 @@ def build_unit_world(index: UnitIndex, address: str, *, href: Callable[[str], st
             item, name, path, kind, LOT_METAPHOR, position, (),
             words.building(name, words.identity(item), source_kind=kind, metaphor=LOT_METAPHOR),
         ))
-    folder = index.regions[unit.region]
-    courtyard_name = (folder["path"] or ".") + ("" if unit.offset is None else f" @ {unit.offset}")
+    place = unit.region if unit.region in index.views else (index.regions[unit.region]["path"] or ".")
+    courtyard_name = place + ("" if unit.offset is None else f" @ {unit.offset}")
     courtyard = AbstractUIRegion(
         unit.address, courtyard_name, GridPosition(0, 0), tuple(lots),
         words.region(courtyard_name, *(lot.intention for lot in lots), words.identity(unit.address)),
@@ -93,6 +101,11 @@ def build_unit_world(index: UnitIndex, address: str, *, href: Callable[[str], st
         opens = door.address(0) if isinstance(door, Treadmill) else door
         tracks.append(AbstractUITrack(sub, opens, "door", opens,
                                       words.track(words.identity(sub), words.identity(opens), relationship="door", label=opens)))
+    homes = unit.homes or {}
+    for item, home in homes.items():                      # a view's lots: the door home to the real folder
+        tracks.append(AbstractUITrack(item, home, "home", home,
+                                      words.track(words.identity(item), words.identity(home), relationship="home",
+                                                  label=home)))
     if unit.way_out is not None:
         tracks.append(AbstractUITrack(unit.address, unit.way_out, "way-out", unit.way_out,
                                       words.track(words.identity(unit.address), words.identity(unit.way_out),
@@ -108,6 +121,8 @@ def build_unit_world(index: UnitIndex, address: str, *, href: Callable[[str], st
                                            href=link(door.address(0)))
         else:
             world = declare_island_door(world, sub, island_of(sub), href=link(door))
+    for item, home in homes.items():
+        world = declare_island_door(world, item, island_of(index.rooms[item]["region"]), href=link(home))
     if unit.way_out is not None:
         parent, _offset = split_address(unit.way_out)
         world = declare_island_passage(world, unit.address, lot=unit.region, outside=island_of(parent),
@@ -129,4 +144,19 @@ def unit_graph(index: UnitIndex, address: str, *, href: Callable[[str], str] | N
     return graph
 
 
-__all__ = ["LOT_METAPHOR", "build_unit_world", "island_of", "unit_graph"]
+def measure_unit(index: UnitIndex, address: str) -> dict[str, Any]:
+    """A unit's size before any HTML is rendered (gap E): its items, tracks and openings, and the bytes of its
+    ``abstract-ui-div-map-v0`` graph as compact JSON."""
+
+    import json
+
+    world = build_unit_world(index, address)
+    graph = unit_graph(index, address)
+    openings = sum(len(building.openings) for region in world.regions for building in region.buildings) + \
+        sum(len(region.openings) for region in world.regions)
+    return {"address": address, "items": sum(len(region.buildings) for region in world.regions),
+            "tracks": len(world.tracks), "openings": openings,
+            "graph_bytes": len(json.dumps(graph, separators=(",", ":"), sort_keys=True).encode("utf-8"))}
+
+
+__all__ = ["LOT_METAPHOR", "build_unit_world", "island_of", "measure_unit", "unit_graph"]

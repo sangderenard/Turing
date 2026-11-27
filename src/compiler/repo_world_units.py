@@ -28,6 +28,17 @@ What leaves a unit is named by address, never by loading the other side:
     index.door(region_identity)        -> the plain address, or the Treadmill behind that folder's door
     index.unit_of(item_identity)       -> the window that shows a file or a subfolder lot (starting at it)
     index.unit(address)                -> Unit: its items, its way out, its doors and its portals out of the window
+
+VIEWS (dev pages ticket 3/8, research case 810bfd48). A view is a courtyard that is no folder on disk: a unit whose
+items come from a filter -- the files a project contract's scope selects (``project_view``). The index may hold
+several scans (a project's roots may span a branch and a space; every identity carries its commit, so scans never
+collide), and named views beside the folders:
+
+    view:<account>/<project>/<view name>            a view that fits one window (owner, 2026-11-27)
+    view:<account>/<project>/<view name>@<offset>   the window of one that does not: a treadmill, like a folder
+
+A view lot keeps its real identity. Its home is the window that shows it in its real folder (``unit_of``), named in
+the unit's ``homes``; a view has no way out of its own, and never becomes any item's home.
 """
 
 from __future__ import annotations
@@ -40,17 +51,27 @@ UNIT_ITEMS = 1024
 cursor (4,096 places); this is a capacity, not a meaning, and a caller may ask for less."""
 
 WINDOW_SEPARATOR = "@"
+VIEW_PREFIX = "view:"
 
 
 def window_address(region: str, offset: int) -> str:
     return f"{region}{WINDOW_SEPARATOR}{int(offset)}"
 
 
+def view_address(account: str, project: str, name: str) -> str:
+    """A view's address (owner, 2026-11-27): the project is part of it, so every project's views are distinct."""
+
+    for part in (account, project, name):
+        if not isinstance(part, str) or not part or "/" in part or WINDOW_SEPARATOR in part:
+            raise ValueError(f"a view address part must be a plain name, not {part!r}")
+    return f"{VIEW_PREFIX}{account}/{project}/{name}"
+
+
 def split_address(address: str) -> tuple[str, int | None]:
     """(region identity, window offset or None)."""
 
     region, sep, offset = address.rpartition(WINDOW_SEPARATOR)
-    if sep and offset.isdigit() and "/dir:" in region:
+    if sep and offset.isdigit() and ("/dir:" in region or region.startswith(VIEW_PREFIX)):
         return region, int(offset)
     return address, None
 
@@ -101,33 +122,50 @@ class Unit:
     doors: Mapping[str, Any]        # subfolder region identity -> its plain address or its Treadmill
     portals: tuple[UnitPortal, ...] # pairs crossing this unit's boundary
     inner_portals: tuple[str, ...]  # pairs with both ends in this unit
+    homes: Mapping[str, str] = None # a view's lots: item -> the window that shows it in its real folder
 
     def to_data(self) -> dict[str, Any]:
         return {"address": self.address, "region": self.region, "offset": self.offset,
                 "length": self.length, "items": list(self.items), "way_out": self.way_out,
                 "doors": {k: (v.to_data() if isinstance(v, Treadmill) else v) for k, v in self.doors.items()},
-                "portals": [p.to_data() for p in self.portals], "inner_portals": list(self.inner_portals)}
+                "portals": [p.to_data() for p in self.portals], "inner_portals": list(self.inner_portals),
+                "homes": dict(self.homes or {})}
 
 
 def _records(scan: Any) -> tuple[Iterable, Iterable, Iterable]:
-    """Regions, rooms and portal pairs from a RepoWorldScan or its ``to_data()`` form, as plain dicts."""
+    """Regions, rooms and portal pairs from a RepoWorldScan or its ``to_data()`` form, as plain dicts; from several
+    scans, all of their records (each identity carries its commit)."""
 
+    if isinstance(scan, (list, tuple)):
+        parts = [_records(one) for one in scan]
+        return tuple(tuple(r for part in parts for r in part[k]) for k in range(3))
     if isinstance(scan, Mapping):
         return scan["regions"], scan["rooms"], scan["portals"]
     return ([r.to_data() for r in scan.regions], [r.to_data() for r in scan.rooms],
             [p.to_data() for p in scan.portals])
 
 
-class UnitIndex:
-    """Every unit of one repository scan. Cheap to build: no layout, only the containment and the portals."""
+def _unique(records: Iterable, kind: str) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    for record in records:
+        held = found.setdefault(record["identity"], record)
+        if held is not record and held != record:
+            raise ValueError(f"two scans disagree about the {kind} {record['identity']!r}")
+    return found
 
-    def __init__(self, scan: Any, *, capacity: int = UNIT_ITEMS):
+
+class UnitIndex:
+    """Every unit of one repository scan, or of several, and the views named over them. Cheap to build: no layout,
+    only the containment and the portals."""
+
+    def __init__(self, scan: Any, *, capacity: int = UNIT_ITEMS, views: Mapping[str, Iterable[str]] | None = None):
         if not isinstance(capacity, int) or capacity < 1:
             raise ValueError("capacity must be a positive whole number of items")
         regions, rooms, portals = _records(scan)
         self.capacity = capacity
-        self.regions = {r["identity"]: r for r in regions}
-        self.rooms = {r["identity"]: r for r in rooms}
+        self.regions = _unique(regions, "folder")
+        self.rooms = _unique(rooms, "file")
+        portals = tuple(_unique(portals, "portal pair").values())
         children: dict[str, list[dict]] = {k: [] for k in self.regions}
         files: dict[str, list[dict]] = {k: [] for k in self.regions}
         for region in self.regions.values():
@@ -145,14 +183,31 @@ class UnitIndex:
             for index, item in enumerate(items):
                 self._home[item] = window_address(region, index) if long else region
         self.portals = tuple(portals)
+        self.views: dict[str, tuple[str, ...]] = {}
+        for address, items in (views or {}).items():
+            if not isinstance(address, str) or not address.startswith(VIEW_PREFIX) or \
+                    split_address(address)[1] is not None or WINDOW_SEPARATOR in address:
+                raise ValueError(f"a view's address is {VIEW_PREFIX}<account>/<project>/<name>, not {address!r}")
+            items = tuple(items)
+            unknown = [item for item in items if item not in self.rooms]
+            if unknown:
+                raise KeyError(f"view {address!r} names files that are in no scan: {unknown[:5]}")
+            if len(set(items)) != len(items):
+                raise ValueError(f"view {address!r} names one file twice")
+            self.views[address] = tuple(sorted(items, key=lambda item: (self.rooms[item]["path"], item)))
+
+    def _courtyard(self, region: str) -> tuple[str, ...]:
+        if region in self.views:
+            return self.views[region]
+        if region in self.regions:
+            return self.items[region]
+        raise KeyError(f"no folder or view {region!r} in this index")
 
     # ---- addresses -------------------------------------------------------------------------------------------------
     def door(self, region: str) -> Any:
-        """What a folder's door opens on: its plain address when it fits, else its Treadmill."""
+        """What a folder's or a view's door opens on: its plain address when it fits, else its Treadmill."""
 
-        if region not in self.regions:
-            raise KeyError(f"no folder {region!r} in this scan")
-        length = len(self.items[region])
+        length = len(self._courtyard(region))
         return region if length <= self.capacity else Treadmill(region, length, self.capacity)
 
     def unit_of(self, item: str) -> str:
@@ -167,9 +222,7 @@ class UnitIndex:
     # ---- one unit -------------------------------------------------------------------------------------------------
     def unit(self, address: str) -> Unit:
         region, offset = split_address(address)
-        if region not in self.regions:
-            raise KeyError(f"no folder {region!r} in this scan")
-        everything = self.items[region]
+        everything = self._courtyard(region)
         long = len(everything) > self.capacity
         if long != (offset is not None) or (offset is not None and not 0 <= offset < len(everything)):
             raise KeyError(f"{address!r} is not a unit: {region!r} "
@@ -177,8 +230,10 @@ class UnitIndex:
                               if long else "fits whole and has no treadmill"))
         items = everything if offset is None else everything[offset:offset + self.capacity]
         inside = set(items)
-        parent = self.regions[region]["parent"]
+        view = region in self.views
+        parent = None if view else self.regions[region]["parent"]
         doors = {item: self.door(item) for item in items if item in self.regions}
+        homes = {item: self.unit_of(item) for item in items} if view else {}
         crossing, inner = [], []
         for pair in self.portals:
             source, target = pair["source_room"], pair["target_room"]
@@ -190,8 +245,18 @@ class UnitIndex:
                 crossing.append(UnitPortal(pair["identity"], here, there, self.unit_of(there),
                                            "out" if ins else "in", pair["reference_kind"]))
         return Unit(address, region, offset, len(everything), items,
-                    None if parent is None else self.unit_of(region), doors, tuple(crossing), tuple(inner))
+                    None if parent is None else self.unit_of(region), doors, tuple(crossing), tuple(inner), homes)
 
 
-__all__ = ["Treadmill", "UNIT_ITEMS", "Unit", "UnitIndex", "UnitPortal", "WINDOW_SEPARATOR", "split_address",
-           "window_address"]
+def project_view(contract: Any, scans: Any, *, capacity: int = UNIT_ITEMS) -> tuple[UnitIndex, str]:
+    """The index over a project's scans with its one view: every file the contract's scope admits
+    (``ProjectContract.includes``), from any scan. Returns the index and the view's address."""
+
+    index = UnitIndex(scans, capacity=capacity)
+    address = view_address(contract.account, contract.project, contract.view)
+    selected = [identity for identity, room in index.rooms.items() if contract.includes(room["path"])]
+    return UnitIndex(scans, capacity=capacity, views={address: selected}), address
+
+
+__all__ = ["Treadmill", "UNIT_ITEMS", "Unit", "UnitIndex", "UnitPortal", "VIEW_PREFIX", "WINDOW_SEPARATOR",
+           "project_view", "split_address", "view_address", "window_address"]
