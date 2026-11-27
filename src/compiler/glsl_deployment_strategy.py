@@ -3610,6 +3610,29 @@ def _planned_scalar_dtypes_from_graph(
             return None
         return int(reader)
 
+    # Program: the Studio response shader's ``int studio_origin_medium``,
+    # read as ``held: 'i32' = int(...) - 2; return held``.  Wrong record: the
+    # annotated local is the value of its expression, which the operator
+    # rules widened to int64, so the return settled int64 and the caller's
+    # ``'i32'`` local refused the call result.  Rule: a value bound to an
+    # annotated fixed-width local has the declared width (the declaration
+    # is proved by its ANNOTATION_DECLARATION cell); it is seeded first, so
+    # no operator rule replaces it.
+    from .concordance_declarations import ANNOTATION_DECLARATION as _ANNOTATION
+    from ..transmogrifier.dtype_layout import source_annotation_dtype as _declared
+    for node_id, data in G.nodes(data=True):
+        local_declaration = (data.get("attributes") or {}).get(
+            "local_scalar_annotation"
+        )
+        if local_declaration is None:
+            continue
+        width, annotation_cell = local_declaration
+        annotation_fact = _range_book().page(_ANNOTATION).cell(
+            annotation_cell.row, annotation_cell.column,
+        )
+        if _declared(annotation_fact.annotation) == width:
+            scalar.setdefault(int(node_id), str(width))
+
     records = G.graph.get("source_sequence_mutation_records") or {}
     # Program: ``xs = collect(n); return sum(xs)`` (corpus c152).  Wrong
     # record: the call result's element type was unread, so ``sum`` fell to
@@ -34606,6 +34629,12 @@ def _fold_callsite_structural_values(
                 "sequence_writable",
                 "aggregate_leaf_value_ids",
                 "tensor_output_descriptors",
+                # GLSL ``return -1;`` from an ``int`` function, read as
+                # ``held: 'i32' = -__glsl_literal_1``: the fold made the
+                # literal -1 and dropped its declaration, so it settled as
+                # the int class (int64) beside the other return site's
+                # int32.  The value is still the annotated local's value.
+                "local_scalar_annotation",
             )
             if key in source_attributes
         }

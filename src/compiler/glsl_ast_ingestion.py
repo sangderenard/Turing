@@ -1133,7 +1133,26 @@ class _ASTExpressionParser:
                 return self._vector_call(token, args, vector)
         if name in GLSL_CASTS:
             self._arity(token, args, 1)
-            return _typed(_call(name, args), name)
+            converted = _typed(_call(name, args), name)
+            if self.context is None:
+                return converted
+            # GLSL ``int(x)`` converts to int32 and ``float(x)`` to
+            # float32; the Python spellings ``int``/``float`` are the
+            # builtin classes (int64/float64).  Program: the Studio
+            # response shader's ``int studio_origin_medium(...)`` returns
+            # ``int(...) - 2``; its return sites settled int64 and the
+            # caller's ``int currentMedium`` (i32) refused the call result
+            # ("authored local scalar conflicts with an existing physical
+            # ABI").  The conversion is held in a temporary annotated with
+            # the GLSL width, as literals are; the prelude is branch-local,
+            # so a conversion inside a selected arm still runs only there.
+            temporary = self.context.temporaries.fresh()
+            self.context.scope[temporary] = name
+            self.prelude.append(ast.AnnAssign(
+                target=ast.Name(id=temporary, ctx=ast.Store()),
+                annotation=self.context.types.annotation(name),
+                value=converted, simple=1))
+            return _typed(_name(temporary), name)
         result_type = _type_of(args[0]) if args else None
         if name == "pow":
             self._arity(token, args, 2)
@@ -2564,17 +2583,43 @@ def _helper_definition(context, name, signature, statements, token):
         """A returned vector, struct or array is a copy (_value_copy)."""
 
         def visit_Return(self, node):
-            if node.value is not None:
-                node.value = _copied_read(
-                    context, node.value, token,
-                    _type_of(node.value) or signature.result_type,
-                )
+            if node.value is None:
+                return node
+            if signature.result_type in _SCALAR_TYPES:
+                # GLSL converts a returned value to the function's result
+                # type.  Program: ``int studio_origin_medium(...)`` returns
+                # ``-1`` and ``int(...) - 2``, whose value-domain widths are
+                # int64; the declared ``int`` is int32, and its caller's
+                # ``int currentMedium`` refused the int64 call result.  The
+                # returned value is held in a temporary annotated with the
+                # result type, so the return carries the declared width.
+                held = context.temporaries.fresh()
+                context.scope[held] = signature.result_type
+                return [
+                    ast.AnnAssign(
+                        target=ast.Name(id=held, ctx=ast.Store()),
+                        annotation=context.types.annotation(
+                            signature.result_type),
+                        value=node.value, simple=1),
+                    ast.Return(value=_typed(
+                        _name(held), signature.result_type)),
+                ]
+            node.value = _copied_read(
+                context, node.value, token,
+                _type_of(node.value) or signature.result_type,
+            )
             return node
 
         def visit_FunctionDef(self, node):
             return node
 
-    body = [ReturnCopies().visit(statement) for statement in body]
+    body = [
+        rewritten
+        for statement in body
+        for rewritten in (
+            lambda result: result if isinstance(result, list) else [result]
+        )(ReturnCopies().visit(statement))
+    ]
     # An ``in``/``inout`` parameter is the helper's own copy of its actual:
     # one whose fields or elements the helper stores into starts as a copy,
     # so the caller's object is never written (_value_copy).  The copy is a
