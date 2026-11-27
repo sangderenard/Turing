@@ -28,6 +28,7 @@
 # tensor operations.
 
 import os
+import shutil
 import ctypes
 import ctypes.util
 import json
@@ -286,9 +287,18 @@ def native_library_path() -> Path | None:
             C_SOURCE, name="ctensor_ops", directory=build, extra_flags=flags, toolchain=toolchain,
         )
         library.parent.mkdir(parents=True, exist_ok=True)
+        # Program: the service (svc-meowdoku) importing c_backend after the operator's account built the library,
+        # 2026-11-27.  Wrong record: the build folder is the builder's own %TEMP%, and a move keeps a file's own
+        # access list, so the cached library allowed only the builder (SYSTEM, Administrators, alber) and every other
+        # account's dlopen failed with error 0x5, though the cache folder grants them read and execute.  Rule: the
+        # library is copied into the cache folder as a new file, which takes that folder's inherited access list, and
+        # renamed into place there (one folder, so the rename is atomic and keeps that list).
+        staged = library.with_name(f".{library.name}.{os.getpid()}.part")
         try:
-            os.replace(built, library)
+            shutil.copyfile(built, staged)
+            os.replace(staged, library)
         except OSError:
+            staged.unlink(missing_ok=True)
             if not library.exists():           # another process placed the same library first
                 raise
     return library
