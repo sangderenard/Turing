@@ -22,7 +22,7 @@
    "env": {
     "SPEAKTOME_REPO": "/srv/powershell/speaktome",
     "NODUS_TENSOR_CORE": "/srv/powershell/nodus/build-linux/libnodus_tensor_core.so",
-    "SPEAKTOME_PUBLIC_ORIGIN": "https://oracle.speaktome.dev",
+    "SPEAKTOME_PUBLIC_ORIGIN": "https://speaktome.dev",
     "GIT_CONFIG_COUNT": "1",
     "GIT_CONFIG_KEY_0": "safe.directory",
     "GIT_CONFIG_VALUE_0": "*"
