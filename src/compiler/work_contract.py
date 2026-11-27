@@ -143,6 +143,12 @@ _HONORED_GLSL_GEMM = ("glslblas_gemm", "source_algorithm")
 #: ``compile_policy`` row on the book and every callsite's decision a
 #: ``callsite_descriptor_reuse`` row.
 _HONORED_CALLSITE_DESCRIPTOR_REUSE = ("signature", "callsite")
+# The register width the native CPU lanes (LLVM, C) compute a float32 SCALAR
+# in.  ``float32``: a float32 value is computed in float32, as GLSL and every
+# float32 lane define it.  ``float64``: the earlier lane convention -- the
+# scalar is held and computed in a double register and rounded at its store,
+# so a chain of float32 operations rounds once (more accurate, not float32).
+_HONORED_FLOAT32_SCALAR_REGISTER = ("float32", "float64")
 
 
 def _validate_depth(name, value):
@@ -242,6 +248,12 @@ class WorkContract:
     # (callee, signature) per round (``signature``) or once per callsite
     # (``callsite``).  See ``_HONORED_CALLSITE_DESCRIPTOR_REUSE``.
     callsite_descriptor_reuse: str = "signature"
+    # The register width of a float32 scalar on the native CPU lanes (LLVM,
+    # C); see ``_HONORED_FLOAT32_SCALAR_REGISTER``.  Spans are float32
+    # storage under both.  Owner, 2026-11-27: the double register "is too
+    # quirky to be the default" -- float32 is computed as float32 unless a
+    # contract asks for the wider register.
+    float32_scalar_register: str = "float32"
     # Who defines the repository tensor kernels in native products:
     # ``repository`` (the authored, compensated kernels) or ``eigen``
     # (Eigen's GEMM linked in; a different numerical contract).  See
@@ -356,6 +368,11 @@ class WorkContract:
                 f"tensor_kernel_lane={self.tensor_kernel_lane!r} is not "
                 f"honored; honored: {_HONORED_LANES}"
             )
+        if self.float32_scalar_register not in _HONORED_FLOAT32_SCALAR_REGISTER:
+            raise ValueError(
+                f"float32_scalar_register={self.float32_scalar_register!r} is "
+                f"not honored; honored: {_HONORED_FLOAT32_SCALAR_REGISTER}"
+            )
         if self.callsite_descriptor_reuse not in _HONORED_CALLSITE_DESCRIPTOR_REUSE:
             raise ValueError(
                 f"callsite_descriptor_reuse={self.callsite_descriptor_reuse!r} "
@@ -398,6 +415,7 @@ class WorkContract:
             f"glsl-gemm={self.shaders.blas_gemm}",
             f"deployment={self.deployment}",
             f"callsite-descriptor-reuse={self.callsite_descriptor_reuse}",
+            f"float32-scalar-register={self.float32_scalar_register}",
             f"graph-resident-regions={self.graph_resident_regions}",
             f"graph-workers={self.graph_workers}",
         ]
@@ -569,6 +587,16 @@ def active_contract() -> WorkContract:
               if os.environ.get(variable)}
     if depths:
         contract = with_expansion_policy(contract, depths)
+
+    # A fidelity choice (it changes float32 results), so it renames the
+    # contract as the legacy single-field overrides below do.
+    register = os.environ.get("TURING_FLOAT32_SCALAR_REGISTER")
+    if register and register != contract.float32_scalar_register:
+        contract = dataclasses.replace(
+            contract,
+            name=f"{contract.name}+float32-scalar-{register}",
+            float32_scalar_register=register,
+        )
 
     inexact = _flag("TURING_POW_INEXACT")
     fma = _flag("TURING_FMA_CONTRACT")

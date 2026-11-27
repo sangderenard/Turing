@@ -231,6 +231,37 @@ def resolve(name: object) -> DTypeLayout | None:
     return None if canonical is None else DTYPES[canonical]
 
 
+#: Annotation spellings that name a Python CLASS, with the class's language
+#: width.  A class names a kind; its width here is a default, not a
+#: declaration (``source_annotation_states_width``).
+_BUILTIN_ANNOTATION_CLASSES = {
+    "bool": "bool", "int": "int64", "float": "float64",
+    "Any": "opaque_ref", "object": "opaque_ref",
+}
+
+
+def source_annotation_states_width(annotation: object) -> bool:
+    """Whether an authored scalar annotation declares a fixed width.
+
+    ``'float32'`` / ``'i32'`` / ``uint32`` declare one; the class spellings
+    ``int`` / ``float`` / ``bool`` name a kind whose width is the class
+    default.  Unknown spellings declare nothing.
+    """
+    import ast
+    spelling = str(annotation).strip()
+    if spelling[:1] in {"'", '"'}:
+        try:
+            value = ast.literal_eval(spelling)
+        except (ValueError, SyntaxError):
+            return False
+        if not isinstance(value, str):
+            return False
+        spelling = value
+    if spelling in _BUILTIN_ANNOTATION_CLASSES:
+        return False
+    return source_annotation_dtype(spelling) is not None
+
+
 def source_annotation_dtype(annotation: object) -> str | None:
     """Resolve an authored scalar annotation without losing explicit widths.
 
@@ -248,10 +279,8 @@ def source_annotation_dtype(annotation: object) -> str | None:
         if not isinstance(value, str):
             return None
         spelling = value
-    builtin = {"bool": "bool", "int": "int64", "float": "float64",
-               "Any": "opaque_ref", "object": "opaque_ref"}
-    if spelling in builtin:
-        return builtin[spelling]
+    if spelling in _BUILTIN_ANNOTATION_CLASSES:
+        return _BUILTIN_ANNOTATION_CLASSES[spelling]
     layout = resolve(spelling)
     if layout is None or layout.kind not in {"bool", "int", "uint", "float"}:
         return None

@@ -519,3 +519,65 @@ def test_float_returned_through_inout_tuple_stays_float32_on_llvm():
         # Within one float32 ulp: the LLVM lane evaluates a float32 region
         # in double and rounds at the store.
         assert abs(float(outs[0]) - float(expected)) <= float(np.spacing(expected))
+
+
+def test_declared_float32_formal_converts_a_float64_actual_on_llvm():
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    # The Studio response shader's cosine_dir(float u, ...): a declared
+    # ``u: 'float32'`` formal reached by a float64 actual.  Before: the
+    # formal took the actual's float64, so ``1.0 - u`` was float64 beside the
+    # float32 literal arm of ``max(0.0, 1.0 - u)`` ("conditional union arm
+    # changes its physical ABI").  The declared width governs; the actual
+    # converts at the call.
+    source = '''
+from src.common.tensors.abstraction import AbstractTensor
+def f(u: 'float32') -> 'float32':
+    zero: 'float32' = 0.0
+    one: 'float32' = 1.0
+    held: 'float32' = zero if zero > one - u else one - u
+    return held
+def main(x: float, out: AbstractTensor):
+    out[0] = f(x)
+'''
+    root = Path(__file__).resolve().parents[1]
+    contract = ExtractionContract(
+        root / 'extraction_contracts/program_extraction.yaml'
+    ).with_program_abi({'records': {}, 'bindings': [], 'values': [
+        {'function': 'main', 'parameter': 'x', 'storage': 'scalar',
+         'dtype': 'float64', 'rank': 0, 'shape': [], 'python_type': 'builtins.float'},
+        {'function': '*', 'parameter': 'out', 'storage': 'span', 'dtype': 'float32',
+         'rank': 1, 'python_type': 'src.common.tensors.abstraction.AbstractTensor'},
+    ]}).with_execution_file(
+        root / 'extraction_contracts/vehicle_full_native_execution.yaml')
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, 'main', extraction_contract=contract,
+        python_bindings={'AbstractTensor': AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        runtime_closure_only=True, progress_bars=False)
+    callee_widths = {getattr(value, 'dtype', None)
+                     for name, fn in module.functions.items() if '__f__' in name
+                     for block in fn.blocks.values()
+                     for ins in block.instrs for value in (*ins.args, ins.res)}
+    assert 'float64' not in callee_widths
+    entry = exports[0]
+    names = dict(module.functions[entry].metadata['parameter_names'])
+    emitted = emit_ssa_function_to_llvm(module, entry)
+    assert not emitted.shortfalls
+    artifact = compile_artifact(emitted, directory=tempfile.mkdtemp())
+    for x in (0.25, 1.5, 1.0 / 3.0):
+        out = np.zeros(1, dtype=np.float32)
+        prepare_artifact_execution(artifact, {names['x']: x, names['out']: out}).run()
+        u = np.float32(x)
+        expected = max(np.float32(0.0), np.float32(1.0) - u)
+        assert float(out[0]) == float(expected)

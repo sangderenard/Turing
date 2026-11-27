@@ -1751,6 +1751,18 @@ def _double_literal(value: _Any) -> str:
     return f"0x{bits:016X}"
 
 
+def _float_literal(value: _Any) -> str:
+    """An LLVM ``float`` constant: the hex double of the float32-rounded value.
+
+    LLVM's textual ``float`` constant is a double bit pattern that must be
+    exactly representable in float32; rounding through binary32 first makes
+    it so (the value a float32 store of ``value`` holds).
+    """
+
+    rounded = _struct.unpack(">f", _struct.pack(">f", float(value)))[0]
+    return _double_literal(rounded)
+
+
 #: Bytes one element of each LLVM ABI type occupies in a buffer. This is the
 #: SAME set ``prepare_artifact_execution`` allocates from -- double/f64,
 #: i32, i64, i1 as one byte (numpy bool_), ptr as a machine word -- so a block
@@ -1889,10 +1901,15 @@ def _value_llvm_type(value: _Any) -> str:
         accounting.get("physical_dtype") or getattr(value, "dtype", None)
     )
     # A float32 SPAN is stored as ``float`` (its public buffer is float32).  A
-    # float32 scalar keeps the lane's double register width: scalar arithmetic
-    # is double throughout, and a one-element slot gains nothing from ``float``.
+    # float32 scalar's register is the work contract's
+    # ``float32_scalar_register``: ``float32`` (the default) computes it as
+    # ``float``; ``float64`` keeps the earlier double register, where scalar
+    # arithmetic is double throughout and rounds at the store.
     if llvm_type == "float" and _declared_span_rank(value) == 0:
-        return "double"
+        from .work_contract import active_contract
+
+        if active_contract().float32_scalar_register == "float64":
+            return "double"
     return llvm_type
 
 
@@ -2675,6 +2692,11 @@ def _emit_repository_call_module(
     def literal(payload: _Any, llvm_type: str) -> str:
         if llvm_type == "double":
             return _double_literal(0.0 if payload is None else payload)
+        if llvm_type == "float":
+            # A float32 register (``float32_scalar_register="float32"``):
+            # LLVM spells a ``float`` constant as the hex double of its
+            # float32-exact value.
+            return _float_literal(0.0 if payload is None else payload)
         if llvm_type == "i1":
             return "true" if bool(payload) else "false"
         return str(int(0 if payload is None else payload))
@@ -3078,8 +3100,14 @@ def _emit_repository_call_module(
                 return loaded
             converted = f"%convert.{tag}"
             if source_type == "float":
-                body.append(f"  {converted}.wide = fpext float {loaded} to double")
-                return convert_loaded(f"{converted}.wide", "double", wanted, f"{tag}.wide",
+                # The widened register and the recursive conversion's own
+                # register (``%convert.{tag}.wide``) must be distinct names:
+                # both were ``%convert.{tag}.wide`` ("multiple definition of
+                # local value") once float32 scalars were held as ``float``
+                # (``float32_scalar_register="float32"``).
+                widened = f"{converted}.f64"
+                body.append(f"  {widened} = fpext float {loaded} to double")
+                return convert_loaded(widened, "double", wanted, f"{tag}.wide",
                                       target_unsigned=target_unsigned)
             if wanted == "float":
                 narrow = convert_loaded(loaded, source_type, "double", f"{tag}.n",
