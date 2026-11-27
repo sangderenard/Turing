@@ -1,9 +1,7 @@
 """Authored C and repository LLVM top-k keep exact signed int64 order."""
 
 import ctypes
-from pathlib import Path
 
-from cffi import FFI
 import pytest
 from llvmlite import binding as llvm
 
@@ -15,20 +13,11 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
 
 @pytest.fixture(scope="module")
 def native_kernels():
-    root = Path(__file__).resolve().parents[1]
-    directory = root / "src/common/tensors/accelerator_backends/c_backend"
-    ffi = FFI()
-    ffi.cdef(
-        "void topk_int64_dim(const long long*, const int*, int, int, int, "
-        "long long*, long long*);"
-        "void topk_double_dim(const double*, const int*, int, int, int, "
-        "double*, double*);"
-    )
-    c = ffi.verify(
-        '#include "ctensor_ops.h"',
-        sources=[str(directory / "ctensor_ops.c")],
-        include_dirs=[str(directory)],
-    )
+    # The authored C is the library c_backend loads (a plain shared library in the accelerator cache), not a
+    # second extension module built beside this file.
+    from src.common.tensors.accelerator_backends.c_backend import C as c
+    from src.common.tensors.accelerator_backends.c_backend import ffi
+
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
     module = llvm.parse_assembly(LLVM_SSA_MODULE)
