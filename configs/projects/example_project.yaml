@@ -1,0 +1,38 @@
+# Project contract: what a dev page's project is, where it lives, what it holds.
+#
+# Read by src/compiler/project_contract.py. A project is a folder with this file,
+# named project.yaml, at its root (dev pages ticket 9db5ea72, case 8e062373).
+#
+# identity    <account>/<project>.
+# placement   chosen when the project is opened:
+#   mode      branch       a branch, checked out centrally (needs branch:)
+#             standalone   a folder in the account's readable project space
+#                          (needs space:, a path under projects/)
+#             branch-copy  both: a branch and its copy in the space (needs both)
+#             A key the mode does not use is refused.
+# scope       the sources of the forward-facing product, set by hand and
+#             editable later: shaders and code, Nodus and Python files. Never
+#             binary products or the published page.
+#   roots     folders, relative to the repository.
+#   include   languages: names from repo_world_scan.LANGUAGE_SUFFIXES
+#             (python, javascript, cpp, glsl, wgsl).
+#   exclude   patterns; one ending in / excludes that folder at any depth.
+# view        the view courtyard that shows the scope (ticket 3/8).
+schema: project-contract-v0
+identity: alice/marble-garden
+
+placement:
+  mode: branch-copy
+  branch: {repository: turing, name: alice/marble-garden}
+  space: projects/marble-garden
+
+scope:
+  roots:
+    - examples/marble_garden
+    - nodus/plugins/marble_garden
+  include:
+    languages: [python, glsl, wgsl, cpp, javascript]
+  exclude: ["build/", "*.wasm", "*.min.js"]
+
+view:
+  name: sources
