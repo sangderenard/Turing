@@ -998,6 +998,15 @@ def _place_failure_exit_blocks(
         bindings = []
         for name, cell in named:
             candidates = by_origin.get(origin_cell(book, cell), set())
+            # Program: WORKER's ``value = 5`` before ``try: value = 12 // n``.
+            # Wrong record: the 5 no path reads (the handler and the body
+            # both rebind ``value``) was removed from this graph, and the
+            # binding with no node refused the site.  Rule: a version with
+            # no node here has no reader here and is not carried; a guard
+            # merge that does read it refuses in ``_join_failure_exits``
+            # ("no unique version").  Two nodes still refuse.
+            if not candidates:
+                continue
             if len(candidates) != 1:
                 raise ValueError(
                     f"failure site {row[0]} binding {name!r} has no unique "
@@ -36787,6 +36796,22 @@ def _fold_callsite_structural_values(
     # to the selected producer.  The proof is the graph constant above; no
     # runtime tensor value or Python callable participates.
     branch_memberships = _branch_compartments(graph)
+    # Program: ``try: result = 12 // n`` (tests/test_source_c_exceptions,
+    # BASIC).  Wrong record: exception ingestion spells the protected body's
+    # guard ``if True:`` (its record is fresh by construction, 7030b938) and
+    # this fold removed it, so the failure site the reducer recorded in that
+    # guard had no guard to leave to ("no unique protected guard here: []").
+    # Rule: a guard a failure site exits to is not decided by its test --
+    # the site's exit is a second way to its end -- so it is not folded; the
+    # reducer already treats its never-taken arm as terminal.
+    from .concordance_declarations import SOURCE_FAILURE_SITE, SOURCE_SPAN
+    from ..transmogrifier.graph.graph_express2 import source_span_row
+
+    failure_site_page = fold_book.pages.get(SOURCE_FAILURE_SITE.name)
+    failure_guards = frozenset(
+        failure_site_page.latest(row)[3]
+        for row in failure_site_page.rows()
+    ) if failure_site_page is not None else frozenset()
     pruned = True
     while pruned:
         pruned = False
@@ -36794,6 +36819,12 @@ def _fold_callsite_structural_values(
             expression = control_data.get("expr_obj")
             if not isinstance(expression, ast.If):
                 continue
+            if failure_guards:
+                span_row = source_span_row(None, expression)
+                if span_row is not None and fold_book.latest_ref(
+                    SOURCE_SPAN, span_row,
+                ) in failure_guards:
+                    continue
             predicate_id = next((
                 int(parent)
                 for parent, role in control_data.get("parents") or ()
