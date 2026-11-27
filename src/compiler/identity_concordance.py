@@ -20811,6 +20811,47 @@ class IdentityBook:
         taken = readers.pop((page.name, target.row), []) if readers else []
         return target, taken
 
+    def post_against_latest(
+        self, page: Page, row: tuple, decide: Any, *, stage: Stage,
+        provenance: Derived | Novel | Unsourced, mode: Mode,
+    ) -> tuple[Any, Ref | None]:
+        """Decide a post from the row's latest fact and commit it, as one
+        transaction with every other post of the row.
+
+        ``decide(incumbent)`` gets the row's latest fact (``None`` when the
+        row has no cell) and returns ``(fact, result)``: ``fact`` is posted,
+        or nothing when it is ``None``; ``result`` is handed back.  It may
+        raise to refuse.  A writer that looks before it posts with two
+        calls lets another post fall between them: two writers both find
+        the row absent and the second CONCORD post disagrees with the first
+        over a free ``source`` string (ticket 53cc36f3, review 176f3a29).
+        Readers the post wakes run after the transaction, as ``post``'s do.
+        Returns ``(result, ref)``; ``ref`` is ``None`` when nothing was
+        posted.
+        """
+        result, target, readers = self._decide_post_taking_readers(
+            page, row, decide, stage=stage, provenance=provenance, mode=mode,
+        )
+        if target is not None:
+            _run_row_readers(readers, target)
+        return result, target
+
+    def _decide_post_taking_readers(
+        self, page: Page, row: tuple, decide: Any, *, stage: Stage,
+        provenance: Derived | Novel | Unsourced, mode: Mode,
+    ) -> tuple[Any, Ref | None, list]:
+        """The look, the decision and ``_post_taking_readers`` in one
+        transaction (``_ConcurrentIdentityBook`` holds the publication lock,
+        a re-entrant lock, across all three)."""
+        row = tuple(row)
+        fact, result = decide(self.page(page).latest(row))
+        if fact is None:
+            return result, None, []
+        target, readers = self._post_taking_readers(
+            page, row, fact, stage=stage, provenance=provenance, mode=mode,
+        )
+        return result, target, readers
+
     def await_row(self, page: Page, row: tuple, reader: Any) -> None:
         """Run ``reader(ref)`` once with the cell of ``row`` on ``page``.
 
@@ -21633,7 +21674,7 @@ def _concurrent_book_operation(operation):
     return locked
 
 
-for _operation in ("_post_taking_readers", "_await_or_latest", "latest_ref", "mint_scope", "_source_stamp",
+for _operation in ("_post_taking_readers", "_decide_post_taking_readers", "_await_or_latest", "latest_ref", "mint_scope", "_source_stamp",
                    "derive_current", "current_ref", "stale_derivations", "settle_derivations", "import_cell",
                    "_materialise_row", "_preserve_fork_snapshots", "register_read_through",
                    "register_scope_projection", "edges_into", "edges_out_of", "mint_of"):

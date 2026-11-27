@@ -494,52 +494,60 @@ def _concord_source_value_class(
     from ...compiler.identity_concordance import Derived, Mode
 
     book = current_identity_book()
-    page = book.page(SOURCE_VALUE_CLASS)
     row = (scope, int(value_id))
     proposed = (
         _canonical_source_class_identity(class_identity),
         max(int(precision_limbs or 1), 1),
     )
-    incumbent = page.latest(row)
-    if incumbent is not None:
-        recorded = (str(incumbent[0]), int(incumbent[1]))
-        if recorded != proposed:
-            from ...compiler.identity_concordance import attach_failure_claim
 
-            error = ValueError(
-                "source value class concordance disagreement for "
-                f"{scope!r} value {value_id}: recorded={recorded!r}, "
-                f"recorded_source={tuple(incumbent[2:])!r}, "
-                f"{source} says {proposed!r}"
+    def decide(incumbent):
+        if incumbent is not None:
+            recorded = (str(incumbent[0]), int(incumbent[1]))
+            if recorded != proposed:
+                from ...compiler.identity_concordance import (
+                    attach_failure_claim,
+                )
+
+                error = ValueError(
+                    "source value class concordance disagreement for "
+                    f"{scope!r} value {value_id}: recorded={recorded!r}, "
+                    f"recorded_source={tuple(incumbent[2:])!r}, "
+                    f"{source} says {proposed!r}"
+                )
+                # Refused here, not through ``post``: hand the claim to the
+                # failure report so its concordance neighborhood is shown.
+                attach_failure_claim(
+                    book, error, SOURCE_VALUE_CLASS, row,
+                    (*proposed, str(source)), REDUCTION, provenance,
+                    Mode.CONCORD,
+                )
+                raise error
+            if isinstance(provenance, Derived):
+                # CONCORD owns exactly this case: the fact remains unchanged
+                # while every independently established predecessor edge is
+                # retained.  Returning before this post severed later
+                # call/annotation paths whenever an earlier reduction had
+                # already named the same class.
+                return incumbent, recorded
+            return None, recorded
+        if not isinstance(provenance, Derived):
+            raise ValueError(
+                f"source_value_class: no source cell for {row!r} -- the "
+                f"caller ({source}) passed no Derived cells"
             )
-            # Refused here, not through ``post``: hand the claim to the
-            # failure report so its concordance neighborhood is shown.
-            attach_failure_claim(
-                book, error, SOURCE_VALUE_CLASS, row,
-                (*proposed, str(source)), REDUCTION, provenance,
-                Mode.CONCORD,
-            )
-            raise error
-        if isinstance(provenance, Derived):
-            # CONCORD owns exactly this case: the fact remains unchanged while
-            # every independently established predecessor edge is retained.
-            # Returning before this post severed later call/annotation paths
-            # whenever an earlier reduction had already named the same class.
-            book.post(
-                SOURCE_VALUE_CLASS, row, incumbent, stage=REDUCTION,
-                provenance=provenance, mode=Mode.CONCORD,
-            )
-        return recorded
-    if not isinstance(provenance, Derived):
-        raise ValueError(
-            f"source_value_class: no source cell for {row!r} -- the caller "
-            f"({source}) passed no Derived cells"
-        )
-    book.post(
-        SOURCE_VALUE_CLASS, row, (*proposed, str(source)), stage=REDUCTION,
+        return (*proposed, str(source)), proposed
+
+    # The look and the post are one transaction (ticket 53cc36f3, review
+    # 176f3a29): two writers of the row that both looked before either
+    # posted would each post their own ``source`` string, and the second
+    # CONCORD post would refuse an agreeing class over that free string.
+    # Readers of the row run once the transaction is over, so a reader
+    # (``_class_call_result``) may race any other writer of this row.
+    decided, _posted = book.post_against_latest(
+        SOURCE_VALUE_CLASS, row, decide, stage=REDUCTION,
         provenance=provenance, mode=Mode.CONCORD,
     )
-    return proposed
+    return decided
 
 
 def _source_numeric_scope(graph: Any, fallback: str = "<module>") -> Any:

@@ -7,15 +7,21 @@ belongs to the book (``IdentityBook.await_row``) and ``post`` wakes it.
 ``await_row`` looks and registers in one transaction with ``post``'s commit
 and hands the reader the cell, so no post falls between a look and a wait.
 """
+import contextvars
 import copy
-import inspect
 import pickle
+from types import SimpleNamespace
 import threading
 
+import networkx as nx
 import pytest
 
+from src.common.tensors import topological_reducer
 from src.compiler import glsl_deployment_strategy
-from src.compiler.concordance_declarations import INGESTION, INGEST_SOURCE
+from src.compiler.concordance_declarations import (
+    INGESTION, INGEST_SOURCE, REDUCTION, SOURCE_SPAN, SOURCE_VALUE_CLASS,
+    SpanFact,
+)
 from src.compiler.identity_concordance import (
     Derived, Mode, Novel, RowField, RowFieldKind as KeyKind,
     begin_identity_book, concurrent_identity_publication, declare_page,
@@ -201,10 +207,143 @@ def test_call_result_readers_have_no_process_global_table():
     assert not hasattr(glsl_deployment_strategy, "_CALL_RESULT_CLASS_READERS")
 
 
-def test_publish_call_result_class_acts_on_the_handed_cell_only():
-    """No second lookup gap: the publisher never reads the returned row
-    itself; it acts on the Ref ``await_row`` hands to its reader."""
-    publish = inspect.getsource(
-        glsl_deployment_strategy._publish_call_result_class)
-    assert "await_row" in publish
-    assert "latest_ref" not in publish
+CALLER_SCOPE = ("test_row_readers", "caller")
+CALLEE_SCOPE = ("test_row_readers", "callee")
+CALL_ID = 3
+CALL_VALUE = 30
+
+
+def _span(book, name):
+    return book.post(
+        SOURCE_SPAN, ("test_row_readers", name, ()),
+        SpanFact("Name", 1, 0, 1, 0, name),
+        stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+        mode=Mode.CONCORD,
+    )
+
+
+def _caller(book, monkeypatch):
+    """A caller graph whose call node ``CALL_ID`` carries ``CALL_VALUE``;
+    its identity cell is a span the test authors."""
+    graph = nx.DiGraph()
+    graph.graph["authored_function_identity"] = CALLER_SCOPE
+    graph.add_node(CALL_ID, value_id=CALL_VALUE)
+    identity = _span(book, "call-node")
+    monkeypatch.setattr(topological_reducer, "node_identity_cell",
+                        lambda caller, node_id, **_: identity)
+    return SimpleNamespace(G=graph), identity
+
+
+def test_class_call_result_follows_the_handed_ref_not_the_latest(monkeypatch):
+    """The reader acts on the Ref ``await_row`` hands it.  The callee's row
+    holds an older and a newer cell of different class and width; handed
+    the older Ref, the caller's class and its provenance edge follow it."""
+    book, token = begin_identity_book()
+    try:
+        caller, identity = _caller(book, monkeypatch)
+        span = _span(book, "returned")
+        row = (CALLEE_SCOPE, 5)
+        older = book.post(SOURCE_VALUE_CLASS, row, ("builtins.int", 1, "old"),
+                          stage=REDUCTION, provenance=Derived((span,)),
+                          mode=Mode.CONCORD)
+        newer = book.post(SOURCE_VALUE_CLASS, row,
+                          ("builtins.float", 2, "new"), stage=REDUCTION,
+                          provenance=Derived((_span(book, "revised"),)),
+                          mode=Mode.REVISE)
+        assert newer != older
+        assert book.latest_ref(SOURCE_VALUE_CLASS, row) == newer
+
+        glsl_deployment_strategy._class_call_result(
+            book, caller, CALL_ID, older)
+
+        page = book.page(SOURCE_VALUE_CLASS)
+        classed = book.latest_ref(SOURCE_VALUE_CLASS,
+                                  (CALLER_SCOPE, CALL_VALUE))
+        assert classed is not None
+        assert tuple(page.cell(classed.row, classed.column)[:2]) == (
+            "builtins.int", 1)
+        sources = {source for source, _stage in book.edges_into(classed)}
+        assert older in sources and identity in sources
+        assert newer not in sources
+    finally:
+        end_identity_book(token)
+
+
+def test_the_call_result_reader_and_a_reducer_writer_race_safely(
+        monkeypatch):
+    """Review 176f3a29, comments 816 and 820: the call-result reader runs
+    outside the publication lock, so it may class the caller's call result
+    while one of the reducer's writers classes the same row.  Both agree on
+    the class and width, not on the free ``source`` string.  The reader
+    looks at the row, and the reducer writer is let in right after that
+    look: it must wait until the reader's post is committed, then concord
+    with it.  Before the look and the post were one transaction, both found
+    the row absent and the second post refused the first."""
+    book, token = begin_identity_book()
+    try:
+        caller, _identity = _caller(book, monkeypatch)
+        returned = topological_reducer._concord_source_value_class(
+            CALLEE_SCOPE, 5, "builtins.int", source="callee writer",
+            provenance=Derived((_span(book, "returned"),)))
+        assert returned == ("builtins.int", 1)
+        handed = book.latest_ref(SOURCE_VALUE_CLASS, (CALLEE_SCOPE, 5))
+        reducer_span = _span(book, "reducer")
+        target = (CALLER_SCOPE, CALL_VALUE)
+
+        with concurrent_identity_publication(book):
+            page_type = type(book.page(SOURCE_VALUE_CLASS))
+            looked = page_type.latest
+            results, errors = [], []
+
+            def reducer_writer():
+                try:
+                    results.append(
+                        topological_reducer._concord_source_value_class(
+                            CALLER_SCOPE, CALL_VALUE, "builtins.int",
+                            source="reducer writer",
+                            provenance=Derived((reducer_span,))))
+                except Exception as error:  # reported by the assertion
+                    errors.append(error)
+
+            context = contextvars.copy_context()
+            writer = threading.Thread(target=context.run,
+                                      args=(reducer_writer,))
+            reader_thread = threading.get_ident()
+            looks, interleaved = [], []
+
+            def look_then_let_the_writer_in(self, row, *args, **kwargs):
+                found = looked(self, row, *args, **kwargs)
+                if (tuple(row) == target
+                        and threading.get_ident() == reader_thread
+                        and not interleaved):
+                    looks.append(found)
+                    # The first look is the reader's own early return in
+                    # ``_class_call_result``; the second is the one the
+                    # post is decided on.
+                    if len(looks) == 2:
+                        writer.start()
+                        writer.join(timeout=0.5)
+                        interleaved.append(writer.is_alive())
+                return found
+
+            monkeypatch.setattr(page_type, "latest",
+                                look_then_let_the_writer_in)
+            glsl_deployment_strategy._class_call_result(
+                book, caller, CALL_ID, handed)
+            writer.join(timeout=10)
+            assert not writer.is_alive()
+        assert looks == [None, None]
+        assert errors == [], f"the reducer writer was refused: {errors!r}"
+        assert results == [("builtins.int", 1)]
+        assert interleaved == [True], (
+            "a post of the row committed between the look and the post")
+        page = book.page(SOURCE_VALUE_CLASS)
+        history = page.history(target)
+        assert len(history) == 1, history
+        _column, fact = history[0]
+        assert tuple(fact) == ("builtins.int", 1, "resolved call result")
+        classed = book.latest_ref(SOURCE_VALUE_CLASS, target)
+        sources = {source for source, _stage in book.edges_into(classed)}
+        assert handed in sources and reducer_span in sources
+    finally:
+        end_identity_book(token)
