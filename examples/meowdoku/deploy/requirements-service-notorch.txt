@@ -10,8 +10,10 @@
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
+aiosmtpd==1.4.6  # 2026-11-13: the mail receiver (deploy/mail_service.py); Apache-2.0
 annotated-doc==0.0.4
 anyio==4.12.1
+atpublic==9.0.0  # required by aiosmtpd; Apache-2.0
 attrs==25.4.0
 audioread==3.1.0
 beautifulsoup4==4.14.3

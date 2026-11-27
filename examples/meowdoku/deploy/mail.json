@@ -1,0 +1,20 @@
+{
+  "domain": "stichka.duckdns.org",
+  "listen_host": "0.0.0.0",
+  "listen_port": 47625,
+  "tls_cert": "C:/dev/Powershell/srv/state/secrets/tls-public/fullchain.cer",
+  "tls_key": "C:/dev/Powershell/srv/state/secrets/tls-public/cert.key",
+  "max_message_bytes": 10485760,
+  "max_recipients": 20,
+  "per_ip_per_minute": 20,
+  "mailbox_bytes": 209715200,
+  "outgoing_per_day": 50,
+  "provider_host": null,
+  "provider_port": 587,
+  "provider_security": "starttls",
+  "from_address": null,
+  "credential_file": null,
+  "site_url": "https://stichka.duckdns.org:8766/",
+  "retry_minutes": [5, 15, 60, 240, 720],
+  "give_up_hours": 72
+}
