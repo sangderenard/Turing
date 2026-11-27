@@ -83,9 +83,11 @@ def _checkout(db, policy, root, who, operation, **body):
                                 operation=operation, body=body)
 
 
-def _undo(db, policy, root, who, *, repository, branch, wrote, made_checkout, made_branch, made_owner) -> None:
-    """[WHOLE] remove what this open made, and nothing else."""
-    db.execute("DELETE FROM projects WHERE repository = ? AND branch = ? AND head IS NULL", (repository, branch))
+def _undo(db, policy, root, who, *, identity, repository, branch, wrote, made_checkout, made_branch,
+          made_owner) -> None:
+    """[WHOLE] remove what this open made, and nothing else: only the row this open claimed, never another
+    open's in-flight row on the same branch."""
+    db.execute("DELETE FROM projects WHERE identity = ? AND head IS NULL", (identity,))
     if wrote and central_checkout._row(db, repository, branch) is not None:
         try:
             _checkout(db, policy, root, who, "remove", repository=repository, branch=branch, path=wrote)
@@ -133,8 +135,8 @@ def open_project(db, policy, root, *, user_id, username, text, now=None) -> dict
     had_checkout = central_checkout._row(db, repository, branch) is not None
     who = {"user_id": user_id, "username": username}
     path = contract_path(contract)
-    undo = {"repository": repository, "branch": branch, "wrote": None, "made_checkout": not had_checkout,
-            "made_branch": not had_branch, "made_owner": held is None}
+    undo = {"identity": contract.identity, "repository": repository, "branch": branch, "wrote": None,
+            "made_checkout": not had_checkout, "made_branch": not had_branch, "made_owner": held is None}
     now = time.time() if now is None else now
     try:
         db.execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?,?,?)",                       # [ONCE] claimed first
@@ -160,13 +162,17 @@ def open_project(db, policy, root, *, user_id, username, text, now=None) -> dict
         committed = _checkout(db, policy, root, who, "commit", repository=repository, branch=branch,
                               message=f"Open project {contract.identity} (branch placement)\n\n"
                                       f"{path}: the project contract, validated by project_contract before writing.")
-        db.execute("UPDATE projects SET head = ? WHERE identity = ?", (committed["head"], contract.identity))
+        recorded = db.execute("UPDATE projects SET head = ? WHERE identity = ? AND head IS NULL",
+                              (committed["head"], contract.identity)).rowcount
     except central_checkout.CheckoutError as error:
         _undo(db, policy, root, who, **undo)
         raise ProjectError(error.message, error.status) from None
     except BaseException:
         _undo(db, policy, root, who, **undo)
         raise
+    if recorded != 1:                  # the commit stands in the branch, but this open's catalog row is gone
+        raise ProjectError(f"project {contract.identity!r} was committed to {branch!r} at {committed['head']}, "
+                           "but its catalog row was removed meanwhile; it is not listed as open", 409)
     return {"identity": contract.identity, "mode": contract.mode, "repository": repository, "branch": branch,
             "path": path, "head": committed["head"], "base": opened.get("base"), "server": opened.get("server"),
             "contract": contract.to_data(),
