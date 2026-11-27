@@ -1210,6 +1210,24 @@ def _eager_step(law, cols, n):
     return nxt, got
 
 
+def test_the_out_reasons_cover_n_out():
+    """Case a0e9535f: ``n_out_x`` / ``n_out_y`` / ``n_out_z`` / ``n_sdf_gone`` say why ids are ``n_out``.  Each reason
+    counts only outside ids, and every outside id has at least one reason (an id may have two)."""
+    n = 5
+    cols = F.initial_columns(n, mix=0.0)
+    half, dh = float(cols["half"]), float(cols["dh"])                       # uniforms: one value, not a column
+    cols["age"][:] = 1.0e3
+    cols["x"][:] = [3.0 * half, 0.0, 0.0, 3.0 * half, 0.0]                   # past a side wall, under the floor,
+    cols["y"][:] = [0.05, -3.0, 0.05, -3.0, 0.05]                            # past the plexiglass, two at once, inside
+    cols["z"][:] = [0.0, 0.0, 3.0 * dh, 0.0, 0.0]
+    _nxt, got = _eager_step(F.make_law(n, n), cols, n)
+    n_out, ox, oy, oz, og = (float(got[k][0]) for k in ("n_out", "n_out_x", "n_out_y", "n_out_z", "n_sdf_gone"))
+    assert n_out > 0
+    assert max(ox, oy, oz, og) <= n_out
+    assert ox + oy + oz + og >= n_out
+    assert float(got["n_nan"][0] + got["n_out"][0] + got["n_parked"][0] + got["n_live"][0]) == n
+
+
 def _thrown(n, uni, seed=0, box=((-0.15, 0.15), (0.012, 0.09))):
     """``n`` live grains packed into a small region with random velocities and spin (contact-rich from the first step)."""
     rng = np.random.default_rng(seed)
