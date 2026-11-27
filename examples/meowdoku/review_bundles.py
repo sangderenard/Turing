@@ -93,16 +93,24 @@ def checked_out(db, now=None) -> list:
             "SELECT m.bundle_id, m.repository, m.branch FROM review_bundle_members m JOIN review_bundles b "
             "ON b.id = m.bundle_id WHERE b.status = 'consolidating' AND NOT EXISTS (SELECT 1 FROM "
             "review_bundle_closures c WHERE c.bundle_id = m.bundle_id AND c.branch = m.branch)")}
-    in_play = {}
+    in_play, latest = {}, {}
     for record in branch_review.listing(db, now, limit=1000):
+        key = (record["repository"], record["branch"])
+        seen = {"id": record["id"], "head": record["head"], "standing": record["standing"]}
+        if key not in latest or record["created_at"] > latest[key][0]:
+            latest[key] = (record["created_at"], seen)
         if record["standing"] not in ("landed", "withdrawn", "rejected"):
-            in_play.setdefault((record["repository"], record["branch"]), {"id": record["id"], "head": record["head"],
-                                                                          "standing": record["standing"]})
+            in_play.setdefault(key, seen)
+    removing = set(db.execute(
+        "SELECT repository, branch FROM review_bundle_closures WHERE remove = 1 AND carried_at IS NULL UNION "
+        "SELECT repository, branch FROM branch_deletions WHERE carried_at IS NULL"))
     out = []
     for key in sorted(rows, key=lambda k: (k[0], k[1])):
         row = rows[key]
         row["bundle"] = consolidating.get(key)
         row["review"] = in_play.get(key)
+        row["latest_review"] = latest[key][1] if key in latest else None     # what "reopen" puts back up
+        row["removing"] = key in removing                                    # the cleanup account is still to remove it
         out.append(row)
     return out
 
@@ -317,18 +325,67 @@ def close(db, bundle_id, branch, *, user_id, username, reason, remove=False, wor
     return {"bundle": bundle, "tell": sorted(set(bundle["owners"]) - {str(username)})}
 
 
+def delete_branch(db, *, user_id, username, repository, branch, reason, work, known, now=None) -> dict:
+    """Ask the cleanup account to delete one branch that is in no bundle, with a reason: at its next run it removes the
+    branch as it removes a branch closed out of a bundle (``branch_gate.carry_closures``), its unlanded work archived or
+    discarded as ``work`` says. Its reviews in play are withdrawn with the reason. A bundled branch is closed out of its
+    bundle instead (``close`` with remove). The caller is the branch's owner, or an operator or admin. Answers the
+    deletion and who is to be told (the owner, unless the owner asked)."""
+    branch_review._account(user_id)
+    reason = _reason(reason)
+    if work not in CLOSE_WORK:
+        raise ReviewError("a branch to be deleted says what happens to its unlanded work: work is archive or discard")
+    if repository not in known:
+        raise ReviewError("repository must be one the policy names: " + ", ".join(sorted(known)), 404)
+    now = time.time() if now is None else now
+    row = next((item for item in checked_out(db, now)
+                if item["repository"] == repository and item["branch"] == branch), None)
+    if row is None:
+        raise ReviewError(f"{branch} is not checked out or registered in {repository}", 404)
+    if row["bundle"] is not None:
+        raise ReviewError(f"{branch} is in bundle {row['bundle'][:8]}: close it out of the bundle, to be removed", 409)
+    if row["removing"]:
+        raise ReviewError(f"{branch} is already to be removed by the cleanup account", 409)
+    owner = row["owner"]
+    if str(username) != owner and not branch_review.may_moderate(db, user_id):
+        raise ReviewError("the branch's owner, or an operator or admin, deletes a branch", 403)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("INSERT INTO branch_deletions (repository, branch, requested_at, requested_by, reason, work) "
+                   "VALUES (?,?,?,?,?,?)", (repository, branch, now, str(username), reason, work))
+        db.execute("UPDATE branch_reviews SET status = 'withdrawn', reviewed_at = ?, note = ? WHERE repository = ? "
+                   "AND branch = ? AND status IN ('open', 'approved') AND landed_at IS NULL",
+                   (now, f"deleted by {username}: {reason}", repository, branch))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    deletion = {"repository": repository, "branch": branch, "owner": owner, "requested_at": now,
+                "requested_by": str(username), "reason": reason, "work": work}
+    return {"deletion": deletion, "tell": [owner] if owner and owner != str(username) else []}
+
+
 def removals_pending(db) -> list:
-    """The closed branches the cleanup account is still to remove, oldest first."""
+    """The branches the cleanup account is still to remove, oldest first: those closed out of a bundle for removal, and
+    those asked to be deleted outside any bundle (``bundle_id`` None)."""
     branch_review.ensure(db)
-    return [dict(zip(("bundle_id", "repository", "branch", "closed_at", "closed_by", "reason", "work"), row))
-            for row in db.execute("SELECT bundle_id, repository, branch, closed_at, closed_by, reason, work FROM "
-                                  "review_bundle_closures WHERE remove = 1 AND carried_at IS NULL ORDER BY closed_at")]
+    keys = ("bundle_id", "repository", "branch", "closed_at", "closed_by", "reason", "work")
+    return [dict(zip(keys, row)) for row in db.execute(
+        "SELECT bundle_id, repository, branch, closed_at, closed_by, reason, work FROM review_bundle_closures "
+        "WHERE remove = 1 AND carried_at IS NULL UNION ALL SELECT NULL, repository, branch, requested_at, requested_by, "
+        "reason, work FROM branch_deletions WHERE carried_at IS NULL ORDER BY 4")]
 
 
-def mark_carried(db, bundle_id, branch, carried, now=None) -> None:
-    """The cleanup account's receipt for one closed branch: what it removed and kept."""
+def mark_carried(db, bundle_id, branch, carried, now=None, *, repository=None) -> None:
+    """The cleanup account's receipt for one removed branch: what it removed and kept. A deletion outside any bundle
+    (``bundle_id`` None) is named by its ``repository``."""
+    at, carried = time.time() if now is None else now, str(carried)[:500]
+    if bundle_id is None:
+        db.execute("UPDATE branch_deletions SET carried_at = ?, carried = ? WHERE repository = ? AND branch = ? "
+                   "AND carried_at IS NULL", (at, carried, repository, branch))
+        return
     db.execute("UPDATE review_bundle_closures SET carried_at = ?, carried = ? WHERE bundle_id = ? AND branch = ? "
-               "AND carried_at IS NULL", (time.time() if now is None else now, str(carried)[:500], bundle_id, branch))
+               "AND carried_at IS NULL", (at, carried, bundle_id, branch))
 
 
 def _paths(paths) -> list:

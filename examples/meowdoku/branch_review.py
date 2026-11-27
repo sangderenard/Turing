@@ -118,6 +118,12 @@ DDL = (
     "branch TEXT NOT NULL, closed_at REAL NOT NULL, closed_by TEXT NOT NULL, reason TEXT NOT NULL, "
     "remove INTEGER NOT NULL CHECK(remove IN (0,1)), work TEXT CHECK(work IN ('archive','discard')), "
     "carried_at REAL, carried TEXT, PRIMARY KEY(bundle_id, branch))",
+    # A branch outside any bundle asked to be deleted, with its reason (review_bundles.delete_branch): the cleanup account
+    # removes it at its next run as it removes a closed bundled branch (branch_gate.carry_closures).
+    "CREATE TABLE IF NOT EXISTS branch_deletions (repository TEXT NOT NULL, branch TEXT NOT NULL, "
+    "requested_at REAL NOT NULL, requested_by TEXT NOT NULL, reason TEXT NOT NULL, "
+    "work TEXT NOT NULL CHECK(work IN ('archive','discard')), carried_at REAL, carried TEXT, "
+    "PRIMARY KEY(repository, branch, requested_at))",
 )
 READY = ("approved", "accepted", "landed")     # a companion in one of these lets its set land
 MAX_TOGETHER = 20
@@ -543,6 +549,52 @@ def withdraw(db, review_id, *, user_id, now=None) -> dict:
     return get(db, review_id, now)
 
 
+def removal_pending(db, repository, branch) -> bool:
+    """The cleanup account is still to remove this branch: closed out of a bundle for removal, or asked to be deleted."""
+    ensure(db)
+    return db.execute("SELECT 1 FROM review_bundle_closures WHERE repository = ? AND branch = ? AND remove = 1 "
+                      "AND carried_at IS NULL UNION ALL SELECT 1 FROM branch_deletions WHERE repository = ? "
+                      "AND branch = ? AND carried_at IS NULL", (repository, branch, repository, branch)).fetchone() is not None
+
+
+def reopen(db, review_id, *, user_id, username, timeout_s, tip, now=None) -> dict:
+    """Put a withdrawn review back up: the same change, in a fresh review window of ``timeout_s``. Its author, or an
+    operator or admin, reopens it. Only the branch's latest review is reopened, and only while the branch is still at
+    the reviewed commit (``tip(repository, branch)``), no other review of it is in play and no removal of it is pending;
+    a branch that moved on is submitted again at its new tip instead. A bundled branch's reopened review stands
+    consolidating, like any other review of it."""
+    _account(user_id)
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 0 <= timeout_s <= MAX_TIMEOUT_S:
+        raise ReviewError(f"timeout must be between 0 and {int(MAX_TIMEOUT_S)} seconds")
+    now = time.time() if now is None else now
+    record = get(db, review_id, now)
+    label = f"review {record['id'][:8]}"
+    if record["standing"] != "withdrawn":
+        raise ReviewError(f"{label} is {record['standing']}; only a withdrawn review is reopened", 409)
+    if record["owner_id"] != user_id and not may_moderate(db, user_id):
+        raise ReviewError("its author, or an operator or admin, reopens a review", 403)
+    repository, branch = record["repository"], record["branch"]
+    latest = db.execute("SELECT id FROM branch_reviews WHERE repository = ? AND branch = ? ORDER BY created_at DESC "
+                        "LIMIT 1", (repository, branch)).fetchone()[0]
+    if latest != record["id"]:
+        raise ReviewError(f"{branch} has a newer review, {latest[:8]}; only the latest review of a branch is reopened", 409)
+    if in_review(db, repository, branch):
+        raise ReviewError(f"a review of {branch} is already in play", 409)
+    if removal_pending(db, repository, branch):
+        raise ReviewError(f"{branch} is to be removed by the cleanup account; its review is not reopened", 409)
+    current = tip(repository, branch)
+    if current != record["head"]:
+        where = f"at {current[:12]}" if current else "gone"
+        raise ReviewError(f"{branch} is {where} now, not at the reviewed {record['head'][:12]}: submit it again at its tip",
+                          409)
+    done = db.execute("UPDATE branch_reviews SET status = 'open', reviewed_at = NULL, reviewer_id = NULL, "
+                      "reviewer_name = NULL, accept_after = ?, note = ? WHERE id = ? AND status = 'withdrawn' "
+                      "AND landed_at IS NULL", (now + float(timeout_s), f"reopened by {username}", record["id"]))
+    if done.rowcount != 1:
+        raise ReviewError(f"{label} changed while it was reopened; read it again", 409)
+    return get(db, record["id"], now)
+
+
 def landable(db, now=None) -> list:
     now = time.time() if now is None else now
     return [record for record in listing(db, now, limit=1000)
@@ -937,6 +989,17 @@ def _contains(policy):
     return contains
 
 
+def _tip(policy):
+    """``tip(repository, branch)``: the branch's current commit here, local first, else the remote's; None if gone."""
+    def tip(repository, branch):
+        from meowdoku import branch_gate
+        repo = policy["repositories"][repository]["path"]
+        return (branch_gate.git(repo, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False)
+                or branch_gate.git(repo, "rev-parse", "-q", "--verify",
+                                   f"refs/remotes/{policy.get('remote', 'origin')}/{branch}", check=False) or None)
+    return tip
+
+
 def http_route(self, path, method, *, policy, accounts_db, land_request=None, landing_schedule_path=None,
                notify=None, notify_bundle=None, open_ticket=None):
     """The reviews over REST. ``self`` is the host's request handler; ``policy`` the loaded branch policy.
@@ -961,6 +1024,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         POST /api/reviews/hold            {id, reason}                                        an admin pauses
         POST /api/reviews/release         {id, note?}                                         an admin resumes
         POST /api/reviews/withdraw        {id}                                                the author
+        POST /api/reviews/reopen          {id, timeout_hours?}      the author, an operator or admin puts a
+                                          withdrawn review back up, while its branch is still at its commit
         POST /api/reviews/checkout        {repository, branch}      register a branch to yourself; answers the steps
         GET  /api/reviews/identity        the Git author identity this account declared
         POST /api/reviews/identity        {name, email}             declare it (each account its own)
@@ -976,6 +1041,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
                                           bundle (its owner, an operator or admin); remove=true with work archive|discard
                                           has the cleanup account remove it at its next run
         POST /api/reviews/redelegate      {kind: review|bundle, id, paths: [{title, detail}], note?}   into one ticket
+        POST /api/reviews/branches/delete {repository, branch, reason, work}   delete one branch outside any bundle:
+                                          the cleanup account removes it at its next run (archive or discard its work)
     ``notify_bundle(usernames, text, bundle_id)`` tells a bundle's owners; ``open_ticket(title, description,
     diagnostics)`` opens the redelegation's issue ticket as the caller and answers its id.
 
@@ -1048,7 +1115,7 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
         if not isinstance(body, dict):
             return self._json({"error": "a JSON object is required"}, 400)
         if path in ("/api/reviews/bundles", "/api/reviews/bundles/consolidate", "/api/reviews/bundles/dissolve",
-                    "/api/reviews/bundles/close", "/api/reviews/redelegate"):
+                    "/api/reviews/bundles/close", "/api/reviews/redelegate", "/api/reviews/branches/delete"):
             from meowdoku import review_bundles
             if path == "/api/reviews/bundles":
                 told = review_bundles.flag(db, **who, repository=body.get("repository"), branches=body.get("branches"),
@@ -1065,6 +1132,13 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
                 told = review_bundles.close(db, body.get("bundle"), body.get("branch"), **who, reason=body.get("reason"),
                                             remove=body.get("remove", False), work=body.get("work"))
                 text = told["bundle"]["notice"]
+            elif path == "/api/reviews/branches/delete":
+                told = review_bundles.delete_branch(db, **who, repository=body.get("repository"),
+                                                    branch=body.get("branch"), reason=body.get("reason"),
+                                                    work=body.get("work"), known=list(known))
+                made = told["deletion"]
+                text = (f"{principal.username} asked for {made['repository']} {made['branch']} to be deleted "
+                        f"(work {made['work']}d): {made['reason']}. The cleanup account removes it at its next run.")
             else:
                 told = review_bundles.redelegate(db, kind=body.get("kind"), source_id=body.get("id"),
                                                  paths=body.get("paths"), note=body.get("note", ""), **who,
@@ -1073,7 +1147,8 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
                 text = (f"{principal.username} redelegated {made['source_kind']} {made['source_id'][:8]} into ticket "
                         f"{made['ticket_id']}: " + "; ".join(path_["title"] for path_ in made["paths"])
                         + ". It does not land; the work comes back as one branch and review per path.")
-            subject = told["bundle"]["id"] if "bundle" in told else told["redelegation"]["source_id"]
+            subject = (told["bundle"]["id"] if "bundle" in told else told["deletion"]["branch"] if "deletion" in told
+                       else told["redelegation"]["source_id"])
             if notify_bundle is not None and told["tell"]:
                 notify_bundle(told["tell"], text, subject)
             print(f"[reviews] {principal.username} {path.rsplit('/', 1)[1]} {subject[:12]} -> told "
@@ -1109,6 +1184,11 @@ def http_route(self, path, method, *, policy, accounts_db, land_request=None, la
             made = release(db, body.get("id"), **who, note=body.get("note", ""))
         elif path == "/api/reviews/withdraw":
             made = withdraw(db, body.get("id"), user_id=principal.user_id)
+        elif path == "/api/reviews/reopen":
+            hours = body.get("timeout_hours", policy["review_timeout_hours"])
+            if isinstance(hours, bool) or not isinstance(hours, (int, float)):
+                raise ReviewError("timeout_hours must be a number")
+            made = reopen(db, body.get("id"), **who, timeout_s=hours * 3600.0, tip=_tip(policy))
         elif path == "/api/reviews/read":
             made = mark_read(db, body.get("id"), **who)
         elif path == "/api/reviews/revoke":

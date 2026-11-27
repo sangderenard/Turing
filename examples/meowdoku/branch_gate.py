@@ -495,7 +495,8 @@ def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> li
 
 
 def carry_closures(policy, db, *, apply, actor=None, now=None, log=print) -> list:
-    """Remove the branches closed out of a bundle for removal (review_bundles.close with remove=True).
+    """Remove the branches closed out of a bundle for removal (review_bundles.close with remove=True) and the
+    branches asked to be deleted outside any bundle (review_bundles.delete_branch).
 
     The closer has decided, with a reason, so no age or idle rule applies. In order, for each such branch:
     archive (work=archive) commits any uncommitted work in its worktree and pushes the branch's final commit to
@@ -516,7 +517,8 @@ def carry_closures(policy, db, *, apply, actor=None, now=None, log=print) -> lis
     actions = []
     for closure in review_bundles.removals_pending(db):
         name, branch = closure["repository"], closure["branch"]
-        why = f"closed out of bundle {closure['bundle_id'][:8]} by {closure['closed_by']}: {closure['reason']}"
+        why = (f"closed out of bundle {closure['bundle_id'][:8]} by {closure['closed_by']}: {closure['reason']}"
+               if closure["bundle_id"] else f"deleted by {closure['closed_by']}: {closure['reason']}")
         entry = {"repository": name, "branch": branch, "head": None}
         actions.append(entry)
         declared = policy["repositories"].get(name)
@@ -588,7 +590,7 @@ def carry_closures(policy, db, *, apply, actor=None, now=None, log=print) -> lis
                 done.append("local branch removed")
             detail = "; ".join(done) or "nothing of it was left here"
             branch_review.record_removed(db, name, branch, head or "", f"{why}; {detail}", now, removed_by=signer)
-            review_bundles.mark_carried(db, closure["bundle_id"], branch, detail, now)
+            review_bundles.mark_carried(db, closure["bundle_id"], branch, detail, now, repository=name)
             entry.update(action="removed", reason=f"{why}; {detail}")
         except GateError as error:
             entry.update(action="failed", reason=f"{why}; {error}")

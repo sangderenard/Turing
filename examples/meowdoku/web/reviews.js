@@ -436,40 +436,113 @@ function redelegateBox(kind, id, label) {
   return box;
 }
 
+// What each action of the branch selector says and asks (the selector is the operators' and admins' tool).
+const BRANCH_ACTIONS = {
+  bundle: { button: "Bundle the selected branches", reason: "Why they are to be merged together", needsReason: true },
+  reopen: { button: "Reopen the selected branches' reviews", reason: "Note (optional; not sent)", needsReason: false },
+  delete: { button: "Delete the selected branches", reason: "Why they are deleted: abandoned on purpose, superseded, "
+            + "already landed…", needsReason: true },
+};
+
+// The review "reopen" would put back up for a row, or why there is none.
+function reopenable(row) {
+  if (row.review) return { why: `review ${row.review.id.slice(0, 8)} is ${row.review.standing} already` };
+  if (row.removing) return { why: "it is to be removed" };
+  if (!row.latest_review) return { why: "it has no review" };
+  if (row.latest_review.standing !== "withdrawn") return { why: `its latest review is ${row.latest_review.standing}` };
+  return { id: row.latest_review.id };
+}
+
 function renderFlagForm(rows, repositories) {
   const select = byId("bundle-repo"), chosen = select.value || rows[0]?.repository || repositories[0] || "";
   select.replaceChildren(...repositories.map(name => { const option = el("option", name); option.value = name; return option; }));
   select.value = chosen;
   select.onchange = renderBundles;
+  const shown = rows.filter(r => r.repository === select.value);
+  const keyOf = row => `${row.repository} ${row.branch}`;
+  const count = () => {
+    const n = shown.filter(row => picked.has(keyOf(row))).length;
+    byId("bundle-count").textContent = `${n} of ${shown.length} selected`;
+  };
   const picks = byId("bundle-picks");
   picks.replaceChildren();
-  for (const row of rows.filter(r => r.repository === select.value)) {
-    const key = `${row.repository} ${row.branch}`;
+  for (const row of shown) {
+    const key = keyOf(row);
     const label = el("label"), box = document.createElement("input");
-    box.type = "checkbox"; box.checked = picked.has(key); box.disabled = Boolean(row.bundle);
-    box.onchange = () => { if (box.checked) picked.add(key); else picked.delete(key); };
+    box.type = "checkbox"; box.checked = picked.has(key); box.disabled = row.removing;
+    box.onchange = () => { if (box.checked) picked.add(key); else picked.delete(key); count(); };
+    const latest = !row.review && row.latest_review ? ` · last review ${row.latest_review.id.slice(0, 8)} ${row.latest_review.standing}` : "";
     const text = `${row.branch} — ${row.owner || "unregistered"}` + (row.checked_out ? "" : " (registered, not checked out)")
-      + (row.review ? ` · review ${row.review.id.slice(0, 8)} ${row.review.standing}` : "")
-      + (row.bundle ? ` · in bundle ${row.bundle.slice(0, 8)}` : "");
+      + (row.review ? ` · review ${row.review.id.slice(0, 8)} ${row.review.standing}` : latest)
+      + (row.bundle ? ` · in bundle ${row.bundle.slice(0, 8)}` : "")
+      + (row.removing ? " · to be removed at the cleanup's next run" : "");
     label.append(box, el("span", text));
     picks.append(label);
   }
   if (!picks.children.length) picks.append(el("p", "No branch of this repository is checked out.", "muted"));
+  count();
+  byId("bundle-all").onclick = () => { shown.filter(row => !row.removing).forEach(row => picked.add(keyOf(row))); renderBundles(); };
+  byId("bundle-none").onclick = () => { shown.forEach(row => picked.delete(keyOf(row))); renderBundles(); };
+  const action = byId("bundle-action");
+  const describe = () => {
+    const said = BRANCH_ACTIONS[action.value];
+    byId("bundle-make").textContent = said.button;
+    byId("bundle-reason-label").textContent = said.reason;
+    byId("bundle-work-row").hidden = action.value !== "delete";
+    byId("bundle-reason").hidden = byId("bundle-reason-label").hidden = action.value === "reopen";
+  };
+  action.onchange = describe;
+  describe();
   byId("bundle-make").onclick = async () => {
-    const prefix = select.value + " ";
-    const branches = [...picked].filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length));
+    const chosenRows = shown.filter(row => picked.has(keyOf(row)));
     const feedback = byId("bundle-feedback");
-    if (branches.length < 2) { feedback.textContent = "Tick at least two branches."; return; }
-    if (!byId("bundle-reason").value.trim()) { feedback.textContent = "Say why they are to be merged together."; return; }
-    try {
-      const { bundle, tell } = await request("/api/reviews/bundles",
-        { repository: select.value, branches, reason: byId("bundle-reason").value });
-      branches.forEach(branch => picked.delete(prefix + branch));
-      byId("bundle-reason").value = "";
-      feedback.textContent = `Bundle ${bundle.id.slice(0, 8)} made; told ${tell.join(", ") || "nobody else"}. `
-        + "Copy its notice below into each conversation working on these branches.";
-      await load();
-    } catch (error) { feedback.textContent = error.message; }
+    const reason = byId("bundle-reason").value.trim();
+    if (!chosenRows.length) { feedback.textContent = "Select at least one branch."; return; }
+    if (BRANCH_ACTIONS[action.value].needsReason && !reason) { feedback.textContent = "Say why."; return; }
+    if (action.value === "bundle") {
+      if (chosenRows.length < 2) { feedback.textContent = "Select at least two branches to bundle."; return; }
+      const bundled = chosenRows.filter(row => row.bundle);
+      if (bundled.length) { feedback.textContent = `${bundled.map(row => row.branch).join(", ")} already in a bundle.`; return; }
+      try {
+        const { bundle, tell } = await request("/api/reviews/bundles",
+          { repository: select.value, branches: chosenRows.map(row => row.branch), reason });
+        chosenRows.forEach(row => picked.delete(keyOf(row)));
+        byId("bundle-reason").value = "";
+        feedback.textContent = `Bundle ${bundle.id.slice(0, 8)} made; told ${tell.join(", ") || "nobody else"}. `
+          + "Copy its notice below into each conversation working on these branches.";
+        await load();
+      } catch (error) { feedback.textContent = error.message; }
+      return;
+    }
+    if (action.value === "delete") {
+      const work = byId("bundle-work").value;
+      if (!confirm(`Delete ${chosenRows.length} branch(es) of ${select.value}? The cleanup account removes each one's `
+        + "worktree, checkout and branch at its next run, "
+        + (work === "archive" ? "keeping its final commit as archive/<branch>." : "discarding its unlanded work.")
+        + " A bundled branch is closed out of its bundle.")) return;
+    }
+    const done = [], failed = [];
+    for (const row of chosenRows) {
+      try {
+        if (action.value === "reopen") {
+          const target = reopenable(row);
+          if (!target.id) { failed.push(`${row.branch}: ${target.why}`); continue; }
+          await request("/api/reviews/reopen", { id: target.id });
+        } else if (row.bundle) {
+          await request("/api/reviews/bundles/close", { bundle: row.bundle, branch: row.branch, reason, remove: true,
+                                                        work: byId("bundle-work").value });
+        } else {
+          await request("/api/reviews/branches/delete", { repository: select.value, branch: row.branch, reason,
+                                                          work: byId("bundle-work").value });
+        }
+        done.push(row.branch);
+        picked.delete(keyOf(row));
+      } catch (error) { failed.push(`${row.branch}: ${error.message}`); }
+    }
+    const verb = action.value === "reopen" ? "Reopened" : "To be deleted";
+    feedback.textContent = (done.length ? `${verb}: ${done.join(", ")}.` : "Nothing was done.")
+      + (failed.length ? ` Not done: ${failed.join("; ")}.` : "");
+    if (done.length) { if (action.value === "delete") byId("bundle-reason").value = ""; await load(); }
   };
 }
 

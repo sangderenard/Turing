@@ -565,6 +565,24 @@ def test_branches_closed_out_of_a_bundle_are_removed_by_the_cleaner_as_their_clo
     assert branch_gate.carry_closures(policy, db, apply=True, actor=CLEANER, log=lambda line: None) == []
 
 
+def test_a_branch_deleted_outside_any_bundle_is_removed_by_the_cleaner(world):
+    from meowdoku import review_bundles
+    work, db, policy = world["work"], world["db"], world["policy"]
+    trees = work.parent / "trees"
+    run(work, "worktree", "add", "-q", "-b", "stale", str(trees / "stale"), "main")
+    head = commit(trees / "stale", "stale.txt")
+    run(work, "push", "-q", "origin", "stale")
+    branch_review.register(db, user_id=ANN, username="ann", repository="work", branch="stale", known=["work"], now=10.0)
+    review_bundles.delete_branch(db, user_id=ADMIN, username="admin", repository="work", branch="stale",
+                                 reason="already landed", work="archive", known=["work"], now=20.0)
+    done = {e["branch"]: e for e in branch_gate.carry_closures(policy, db, apply=True, actor=CLEANER, log=lambda line: None)}
+    assert done["stale"]["action"] == "removed" and "deleted by admin: already landed" in done["stale"]["reason"]
+    assert not (trees / "stale").exists() and remote_has(world, "stale") is None
+    assert remote_has(world, "archive/stale") == head
+    assert review_bundles.removals_pending(db) == []
+    assert "already landed" in {n["branch"]: n for n in branch_review.removed(db)}["stale"]["reason"]
+
+
 def test_a_dirty_worktree_waits_for_a_reviewers_verdict(world):
     import time
     work, db, policy = world["work"], world["db"], world["policy"]
