@@ -337,3 +337,113 @@ def test_glsl_source_correspondence_rejects_changed_literal_location():
     node._glsl_source_location=(1,1,'2.0')
     with pytest.raises(ValueError,match='correspondence'):
         retain_glsl_source_evidence(result.module,source)
+
+
+def _declared_literals(function):
+    return {node.target.id: (node.annotation.value,
+                             ast.literal_eval(ast.unparse(node.value)))
+            for node in function.body
+            if isinstance(node, ast.AnnAssign)
+            and node.target.id.startswith('__glsl_literal_')}
+
+
+def test_negated_int_literal_is_one_declared_int32_literal_unsigned_keeps_operator():
+    result = lower_glsl_source_to_ast('''uniform float x;out int a;out uint b;
+      void main(){a = x > 0.0 ? 1 : -1; b = -1u;}''')
+    assert result.complete, result.shortfall_report()
+    fn = result.module.body[-1]
+    literals = _declared_literals(fn)
+    selected = next(node for node in ast.walk(fn) if isinstance(node, ast.IfExp))
+    arms = [selected.body, selected.orelse]
+    # Both arms of ``? 1 : -1`` are declared int32 literals (no UnaryOp).
+    assert all(isinstance(arm, ast.Name) for arm in arms)
+    assert [literals[arm.id] for arm in arms] == [
+        ('int32', 1), ('int32', -1)]
+    # ``-1u`` wraps: the unsigned literal keeps its negation operator.
+    negations = [node for node in ast.walk(fn)
+                 if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+                 and isinstance(node.operand, ast.Name)]
+    assert len(negations) == 1
+    assert literals[negations[0].operand.id] == ('uint32', 1)
+
+
+def test_scalar_conversion_and_return_are_held_at_the_glsl_width():
+    result = lower_glsl_source_to_ast('''uniform float x;out int y;
+      int pick(float v){ if (v < 0.0) return -1; return int(v) - 2; }
+      void main(){ y = pick(x); }''')
+    assert result.complete, result.shortfall_report()
+    pick = next(node for node in result.module.body
+                if isinstance(node, ast.FunctionDef) and node.name == 'pick')
+    held = {node.target.id: (node.annotation.value, ast.unparse(node.value))
+            for node in ast.walk(pick) if isinstance(node, ast.AnnAssign)
+            and not node.target.id.startswith('__glsl_literal_')}
+    # ``int(v)`` is an int32 conversion, not the Python int class.
+    assert ('i32', 'int(v)') in held.values()
+    # Every returned value is a temporary declared with the result type.
+    returns = [node for node in ast.walk(pick) if isinstance(node, ast.Return)]
+    assert len(returns) == 2
+    assert all(isinstance(node.value, ast.Name) and held[node.value.id][0] == 'i32'
+               for node in returns)
+
+
+def test_declared_int_return_and_folded_constants_keep_glsl_widths_on_llvm():
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    # The Studio response shader's int widths: a declared ``int`` return
+    # computed as ``int(...) - 2`` or ``-1``, its caller's ``int`` local, a
+    # conditional whose arm folds (``2 * 3``) beside ``-1``, and a folded
+    # float constant.  Before: "authored local scalar conflicts with an
+    # existing physical ABI" / "conditional union arm changes its physical
+    # ABI" (int32 against int64).
+    source = '''#version 430
+    layout(local_size_x = 1) in;
+    layout(std430, binding = 0) buffer Vals { float vals[]; };
+    layout(std430, binding = 1) buffer Outs { int outs[]; };
+    int pick(float x) { if (x < 0.0) return -1; return int(x) - 2; }
+    void main() {
+        int m = pick(vals[0]);
+        int s = m + (vals[0] > 0.0 ? 2 * 3 : -1);
+        float f = vals[0] * (0.5 * 4.0);
+        outs[0] = s + int(f);
+    }'''
+    result = lower_glsl_source_to_ast(source)
+    assert result.complete, result.shortfall_report()
+    root = Path(__file__).resolve().parents[1]
+    span = {'function': '*', 'storage': 'span', 'rank': 1,
+            'python_type': 'src.common.tensors.abstraction.AbstractTensor'}
+    contract = ExtractionContract(
+        root / 'extraction_contracts/program_extraction.yaml'
+    ).with_program_abi({'records': {}, 'bindings': [], 'values': [
+        {**span, 'parameter': 'vals', 'dtype': 'float32'},
+        {**span, 'parameter': 'outs', 'dtype': 'int32'},
+    ]}).with_execution_file(
+        root / 'extraction_contracts/vehicle_full_native_execution.yaml')
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        ast.unparse(result.module), 'main', extraction_contract=contract,
+        python_bindings={'AbstractTensor': AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        runtime_closure_only=True, progress_bars=False)
+    phis = [ins for fn in module.functions.values() for block in fn.blocks.values()
+            for ins in block.instrs if ins.op == 'Phi']
+    assert phis and all(arg.dtype == 'int32' for ins in phis for arg in ins.args)
+    entry = exports[0]
+    names = dict(module.functions[entry].metadata['parameter_names'])
+    emitted = emit_ssa_function_to_llvm(module, entry)
+    assert not emitted.shortfalls
+    artifact = compile_artifact(emitted, directory=tempfile.mkdtemp())
+    for x, expected in ((5.7, 3 + 6 + 11), (-1.0, -1 - 1 - 2), (2.0, 0 + 6 + 4)):
+        vals = np.array([x], dtype=np.float32)
+        outs = np.zeros(1, dtype=np.int32)
+        prepare_artifact_execution(
+            artifact, {names['vals']: vals, names['outs']: outs}).run()
+        assert int(outs[0]) == expected
