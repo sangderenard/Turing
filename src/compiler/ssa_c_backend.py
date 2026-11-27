@@ -1023,9 +1023,13 @@ def _scalar_c_type(dtype) -> str:
         # Conceptual None's existing inert scalar carrier; not a numeric dtype.
         return "double"
     layout = dtype_layout(name)
-    # Scalar float32 arithmetic deliberately uses the native lane's double
-    # register contract. Its span storage remains float below.
-    return "double" if layout.name == "float32" else layout.c_storage_type
+    # Scalar float32 and float16 arithmetic deliberately use the native
+    # lane's double register contract (as the LLVM lane does). Their span
+    # storage remains float / _Float16 below.
+    return (
+        "double" if layout.name in {"float32", "float16"}
+        else layout.c_storage_type
+    )
 
 
 def _unsigned_c_type(dtype) -> str:

@@ -68660,8 +68660,13 @@ def lower_ast_source_by_signature(source: str, entrypoint: str, root_calls, **kw
 
 
 #: The owner's type matrix (2026-11-26): what a vague entry type means.
+#: Every integer width has its signed and its unsigned member.
 TYPE_MATRIX: tuple[str, ...] = (
-    "bool", "int8", "float16", "int16", "float32", "int32", "float64", "int64",
+    "bool",
+    "int8", "uint8",
+    "float16", "int16", "uint16",
+    "float32", "int32", "uint32",
+    "float64", "int64", "uint64",
 )
 
 #: Which dtype-layout field spells a dtype in each native lane.
@@ -68699,6 +68704,7 @@ def type_matrix_members(lane: str, members: Sequence[str] = TYPE_MATRIX) -> dict
         if layout.kind in {"int", "uint"} and getattr(layout, field)
     }
     result: dict[str, str] = {}
+    unspelled: list[str] = []
     for member in members:
         layout = resolve(str(member))
         compiled = layout.name
@@ -68707,7 +68713,15 @@ def type_matrix_members(lane: str, members: Sequence[str] = TYPE_MATRIX) -> dict
             or getattr(layout, field) in integer_spellings
         ):
             compiled = "int8"
+        elif not getattr(layout, field):
+            unspelled.append(layout.name)
         result[layout.name] = compiled
+    if unspelled:
+        raise ValueError(
+            f"type matrix member(s) {unspelled!r} have no {lane} spelling "
+            f"(dtype_layout.{field} is empty): the {lane} lane has no native "
+            "form for them"
+        )
     return result
 
 

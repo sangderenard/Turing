@@ -183,6 +183,19 @@ _DECLARED: tuple[DTypeLayout, ...] = (
         numpy_dtype=None, nodus_code=None,
         aliases=("uint128",),
     ),
+    # IEEE binary16 (owner's type matrix, 2026-11-26).  LLVM spells it
+    # ``half``; the C module lane's clang (``zig cc``) spells it
+    # ``_Float16``.  ctypes has no half type: a caller moves the 16-bit
+    # storage word, and public buffers carry numpy ``float16``.  gfortran
+    # declares no half-precision real kind (13.2: kinds 4, 8, 10, 16), so
+    # the Fortran lane has no spelling for it.
+    DTypeLayout(
+        name="float16", kind="float", byte_size=2, alignment=2,
+        c_type="_Float16", ctypes_name="c_uint16", c_storage_type="_Float16",
+        llvm_type="half", wasm_type=None, fortran_kind=None,
+        numpy_dtype="float16", nodus_code=None,
+        aliases=("float16", "f16", "half"),
+    ),
     DTypeLayout(
         name="float32", kind="float", byte_size=4, alignment=4,
         c_type="float", ctypes_name="c_float", c_storage_type="float",

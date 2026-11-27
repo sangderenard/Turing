@@ -830,6 +830,11 @@ _INTEGER_SELECTION: dict[str, str] = {"Max": "sgt", "Min": "slt"}
 
 
 _INTEGER_LLVM_TYPES = frozenset({"i1", "i8", "i16", "i32", "i64", "i128"})
+#: Floating storage types.  A rank-0 ``half``/``float`` lives in the lane's
+#: double register (``_value_llvm_type``); spans keep their own element.
+_FLOAT_LLVM_TYPES = frozenset({"half", "float", "double"})
+#: Floating storage narrower than the double register.
+_NARROW_FLOAT_LLVM_TYPES = frozenset({"half", "float"})
 
 
 def _unsigned_value(value: _Any) -> bool:
@@ -1895,7 +1900,7 @@ def _value_llvm_type(value: _Any) -> str:
     # A float32 SPAN is stored as ``float`` (its public buffer is float32).  A
     # float32 scalar keeps the lane's double register width: scalar arithmetic
     # is double throughout, and a one-element slot gains nothing from ``float``.
-    if llvm_type == "float" and _declared_span_rank(value) == 0:
+    if llvm_type in _NARROW_FLOAT_LLVM_TYPES and _declared_span_rank(value) == 0:
         return "double"
     return llvm_type
 
@@ -3201,14 +3206,14 @@ def _emit_repository_call_module(
             if source_type == wanted:
                 return loaded
             converted = f"%convert.{tag}"
-            if source_type == "float":
-                body.append(f"  {converted}.wide = fpext float {loaded} to double")
+            if source_type in _NARROW_FLOAT_LLVM_TYPES:
+                body.append(f"  {converted}.wide = fpext {source_type} {loaded} to double")
                 return convert_loaded(f"{converted}.wide", "double", wanted, f"{tag}.wide",
                                       target_unsigned=target_unsigned)
-            if wanted == "float":
+            if wanted in _NARROW_FLOAT_LLVM_TYPES:
                 narrow = convert_loaded(loaded, source_type, "double", f"{tag}.n",
                                         source_unsigned=source_unsigned)
-                body.append(f"  {converted} = fptrunc double {narrow} to float")
+                body.append(f"  {converted} = fptrunc double {narrow} to {wanted}")
                 return converted
             if wanted == "i1":
                 zero = "0.0" if source_type == "double" else "0"
@@ -3844,7 +3849,7 @@ def _emit_repository_call_module(
                         and _declared_span_rank(result) == 0
                         and not tuple(result.shape or ())
                         and _value_llvm_type(result) in (
-                            *_INTEGER_LLVM_TYPES, "float", "double",
+                            *_INTEGER_LLVM_TYPES, *_FLOAT_LLVM_TYPES,
                         )
                     ):
                         # A one-limb index tuple used as a scalar offset.
@@ -4563,7 +4568,8 @@ def _emit_repository_call_module(
                     if (
                         stored_type is not None
                         and stored_type != loaded_type
-                        and (stored_type, loaded_type) != ("float", "double")
+                        and not (stored_type in _NARROW_FLOAT_LLVM_TYPES
+                                 and loaded_type == "double")
                     ):
                         # Loading an integer from a double cell (or the
                         # reverse) reads the other kind's bit pattern.
@@ -4573,7 +4579,7 @@ def _emit_repository_call_module(
                             "explicit conversion required"))
                         continue
                     scalar_pointer_snapshot = scalar_pointer_receipt(result)
-                    if (loaded_type in {"double", "float", *_INTEGER_LLVM_TYPES}
+                    if (loaded_type in {*_FLOAT_LLVM_TYPES, *_INTEGER_LLVM_TYPES}
                             or scalar_pointer_snapshot
                             or int(address_argument.id) in owned_heap_addresses
                             or (result.dtype in {'int64', 'uint64', 'opaque_ref'} and not result.shape)):
@@ -6113,7 +6119,7 @@ def _emit_repository_call_module(
                                  if _value_llvm_type(argument) in _INTEGER_LLVM_TYPES
                                  and _value_llvm_type(argument) != "i1"]
                 if (len({_unsigned_value(argument) for argument in integer_sides}) > 1
-                        and not any(_value_llvm_type(argument) in {"float", "double"}
+                        and not any(_value_llvm_type(argument) in _FLOAT_LLVM_TYPES
                                     for argument in instruction.args)):
                     shortfalls.append(LLVMEmissionShortfall(name, operation,
                         "mixed signed/unsigned arithmetic requires an explicit common dtype conversion"))
@@ -6412,7 +6418,7 @@ def _emit_repository_call_module(
                     f"align {_align(element_type)}"
                 )
                 if operation in {"any", "all"}:
-                    if element_type in {"double", "float"}:
+                    if element_type in _FLOAT_LLVM_TYPES:
                         body.append(
                             f"  %axr.t.{tag} = fcmp une {element_type} %axr.v.{tag}, 0.0"
                         )
@@ -6598,7 +6604,7 @@ def _emit_repository_call_module(
                     loaded = f"%red.v.{label}.{tag}"
                     if operation in {"any", "all"}:
                         truth = f"%red.t.{label}.{tag}"
-                        if element_type in {"double", "float"}:
+                        if element_type in _FLOAT_LLVM_TYPES:
                             # NaN is truthy, as in Python.
                             body.append(
                                 f"  {truth} = fcmp une {element_type} {loaded}, 0.0"
@@ -6750,13 +6756,13 @@ def _emit_repository_call_module(
                                      if _value_llvm_type(argument) in _INTEGER_LLVM_TYPES
                                      and _value_llvm_type(argument) != "i1"]
                 integer_signs = {_unsigned_value(argument) for argument in integer_arguments}
-                if len(integer_signs) > 1 and not any(t in {"float", "double"} for t in operand_argument_types):
+                if len(integer_signs) > 1 and not any(t in _FLOAT_LLVM_TYPES for t in operand_argument_types):
                     shortfalls.append(LLVMEmissionShortfall(name, operation,
                         "mixed signed/unsigned arithmetic requires an explicit common dtype conversion"))
                     continue
                 compute_unsigned = next(iter(integer_signs), False)
                 operand_type = (
-                    "double" if any(t in {"float", "double"} for t in operand_argument_types)
+                    "double" if any(t in _FLOAT_LLVM_TYPES for t in operand_argument_types)
                     else max(operand_argument_types, key=lambda t: int(t[1:]))
                     if operand_argument_types else result_type
                 )
@@ -6791,7 +6797,7 @@ def _emit_repository_call_module(
                 # stored (`or i1 <double>` fails LLVM verification).
                 if operation in {"LAnd", "LOr", "LNot"}:
                     operand_type = "i1"
-                if operation == "Div" and result_type in {"double", "float"}:
+                if operation == "Div" and result_type in _FLOAT_LLVM_TYPES:
                     # Python ``/`` is true division: ``Div(i64, i64) ->
                     # float64`` divides the converted operands (``sdiv``
                     # truncated 7 / 2 to 3), as the module lane's
@@ -9022,7 +9028,8 @@ def emit_ssa_function_to_llvm(
         len(repository_closure) > 1
         or len(module.functions[function_name].blocks) > 1
         or calls_piece
-        or any(_value_llvm_type(value) == "float" for value in function.args)
+        or any(_value_llvm_type(value) in _NARROW_FLOAT_LLVM_TYPES
+               for value in function.args)
         # The repository module emitter owns exact physical integer widths
         # and signedness; the legacy register-only leaf path has no such ABI.
         or any(_value_llvm_type(v) in {"i8", "i16", "i128"}
