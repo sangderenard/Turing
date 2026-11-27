@@ -131,7 +131,8 @@ class Session:
                             prefix = self._again()
                         answer = agent.ask(prefix + waiting, self.answer_seconds)
                         self.turns += 1
-                        log(f"turn {self.turns}: {answer.strip()[:300]}")
+                        # One line per turn: the relay writes each line it reads to tick.log (Start-AgentDay.ps1).
+                        log(f"turn {self.turns}: {' '.join(answer.split())[:300]}")
                     except SeatError as failed:                # a broken session is not kept; the next notice starts one
                         log(f"turn failed: {failed}")
                         if agent is not None:
@@ -167,6 +168,10 @@ class Session:
 
 
 def main(argv=None) -> int:
+    # The relay reads this output as UTF-8 (Start-AgentDay.ps1 Invoke-AgentSession); the account's own code page would
+    # garble every character outside it.
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--agent", required=True, choices=("claude", "codex"))
     parser.add_argument("--login", required=True)

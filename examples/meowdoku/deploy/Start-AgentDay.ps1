@@ -25,6 +25,9 @@ agent's own lock (<AgentDays>\running\<agent>.lock), so two ticks never start th
      session as the agent's account that asks for new notices every 10 seconds and answers each within seconds, briefed
      in full only once a day or when its documents change, and ends after 30 idle minutes. While it lives the tick
      still asks the bell's question, only to keep what was seen current; the session answers. It never blocks a work run.
+     The tick starts it through a relay (this script, -Session, as the operator), which writes every line the session
+     prints (each turn, a failed turn, its end) and the session's exit to tick.log: the agent's account cannot write
+     <AgentDays>.
 Whatever stops a tick from starting a run is written to <AgentDays>\tick.log; nothing is skipped silently.
 
 Every run's prompt is the preamble (built in; <AgentDays>\preamble.md replaces it) and, for a work run, the day's prompt:
@@ -43,6 +46,7 @@ stopped after -TimeoutMinutes. What each did, the agents report in SpeakToMe; ea
 #Requires -Version 7
 param(
     [switch]$Tick,
+    [switch]$Session,
     [string]$Agent,
     [string]$RunOne,
     [string]$Reason = 'manual',
@@ -211,10 +215,28 @@ function Get-DefaultMemoryId([string]$name, [bool]$bellRun) {
     $memoryId
 }
 
-# [SESSIONS] A kept bell session, started as the agent's account; its record names its own process, so it lives exactly
-# as long as the session does.
-function Start-AgentSession([string]$name, [pscredential]$cred, [string]$why) {
+# [SESSIONS] A kept bell session, started as the agent's account by a relay that runs as the operator (owner,
+# 2026-11-27: the bell session logs to tick.log).  The session's own log went to a hidden console nobody read, so a long
+# session could not be told from a stuck one, and the agent's account cannot write <AgentDays>.  The relay (this script,
+# -Session) holds the session's output and writes each line, then its exit, with Log.  The record names the relay, which
+# lives exactly as long as the session does.
+function Start-AgentSession([string]$name, [string]$why) {
+    $info = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+    foreach ($a in @('-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-Session', '-Agent', $name, '-Why', $why,
+                     '-AgentDays', $AgentDays, '-AccountsDb', $AccountsDb, '-BellTimeoutMinutes', "$BellTimeoutMinutes")) {
+        $info.ArgumentList.Add($a)
+    }
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $relay = [Diagnostics.Process]::Start($info)
+    Add-AgentRecord $AgentDays 'session' $Agents[$name].account $relay.Id @{ agent = $name; reason = 'bell' } | Out-Null
+}
+
+# The relay's body: the session as the agent's account, its output into tick.log line by line, then its exit.
+function Invoke-AgentSession([string]$name, [string]$why) {
     $declared = $Agents[$name]
+    $cred = Read-AgentCredential $declared.account
+    if (-not $cred) { Log "${name}: bell session not started: no saved password for $($declared.account)"; return }
     $memoryId = Get-DefaultMemoryId $name $true
     & $Python (Join-Path $PSScriptRoot 'profile_prompt.py') --accounts-db $AccountsDb --individual $declared.login --ensure-memory $memoryId
     if ($LASTEXITCODE -ne 0) { throw "Could not prepare persistence $memoryId for $name" }
@@ -226,9 +248,17 @@ function Start-AgentSession([string]$name, [pscredential]$cred, [string]$why) {
         '--answer-minutes', "$BellTimeoutMinutes", '--base', $Base, '--why', $why)
     if (Test-AgentExecution $declared.login) { $arguments += '--allow-exec' }
     if ($workId -match '^[a-f0-9]{32}$') { $arguments += @('--work-memory', $workId) }
-    $process = Start-AsAgent $cred $Python $arguments $Workspace -Hidden
-    Add-AgentRecord $AgentDays 'session' $declared.account $process.Id @{ agent = $name; reason = 'bell' } | Out-Null
-    Log "${name}: bell session started as $($declared.account), instance $catalogId, persistence $memoryId, pid $($process.Id): $why"
+    $started = Get-Date
+    $process = Start-AsAgent $cred $Python $arguments $Workspace -Hidden -Redirect
+    $process.StandardInput.Close()
+    $out = $process.StandardOutput.ReadToEndAsync()
+    Log "${name}: bell session started as $($declared.account), instance $catalogId, persistence $memoryId, pid $($process.Id), relay $PID`: $why"
+    while ($null -ne ($line = $process.StandardError.ReadLine())) {
+        if ($line.Trim()) { Log "${name}: session: $line" }
+    }
+    $process.WaitForExit()
+    foreach ($line in ($out.Result -split "`r?`n")) { if ($line.Trim()) { Log "${name}: session: $line" } }
+    Log "${name}: bell session ended: exit $($process.ExitCode) in $([int]((Get-Date) - $started).TotalSeconds) s"
 }
 
 function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
@@ -369,6 +399,14 @@ function Invoke-AgentExecution([string]$name, $declared) {
     return $true
 }
 
+# ---------------------------------------------------------------- a kept bell session's relay (Start-AgentSession)
+if ($Session) {
+    if (-not $Agents.Contains($Agent)) { Write-Host "-Session needs -Agent, one of: $($Agents.Keys -join ', ')"; exit 2 }
+    try { Invoke-AgentSession $Agent $Why }
+    catch { Log "${Agent}: bell session failed: $($_.Exception.Message)"; exit 1 }
+    exit 0
+}
+
 # ---------------------------------------------------------------- the tasks
 if ($Register -or $Unregister) {
     $order = 0
@@ -501,7 +539,7 @@ try {
         }
         Save-State $Agent $state
         if ($run -and $run.kind -eq 'session') {                    # started under this lock, so two ticks never start two
-            try { Start-AgentSession $Agent $cred $run.why }
+            try { Start-AgentSession $Agent $run.why }
             catch { Log "${Agent}: bell session not started: $($_.Exception.Message)" }
             exit 0
         }
