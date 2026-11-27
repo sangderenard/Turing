@@ -2645,15 +2645,23 @@ def make_handler(sessions: Sessions):
 
         def _projects_route(self, path: str, method: str) -> None:
             """[PROJECTS] a dev page's project opened in its placement (project_open.py, research case d442be8d); the
-            branch placement works through the central checkout."""
-            from meowdoku import branch_gate, project_open
+            branch placement works through the central checkout, the standalone one in the readable project space
+            (project_space.py, research case 35c3b249), configured by the operator in deploy/project_space.json."""
+            from meowdoku import branch_gate, project_open, project_space
             self._classify()
             try:
                 policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
             except (OSError, ValueError, branch_gate.GateError):
                 return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            try:
+                config = project_space.load_config(HERE / "deploy" / "project_space.json")
+            except project_space.SpaceError as error:
+                return self._json({"error": error.message}, HTTPStatus.SERVICE_UNAVAILABLE)
+            space = project_space.Space(sessions.accounts_db, sessions.state.content_dir, config)
+            if path.startswith("/api/projects/space/"):
+                return project_space.http_route(self, path, method, space=space, accounts_db=sessions.accounts_db)
             return project_open.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
-                                           root=sessions.state.content_dir / "checkouts")
+                                           root=sessions.state.content_dir / "checkouts", space=space)
 
         def _link_ticket_route(self, path: str) -> None:
             """[LINK] POST /api/link/ticket/<prefix> {grant_id, secret, direction} -> the two tickets of one new Nodus link.

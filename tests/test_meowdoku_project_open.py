@@ -89,8 +89,8 @@ def test_a_branch_project_is_opened_through_the_checkout_and_committed(world):
 
 @pytest.mark.parametrize("text, user, username, message", [
     ("schema: project-contract-v9\n", ANN, "ann", "schema must be"),
-    (contract(mode="standalone"), ANN, "ann", "needs the readable project space"),
-    (contract(mode="branch-copy"), ANN, "ann", "needs the readable project space"),
+    (contract(mode="standalone"), ANN, "ann", "the project space is not configured"),
+    (contract(mode="branch-copy"), ANN, "ann", "needs refresh and accept"),
     (contract(identity="bob/garden"), ANN, "ann", "names account 'bob'"),
     (contract(repository="elsewhere"), ANN, "ann", "is not one of \\['work'\\]"),
     (contract(identity="bob/garden"), BOB, "bob", "declare your Git author identity"),

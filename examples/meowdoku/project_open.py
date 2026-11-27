@@ -1,8 +1,8 @@
-"""Opening a dev page's project (research case d442be8d, dev pages ticket 9db5ea72): the branch placement.
+"""Opening a dev page's project (research case d442be8d, dev pages ticket 9db5ea72): branch and standalone.
 
 A project is a folder with a ``project.yaml`` at its root (src/compiler/project_contract.py). Opening one makes
-its placement and writes that first file. This module opens the ``branch`` placement only; ``standalone`` and
-``branch-copy`` need the account's readable project space (ticket 2/8, 5e77787b) and are refused until it exists.
+its placement and writes that first file. This module opens the ``branch`` and ``standalone`` placements;
+``branch-copy`` needs refresh and accept between the branch and its copy (case d442be8d) and is refused until then.
 
     GET  /api/projects                 your projects
     POST /api/projects/open  {text}    open a project from the text of its project.yaml
@@ -15,6 +15,10 @@ any other checkout. The contract is validated first (project_contract.parse_proj
 policy's repositories), and only then written to ``projects/<account>/<project>/project.yaml`` in the branch
 (the place the owner approved, 2026-11-27) and committed as the account's declared identity, naming the project.
 The commit then goes up for review like any other change (reviews_submit); branch -> main is the review gate.
+
+[STANDALONE] The project's own readable space (project_space.py, ticket 2/8, case 35c3b249): a Git repository
+the service manages, with no remote, under content/workspaces/projects/<user id>/, accounted by workspace_accounting.
+While the operator has not configured the space, a standalone open is refused and nothing is made.
 
 [ACCOUNT] The contract's identity is ``<account>/<project>``; its account must be the signed-in account's name.
 
@@ -35,7 +39,8 @@ from pathlib import PurePosixPath
 from meowdoku import branch_review, central_checkout
 
 MAX_CONTRACT = 64_000
-SPACE_MODES_WAIT = "the {mode!r} placement needs the readable project space (dev pages ticket 2/8), which is not built yet"
+COPY_WAITS = ("the 'branch-copy' placement needs refresh and accept between a branch and its copy "
+              "(research case d442be8d), which are not built yet")
 DDL = (
     "CREATE TABLE IF NOT EXISTS projects (identity TEXT PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT, "
     "mode TEXT NOT NULL, repository TEXT, branch TEXT, path TEXT NOT NULL, head TEXT, opened_at REAL NOT NULL)",
@@ -108,14 +113,39 @@ def _undo(db, policy, root, who, *, repository, branch, wrote, made_checkout, ma
                    (repository, branch, who["user_id"]))
 
 
-def open_project(db, policy, root, *, user_id, username, text, now=None) -> dict:
-    """Open a project from its project.yaml text. Only the branch placement is opened here."""
+def _open_standalone(db, space, contract, text, *, user_id, username, now) -> dict:
+    """[STANDALONE] the project's own space (project_space.py): claimed here, made there, all or nothing."""
+    from meowdoku import project_space
+    if space is None or space.config is None:
+        raise ProjectError(project_space.NOT_CONFIGURED, 503)
+    now = time.time() if now is None else now
+    try:
+        db.execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?,?,?)",                       # [ONCE] claimed first
+                   (contract.identity, int(user_id), username, contract.mode, None, None, contract.space, None, now))
+    except sqlite3.IntegrityError:
+        raise ProjectError(f"project {contract.identity!r} is already open", 409) from None
+    try:
+        made = space.create(db, user_id=user_id, username=username, contract=contract, text=text)
+        db.execute("UPDATE projects SET head = ? WHERE identity = ?", (made["head"], contract.identity))
+    except project_space.SpaceError as error:
+        db.execute("DELETE FROM projects WHERE identity = ? AND head IS NULL", (contract.identity,))
+        raise ProjectError(error.message, error.status) from None
+    except BaseException:
+        db.execute("DELETE FROM projects WHERE identity = ? AND head IS NULL", (contract.identity,))
+        raise
+    return {"identity": contract.identity, "mode": contract.mode, "space": contract.space, "path": made["path"],
+            "head": made["head"], "space_bytes": made["bytes"], "contract": contract.to_data(),
+            "next": "work in it with the project_space_* tools (POST /api/projects/space/<operation>)"}
+
+
+def open_project(db, policy, root, *, user_id, username, text, space=None, now=None) -> dict:
+    """Open a project from its project.yaml text: the branch or standalone placement."""
     ensure(db)
     if user_id is None or not username:
         raise ProjectError("sign in first", 401)
     contract = _parse(text, policy)
-    if contract.mode != "branch":
-        raise ProjectError(SPACE_MODES_WAIT.format(mode=contract.mode), 409)
+    if contract.mode == "branch-copy":
+        raise ProjectError(COPY_WAITS, 409)
     if contract.account != username:                                                   # [ACCOUNT]
         raise ProjectError(f"identity {contract.identity!r} names account {contract.account!r}; "
                            f"you open projects as {username!r}", 403)
@@ -124,6 +154,8 @@ def open_project(db, policy, root, *, user_id, username, text, now=None) -> dict
     if not branch_review.identity(db, user_id):
         raise ProjectError("declare your Git author identity first (POST /api/reviews/identity, reviews_identity_set)",
                            409)
+    if contract.mode == "standalone":
+        return _open_standalone(db, space, contract, text, user_id=user_id, username=username, now=now)
     repository, branch = contract.branch["repository"], contract.branch["name"]
     held = branch_review.owner(db, repository, branch)
     if held is not None and held["user_id"] != user_id:
@@ -173,7 +205,7 @@ def open_project(db, policy, root, *, user_id, username, text, now=None) -> dict
             "next": "submit it: reviews_submit (POST /api/reviews) with this repository, branch and head"}
 
 
-def http_route(self, path, method, *, policy, accounts_db, root):
+def http_route(self, path, method, *, policy, accounts_db, root, space=None):
     """Projects over REST, for signed-in accounts holding dev_ui."""
     import sqlite3
     self._set_cookie = []
@@ -198,9 +230,8 @@ def http_route(self, path, method, *, policy, accounts_db, root):
         if not isinstance(body, dict):
             return self._json({"error": "a JSON object is required"}, 400)
         result = open_project(db, policy, root, user_id=principal.user_id, username=principal.username,
-                              text=body.get("text"))
-        print(f"[projects] {principal.username} open {result['identity']} {result['repository']} {result['branch']}",
-              flush=True)
+                              text=body.get("text"), space=space)
+        print(f"[projects] {principal.username} open {result['identity']} {result['mode']}", flush=True)
         return self._json(result)
     except ProjectError as error:
         return self._json({"error": error.message}, error.status)
