@@ -249,6 +249,9 @@ def test_rest_needs_dev_ui_and_takes_the_account_from_the_session(world):
             return self._capset
 
         def _body_json(self, limit):
+            if not 0 < len(json.dumps(self._body).encode("utf-8")) <= limit:
+                self._json({"error": "body size is invalid"}, 400)
+                return None
             return self._body
 
         def _json(self, payload, status=200):
@@ -265,3 +268,16 @@ def test_rest_needs_dev_ui_and_takes_the_account_from_the_session(world):
     assert status == 200 and answer["text"].startswith("schema: project-contract-v0")
     assert post("read", {"identity": "ann/garden", "path": "project.yaml"}, user=BOB, username="bob")[0] == 404
     assert post("write", {"identity": "ann/garden", "path": "../x", "text": "x"})[0] == 400
+    text = "\x01" * 1000                                   # issue 6d7b113d: six bytes each in JSON
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(central_checkout, "MAX_FILE_BYTES", 1000)
+        assert len(json.dumps({"text": text}).encode("utf-8")) > 3 * 1000, "the old limit refused it"
+        status, answer = post("write", {"identity": "ann/garden", "path": "src/control.txt", "text": text})
+        assert status == 200 and answer["bytes"] == 1000, answer
+        assert post("write", {"identity": "ann/garden", "path": "src/big.txt", "text": "a" * 1001})[0] == 413
+        patch.setattr(central_checkout, "ENVELOPE_BYTES", 1000)         # review d16933d0: edit carries two texts
+        body = {"identity": "ann/garden", "path": "src/control.txt", "old": text, "new": "\x02" * 1000}
+        assert len(json.dumps(body).encode("utf-8")) > central_checkout.body_limit("write")
+        status, answer = post("edit", body)
+        assert status == 200, answer
+        assert post("read", {"identity": "ann/garden", "path": "src/control.txt"})[1]["text"] == "\x02" * 1000

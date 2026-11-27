@@ -163,27 +163,33 @@ def test_large_binary_and_unknown_operations_are_refused(world):
     assert unknown.value.status == 404
 
 
-def test_rest_takes_the_account_from_the_session_only(world):
-    class Handler:
-        def __init__(self, path, body, user, username, caps=("dev_ui",)):
-            raw = json.dumps(body).encode("utf-8")
-            self.path, self.headers, self._raw, self.sent = path, {"Content-Type": "application/json",
-                                                                 "Content-Length": str(len(raw))}, raw, None
-            self._user, self._username, self._capset = user, username, set(caps)
+class Handler:
+    """A request as server.py's handler presents it to http_route: _body_json refuses a body over its limit (400)."""
 
-        def _principal(self):
-            from types import SimpleNamespace
-            return SimpleNamespace(user_id=self._user, username=self._username)
+    def __init__(self, path, body, user, username, caps=("dev_ui",)):
+        raw = json.dumps(body).encode("utf-8")
+        self.path, self.headers, self._raw, self.sent = path, {"Content-Type": "application/json",
+                                                             "Content-Length": str(len(raw))}, raw, None
+        self._user, self._username, self._capset = user, username, set(caps)
 
-        def _caps(self):
-            return self._capset
+    def _principal(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(user_id=self._user, username=self._username)
 
-        def _body_json(self, limit):
-            return json.loads(self._raw)
+    def _caps(self):
+        return self._capset
 
-        def _json(self, payload, status=200):
-            self.sent = (status, payload)
+    def _body_json(self, limit):
+        if not 0 < len(self._raw) <= limit:
+            self._json({"error": "body size is invalid"}, 400)
+            return None
+        return json.loads(self._raw)
 
+    def _json(self, payload, status=200):
+        self.sent = (status, payload)
+
+
+def poster(world):
     db_file = world["db"].execute("PRAGMA database_list").fetchone()[2]
 
     def post(operation, body, user=ANN, username="ann", caps=("dev_ui",)):
@@ -191,12 +197,78 @@ def test_rest_takes_the_account_from_the_session_only(world):
         central_checkout.http_route(handler, handler.path, "POST", policy=world["policy"], accounts_db=db_file,
                                     root=world["root"])
         return handler.sent
+    return post
 
+
+def test_rest_takes_the_account_from_the_session_only(world):
+    post = poster(world)
     status, answer = post("open", {"repository": "work", "branch": "ann/rest", "user_id": BOB})
     assert status == 200 and branch_review.owner(world["db"], "work", "ann/rest")["user_id"] == ANN, "a body's user is ignored"
     assert post("open", {"repository": "work", "branch": "ann/rest2"}, user=None, username=None)[0] == 401
     assert post("open", {"repository": "work", "branch": "ann/rest2"}, caps=())[0] == 403
     assert post("read", {"repository": "work", "branch": "ann/rest", "path": "../x"})[0] == 400
+
+
+def test_a_full_file_in_its_worst_json_escape_passes_the_route_body_limit(world, monkeypatch):
+    """Issue 6d7b113d: JSON writes a control character as six bytes, and a 2-byte accented one as six."""
+    monkeypatch.setattr(central_checkout, "MAX_FILE_BYTES", 1000)
+    post = poster(world)
+    assert post("open", {"repository": "work", "branch": "ann/escape"})[0] == 200
+    for name, text in (("control.txt", "\x01" * 1000), ("accented.txt", "é" * 500)):
+        assert len(text.encode("utf-8")) == 1000
+        body = {"repository": "work", "branch": "ann/escape", "path": name, "text": text}
+        assert len(json.dumps(body).encode("utf-8")) > 3 * 1000, "the old limit refused it"
+        status, answer = post("write", body)
+        assert status == 200 and answer["bytes"] == 1000, answer
+    body = {"repository": "work", "branch": "ann/escape", "path": "accented.txt", "old": "é" * 400,
+            "new": "è" * 400}
+    assert len(json.dumps(body).encode("utf-8")) > 3 * 1000, "the old limit refused it"
+    status, answer = post("edit", body)
+    assert status == 200, answer
+    assert (folder_of(world) / "accented.txt").read_text(encoding="utf-8") == "è" * 400 + "é" * 100
+
+
+def test_a_full_replacement_edit_carries_two_worst_escaped_texts_through_the_route(world, monkeypatch):
+    """Review d16933d0 (codex 861, operator-gpt 862): edit's old and new are each a full file.
+
+    The envelope is made small too, so it cannot hide a one-text bound behind its own size.
+    """
+    monkeypatch.setattr(central_checkout, "MAX_FILE_BYTES", 1000)
+    monkeypatch.setattr(central_checkout, "ENVELOPE_BYTES", 1000)
+    post = poster(world)
+    assert post("open", {"repository": "work", "branch": "ann/replace"})[0] == 200
+    old, new = "\x01" * 1000, "\x02" * 1000
+    assert post("write", {"repository": "work", "branch": "ann/replace", "path": "c.txt", "text": old})[0] == 200
+    body = {"repository": "work", "branch": "ann/replace", "path": "c.txt", "old": old, "new": new}
+    assert len(json.dumps(body).encode("utf-8")) > central_checkout.body_limit("write"), "a one-text bound refuses it"
+    status, answer = post("edit", body)
+    assert status == 200, answer
+    assert (folder_of(world) / "c.txt").read_bytes() == new.encode("utf-8")
+
+
+def test_the_file_size_rule_still_refuses_one_byte_over_through_the_route(world, monkeypatch):
+    monkeypatch.setattr(central_checkout, "MAX_FILE_BYTES", 1000)
+    monkeypatch.setattr(central_checkout, "ENVELOPE_BYTES", 1000)
+    post = poster(world)
+    assert post("open", {"repository": "work", "branch": "ann/over"})[0] == 200
+    status, answer = post("write", {"repository": "work", "branch": "ann/over", "path": "big.txt", "text": "a" * 1001})
+    assert status == 413, answer
+    assert not (folder_of(world) / "big.txt").exists()
+    kept = "\x01" * 1000
+    assert post("write", {"repository": "work", "branch": "ann/over", "path": "c.txt", "text": kept})[0] == 200
+    status, answer = post("edit", {"repository": "work", "branch": "ann/over", "path": "c.txt", "old": kept,
+                                   "new": kept + "a"})
+    assert status == 413, answer
+    assert (folder_of(world) / "c.txt").read_bytes() == kept.encode("utf-8"), "a refused edit changes nothing"
+
+
+def test_the_body_limit_holds_the_worst_escape_of_each_operation():
+    full = "\x01" * central_checkout.MAX_FILE_BYTES
+    write = json.dumps({"path": "a.txt", "text": full}).encode("utf-8")
+    assert len(write) <= central_checkout.body_limit("write")
+    edit = json.dumps({"path": "a.txt", "old": full, "new": full}).encode("utf-8")
+    assert len(edit) > central_checkout.body_limit("write")
+    assert len(edit) <= central_checkout.body_limit("edit")
 
 
 def folder_of(world):
