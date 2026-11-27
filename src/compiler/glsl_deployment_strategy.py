@@ -32840,6 +32840,37 @@ def _fold_callsite_structural_values(
     from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
     from .identity_concordance import current_identity_book
     fold_book = current_identity_book()
+    # Program: ``try: result = 12 // n`` (tests/test_source_c_exceptions,
+    # BASIC).  Wrong record: exception ingestion spells the protected body's
+    # guard ``if True:`` (its record is fresh by construction, 7030b938) and
+    # this fold removed it and aliased its merges to the body, so the
+    # failure site the reducer recorded in that guard had no guard to leave
+    # to ("no unique protected guard here: []"), and the code after it read
+    # the body's versions on the exit path.  Rule: a guard a failure site
+    # exits to is not decided by its test -- the site's exit is a second way
+    # to its end -- so neither it nor its merges are folded.
+    from .concordance_declarations import SOURCE_FAILURE_SITE
+    from ..transmogrifier.graph.graph_express2 import source_span_row
+
+    failure_site_page = fold_book.pages.get(SOURCE_FAILURE_SITE.name)
+    failure_guard_rows = frozenset(
+        failure_site_page.latest(row)[3].row
+        for row in failure_site_page.rows()
+    ) if failure_site_page is not None else frozenset()
+
+    def failure_exit_guard(control_id: Any) -> bool:
+        """Whether graph control ``control_id`` is a guard a recorded failure
+        site exits to (``source_failure_site``)."""
+
+        if not failure_guard_rows or control_id is None:
+            return False
+        control = graph.G.nodes.get(int(control_id))
+        expression = None if control is None else control.get("expr_obj")
+        if not isinstance(expression, ast.If):
+            return False
+        span_row = source_span_row(None, expression)
+        return span_row is not None and span_row in failure_guard_rows
+
     from ..common.tensors.topological_reducer import _source_numeric_scope
     source_value_class_scope = _source_numeric_scope(graph.G)
     source_value_class_page = fold_book.page(
@@ -34170,6 +34201,10 @@ def _fold_callsite_structural_values(
                     count *= int(extent)
                 return count
         if node_type == "Phi" or isinstance(expression, ast.IfExp):
+            if node_type == "Phi" and failure_exit_guard(
+                (data.get("attributes") or {}).get("source_conditional_id"),
+            ):
+                return unresolved
             parents = {
                 str(role): int(parent)
                 for parent, role in (data.get("parents") or ())
@@ -36796,22 +36831,6 @@ def _fold_callsite_structural_values(
     # to the selected producer.  The proof is the graph constant above; no
     # runtime tensor value or Python callable participates.
     branch_memberships = _branch_compartments(graph)
-    # Program: ``try: result = 12 // n`` (tests/test_source_c_exceptions,
-    # BASIC).  Wrong record: exception ingestion spells the protected body's
-    # guard ``if True:`` (its record is fresh by construction, 7030b938) and
-    # this fold removed it, so the failure site the reducer recorded in that
-    # guard had no guard to leave to ("no unique protected guard here: []").
-    # Rule: a guard a failure site exits to is not decided by its test --
-    # the site's exit is a second way to its end -- so it is not folded; the
-    # reducer already treats its never-taken arm as terminal.
-    from .concordance_declarations import SOURCE_FAILURE_SITE, SOURCE_SPAN
-    from ..transmogrifier.graph.graph_express2 import source_span_row
-
-    failure_site_page = fold_book.pages.get(SOURCE_FAILURE_SITE.name)
-    failure_guards = frozenset(
-        failure_site_page.latest(row)[3]
-        for row in failure_site_page.rows()
-    ) if failure_site_page is not None else frozenset()
     pruned = True
     while pruned:
         pruned = False
@@ -36819,12 +36838,8 @@ def _fold_callsite_structural_values(
             expression = control_data.get("expr_obj")
             if not isinstance(expression, ast.If):
                 continue
-            if failure_guards:
-                span_row = source_span_row(None, expression)
-                if span_row is not None and fold_book.latest_ref(
-                    SOURCE_SPAN, span_row,
-                ) in failure_guards:
-                    continue
+            if failure_exit_guard(control_id):
+                continue
             predicate_id = next((
                 int(parent)
                 for parent, role in control_data.get("parents") or ()
