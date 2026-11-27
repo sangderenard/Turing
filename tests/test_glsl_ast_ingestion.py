@@ -447,3 +447,75 @@ def test_declared_int_return_and_folded_constants_keep_glsl_widths_on_llvm():
         prepare_artifact_execution(
             artifact, {names['vals']: vals, names['outs']: outs}).run()
         assert int(outs[0]) == expected
+
+
+def test_float_returned_through_inout_tuple_stays_float32_on_llvm():
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    # The Studio response shader's rand01 -> cosine_dir: a float result of an
+    # inout helper (returned with its uint state) feeds ``max(0.0, 1.0 - u)``.
+    # Before: ``float(...)`` was described float64 by its class, the formal
+    # ``u: 'float32'`` and ``1.0 - u`` followed, and the conditional's arms
+    # refused ("conditional union arm changes its physical ABI").
+    source = '''#version 430
+    layout(local_size_x = 1) in;
+    layout(std430, binding = 0) buffer Seeds { uint seeds[]; };
+    layout(std430, binding = 1) buffer Outs { float outs[]; };
+    float rand01(inout uint s) {
+        s = s * 1664525u + 1013904223u;
+        return float(s & 0x00ffffffu) / 16777215.0;
+    }
+    float f(float u) { return max(0.0, 1.0 - u); }
+    void main() {
+        uint rng = seeds[0];
+        outs[0] = f(rand01(rng));
+        seeds[0] = rng;
+    }'''
+    result = lower_glsl_source_to_ast(source)
+    assert result.complete, result.shortfall_report()
+    root = Path(__file__).resolve().parents[1]
+    span = {'function': '*', 'storage': 'span', 'rank': 1,
+            'python_type': 'src.common.tensors.abstraction.AbstractTensor'}
+    contract = ExtractionContract(
+        root / 'extraction_contracts/program_extraction.yaml'
+    ).with_program_abi({'records': {}, 'bindings': [], 'values': [
+        {**span, 'parameter': 'seeds', 'dtype': 'uint32'},
+        {**span, 'parameter': 'outs', 'dtype': 'float32'},
+    ]}).with_execution_file(
+        root / 'extraction_contracts/vehicle_full_native_execution.yaml')
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        ast.unparse(result.module), 'main', extraction_contract=contract,
+        python_bindings={'AbstractTensor': AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        runtime_closure_only=True, progress_bars=False)
+    widths = {getattr(value, 'dtype', None)
+              for fn in module.functions.values() for block in fn.blocks.values()
+              for ins in block.instrs for value in (*ins.args, ins.res)}
+    assert 'float64' not in widths
+    entry = exports[0]
+    names = dict(module.functions[entry].metadata['parameter_names'])
+    emitted = emit_ssa_function_to_llvm(module, entry)
+    assert not emitted.shortfalls
+    artifact = compile_artifact(emitted, directory=tempfile.mkdtemp())
+    for seed in (0, 12345, 4000000000):
+        seeds = np.array([seed], dtype=np.uint32)
+        outs = np.zeros(1, dtype=np.float32)
+        prepare_artifact_execution(
+            artifact, {names['seeds']: seeds, names['outs']: outs}).run()
+        state = np.uint32((seed * 1664525 + 1013904223) % (1 << 32))
+        unit = np.float32(state & 0x00ffffff) / np.float32(16777215.0)
+        expected = max(np.float32(0.0), np.float32(1.0) - unit)
+        assert int(seeds[0]) == int(state)
+        # Within one float32 ulp: the LLVM lane evaluates a float32 region
+        # in double and rounds at the store.
+        assert abs(float(outs[0]) - float(expected)) <= float(np.spacing(expected))

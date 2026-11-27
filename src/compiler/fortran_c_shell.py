@@ -27310,9 +27310,36 @@ def _class_surface_ssa_program(
                         declared_widths.add(str(width))
                 if len(declared_widths) == 1:
                     declared_annotation_dtype = next(iter(declared_widths))
+            # Program: GLSL ``max(0.0, 1.0 - u)`` over float32 values (the
+            # Studio shader's cosine_dir).  Wrong record: ``1.0 - u`` had a
+            # class-only contract (builtins.float), so its arm took the
+            # class receipt's float64 although its own concorded descriptor
+            # (descriptor_state_cell, cited above) is float32, beside the
+            # float32 literal arm.  Rule: the class proves the kind; with no
+            # declared width, an exact rank-0 descriptor of that kind is the
+            # value's width.  The class receipt is the default only without
+            # one.
+            descriptor_width = None
+            if (
+                primitive_receipt is not None
+                and str(primitive_receipt["storage"]) == "scalar"
+                and exact_descriptor is not None
+                and not exact_shape and exact_rank == 0
+                and exact_dtype not in {"", "unknown"}
+            ):
+                from ..transmogrifier.dtype_layout import resolve as _width_layout
+
+                exact_layout = _width_layout(exact_dtype)
+                class_layout = _width_layout(str(primitive_receipt["dtype"]))
+                if exact_layout is not None and class_layout is not None and (
+                    exact_layout.kind == class_layout.kind
+                    or {exact_layout.kind, class_layout.kind} <= {"int", "uint"}
+                ):
+                    descriptor_width = exact_dtype
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
                 or declared_annotation_dtype
+                or descriptor_width
                 or (primitive_receipt or {}).get("dtype")
                 or ""
             )
