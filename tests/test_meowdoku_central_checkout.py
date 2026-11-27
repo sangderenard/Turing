@@ -303,3 +303,49 @@ def test_a_codex_patch_applies_whole_or_not_at_all(world):
         call(world, "edit", branch="ann/codex", patch="*** Begin Patch\n*** Add File: ../out.txt\n+x\n*** End Patch\n")
     recorded = [r[0] for r in world["db"].execute("SELECT path FROM checkout_calls WHERE operation = 'edit' AND ok = 1")]
     assert "base.txt,docs/notes.md" in recorded, "a patch's call records the files it changed"
+
+
+def test_merge_brings_a_registered_branch_in_and_a_conflict_is_resolved_through_edit(world):
+    """[MERGE] A meta review is made through the checkout: merge, resolve with edit, commit; never a command line."""
+    db = world["db"]
+    branch_review.set_identity(db, user_id=ANN, name="Ann", email="ann@example.invalid")
+    branch_review.set_identity(db, user_id=BOB, name="Bob", email="bob@example.invalid")
+    call(world, "open", branch="ann/a")
+    call(world, "write", branch="ann/a", path="base.txt", text="base, Ann\n")
+    call(world, "write", branch="ann/a", path="ann.txt", text="ann\n")
+    ann_tip = call(world, "commit", branch="ann/a", message="Ann")["head"]
+    call(world, "open", BOB, "bob", branch="bob/b")
+    call(world, "write", BOB, "bob", branch="bob/b", path="base.txt", text="base, Bob\n")
+    bob_tip = call(world, "commit", BOB, "bob", branch="bob/b", message="Bob")["head"]
+    call(world, "open", branch="ann/meta")
+
+    with pytest.raises(central_checkout.CheckoutError, match="another branch"):
+        call(world, "merge", branch="ann/meta", **{"from": "ann/meta"})
+    with pytest.raises(central_checkout.CheckoutError, match="registered branch"):
+        run(world["work"], "branch", "stray", "main")
+        call(world, "merge", branch="ann/meta", **{"from": "stray"})
+    with pytest.raises(central_checkout.CheckoutError, match="not a branch name"):
+        call(world, "merge", branch="ann/meta", **{"from": "bad..name"})
+
+    clean = call(world, "merge", branch="ann/meta", **{"from": "ann/a"})
+    assert clean["commit"] == ann_tip and run(world["work"], "rev-parse", f"{clean['head']}^2") == ann_tip, "two parents"
+    assert call(world, "merge", branch="ann/meta", **{"from": "ann/a"})["already"], "nothing to bring in twice"
+
+    torn = call(world, "merge", branch="ann/meta", **{"from": "bob/b"})
+    assert torn["conflicts"] == ["base.txt"] and torn["head"] == clean["head"], "a conflict leaves the merge unfinished"
+    assert call(world, "status", branch="ann/meta")["merging"] == [bob_tip]
+    with pytest.raises(central_checkout.CheckoutError, match="unfinished"):
+        call(world, "close", branch="ann/meta")
+    with pytest.raises(central_checkout.CheckoutError, match="conflict markers: base.txt"):
+        call(world, "commit", branch="ann/meta", message="meta")
+
+    call(world, "merge", branch="ann/meta", abort=True)
+    assert call(world, "status", branch="ann/meta")["merging"] == [] and not call(world, "status", branch="ann/meta")["changes"]
+    call(world, "merge", branch="ann/meta", **{"from": "bob/b"})
+    call(world, "write", branch="ann/meta", path="base.txt", text="base, Ann and Bob\n")
+    done = call(world, "commit", branch="ann/meta", message="Meta: Ann and Bob agree")
+    assert done["merged"] == [bob_tip]
+    for tip in (ann_tip, bob_tip):
+        assert subprocess.run(["git", "-C", str(world["work"]), "merge-base", "--is-ancestor", tip, done["head"]]).returncode == 0
+    assert run(world["work"], "show", f"{done['head']}:base.txt") == "base, Ann and Bob"
+    assert call(world, "merge", branch="ann/meta", **{"from": "main"})["already"], "the default branch is a source too"

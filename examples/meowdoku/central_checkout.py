@@ -15,7 +15,19 @@ The account then works through declared operations only, each a name and typed a
     status  {repository, branch}            what differs from the branch's last commit
     diff    {repository, branch, path?}     the change in the tracked files, as a unified diff
     commit  {repository, branch, message}   commit everything, as the author identity this account declared
+    merge   {repository, branch, from, message?}   bring another branch into this one (see [MERGE])
+            {repository, branch, abort: true}      give up an unfinished merge
     close   {repository, branch}            remove the working folder (it must be committed); the branch stays
+
+[MERGE] The one Git act beyond committing that an account reaches, and still a declared operation, not a command line.
+``from`` must be the repository's default branch or a branch registered in this repository (branch_review: a central
+checkout or a registered branch, anyone's), never this branch itself. The working folder must be committed first and
+the account's author identity declared. A merge that applies is committed at once (both parents, the declared
+identity). A merge that conflicts stays unfinished in the working folder: ``status`` names the commits it brings in
+(``merging``) and the conflicted files; the account resolves them with ``edit`` or ``write`` and ends the merge with
+``commit``, which refuses while any conflicted file still holds a conflict marker line; or gives it up with
+``abort``. ``close`` refuses an unfinished merge. The merge is then an ordinary commit of this branch: it is
+submitted, reviewed and landed like any other (it is how a review bundle's meta review is made, review_bundles.py).
 
 [LOAN] Opening a turing or speaktome checkout also lends its owner a server for the branch (branch_servers.py); the answer
 says which (``server``), or why there is none. Closing the checkout ends the loan.
@@ -41,7 +53,9 @@ MAX_LISTING = 2000
 MAX_DIFF_BYTES = 400_000
 MAX_MESSAGE = 5000
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-OPERATIONS = ("open", "files", "read", "write", "remove", "edit", "status", "diff", "commit", "close")
+OPERATIONS = ("open", "files", "read", "write", "remove", "edit", "status", "diff", "commit", "merge", "close")
+MAX_BRANCH = 200
+CONFLICT_MARKERS = ("<<<<<<< ", ">>>>>>> ", "<<<<<<<\n", ">>>>>>>\n")
 
 DDL = (
     "CREATE TABLE IF NOT EXISTS checkouts (repository TEXT NOT NULL, branch TEXT NOT NULL, user_id INTEGER NOT NULL, "
@@ -467,7 +481,7 @@ def status(row) -> dict:
     lines = _porcelain(row["path"])
     return {"head": _git(row["path"], "rev-parse", "HEAD"),
             "changes": [{"state": line[:2], "path": line[3:]} for line in lines[:MAX_LISTING]],
-            "truncated": len(lines) > MAX_LISTING}
+            "truncated": len(lines) > MAX_LISTING, "merging": _merging(row["path"])}
 
 
 def diff(row, path=None) -> dict:
@@ -487,16 +501,104 @@ def commit(db, row, *, user_id, message) -> dict:
     if not declared:
         raise CheckoutError("declare your Git author identity first (POST /api/reviews/identity, reviews_identity_set)", 409)
     folder = row["path"]
-    if not _porcelain(folder):
+    merging = _merging(folder)
+    if merging:                                    # [MERGE] ending an unfinished merge: no conflict may be left in it
+        marked = [name for name in _unmerged(folder) if _has_marker(Path(folder) / name)]
+        if marked:
+            raise CheckoutError("these files still hold conflict markers: " + ", ".join(marked[:20]) +
+                                "; resolve them with edit or write, or give the merge up (merge with abort)", 409)
+    elif not _porcelain(folder):
         raise CheckoutError("nothing to commit", 409)
     _git(folder, "add", "--all")
     _git(folder, "-c", f"user.name={declared['name']}", "-c", f"user.email={declared['email']}", "commit", "--quiet",
          "-m", message)
-    return {"head": _git(folder, "rev-parse", "HEAD"), "branch": row["branch"],
+    return {"head": _git(folder, "rev-parse", "HEAD"), "branch": row["branch"], **({"merged": merging} if merging else {}),
             "next": "submit it: reviews_submit (POST /api/reviews) with this repository, branch and head"}
 
 
+# ---------------------------------------------------------------- merge: another branch brought into this one [MERGE]
+
+def _merging(folder) -> list:
+    """The commits an unfinished merge is bringing in (Git's MERGE_HEAD), or [] when none is."""
+    place = Path(_git(folder, "rev-parse", "--git-path", "MERGE_HEAD"))
+    place = place if place.is_absolute() else Path(folder) / place
+    return place.read_text(encoding="ascii").split() if place.is_file() else []
+
+
+def _unmerged(folder) -> list:
+    """The files Git still records as conflicted in the unfinished merge."""
+    text = _git(folder, "diff", "--name-only", "--diff-filter=U", check=False)
+    return sorted({line.strip() for line in text.splitlines() if line.strip()})
+
+
+def _has_marker(place: Path) -> bool:
+    if not place.is_file():
+        return False
+    return any(line.startswith(CONFLICT_MARKERS) for line in
+               place.read_bytes().decode("utf-8", "replace").replace("\r\n", "\n").splitlines(keepends=True))
+
+
+def _source(db, policy, row, source) -> str:
+    """The commit ``from`` names, or a refusal: the default branch, or a branch registered in this repository."""
+    repo, default, remote = _repository(policy, row["repository"])
+    if not isinstance(source, str) or not source or len(source) > MAX_BRANCH or source == row["branch"]:
+        raise CheckoutError("from must name another branch of this repository")
+    if _git(repo, "check-ref-format", "--branch", source, check=False) != source:
+        raise CheckoutError(f"{source!r} is not a branch name", 400)
+    if source != default and branch_review.owner(db, row["repository"], source) is None:
+        raise CheckoutError("from must be the default branch or a registered branch of this repository", 404)
+    _git(repo, "fetch", "--quiet", remote, default if source == default else source, check=False)
+    places = ((f"refs/remotes/{remote}/{default}",) if source == default
+              else (f"refs/heads/{source}", f"refs/remotes/{remote}/{source}"))
+    for place in places:                           # a checkout commits to refs/heads; the default lands on the remote
+        found = _git(repo, "rev-parse", "-q", "--verify", f"{place}^{{commit}}", check=False)
+        if found:
+            return found
+    raise CheckoutError(f"there is no branch {source!r} in this repository", 404)
+
+
+def merge(db, policy, row, *, user_id, source, message=None, abort=False) -> dict:
+    import subprocess
+    folder = row["path"]
+    merging = _merging(folder)
+    if abort:
+        if not merging:
+            raise CheckoutError("no merge is unfinished here", 409)
+        _git(folder, "merge", "--abort")
+        return {"aborted": merging, "head": _git(folder, "rev-parse", "HEAD")}
+    if merging:
+        raise CheckoutError("a merge is unfinished here: resolve it and commit, or merge with abort", 409)
+    if _porcelain(folder):
+        raise CheckoutError("the working folder has uncommitted changes: commit them first", 409)
+    declared = branch_review.identity(db, user_id)
+    if not declared:
+        raise CheckoutError("declare your Git author identity first (POST /api/reviews/identity, reviews_identity_set)", 409)
+    if message is not None and (not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE):
+        raise CheckoutError(f"message must be text of 1 to {MAX_MESSAGE} characters")
+    commit_id = _source(db, policy, row, source)
+    before = _git(folder, "rev-parse", "HEAD")
+    if subprocess.run(["git", "-C", str(folder), "merge-base", "--is-ancestor", commit_id, "HEAD"],
+                      capture_output=True).returncode == 0:      # already contained: nothing to bring in
+        return {"from": source, "commit": commit_id, "head": before, "already": True, "files": []}
+    done = subprocess.run(["git", "-C", str(folder), "-c", f"user.name={declared['name']}",
+                           "-c", f"user.email={declared['email']}", "merge", "--no-ff", "--no-edit",
+                           "-m", message or f"Merge {source} into {row['branch']}", commit_id],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if done.returncode == 0:
+        return {"from": source, "commit": commit_id, "head": _git(folder, "rev-parse", "HEAD"), "files": [],
+                "next": "submit it: reviews_submit (POST /api/reviews) with this repository, branch and head"}
+    conflicts = _unmerged(folder)
+    if _merging(folder) and conflicts:
+        return {"from": source, "commit": commit_id, "head": before, "conflicts": conflicts, "files": conflicts,
+                "next": "resolve each conflicted file with edit or write, then commit; or merge with abort"}
+    if _merging(folder):
+        _git(folder, "merge", "--abort", check=False)
+    raise CheckoutError(f"the merge did not apply (nothing was changed): {(done.stderr or done.stdout).strip()[-600:]}", 409)
+
+
 def close(db, policy, row) -> dict:
+    if _merging(row["path"]):
+        raise CheckoutError("a merge is unfinished here: commit it or give it up (merge with abort) first", 409)
     if _porcelain(row["path"]):
         raise CheckoutError("the working folder has uncommitted changes: commit them first", 409)
     repo, _, _ = _repository(policy, row["repository"])
@@ -542,6 +644,9 @@ def run(db, policy, root, *, user_id, username, operation, body) -> dict:
                 result = diff(row, path)
             elif operation == "commit":
                 result = commit(db, row, user_id=user_id, message=body.get("message"))
+            elif operation == "merge":
+                result = merge(db, policy, row, user_id=user_id, source=body.get("from"), message=body.get("message"),
+                               abort=body.get("abort") is True)
             else:
                 result = close(db, policy, row)
                 ended = branch_servers.release(db, row["repository"], row["branch"])                       # [LOAN]
