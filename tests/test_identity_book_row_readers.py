@@ -294,8 +294,42 @@ def test_the_call_result_reader_and_a_reducer_writer_race_safely(
             page_type = type(book.page(SOURCE_VALUE_CLASS))
             looked = page_type.latest
             results, errors = [], []
+            # Review 7c0ad27d, comment 825: "the writer is still alive after
+            # a short join" also holds when the scheduler has not run it
+            # yet.  The writer thread reports instead which came first: an
+            # acquisition of the publication lock that has to wait (the
+            # reader's transaction holds it), or its own end.
+            waited, settled = threading.Event(), threading.Event()
+            writer_threads = []
+
+            class _ReportingLock:
+                def __init__(self, lock):
+                    self._lock = lock
+
+                def acquire(self, blocking=True, timeout=-1):
+                    if (writer_threads
+                            and threading.get_ident() == writer_threads[0]
+                            and blocking):
+                        if self._lock.acquire(blocking=False):
+                            return True
+                        waited.set()
+                        settled.set()
+                    return self._lock.acquire(blocking, timeout)
+
+                def release(self):
+                    self._lock.release()
+
+                def __enter__(self):
+                    self.acquire()
+                    return self
+
+                def __exit__(self, *exc):
+                    self.release()
+
+            book._publication_lock = _ReportingLock(book._publication_lock)
 
             def reducer_writer():
+                writer_threads.append(threading.get_ident())
                 try:
                     results.append(
                         topological_reducer._concord_source_value_class(
@@ -304,6 +338,8 @@ def test_the_call_result_reader_and_a_reducer_writer_race_safely(
                             provenance=Derived((reducer_span,))))
                 except Exception as error:  # reported by the assertion
                     errors.append(error)
+                finally:
+                    settled.set()
 
             context = contextvars.copy_context()
             writer = threading.Thread(target=context.run,
@@ -322,8 +358,10 @@ def test_the_call_result_reader_and_a_reducer_writer_race_safely(
                     # post is decided on.
                     if len(looks) == 2:
                         writer.start()
-                        writer.join(timeout=0.5)
-                        interleaved.append(writer.is_alive())
+                        assert settled.wait(timeout=10), (
+                            "the reducer writer neither waited for the "
+                            "publication lock nor finished")
+                        interleaved.append(waited.is_set())
                 return found
 
             monkeypatch.setattr(page_type, "latest",
@@ -336,7 +374,8 @@ def test_the_call_result_reader_and_a_reducer_writer_race_safely(
         assert errors == [], f"the reducer writer was refused: {errors!r}"
         assert results == [("builtins.int", 1)]
         assert interleaved == [True], (
-            "a post of the row committed between the look and the post")
+            "the reducer writer ran between the look and the post without "
+            "waiting for the reader's transaction")
         page = book.page(SOURCE_VALUE_CLASS)
         history = page.history(target)
         assert len(history) == 1, history
