@@ -69,6 +69,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "where_double": 3,
     "broadcast_double": 1,
     "broadcast_int64": 1,
+    "broadcast_bool": 1,
     "reduce_dim_double": 1,
     "sum_dim_int64": 1,
     "mean_dim": 1,
@@ -132,6 +133,7 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "transpose_double": (2, 3),
     "broadcast_double": (2, 4),
     "broadcast_int64": (2, 4),
+    "broadcast_bool": (2, 4),
     "stack_double": (2,),
     "cat_double": (1, 3),
     "topk_int64_dim": (1,),
@@ -164,6 +166,12 @@ C_SSA_I64_POINTER_ARGUMENTS = {
 C_SSA_POINTER_ARRAY_ARGUMENTS = {
     "stack_double": (0,),
     "cat_double": (0,),
+}
+
+# A Boolean span's element is one byte (``uint8_t`` in the C source, ``i1`` in
+# memory in LLVM).  An opaque ``ptr`` loses that, as it loses int64 above.
+C_SSA_BOOL_POINTER_ARGUMENTS = {
+    "broadcast_bool": (0, 1),
 }
 
 
@@ -265,6 +273,7 @@ _C_FUNCTION_ROLES = {
     "where_double": "tensor_kernel",
     "broadcast_double": "tensor_kernel",
     "broadcast_int64": "tensor_kernel",
+    "broadcast_bool": "tensor_kernel",
     "cumsum_dim_double": "tensor_kernel",
     "cumsum_dim_int64": "tensor_kernel",
     "argreduce_dim_double": "tensor_kernel",
@@ -1180,6 +1189,119 @@ store:
   %output.ptr = getelementptr inbounds i64, ptr %output, i64 %flat64
   %value = load i64, ptr %input.ptr, align 8
   store i64 %value, ptr %output.ptr, align 8
+  br label %flat.latch
+
+flat.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %flat.header
+
+exit:
+  ret void
+}
+
+define internal void @broadcast_bool(
+    ptr %input, ptr %output, ptr %input_shape, i32 %input_ndim,
+    ptr %output_shape, i32 %output_ndim) {
+entry:
+  br label %total.header
+
+total.header:
+  %total.axis = phi i32 [ 0, %entry ], [ %total.axis.next, %total.body ]
+  %total = phi i32 [ 1, %entry ], [ %total.next, %total.body ]
+  %total.continue = icmp slt i32 %total.axis, %output_ndim
+  br i1 %total.continue, label %total.body, label %flat.header
+
+total.body:
+  %total.axis64 = sext i32 %total.axis to i64
+  %total.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %total.axis64
+  %total.extent = load i32, ptr %total.extent.ptr, align 4
+  %total.next = mul nsw i32 %total, %total.extent
+  %total.axis.next = add nsw i32 %total.axis, 1
+  br label %total.header
+
+flat.header:
+  %flat = phi i32 [ 0, %total.header ], [ %flat.next, %flat.latch ]
+  %flat.continue = icmp slt i32 %flat, %total
+  br i1 %flat.continue, label %axis.header, label %exit
+
+axis.header:
+  %axis = phi i32 [ 0, %flat.header ], [ %axis.next, %axis.latch ]
+  %remaining = phi i32 [ %flat, %flat.header ], [ %remaining.next, %axis.latch ]
+  %input.flat = phi i32 [ 0, %flat.header ], [ %input.flat.next, %axis.latch ]
+  %axis.continue = icmp slt i32 %axis, %output_ndim
+  br i1 %axis.continue, label %output.stride.entry, label %store
+
+output.stride.entry:
+  %output.later.start = add nsw i32 %axis, 1
+  br label %output.stride.header
+
+output.stride.header:
+  %output.later = phi i32 [ %output.later.start, %output.stride.entry ], [ %output.later.next, %output.stride.body ]
+  %output.stride = phi i32 [ 1, %output.stride.entry ], [ %output.stride.next, %output.stride.body ]
+  %output.later.continue = icmp slt i32 %output.later, %output_ndim
+  br i1 %output.later.continue, label %output.stride.body, label %coordinate
+
+output.stride.body:
+  %output.later64 = sext i32 %output.later to i64
+  %output.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %output.later64
+  %output.extent = load i32, ptr %output.extent.ptr, align 4
+  %output.stride.next = mul nsw i32 %output.stride, %output.extent
+  %output.later.next = add nsw i32 %output.later, 1
+  br label %output.stride.header
+
+coordinate:
+  %coordinate.value = sdiv i32 %remaining, %output.stride
+  %remaining.next = srem i32 %remaining, %output.stride
+  %offset = sub nsw i32 %output_ndim, %input_ndim
+  %input.axis = sub nsw i32 %axis, %offset
+  %input.axis.valid = icmp sge i32 %input.axis, 0
+  br i1 %input.axis.valid, label %input.extent.block, label %axis.noinput
+
+input.extent.block:
+  %input.axis64 = sext i32 %input.axis to i64
+  %input.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.axis64
+  %input.extent = load i32, ptr %input.extent.ptr, align 4
+  %input.broadcast = icmp eq i32 %input.extent, 1
+  br i1 %input.broadcast, label %axis.noinput, label %input.stride.entry
+
+input.stride.entry:
+  %input.later.start = add nsw i32 %input.axis, 1
+  br label %input.stride.header
+
+input.stride.header:
+  %input.later = phi i32 [ %input.later.start, %input.stride.entry ], [ %input.later.next, %input.stride.body ]
+  %input.stride = phi i32 [ 1, %input.stride.entry ], [ %input.stride.next, %input.stride.body ]
+  %input.later.continue = icmp slt i32 %input.later, %input_ndim
+  br i1 %input.later.continue, label %input.stride.body, label %axis.input
+
+input.stride.body:
+  %input.later64 = sext i32 %input.later to i64
+  %input.later.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.later64
+  %input.later.extent = load i32, ptr %input.later.extent.ptr, align 4
+  %input.stride.next = mul nsw i32 %input.stride, %input.later.extent
+  %input.later.next = add nsw i32 %input.later, 1
+  br label %input.stride.header
+
+axis.input:
+  %input.contribution = mul nsw i32 %coordinate.value, %input.stride
+  %input.flat.with = add nsw i32 %input.flat, %input.contribution
+  br label %axis.latch
+
+axis.noinput:
+  br label %axis.latch
+
+axis.latch:
+  %input.flat.next = phi i32 [ %input.flat, %axis.noinput ], [ %input.flat.with, %axis.input ]
+  %axis.next = add nsw i32 %axis, 1
+  br label %axis.header
+
+store:
+  %input.flat64 = sext i32 %input.flat to i64
+  %flat64 = sext i32 %flat to i64
+  %input.ptr = getelementptr inbounds i1, ptr %input, i64 %input.flat64
+  %output.ptr = getelementptr inbounds i1, ptr %output, i64 %flat64
+  %value = load i1, ptr %input.ptr, align 1
+  store i1 %value, ptr %output.ptr, align 1
   br label %flat.latch
 
 flat.latch:
@@ -3828,6 +3950,12 @@ TRANSLATIONS = (
         "row-major signed-int64 singleton-axis broadcast materialization",
     ),
     CBackendLLVMSSA(
+        "broadcast_bool",
+        "broadcast_bool",
+        ("broadcast_to", "expand"),
+        "row-major one-byte Boolean singleton-axis broadcast materialization",
+    ),
+    CBackendLLVMSSA(
         "reduce_dim_double",
         "reduce_dim_double",
         ("sum", "prod", "min", "max", "any", "all"),
@@ -4964,6 +5092,10 @@ def c_backend_repository_ssa_reference():
         function = imported.module.functions[symbol]
         for argument_index in argument_indices:
             function.args[int(argument_index)].dtype = "int64"
+    for symbol, argument_indices in C_SSA_BOOL_POINTER_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        for argument_index in argument_indices:
+            function.args[int(argument_index)].dtype = "bool"
     for symbol, argument_indices in C_SSA_POINTER_ARRAY_ARGUMENTS.items():
         function = imported.module.functions[symbol]
         for argument_index in argument_indices:
@@ -5064,6 +5196,7 @@ __all__ = [
     "C_SSA_OUTPUT_ARGUMENTS",
     "C_SSA_I32_POINTER_ARGUMENTS",
     "C_SSA_I64_POINTER_ARGUMENTS",
+    "C_SSA_BOOL_POINTER_ARGUMENTS",
     "C_SSA_POINTER_ARRAY_ARGUMENTS",
     "C_SSA_EXTERNAL_PRIMITIVES",
     "LLVM_SSA_MODULE",

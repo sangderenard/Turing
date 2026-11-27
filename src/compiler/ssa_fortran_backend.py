@@ -986,12 +986,14 @@ class _FunctionEmitter:
         value_dtypes: Mapping[int, str] | None = None,
         value_shapes: Mapping[int, Sequence[int]] | None = None,
         tensor_table: SSATensorTable | None = None,
+        runtime_shape_vectors: Mapping[int, int] | None = None,
         sequence_table: SSASequenceTable | None = None,
         native_symbol: str | None = None,
         callee_native_symbols: Mapping[str, str] | None = None,
         extent_namespace: str = "",
         release_heap_owners: bool = False,
         dynamic_extent_aliases: Mapping[int, int] | None = None,
+        owned_tensor_bindings: Mapping[str, Sequence[Any]] | None = None,
     ):
         # ``intrinsic`` (the default) spells sin/cos with gfortran's own
         # SIN/COS, as every other transcendental is: the 1e-6 ``lut`` matched
@@ -1015,6 +1017,12 @@ class _FunctionEmitter:
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.tensor_table = tensor_table or SSATensorTable()
+        # Runtime tensor id -> the shape vector its producing call publishes
+        # (TENSOR_METADATA_RESULT_BINDING), for operands with no descriptor.
+        self.runtime_shape_vectors = {
+            int(key): int(value)
+            for key, value in dict(runtime_shape_vectors or {}).items()
+        }
         self.sequence_table = sequence_table
         # Value ids used as an address base anywhere in the module (dynamic
         # arrays), and those a store mutates -- shared across a method's
@@ -1086,6 +1094,23 @@ class _FunctionEmitter:
             int(value.id)
             for value in self.function.args
             if str(value.dtype or "").casefold() in {"ptr", "pointer"}
+        )
+        # Program: declared Sum over a tensor (broadcast_bool's mask
+        # buffers).  Wrong record: a typed kernel buffer (the int64 and bool
+        # registries of c_backend_llvm_ssa retype its ``ptr``) lost the
+        # pointer mark, so callers' runtime ranks unified into it and its
+        # dynamic extents climbed to the root as public parameters.  Rule:
+        # an imported kernel's pointer argument, as its LLVM origin declares
+        # it, is a raw flat buffer whatever element type it was given.
+        kernel_origins = (
+            self.function.metadata.get("llvm_repository_kernel") or (None, {})
+        )[1] or {}
+        self._pointer_value_ids.update(
+            int(value.id)
+            for value in self.function.args
+            if (origin := kernel_origins.get(int(value.id))) is not None
+            and origin[1] == "argument"
+            and str(origin[2]).startswith("ptr ")
         )
         sequence_columns = set() if sequence_table is None else {
             int(column)
@@ -1181,6 +1206,8 @@ class _FunctionEmitter:
         # (``t<id>_v``) refreshed whenever the cell can change.
         self._heap_elements: dict[int, str] = {}
         self._heap_owner_ids: set[int] = set()
+        # Logical tensors that view an owned carrier's arena (value -> carrier).
+        self._owned_views: dict[int, int] = {}
         heap_occurrences: dict[int, SSAValue] = {}
         # Returned/forwarded record pools retain their complete storage
         # descriptor even when a formal occurrence has no resident heap
@@ -1251,6 +1278,47 @@ class _FunctionEmitter:
                 value_id, "ptr", (), occurrence.device,
                 dict(occurrence.accounting or {}),
             )
+        # Owned-heap tensors (``tensor_ssa_lowering``'s Alloca under a
+        # caller-owned owner), read through the audited bindings as the C
+        # module lane reads them.  Program: declared ``Sum(k*x, (k, 1, n))``
+        # over scalar ``n, x`` (owner, 2026-11-25: "use the owner chain").
+        # Rule: (1) a logical tensor bound to a local carrier is that
+        # carrier's arena over its count; (2) a value a region Call names
+        # (``output_ids``) for a callee carrier (``callee_output_ids``) is a
+        # pointer cell holding the arena the callee allocated on the
+        # caller's owner.
+        owned_bindings = dict(owned_tensor_bindings or {})
+        self._owned_counts: dict[int, int] = {}
+        self._caller_heap_cells: set[int] = set()
+        self._owned_outputs: set[int] = set()
+        for binding in owned_bindings.get(function.name, ()):
+            if int(binding.data_value_id) in self._heap_elements:
+                self._owned_views[int(binding.tensor_id)] = int(binding.data_value_id)
+                self._owned_counts[int(binding.tensor_id)] = int(binding.count_value_id)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                callee_name = str(instruction.attributes.get("callee") or "")
+                callee_carriers = {
+                    int(binding.data_value_id): binding
+                    for binding in owned_bindings.get(callee_name, ())
+                }
+                if instruction.op not in ("Call", "call") or not callee_carriers:
+                    continue
+                caller_ids = tuple(map(int, instruction.attributes.get(
+                    "output_ids", ()) or ()))
+                callee_ids = tuple(map(int, instruction.attributes.get(
+                    "callee_output_ids", ()) or ()))
+                if len(caller_ids) != len(callee_ids):
+                    continue
+                for caller_id, callee_id in zip(caller_ids, callee_ids):
+                    binding = callee_carriers.get(callee_id)
+                    if binding is None:
+                        continue
+                    self._heap_elements[caller_id] = str(binding.element_dtype)
+                    self._caller_heap_cells.add(caller_id)
+                    self.array_base_ids.discard(caller_id)
+                    self._pointer_value_ids.discard(caller_id)
+                    self._value_types[caller_id] = SSAValue(caller_id, "ptr", (), None, {})
         # Every heap arena value has a pointer view, refreshed wherever its
         # cell can change; ``_heap_indexed`` are those an element access
         # actually reads through.
@@ -1392,6 +1460,47 @@ class _FunctionEmitter:
                     self.dynamic_array_leading_extents[column_id] = (extent,)
                     if column_id in self.dynamic_array_extents:
                         self.dynamic_array_extents[column_id] = extent
+        # A runtime-sized rank-1 tensor's extent is its dynamic descriptor's
+        # element count, an SSA value of this frame (``tensor_ssa_lowering``),
+        # exactly as the sequence capacity above: never a host-supplied
+        # extent the program computes itself (the declared Sum's index axis).
+        # An owned carrier's extent is its Alloca's count, so a kernel's
+        # array dummy is sized by the arena it receives.
+        defined_ids = {int(argument.id) for argument in self.function.args} | {
+            int(instruction.res.id)
+            for block in self.function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+
+        def counted_extent(count_id: int) -> str:
+            extent = (
+                f"int({_name(SSAValue(int(count_id), 'int32', ()))}, c_int)"
+            )
+            self._local_sequence_extent_expressions.add(extent)
+            return extent
+
+        for descriptor in self.tensor_table.tensors.values():
+            tensor_id = int(descriptor.tensor_id)
+            count_id = descriptor.element_count_value_id
+            if (
+                descriptor.metadata_state == "dynamic"
+                and count_id is not None
+                and int(count_id) in defined_ids
+                and self.dynamic_array_ranks.get(tensor_id) == 1
+                and tensor_id not in self._owned_views
+                and tensor_id not in self._caller_heap_cells
+            ):
+                extent = counted_extent(int(count_id))
+                self.dynamic_array_leading_extents[tensor_id] = (extent,)
+                if tensor_id in self.dynamic_array_extents:
+                    self.dynamic_array_extents[tensor_id] = extent
+        for tensor_id, carrier_id in self._owned_views.items():
+            count_id = self._owned_counts.get(tensor_id)
+            if count_id is not None and int(count_id) in defined_ids:
+                self.dynamic_array_leading_extents[carrier_id] = (
+                    counted_extent(int(count_id)),
+                )
         self._propagate_phi_dynamic_ranks()
         self.runtime_sized_ids = {
             int(value_id) for value_id, rank in dict(
@@ -1751,7 +1860,18 @@ class _FunctionEmitter:
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
         inlined = self._inlined.get(value.id)
+        if inlined is None and int(value.id) in self._owned_views:
+            return self._owned_arena(int(value.id))
         return inlined if inlined is not None else _name(value)
+
+    def _owned_arena(self, value_id: int) -> str:
+        """An owned tensor's elements: its carrier's arena over its count."""
+
+        carrier = _name(SSAValue(self._owned_views[int(value_id)], "ptr", ()))
+        count = self._owned_counts.get(int(value_id))
+        if count is None:
+            return f"{carrier}_v"
+        return f"{carrier}_v(1:int({self._operand(SSAValue(count, 'int32', ()))}, c_int))"
 
     def _call_operand(self, value: SSAValue, *, array_expected: bool) -> str:
         """Render one call operand, folding a repository address to a section.
@@ -1785,6 +1905,11 @@ class _FunctionEmitter:
                     # section retains its rank and aliases the same storage.
                     return f"{self._indexed_base(collection)}({subscripts}:)"
                 return f"{self._indexed_base(collection)}({subscripts})"
+            if int(value.id) in self._heap_elements:
+                # An owned-heap carrier (``tensor_ssa_lowering``'s Alloca):
+                # the kernel's array dummy receives its arena, as the C and
+                # LLVM lanes pass it, never the pointer cell.
+                return self._indexed_base(value)
         return self._operand(value)
 
     def _collect_use_sites(self) -> None:
@@ -2130,8 +2255,15 @@ class _FunctionEmitter:
         if operation == "arange":
             start = int(attributes.get("start", 0))
             step = int(attributes.get("step", 1))
-            end = int(attributes["end"])
             index = self._loop_variable()
+            if "end" not in attributes:
+                # ``arange(count)`` with a runtime count (a declared Sum's
+                # index axis, ``tensor_ssa_lowering``'s dynamic descriptor):
+                # its one operand IS the end, read at run time.
+                if len(args) != 1 or start != 0 or step != 1:
+                    return None
+                return f"[({index}, {index} = 0, int({args[0]}) - 1)]"
+            end = int(attributes["end"])
             # An implied-do array constructor: the Fortran form of arange,
             # with no materialised element list regardless of length.
             return (
@@ -2672,6 +2804,9 @@ class _FunctionEmitter:
         result_rank = self.dynamic_array_ranks.get(
             int(instr.res.id), len(result_shape)
         )
+        if int(instr.res.id) in self._owned_views:
+            # An owned result is its carrier's arena over its count.
+            result_rank = max(int(result_rank), 1)
         result_count = _element_count(result_shape)
         conformed: list[str] = []
         for position, expression in enumerate(args):
@@ -2689,6 +2824,25 @@ class _FunctionEmitter:
             if result_rank == 0 and source_rank > 0 and not shape:
                 subscripts = ", ".join("1" for _ in range(source_rank))
                 conformed.append(f"{expression}({subscripts})")
+                continue
+            owned_count = (
+                self._owned_counts.get(int(instr.res.id))
+                if int(instr.res.id) in self._owned_views else None
+            )
+            if (not shape and source_rank > 1 and owned_count is not None
+                    and not result_shape):
+                # Program: declared Sum over a tensor; the folded view
+                # ``arange(count).unsqueeze(-1)`` reaches region 6 as a
+                # rank-2 runtime dummy.  Wrong record: its elementwise
+                # results are owned arenas, flat over their count, and the
+                # whole-array assignment mixed ranks 1 and 2 (gfortran
+                # refused).  Rule: an owned result is its arena over its
+                # count, so a runtime span operand is read in its storage
+                # order over the same count, the flat walk LLVM and C take.
+                count = self._operand(SSAValue(owned_count, "int32", ()))
+                conformed.append(
+                    f"reshape({expression}, [int({count}, c_int)])"
+                )
                 continue
             if shape == result_shape or not shape:
                 conformed.append(expression)
@@ -2793,6 +2947,37 @@ class _FunctionEmitter:
                 if axis == 1 and dynamic_extent is not None:
                     replacement = str(dynamic_extent)
                     break
+                # Program: declared Sum over a tensor.  Wrong record: every
+                # runtime-shaped region operand (the folded arange view, the
+                # mask and term arenas) had no static shape and no dummy
+                # extent here, so its extents climbed to the root as public
+                # parameters the host cannot know.  Rule: a runtime tensor's
+                # extents are its runtime shape vector, a value this caller
+                # already computes.
+                shape_vector_id = (actual.accounting or {}).get(
+                    "tensor_shape_value_id"
+                )
+                if shape_vector_id is None:
+                    shape_vector_id = self.runtime_shape_vectors.get(
+                        int(actual.id)
+                    )
+                if shape_vector_id is None:
+                    descriptor = self.tensor_table.by_id(int(actual.id))
+                    if (descriptor is not None
+                            and descriptor.metadata_state == "dynamic"):
+                        shape_vector_id = descriptor.shape_value_id
+                if shape_vector_id is not None:
+                    shape_vector = self._value_types.get(int(shape_vector_id))
+                    vector_shape = tuple(
+                        getattr(shape_vector, "shape", None) or ()
+                    )
+                    if (len(vector_shape) == 1
+                            and axis <= int(vector_shape[0])):
+                        replacement = (
+                            f"int({_name(SSAValue(int(shape_vector_id), 'int32', ()))}"
+                            f"({axis}), c_int)"
+                        )
+                        break
             resolved.append(replacement or extent)
         return tuple(resolved)
 
@@ -2895,7 +3080,11 @@ class _FunctionEmitter:
             for position, record_value in enumerate(raw_record):
                 slot = slot_index_by_id.get(int(record_value.id))
                 if slot is None:
-                    return None
+                    if position in outputs:
+                        return None
+                    # An unread record position with no native slot (a
+                    # returned view of the callee's own formal storage).
+                    continue
                 position_to_slot[position] = slot
             if any(position not in position_to_slot for position in outputs):
                 return None
@@ -2915,6 +3104,11 @@ class _FunctionEmitter:
                         slot_dtypes[slot] if slot < len(slot_dtypes) else None
                     )
                     first_dtype = str(self._typed(first).dtype or self.dtype)
+                    # An owned callee output and this caller's pointer cell
+                    # are both the arena address (``type(c_ptr)``); the
+                    # slot's logical element dtype is not a conversion.
+                    if int(first.id) in self._caller_heap_cells:
+                        slot_dtype = None
                     if slot_dtype and slot_dtype != first_dtype:
                         kind = _DTYPE_KIND.get(slot_dtype, "real(c_double)")
                         bridge = f"bridge_c{callsite}_p{slot}"
@@ -2995,6 +3189,10 @@ class _FunctionEmitter:
                 self._locals[value.id] = self._typed(value)
             output_binding_values = list(ordered_outputs)
             output_binding_names = [_name(value) for value in ordered_outputs]
+        # A pointer cell the callee filled: this frame's view follows it.
+        for value in output_binding_values:
+            if int(value.id) in self._caller_heap_cells:
+                postlude.extend(self._heap_refresh(value))
         for value in consumed:
             self._consumed.add(value.id)
 
@@ -3197,9 +3395,18 @@ class _FunctionEmitter:
             aliases_frame = bool(
                 instr.attributes.get("result_aliases_frame", False)
             )
+            result_descriptor = self.tensor_table.by_id(int(instr.res.id))
+            owned_carrier = (
+                result_descriptor is not None
+                and result_descriptor.heap_owner_value_id is not None
+                and int(result_descriptor.data_value_id)
+                == int(instr.args[position].id)
+                and int(instr.args[position].id) in self._heap_elements
+            )
             if (
                 int(instr.args[position].id) != int(instr.res.id)
                 and not aliases_frame
+                and not owned_carrier
             ):
                 return None
             # Linked aggregate/sequence calls publish into an explicit caller
@@ -3223,6 +3430,10 @@ class _FunctionEmitter:
                 # an identity-returning method declared t6 twice.
                 output_value = self._typed(instr.args[position])
                 self._locals[int(output_value.id)] = output_value
+            elif owned_carrier:
+                # The logical tensor views its carrier's arena (the C lane's
+                # ``expressions[result] = expressions[carrier]``).
+                self._owned_views[int(instr.res.id)] = int(instr.args[position].id)
             elif not aliases_frame:
                 self._locals[instr.res.id] = self._typed(instr.res)
         elif output_count == 1 and instr.res is not None:
@@ -4630,6 +4841,9 @@ class _FunctionEmitter:
                     "llvm.trunc.f64": "aint({0})",
                     "llvm.floor.f64": "floor({0}, kind=c_int64_t)",
                     "llvm.ceil.f64": "ceiling({0}, kind=c_int64_t)",
+                    # ``binary_value``'s atan2 arm (repository kernel; the
+                    # LLVM lane's ``@atan2``, the C lane's libm atan2).
+                    "atan2": "atan2({0}, {1})",
                 }.get(callee)
                 if intrinsic is None and len(instr.args) == 1:
                     # A call whose callee is simply the operation's own name,
@@ -5365,6 +5579,16 @@ class _FunctionEmitter:
                                     output, returned, self._operand(returned)
                                 )
                             )
+                # An owned output crosses as its arena's address: the
+                # caller's pointer cell receives the carrier (the C lane's
+                # ``*((void **)(out)) = carrier``).
+                for output in self.outputs:
+                    carrier = self._owned_views.get(int(output.id))
+                    if carrier is not None:
+                        body.append(
+                            f"    {_name(output)} = "
+                            f"{_name(SSAValue(carrier, 'ptr', ()))}"
+                        )
                 body.extend(self._entry_heap_release_lines())
                 body.append("    return")
                 continue
@@ -5477,8 +5701,25 @@ class _FunctionEmitter:
                 )
                 body.append(f"    ! UNSUPPORTED {instr.op}")
                 continue
-            if self._may_inline(instr, block):
+            owned_target = int(instr.res.id) in self._owned_views
+            if not owned_target and self._may_inline(instr, block):
                 self._inlined[instr.res.id] = expression
+                continue
+            if owned_target:
+                # The owned tensor's storage is its carrier's arena (the C
+                # lane writes its elementwise loop into the carrier local).
+                if (
+                    self._instruction_is_logical(instr)
+                    != (str(instr.res.dtype or self.dtype) in _LOGICAL_DTYPES)
+                ):
+                    expression = (
+                        _UNARY["bool_to_float64"].format(expression)
+                        if self._instruction_is_logical(instr)
+                        else f"(({expression}) /= 0)"
+                    )
+                body.append(
+                    f"    {self._owned_arena(int(instr.res.id))} = {expression}"
+                )
                 continue
             self._locals[instr.res.id] = self._typed(instr.res)
             if (
@@ -5753,6 +5994,12 @@ class _FunctionEmitter:
                 # address contract.  An assumed-size rank-one dummy accepts
                 # the caller's contiguous tensor by sequence association;
                 # locals retain the exact compiler-owned element count.
+                # A rank-one static shape is already that flat contract and
+                # states its upper bound, which a whole-array write needs
+                # (the declared Sum's shape vector: ``t = 0`` then
+                # ``t(i + 1) = n``; gfortran refuses an assumed-size target).
+                if dummy and len(extents) == 1:
+                    return extents[0]
                 return "*" if dummy else " * ".join(extents)
             return ", ".join(extents)
 
@@ -5930,6 +6177,11 @@ class _FunctionEmitter:
         for value in self.outputs:
             if value.id in argument_ids:
                 continue
+            if int(value.id) in self._owned_views:
+                declarations.append(
+                    f"    type(c_ptr), intent(out) :: {_name(value)}"
+                )
+                continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
             dynamic_extents = self.dynamic_array_leading_extents.get(
                 int(value.id), ()
@@ -6000,6 +6252,27 @@ class _FunctionEmitter:
                 ))
                 continue
             declarations.append(f"    {kind}, pointer :: t{value_id}_v(:)")
+        # A dummy sized by another formal (a runtime tensor's descriptor
+        # count, ``int(tN, c_int)``) needs that formal typed first: gfortran
+        # refuses "Symbol 'tN' is used before it is typed".
+        extent_symbols = {
+            match.group(1)
+            for expression in self._local_sequence_extent_expressions
+            for match in (re.fullmatch(r"int\((t\d+), c_int\)", expression),)
+            if match is not None
+        }
+        if extent_symbols:
+            leading = [
+                line for line in declarations
+                if (" :: " in line and "intent(" in line
+                    and line.rsplit(" :: ", 1)[1].strip() in extent_symbols)
+            ]
+            if leading:
+                remaining = [line for line in declarations if line not in leading]
+                position = len(extent_names)
+                declarations = [
+                    *remaining[:position], *leading, *remaining[position:],
+                ]
 
         name = self.function.name
         native_name = self.native_symbol
@@ -6072,12 +6345,14 @@ def emit_function(
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, Sequence[int]] | None = None,
     tensor_table: SSATensorTable | None = None,
+    runtime_shape_vectors: Mapping[int, int] | None = None,
     sequence_table: SSASequenceTable | None = None,
     native_symbol: str | None = None,
     callee_native_symbols: Mapping[str, str] | None = None,
     extent_namespace: str = "",
     release_heap_owners: bool = False,
     dynamic_extent_aliases: Mapping[int, int] | None = None,
+    owned_tensor_bindings: Mapping[str, Sequence[Any]] | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -6128,12 +6403,14 @@ def emit_function(
         value_dtypes=value_dtypes,
         value_shapes=value_shapes,
         tensor_table=tensor_table,
+        runtime_shape_vectors=runtime_shape_vectors,
         sequence_table=sequence_table,
         native_symbol=native_symbol,
         callee_native_symbols=callee_native_symbols,
         extent_namespace=extent_namespace,
         release_heap_owners=release_heap_owners,
         dynamic_extent_aliases=dynamic_extent_aliases,
+        owned_tensor_bindings=owned_tensor_bindings,
     ).emit()
 
 
@@ -6399,6 +6676,29 @@ def emit_module(
         if isinstance(module, IRModule)
         else {}
     )
+    # A region's computed tensor result publishes its runtime geometry as
+    # outputs of the same call; the exact binding names the caller's shape
+    # vector for that result (TENSOR_METADATA_RESULT_BINDING).
+    module_runtime_shape_vectors: dict[str, dict[int, int]] = {}
+    if isinstance(module, IRModule):
+        from .concordance_declarations import TENSOR_METADATA_RESULT_BINDING
+        from .identity_concordance import identity_book
+        from .ssa_record_return_state import function_scope_of
+
+        result_page = identity_book(module).page(TENSOR_METADATA_RESULT_BINDING)
+        scope_names = {
+            function_scope_of(function): str(name)
+            for name, function in module.functions.items()
+        }
+        for row in result_page.rows():
+            owner = scope_names.get(row[0])
+            fact = result_page.latest(row)
+            if (owner is None or not isinstance(fact, tuple) or len(fact) != 3
+                    or len(tuple(fact[2])) != 3):
+                continue
+            module_runtime_shape_vectors.setdefault(owner, {})[
+                int(row[3])
+            ] = int(tuple(fact[2])[0])
 
     def _published_tensor_layout(
         function_name: str, value_id: int, seen: set[tuple[str, int]] | None = None,
@@ -6747,9 +7047,40 @@ def emit_module(
         function_name: tuple(values)
         for function_name, values in named_outputs.items()
     }
+    def _unread_storage_view(function_name: str, value: SSAValue) -> bool:
+        """A returned formal of the function itself, read by no caller.
+
+        Program: declared Sum over a tensor; planned region 5 returns
+        ``arange(count).unsqueeze(-1)``: its own formal arange storage (and
+        count) beside the view's shape and rank, and the aggregate fold
+        rebinds every caller to that storage.  Wrong record: the returned
+        formal still named an in/out slot, so the storage formal was
+        declared at the view's rank 2 and the caller passed it the arena's
+        ``c_ptr`` (type mismatch).  Rule: a formal returned unchanged is the
+        caller's own value; when no caller projects it, it is not a native
+        output.
+        """
+
+        function = functions.get(function_name)
+        if function is None:
+            return False
+        if int(value.id) not in {int(formal.id) for formal in function.args}:
+            return False
+        if str(function_name) not in aggregate_outputs:
+            # Only aggregate call sites say which positions they read; a
+            # root or single-result callee publishes every return.
+            return False
+        record = named_output_records.get(function_name, ())
+        projected = aggregate_outputs.get(str(function_name), {})
+        return not any(
+            position < len(record) and int(record[position].id) == int(value.id)
+            for position in projected
+        )
+
     named_outputs = {
         function_name: tuple({
             int(value.id): value for value in values
+            if not _unread_storage_view(function_name, value)
         }.values())
         for function_name, values in named_outputs.items()
     }
@@ -7116,6 +7447,23 @@ def emit_module(
                         continue
                     callee_ranks = function_value_ranks[callee_name]
                     for actual, formal in zip(instruction.args, callee.args):
+                        folded_view = (actual.accounting or {}).get(
+                            "ssa_storage_view"
+                        )
+                        if (isinstance(folded_view, Mapping)
+                                and folded_view.get("folded_view_id") is not None):
+                            # Program: declared Sum over a tensor.  Wrong
+                            # record: a folded view occurrence carries its
+                            # storage's id, so unifying it with the view
+                            # formal (rank 2) raised the storage (rank 1)
+                            # and, through it, region 5's storage formal.
+                            # Rule: the formal takes the view's rank; the
+                            # storage keeps its own.
+                            view_rank = int(folded_view.get("view_rank") or 0)
+                            if callee_ranks.get(int(formal.id), 0) < view_rank:
+                                callee_ranks[int(formal.id)] = view_rank
+                                changed_ranks = True
+                            continue
                         if unify_rank(
                             caller_ranks, actual, callee_ranks, formal
                         ):
@@ -7734,6 +8082,21 @@ def emit_module(
         for function_name in functions
     }
     extent_aliases = _runtime_extent_aliases(functions)
+    # The audited owned-heap carriers of every frame (``ssa_storage_
+    # requirements.owned_tensor_data_bindings``), read exactly as the C module
+    # lane reads them: a region's logical tensor views its carrier's arena,
+    # and a caller's value named for a callee carrier is one pointer cell.
+    owned_tensor_bindings: dict[str, tuple[Any, ...]] = {}
+    if isinstance(module, IRModule) and getattr(module, "tensor_tables", None):
+        from .ssa_storage_requirements import owned_tensor_data_bindings
+
+        for owned_function in functions:
+            if owned_function in module.functions:
+                owned_tensor_bindings[owned_function] = tuple(
+                    binding for binding in owned_tensor_data_bindings(
+                        module, owned_function,
+                    ) if not binding.inherited
+                )
 
     def extent_signature(
         function_name: str,
@@ -7773,11 +8136,15 @@ def emit_module(
                 value_dtypes=function_value_dtypes.get(function_name, {}),
                 value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
+                runtime_shape_vectors=module_runtime_shape_vectors.get(
+                    function_name, {}
+                ),
                 sequence_table=module_sequence_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
                 dynamic_extent_aliases=extent_aliases.get(function_name, {}),
+                owned_tensor_bindings=owned_tensor_bindings,
             ).extent_names
 
     # Extents are a finite call-signature dataflow problem, but dynamic names
@@ -7844,12 +8211,16 @@ def emit_module(
                 value_dtypes=function_value_dtypes.get(function_name, {}),
                 value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
+                runtime_shape_vectors=module_runtime_shape_vectors.get(
+                    function_name, {}
+                ),
                 sequence_table=module_sequence_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
                 release_heap_owners=function_name not in called_functions,
                 dynamic_extent_aliases=extent_aliases.get(function_name, {}),
+                owned_tensor_bindings=owned_tensor_bindings,
             )
             for function_name, function in functions.items()
         )

@@ -830,6 +830,11 @@ _INTEGER_SELECTION: dict[str, str] = {"Max": "sgt", "Min": "slt"}
 
 
 _INTEGER_LLVM_TYPES = frozenset({"i1", "i8", "i16", "i32", "i64", "i128"})
+#: Floating storage types.  A rank-0 ``half``/``float`` lives in the lane's
+#: double register (``_value_llvm_type``); spans keep their own element.
+_FLOAT_LLVM_TYPES = frozenset({"half", "float", "double"})
+#: Floating storage narrower than the double register.
+_NARROW_FLOAT_LLVM_TYPES = frozenset({"half", "float"})
 
 
 def _unsigned_value(value: _Any) -> bool:
@@ -1642,6 +1647,10 @@ exit:
     "turing_validation_error_take_active": (
         "declare i32 @turing_validation_error_take_active(ptr)"
     ),
+    # ssa_fault_exits: a caller reads whether its callee left by a fault.
+    "turing_validation_error_pending": (
+        "declare i32 @turing_validation_error_pending()"
+    ),
     "turing_validation_error_raise_packet": (
         "declare void @turing_validation_error_raise_packet(ptr)"
     ),
@@ -1904,8 +1913,11 @@ def _value_llvm_type(value: _Any) -> str:
     # float32 scalar's register is the work contract's
     # ``float32_scalar_register``: ``float32`` (the default) computes it as
     # ``float``; ``float64`` keeps the earlier double register, where scalar
-    # arithmetic is double throughout and rounds at the store.
-    if llvm_type == "float" and _declared_span_rank(value) == 0:
+    # arithmetic is double throughout and rounds at the store.  A narrower
+    # float scalar (``half``) keeps the lane's double register width.
+    if llvm_type in _NARROW_FLOAT_LLVM_TYPES and _declared_span_rank(value) == 0:
+        if llvm_type != "float":
+            return "double"
         from .work_contract import active_contract
 
         if active_contract().float32_scalar_register == "float64":
@@ -2006,6 +2018,7 @@ def _span_element_count(
     body: list,
     public_span_value: _Any,
     module_extent_slot: _Any,
+    descriptor_count: _Any = None,
 ) -> str | None:
     """An i32 register (or literal) holding this span's element count.
 
@@ -2023,6 +2036,12 @@ def _span_element_count(
         return str(total)
     public_id = public_span_value(function_name, int(value.id))
     if public_id is None or not rank:
+        # Program: declared Sum(f(k, x), (k, 1, n)). Its index axis is
+        # ``arange(count)`` over a count computed in the program, so no
+        # program parameter's extents vector states it. Its dynamic tensor
+        # descriptor does: the exact element-count SSA value. Read that.
+        if descriptor_count is not None and rank:
+            return descriptor_count(value, tag, body)
         return None
     running: str | None = None
     for axis in range(rank):
@@ -2688,6 +2707,12 @@ def _emit_repository_call_module(
         name: "__ssa_" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", name)
         for name in reachable
     }
+    # A fault exit leaves the whole SSA call chain (ssa_fault_exits).
+    from .ssa_fault_exits import (
+        fault_exit_functions as _fault_exit_functions,
+        propagates_fault_after_call as _propagates_fault_after_call,
+    )
+    fault_exits = _fault_exit_functions(module)
 
     def literal(payload: _Any, llvm_type: str) -> str:
         if llvm_type == "double":
@@ -2937,6 +2962,66 @@ def _emit_repository_call_module(
             int(value.id): f"%out.{index}"
             for index, value in enumerate(outputs)
         }
+        # Owned-heap tensors cross a region boundary as the C module lane
+        # carries them (``ssa_c_backend``: ``owned_tensor_data_bindings``).
+        # Program: declared ``Sum(k*x, (k, 1, n))`` over scalar ``n, x``
+        # (owner, 2026-11-25).  Wrong record: region 4 wrote its runtime
+        # ``arange`` into a private heap arena and never published it, and
+        # the caller sized each runtime span result as ONE element, so the
+        # consumers wrote whole spans into it and the sum read 0.0.  Rule:
+        # (1) in the allocating region, the logical tensor is a view of its
+        # carrier's arena and the output port is the carrier's: the Alloca
+        # stores the arena address into the caller's pointer cell; (2) a
+        # caller value the Call names (``output_ids``) for a callee carrier
+        # (``callee_output_ids``) is one pointer cell, and every later reader
+        # receives the arena it holds.
+        from .ssa_storage_requirements import owned_tensor_data_bindings
+        local_owned_views: dict[int, int] = {
+            int(binding.tensor_id): int(binding.data_value_id)
+            for binding in owned_tensor_data_bindings(module, name)
+            if not binding.inherited
+        }
+        local_owned_carriers = set(local_owned_views.values())
+        for output_index_, output_ in enumerate(outputs):
+            carrier_id_ = local_owned_views.get(int(output_.id))
+            if carrier_id_ is not None:
+                output_pointer.pop(int(output_.id), None)
+                output_pointer[carrier_id_] = f"%out.{output_index_}"
+        caller_heap_cells: dict[int, str] = {}
+        caller_heap_producers: dict[int, int] = {}
+        for block_ in function.blocks.values():
+            for instruction_ in block_.instrs:
+                callee_name_ = str(instruction_.attributes.get("callee") or "")
+                if (instruction_.op != "Call" or callee_name_ not in module.functions
+                        or callee_name_ == name):
+                    continue
+                caller_ids_ = tuple(map(int, instruction_.attributes.get(
+                    "output_ids", ()) or ()))
+                callee_ids_ = tuple(map(int, instruction_.attributes.get(
+                    "callee_output_ids", ()) or ()))
+                if not caller_ids_ or len(caller_ids_) != len(callee_ids_):
+                    continue
+                callee_carriers_ = {
+                    int(binding.data_value_id)
+                    for binding in owned_tensor_data_bindings(module, callee_name_)
+                    if not binding.inherited
+                }
+                for caller_id_, callee_id_ in zip(caller_ids_, callee_ids_):
+                    if callee_id_ in callee_carriers_:
+                        caller_heap_cells[caller_id_] = f"%heapcell.{caller_id_}"
+                        caller_heap_producers[caller_id_] = id(instruction_)
+        heap_view_loads = [0]
+        current_instruction: list = [None]
+        for heap_cell_ in caller_heap_cells.values():
+            entry_allocas.append(f"  {heap_cell_} = alloca ptr, i64 1, align 8")
+            entry_allocas.append(f"  store ptr null, ptr {heap_cell_}, align 8")
+
+        def heap_arena(cell: str, value_id: int) -> str:
+            """The arena address a pointer cell holds, loaded where it is read."""
+            heap_view_loads[0] += 1
+            register = f"%heap.view.{value_id}.{heap_view_loads[0]}"
+            body.append(f"  {register} = load ptr, ptr {cell}, align 8")
+            return register
         # A watched value whose storage is a Phi register cannot be copied at
         # the return -- the register does not dominate it. Give it a slot in
         # the entry frame (which dominates everything) and copy the phi's
@@ -2984,8 +3069,52 @@ def _emit_repository_call_module(
                             str(block_name_), [],
                         ).append(result_id_)
 
+        def descriptor_element_count(
+            value: _Any, label: str, lines: list, *, at_entry: bool = False,
+        ) -> str | None:
+            """The span's runtime element count from its dynamic descriptor.
+
+            ``tensor_ssa_lowering`` gives a runtime-sized span a dynamic
+            descriptor whose element count is an exact int32 SSA value (a
+            metadata formal across a region call, or the local value that
+            computed it). In the entry frame only a formal is defined.
+            """
+
+            table = (getattr(module, "tensor_tables", {}) or {}).get(name)
+            descriptor = None if table is None else table.by_id(int(value.id))
+            if (descriptor is None or descriptor.metadata_state != "dynamic"
+                    or descriptor.element_count_value_id is None):
+                return None
+            count_id = int(descriptor.element_count_value_id)
+            count_value = values_by_function.get(name, {}).get(count_id)
+            if at_entry:
+                if count_id not in formal_positions:
+                    return None
+                address = pointers[count_id]
+            elif count_id in pointers:
+                address = pointers[count_id]
+            elif count_value is not None:
+                address = pointer(count_value)
+            else:
+                return None
+            register = f"%dcount.{label}"
+            lines.append(f"  {register} = load i32, ptr {address}, align 4")
+            return register
+
         def pointer(value: _Any) -> str:
             value_id = int(value.id)
+            heap_cell = caller_heap_cells.get(value_id)
+            if heap_cell is not None:
+                # The producing Call writes the arena address into the cell;
+                # every other reader receives the arena.
+                if id(current_instruction[0]) == caller_heap_producers[value_id]:
+                    return heap_cell
+                return heap_arena(heap_cell, value_id)
+            carrier_id = local_owned_views.get(value_id)
+            if carrier_id is not None:
+                carrier = values_by_function.get(name, {}).get(carrier_id)
+                if carrier is not None:
+                    return heap_arena(pointer(carrier), value_id)
             known = pointers.get(value_id)
             if known is not None:
                 return known
@@ -3030,6 +3159,9 @@ def _emit_repository_call_module(
                 runtime_count = _span_element_count(
                     name, value, f"frame.{value_id}", entry_allocas,
                     public_span_value, module_extent_slot,
+                    lambda counted, label, lines: descriptor_element_count(
+                        counted, label, lines, at_entry=True,
+                    ),
                 )
                 if runtime_count is None:
                     shortfalls.append(LLVMEmissionShortfall(
@@ -3099,20 +3231,20 @@ def _emit_repository_call_module(
             if source_type == wanted:
                 return loaded
             converted = f"%convert.{tag}"
-            if source_type == "float":
+            if source_type in _NARROW_FLOAT_LLVM_TYPES:
                 # The widened register and the recursive conversion's own
                 # register (``%convert.{tag}.wide``) must be distinct names:
                 # both were ``%convert.{tag}.wide`` ("multiple definition of
                 # local value") once float32 scalars were held as ``float``
                 # (``float32_scalar_register="float32"``).
                 widened = f"{converted}.f64"
-                body.append(f"  {widened} = fpext float {loaded} to double")
+                body.append(f"  {widened} = fpext {source_type} {loaded} to double")
                 return convert_loaded(widened, "double", wanted, f"{tag}.wide",
                                       target_unsigned=target_unsigned)
-            if wanted == "float":
+            if wanted in _NARROW_FLOAT_LLVM_TYPES:
                 narrow = convert_loaded(loaded, source_type, "double", f"{tag}.n",
                                         source_unsigned=source_unsigned)
-                body.append(f"  {converted} = fptrunc double {narrow} to float")
+                body.append(f"  {converted} = fptrunc double {narrow} to {wanted}")
                 return converted
             if wanted == "i1":
                 zero = "0.0" if source_type == "double" else "0"
@@ -3326,6 +3458,12 @@ def _emit_repository_call_module(
             ret_positions = function_output_ret_positions.get(name)
             for output_index, output in enumerate(outputs):
                 destination = f"%out.{output_index}"
+                if (local_owned_views.get(int(output.id)) is not None
+                        and output_pointer.get(local_owned_views[int(output.id)])
+                        == destination):
+                    # The carrier's Alloca stored the arena address into the
+                    # caller's pointer cell; there is nothing else to copy.
+                    continue
                 ret_position = (
                     ret_positions[output_index]
                     if ret_positions is not None and returned_values
@@ -3478,6 +3616,7 @@ def _emit_repository_call_module(
                 register_cache.clear()
                 span.take(UnitKind.BLOCK_LABEL, spelling=block_name, block=block_name)
             span.open(instruction)
+            current_instruction[0] = instruction
             operation = str(instruction.op)
             if operation not in {"Phi", "phi"}:
                 capture_phi_values()
@@ -3741,7 +3880,7 @@ def _emit_repository_call_module(
                         and _declared_span_rank(result) == 0
                         and not tuple(result.shape or ())
                         and _value_llvm_type(result) in (
-                            *_INTEGER_LLVM_TYPES, "float", "double",
+                            *_INTEGER_LLVM_TYPES, *_FLOAT_LLVM_TYPES,
                         )
                     ):
                         # A one-limb index tuple used as a scalar offset.
@@ -3815,6 +3954,7 @@ def _emit_repository_call_module(
                     total = _span_element_count(
                         name, result, tag, body,
                         public_span_value, module_extent_slot,
+                        descriptor_element_count,
                     )
                     if total is None:
                         shortfalls.append(LLVMEmissionShortfall(
@@ -4459,7 +4599,8 @@ def _emit_repository_call_module(
                     if (
                         stored_type is not None
                         and stored_type != loaded_type
-                        and (stored_type, loaded_type) != ("float", "double")
+                        and not (stored_type in _NARROW_FLOAT_LLVM_TYPES
+                                 and loaded_type == "double")
                     ):
                         # Loading an integer from a double cell (or the
                         # reverse) reads the other kind's bit pattern.
@@ -4469,7 +4610,7 @@ def _emit_repository_call_module(
                             "explicit conversion required"))
                         continue
                     scalar_pointer_snapshot = scalar_pointer_receipt(result)
-                    if (loaded_type in {"double", "float", *_INTEGER_LLVM_TYPES}
+                    if (loaded_type in {*_FLOAT_LLVM_TYPES, *_INTEGER_LLVM_TYPES}
                             or scalar_pointer_snapshot
                             or int(address_argument.id) in owned_heap_addresses
                             or (result.dtype in {'int64', 'uint64', 'opaque_ref'} and not result.shape)):
@@ -4811,8 +4952,14 @@ def _emit_repository_call_module(
                         arguments.insert(int(output_argument), result)
                     rendered: list[str] = []
                     for position, (argument_type, argument) in enumerate(zip(argument_types, arguments)):
+                        # An owned carrier holds its arena's address; the
+                        # kernel's span formal receives that arena (as the C
+                        # module lane passes the carrier local).
                         rendered.append(
-                            f"ptr {pointer(argument)}"
+                            f"ptr {heap_arena(pointer(argument), int(argument.id))}"
+                            if argument_type == "ptr"
+                            and int(argument.id) in local_owned_carriers
+                            else f"ptr {pointer(argument)}"
                             if argument_type == "ptr"
                             else f"{argument_type} {load_as(argument, argument_type, f'{tag}.{position}')}"
                         )
@@ -4853,6 +5000,27 @@ def _emit_repository_call_module(
                     selected = aggregate_positions.get(
                         (name, result_id), tuple(range(len(callee_outputs)))
                     )
+                    # Program: declared Sum over a tensor; region 5 returns
+                    # (view storage, shape, rank) and the folded view leaves
+                    # the call selecting Ret slots (1, 2).  Wrong record: the
+                    # callee's outputs are those selected Ret positions
+                    # renumbered 0..k-1 (function_output_ret_positions), but
+                    # the call read result_ptrs[slot] by the raw Ret slot, so
+                    # the shape (slot 1) took the rank cell and both region 6
+                    # operands were the rank: the runtime broadcast guard
+                    # failed (code 100).  Rule: a slot names a Ret position;
+                    # its out parameter is that position's index among the
+                    # callee's published outputs.
+                    callee_ret_positions = function_output_ret_positions.get(
+                        symbol
+                    )
+
+                    def callee_output_index(slot: int) -> int:
+                        if callee_ret_positions is None:
+                            return int(slot)
+                        if int(slot) in callee_ret_positions:
+                            return callee_ret_positions.index(int(slot))
+                        return -1
                     projections = projection_values.get(result_id, {})
                     forwarded = forwarded_aggregate_calls.get(name)
                     if (
@@ -4887,12 +5055,13 @@ def _emit_repository_call_module(
                         and len(declared_ids) == len(declared_positions)
                         == len(declared_slots)
                         and all(
-                            0 <= slot < len(callee_outputs)
+                            0 <= callee_output_index(slot) < len(callee_outputs)
                             for slot in declared_slots
                         )
                     ):
                         selected_position_by_slot = dict(zip(
-                            declared_slots, declared_positions
+                            map(callee_output_index, declared_slots),
+                            declared_positions,
                         ))
                         result_ptrs = []
                         for output_index, value in enumerate(callee_outputs):
@@ -5063,6 +5232,18 @@ def _emit_repository_call_module(
                             "call integer storage requires explicit conversion: "
                             + repr(call_type_disagreements)))
                         continue
+                    from .ssa_call_operand_extents import (
+                        undersized_call_message, undersized_call_operands,
+                    )
+                    undersized = undersized_call_operands(
+                        module, name, symbol, semantic_arguments,
+                    )
+                    if undersized:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol,
+                            undersized_call_message(symbol, undersized),
+                        ))
+                        continue
                     required_positions = callee_aggregate_parameter_positions.get(
                         symbol, ()
                     )
@@ -5213,6 +5394,25 @@ def _emit_repository_call_module(
                             ))
                             + ")"
                         )
+                        if _propagates_fault_after_call(
+                            module, name, symbol, fault_exits,
+                        ):
+                            # The callee may have left through its fault
+                            # exit without writing its outputs: leave as
+                            # this function's own fault exit does.
+                            prefix = f"fault.propagate.{tag}"
+                            body.extend((
+                                f"  %{prefix}.code = call i32 "
+                                "@turing_validation_error_pending()",
+                                f"  %{prefix}.set = icmp ne i32 %{prefix}.code, 0",
+                                f"  br i1 %{prefix}.set, label %{prefix}.exit, "
+                                f"label %{prefix}.continue",
+                                f"{prefix}.exit:",
+                                "  ret void",
+                                f"{prefix}.continue:",
+                            ))
+                            block_exit_label[active_block] = f"{prefix}.continue"
+                            register_cache.clear()
                     if result is not None:
                         if forwarded is not None and int(forwarded[0]) == result_id:
                             # The call already wrote the wrapper's public
@@ -5225,11 +5425,11 @@ def _emit_repository_call_module(
                         else:
                             if "output_slots" in instruction.attributes:
                                 aggregate_members[result_id] = {
-                                    position: result_ptrs[slot]
+                                    position: result_ptrs[callee_output_index(slot)]
                                     for position, slot in zip(
                                         declared_positions, declared_slots
                                     )
-                                    if 0 <= slot < len(result_ptrs)
+                                    if 0 <= callee_output_index(slot) < len(result_ptrs)
                                 }
                             else:
                                 aggregate_members[result_id] = {
@@ -5331,6 +5531,7 @@ def _emit_repository_call_module(
                 total = _span_element_count(
                     name, result, tag, body,
                     public_span_value, module_extent_slot,
+                    descriptor_element_count,
                 )
                 if total is None:
                     shortfalls.append(LLVMEmissionShortfall(
@@ -5460,6 +5661,114 @@ def _emit_repository_call_module(
                 # through the same truthiness conversion every other target
                 # applies, so a numeric mask needs no separate opcode.
                 result_type = _value_llvm_type(result)
+                if _runtime_sized_span(result):
+                    # Program: declared ``Sum(k*x, (k, 1, n))``; its Boolean
+                    # mask keeps ``where`` as the instruction (rule of
+                    # 2026-11-18: a double kernel stands in only for float
+                    # operands).  Wrong record: the span lowered as ONE
+                    # select, so the sum read its first term.  Rule: over a
+                    # runtime-sized result the select runs over the result's
+                    # own element count (``_span_element_count``, as every
+                    # elementwise loop), each span operand read at the same
+                    # index and each rank-0 operand once.
+                    total = _span_element_count(
+                        name, result, tag, body,
+                        public_span_value, module_extent_slot,
+                        descriptor_element_count,
+                    )
+                    if total is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"select over span %t{result_id} needs its "
+                            "extents; refusing a one-element stand-in",
+                        ))
+                        continue
+                    if any(
+                        _declared_span_rank(argument) not in {
+                            0, _declared_span_rank(result),
+                        }
+                        for argument in instruction.args
+                    ):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"select over runtime-sized span %t{result_id} "
+                            "mixes operand ranks; a runtime broadcast is not stated",
+                        ))
+                        continue
+                    scalar_sides = {
+                        position: (
+                            load_as(argument, "i1", f"select.{tag}.s{position}")
+                            if position == 0 else
+                            load_as(argument, result_type, f"select.{tag}.s{position}")
+                        )
+                        for position, argument in enumerate(instruction.args)
+                        if _declared_span_rank(argument) == 0
+                    }
+                    span_sides = {
+                        position: pointer(argument)
+                        for position, argument in enumerate(instruction.args)
+                        if position not in scalar_sides
+                    }
+                    destination = pointer(result)
+                    entry_label = block_exit_label.get(
+                        active_block or "", active_block or "entry",
+                    )
+                    head, loop_body, done = (
+                        f"sel.head.{tag}", f"sel.body.{tag}", f"sel.done.{tag}",
+                    )
+                    index, nxt = f"%sel.i.{tag}", f"%sel.next.{tag}"
+                    body.append(f"  br label %{head}")
+                    body.append(f"{head}:")
+                    body.append(
+                        f"  {index} = phi i32 [ 0, %{entry_label} ], "
+                        f"[ {nxt}, %{loop_body} ]"
+                    )
+                    body.append(f"  %sel.more.{tag} = icmp slt i32 {index}, {total}")
+                    body.append(
+                        f"  br i1 %sel.more.{tag}, label %{loop_body}, label %{done}"
+                    )
+                    body.append(f"{loop_body}:")
+                    lanes = []
+                    for position, argument in enumerate(instruction.args):
+                        if position in scalar_sides:
+                            lanes.append(scalar_sides[position])
+                            continue
+                        stored_type = _value_llvm_type(argument)
+                        address = f"%sel.op.{tag}.{position}.addr"
+                        loaded = f"%sel.op.{tag}.{position}"
+                        body.append(
+                            f"  {address} = getelementptr {stored_type}, "
+                            f"ptr {span_sides[position]}, i32 {index}"
+                        )
+                        body.append(
+                            f"  {loaded} = load {stored_type}, ptr {address}, "
+                            f"align {_align(stored_type)}"
+                        )
+                        wanted = "i1" if position == 0 else result_type
+                        lanes.append(convert_loaded(
+                            loaded, stored_type, wanted, f"sel.{tag}.{position}",
+                            source_unsigned=_unsigned_value(argument),
+                        ))
+                    chosen = f"%sel.val.{tag}"
+                    body.append(
+                        f"  {chosen} = select i1 {lanes[0]}, "
+                        f"{result_type} {lanes[1]}, {result_type} {lanes[2]}"
+                    )
+                    body.append(
+                        f"  %sel.dst.{tag} = getelementptr {result_type}, "
+                        f"ptr {destination}, i32 {index}"
+                    )
+                    body.append(
+                        f"  store {result_type} {chosen}, ptr %sel.dst.{tag}, "
+                        f"align {_align(result_type)}"
+                    )
+                    body.append(f"  {nxt} = add i32 {index}, 1")
+                    body.append(f"  br label %{head}")
+                    body.append(f"{done}:")
+                    if active_block is not None:
+                        block_exit_label[active_block] = done
+                    register_cache.clear()
+                    continue
                 mask = load_as(instruction.args[0], "i1", f"select.{tag}")
                 when_true = load_as(
                     instruction.args[1], result_type, f"select.{tag}.true",
@@ -5699,6 +6008,7 @@ def _emit_repository_call_module(
                 total = _span_element_count(
                     name, result, tag, body,
                     public_span_value, module_extent_slot,
+                    descriptor_element_count,
                 )
                 if total is None:
                     shortfalls.append(LLVMEmissionShortfall(
@@ -5726,10 +6036,32 @@ def _emit_repository_call_module(
                     ))
                     continue
                 extent_operand = _elementwise_extent_operand(instruction)
+                geometry_table = (getattr(module, "tensor_tables", {}) or {}).get(name)
+
+                def shared_geometry(argument: _Any) -> bool:
+                    # Tensors sharing one geometry name the same exact shape/
+                    # rank/count SSA values in their dynamic descriptors
+                    # (``tensor_ssa_lowering``): equal by construction, as
+                    # region 7's mask and term over the Sum's index axis.
+                    if geometry_table is None:
+                        return False
+                    left = geometry_table.by_id(int(argument.id))
+                    right = geometry_table.by_id(int(result.id))
+                    triple = ("shape_value_id", "rank_value_id",
+                              "element_count_value_id")
+                    return (
+                        left is not None and right is not None
+                        and left.metadata_state == right.metadata_state == "dynamic"
+                        and all(getattr(left, key) is not None for key in triple)
+                        and tuple(getattr(left, key) for key in triple)
+                        == tuple(getattr(right, key) for key in triple)
+                    )
+
                 checked = [
                     argument for argument in instruction.args
                     if _runtime_sized_span(argument)
                     and argument is not extent_operand
+                    and not shared_geometry(argument)
                 ]
                 # Axis by axis: equal element counts over different extents
                 # ((2, 3) against (3, 2)) are a broadcast error in Python.
@@ -5830,7 +6162,7 @@ def _emit_repository_call_module(
                                  if _value_llvm_type(argument) in _INTEGER_LLVM_TYPES
                                  and _value_llvm_type(argument) != "i1"]
                 if (len({_unsigned_value(argument) for argument in integer_sides}) > 1
-                        and not any(_value_llvm_type(argument) in {"float", "double"}
+                        and not any(_value_llvm_type(argument) in _FLOAT_LLVM_TYPES
                                     for argument in instruction.args)):
                     shortfalls.append(LLVMEmissionShortfall(name, operation,
                         "mixed signed/unsigned arithmetic requires an explicit common dtype conversion"))
@@ -6129,7 +6461,7 @@ def _emit_repository_call_module(
                     f"align {_align(element_type)}"
                 )
                 if operation in {"any", "all"}:
-                    if element_type in {"double", "float"}:
+                    if element_type in _FLOAT_LLVM_TYPES:
                         body.append(
                             f"  %axr.t.{tag} = fcmp une {element_type} %axr.v.{tag}, 0.0"
                         )
@@ -6266,6 +6598,7 @@ def _emit_repository_call_module(
                     measured = _span_element_count(
                         name, source, f"red.{tag}", body,
                         public_span_value, module_extent_slot,
+                        descriptor_element_count,
                     )
                     if measured is not None:
                         body.append(f"  %red.n64.{tag} = sext i32 {measured} to i64")
@@ -6314,7 +6647,7 @@ def _emit_repository_call_module(
                     loaded = f"%red.v.{label}.{tag}"
                     if operation in {"any", "all"}:
                         truth = f"%red.t.{label}.{tag}"
-                        if element_type in {"double", "float"}:
+                        if element_type in _FLOAT_LLVM_TYPES:
                             # NaN is truthy, as in Python.
                             body.append(
                                 f"  {truth} = fcmp une {element_type} {loaded}, 0.0"
@@ -6466,13 +6799,13 @@ def _emit_repository_call_module(
                                      if _value_llvm_type(argument) in _INTEGER_LLVM_TYPES
                                      and _value_llvm_type(argument) != "i1"]
                 integer_signs = {_unsigned_value(argument) for argument in integer_arguments}
-                if len(integer_signs) > 1 and not any(t in {"float", "double"} for t in operand_argument_types):
+                if len(integer_signs) > 1 and not any(t in _FLOAT_LLVM_TYPES for t in operand_argument_types):
                     shortfalls.append(LLVMEmissionShortfall(name, operation,
                         "mixed signed/unsigned arithmetic requires an explicit common dtype conversion"))
                     continue
                 compute_unsigned = next(iter(integer_signs), False)
                 operand_type = (
-                    "double" if any(t in {"float", "double"} for t in operand_argument_types)
+                    "double" if any(t in _FLOAT_LLVM_TYPES for t in operand_argument_types)
                     else max(operand_argument_types, key=lambda t: int(t[1:]))
                     if operand_argument_types else result_type
                 )
@@ -6507,7 +6840,7 @@ def _emit_repository_call_module(
                 # stored (`or i1 <double>` fails LLVM verification).
                 if operation in {"LAnd", "LOr", "LNot"}:
                     operand_type = "i1"
-                if operation == "Div" and result_type in {"double", "float"}:
+                if operation == "Div" and result_type in _FLOAT_LLVM_TYPES:
                     # Python ``/`` is true division: ``Div(i64, i64) ->
                     # float64`` divides the converted operands (``sdiv``
                     # truncated 7 / 2 to 3), as the module lane's
@@ -8738,7 +9071,8 @@ def emit_ssa_function_to_llvm(
         len(repository_closure) > 1
         or len(module.functions[function_name].blocks) > 1
         or calls_piece
-        or any(_value_llvm_type(value) == "float" for value in function.args)
+        or any(_value_llvm_type(value) in _NARROW_FLOAT_LLVM_TYPES
+               for value in function.args)
         # The repository module emitter owns exact physical integer widths
         # and signedness; the legacy register-only leaf path has no such ABI.
         or any(_value_llvm_type(v) in {"i8", "i16", "i128"}

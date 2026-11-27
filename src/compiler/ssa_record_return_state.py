@@ -94,14 +94,30 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
         view_row = (
             function_scope_of(callee), callee.name, callee_id,
         ) if callee is not None else None
-        view_refs = tuple(
-            parent for parent, _stage in book.edges_into(result_ref)
+        # Program: declared Sum; region 5's unsqueeze result row 11 was
+        # revised by the element-count passthrough fold. Its latest column
+        # cites its prior column and the rebinding, not the view receipt the
+        # first column cites. The row's own revision chain is one identity.
+        result_chain, pending_chain = [], [result_ref]
+        while pending_chain:
+            revision = pending_chain.pop()
+            if revision in result_chain:
+                continue
+            result_chain.append(revision)
+            pending_chain.extend(
+                parent for parent, _stage in book.edges_into(revision)
+                if parent.page == TENSOR_METADATA_RESULT_BINDING
+                and parent.row == result_ref.row
+            )
+        view_refs = tuple(dict.fromkeys(
+            parent for revision in result_chain
+            for parent, _stage in book.edges_into(revision)
             if parent.page in {
                 TENSOR_RUNTIME_RESHAPE_VALIDITY,
                 TENSOR_RUNTIME_VIEW_GEOMETRY,
                 TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
             } and parent.row == view_row
-        )
+        ))
         if len(view_refs) == 1 and descriptor is not None:
             view_ref = view_refs[0]
             view_page = book.page(view_ref.page)
@@ -186,6 +202,31 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
                     ):
                         matches = (int(caller_outputs[position]),)
                         carrier_proofs = (view_ref,)
+    if not matches:
+        # Program: declared Sum over a tensor; region 5's runtime unsqueeze
+        # view 11 was folded onto the caller's arange storage 8
+        # (``legalize_aggregate_output_views``): the semantic output left the
+        # Call's outputs and its consumers read the caller's actual as that
+        # declared view. The fold's passthrough binding and its rebinding
+        # receipt name the caller value that now carries the view.
+        from .concordance_declarations import AGGREGATE_PASSTHROUGH_REBINDING
+
+        for binding in tuple(call.attributes.get(
+            "aggregate_output_passthrough_bindings", (),
+        )):
+            if (len(binding) == 6 and int(binding[1]) == callee_id
+                    and binding[4] == "runtime_view_storage"):
+                rebinding = book.latest_ref(
+                    AGGREGATE_PASSTHROUGH_REBINDING,
+                    (function_scope_of(caller), int(binding[1])),
+                )
+                if rebinding is not None and not call.attributes.get("source_linked"):
+                    # Consumers read the caller's actual as the view (the
+                    # in-region view spelling); it is a different id from
+                    # the callee's semantic output by construction, and the
+                    # rebinding receipt is the identity proof.
+                    return int(binding[3]), (rebinding,)
+                break
     if not matches:
         # A source function can return a region-allocated tensor. Its outer
         # Call publishes the source's loaded pointer carrier, while the

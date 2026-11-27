@@ -126,6 +126,9 @@ ffi.cdef("""
     void broadcast_int64(
         const long long* input, long long* output, const int* input_shape,
         int input_ndim, const int* output_shape, int output_ndim);
+    void broadcast_bool(
+        const unsigned char* input, unsigned char* output, const int* input_shape,
+        int input_ndim, const int* output_shape, int output_ndim);
     void cumsum_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim);

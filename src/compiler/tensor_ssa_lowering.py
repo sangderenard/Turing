@@ -86,6 +86,25 @@ class TensorSSALoweringShortfall:
     reason: str
 
 
+def _shared_geometry_formal(
+    target: Any, formal: Any, tensor_id: int, metadata_ids: Any, keys: Any,
+) -> bool:
+    """Whether metadata formal ``formal`` belongs to tensor ``tensor_id``'s
+    geometry: it is declared for that tensor, or for a formal tensor that
+    carries this exact shape/rank/count triple (tensors sharing ONE
+    geometry -- a declared Sum's ``Le`` and ``Mul`` over its index axis --
+    share its formals; the first tensor's id is on the formal)."""
+
+    owner_id = (formal.accounting or {}).get("tensor_extent_for")
+    if owner_id == tensor_id:
+        return True
+    owner = next((member for member in target.args
+                  if int(member.id) == owner_id), None)
+    return owner is not None and tuple(
+        (owner.accounting or {}).get(key) for key in keys
+    ) == tuple(metadata_ids)
+
+
 def _own_dynamic_tensor_output(
     module: IRModule, function, book, tensor_table, fresh, register_tensor,
     result: SSAValue, count: SSAValue, element_dtype: str,
@@ -1191,9 +1210,24 @@ def publish_computed_region_result_metadata(
         if binding is None:
             return False
         result_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, result_row)
-        if result_ref is None or result_ref not in {
-            cause for cause, _stage in book.edges_into(binding)
-        }:
+        # The binding is one row per Call; tensors sharing one geometry are
+        # each its cause in some revision (an aggregate fold revises it
+        # citing only the row it folded).  Read the whole revision chain.
+        chain_causes, pending_chain, seen_chain = set(), [binding], set()
+        while pending_chain:
+            current = pending_chain.pop()
+            if current in seen_chain:
+                continue
+            seen_chain.add(current)
+            for cause, _stage in book.edges_into(current):
+                chain_causes.add(cause)
+                if cause.page == current.page and cause.row == current.row:
+                    pending_chain.append(cause)
+        if result_ref is None or not any(
+            cause.page == TENSOR_METADATA_RESULT_BINDING
+            and cause.row == result_ref.row
+            for cause in chain_causes
+        ):
             return False
         bound_actuals, bound_formals = book.page(
             TENSOR_METADATA_CALL_BINDING
@@ -1230,8 +1264,9 @@ def publish_computed_region_result_metadata(
                 extent_formals = tuple(
                     formal for formal in target.args
                     if int(formal.id) == value_id
-                    and (formal.accounting or {}).get("tensor_extent_for")
-                        == target_tensor_id
+                    and _shared_geometry_formal(
+                        target, formal, target_tensor_id, local_ids, keys,
+                    )
                     and (formal.accounting or {}).get("tensor_extent_kind")
                         == kind
                 )
@@ -1568,9 +1603,25 @@ def publish_computed_region_result_metadata(
                     break
                 prior_projections[id(call)] = facts
                 continue
+            # Program: declared Sum(k*x) over a tensor x. Region 6 returns
+            # the mask, whose geometry is its input's (the booked row names
+            # the caller's actuals for those formals: folded, as above), and
+            # the term, whose geometry was projected after the Call. Only the
+            # projected slots are Call outputs; requiring every metadata id
+            # among them skipped the region, and its consumer never received
+            # either geometry. A slot is folded exactly when the Call binds
+            # that callee formal to that caller actual.
+            formal_ids = call.attributes.get("callee_input_ids") or tuple(
+                int(value.id) for value in callee.args
+            )
+            bound_actuals = {
+                int(formal_id): int(actual.id)
+                for formal_id, actual in zip(formal_ids, call.args)
+            }
             projected_ids = tuple(dict.fromkeys(
-                int(value_id) for fact in facts.values()
-                for value_id in fact[2]
+                int(caller_id) for fact in facts.values()
+                for callee_id, caller_id in zip(fact[1], fact[2], strict=True)
+                if bound_actuals.get(int(callee_id)) != int(caller_id)
             ))
             if (
                 len(facts) != len(computed)
@@ -1818,8 +1869,11 @@ def publish_computed_region_result_metadata(
                         if target is None or "__planned_region_" not in downstream_name:
                             continue
                         feeds = tuple(map(int, downstream.attributes.get("feed_ids", ())))
+                        # A folded runtime view of this storage shares its id
+                        # but not its geometry; its own binding forwards that.
                         positions = tuple(index for index, actual in enumerate(downstream.args)
-                                          if int(actual.id) == caller_data_id)
+                                          if int(actual.id) == caller_data_id
+                                          and not _folded_view_occurrence(actual))
                         if len(positions) != 1:
                             continue
                         position = positions[0]
@@ -1968,9 +2022,42 @@ def publish_computed_region_result_metadata(
                         )
                         if not fresh_formals:
                             if local_descriptor is None:
-                                raise ValueError(
-                                    "computed tensor metadata has no exact live Call binding"
+                                # Program: tests/test_graph_function_splicing.py
+                                # finite sum.  Region 6's ``Le`` (12) and
+                                # ``Mul`` (21) results carry ONE callee
+                                # geometry triple, projected to one caller
+                                # triple; the triple's formals were added for
+                                # the first tensor.  Rule: a second tensor of
+                                # the same triple binds those existing formals
+                                # when this live Call already pairs each with
+                                # the same metadata actual; no formal is added
+                                # twice.
+                                existing_formals = tuple(
+                                    formal for formal_id in formal_ids
+                                    for formal in target.args
+                                    if int(formal.id) == int(formal_id)
                                 )
+                                live = tuple(zip(
+                                    (int(value.id) for value in downstream.args),
+                                    (int(value.id) for value in target.args),
+                                ))
+                                if (len(existing_formals) != len(keys)
+                                        or any(
+                                            (int(actual.id), int(formal.id)) not in live
+                                            for actual, formal in zip(
+                                                metadata_actuals, existing_formals,
+                                                strict=True,
+                                            )
+                                        )):
+                                    raise ValueError(
+                                        "computed tensor metadata has no exact live Call binding"
+                                    )
+                                pending_input_bindings.append((
+                                    caller, downstream_block, downstream, target,
+                                    metadata_actuals, existing_formals, row,
+                                    target_tensor_id, alias_cell,
+                                ))
+                                changed = True
                             continue
                         from .concordance_declarations import (
                             TENSOR_HEAP_OWNER_CALL_BINDING,
@@ -2147,12 +2234,18 @@ def publish_computed_region_result_metadata(
                 entry for entry in pending_input_bindings
                 if entry[2] is downstream and entry[3] is target
             )
-            requested_pairs = tuple(
+            # Tensors sharing one geometry name the same (actual, formal)
+            # pair; that is one binding.  An actual bound to two formals, or
+            # a formal fed by two actuals, is a conflict.
+            requested_pairs = tuple(dict.fromkeys(
                 (int(actual.id), int(formal.id))
                 for entry in same_call
                 for actual, formal in zip(entry[4], entry[5], strict=True)
-            )
-            if len(set(requested_pairs)) != len(requested_pairs):
+            ))
+            if (len({actual for actual, _formal in requested_pairs})
+                    != len(requested_pairs)
+                    or len({formal for _actual, formal in requested_pairs})
+                    != len(requested_pairs)):
                 raise ValueError("computed tensor metadata repeats a Call binding")
             live_pairs = tuple(
                 (int(actual.id), int(formal.id))
@@ -2209,13 +2302,26 @@ def publish_computed_region_result_metadata(
         metadata_ids = tuple(int(formal.id) for formal in fresh_formals)
         if len(metadata_ids) != len(keys):
             raise ValueError("computed tensor metadata has incomplete formal geometry")
+        # Program: tests/test_graph_function_splicing.py finite sum.  The
+        # declared Sum's ``arange(count).unsqueeze(-1)`` lowers to a view
+        # that keeps the storage id (``ssa_storage_view``: storage 8, its
+        # own rank-2 geometry).  Wrong record: that view occurrence took the
+        # rank-1 formal's projected metadata and refused as a conflict.
+        # Rule: a declared view of this storage is its own identity
+        # (``ssa_view_structure``); only the formal's occurrences take the
+        # formal's geometry.
+        def _view_of_formal(value: SSAValue) -> bool:
+            view = (value.accounting or {}).get("ssa_storage_view")
+            return (isinstance(view, Mapping)
+                    and view.get("storage_value_id") == tensor_id)
+
         occurrences = (
             *formal_matches,
             *(value for block in target.blocks.values()
               for instruction in block.instrs
               for value in (*instruction.args,
                             *((instruction.res,) if instruction.res is not None else ()))
-              if int(value.id) == tensor_id),
+              if int(value.id) == tensor_id and not _view_of_formal(value)),
         )
         for occurrence in occurrences:
             prior = dict(occurrence.accounting or {})
@@ -2302,7 +2408,8 @@ def publish_computed_region_result_metadata(
                                           if int(member.id) == value_id), None)
                                      for value_id in metadata_ids)
             if (any(member is None for member in metadata_formals)
-                    or any((member.accounting or {}).get("tensor_extent_for") != tensor_id
+                    or any(not _shared_geometry_formal(
+                               target, member, tensor_id, metadata_ids, keys)
                            or (member.accounting or {}).get("tensor_extent_kind") != kind
                            or ssa_value_identity_cell(target, value_id, book=book)
                               is None
@@ -2512,8 +2619,29 @@ def publish_computed_region_result_metadata(
                 "private owned tensor has no ordered final consumer"
             )
         nonescape_cells = []
-        for other_block, position in uses:
+        # Program: declared Sum(f(k, x), (k, 1, n)). Region 5 returns
+        # arange_k.unsqueeze(0), a view of the caller-owned arange storage;
+        # regions 6 and 7 consume that view. The caller still owns the one
+        # heap cell. Each returned view is the same borrowed storage under a
+        # new caller id: it is followed here exactly like the owned tensor
+        # (uses ordered after its defining Call, in the producer block, never
+        # returned), its consumers get their own nonescape receipts derived
+        # from the view-producing receipt, and the release stays after them.
+        borrowers = [(tensor_id, uses, None)]
+        borrowed_ids = {tensor_id}
+        receipted_consumers = set()
+        while borrowers:
+          borrowed_id, borrowed_uses, parent_cell = borrowers.pop(0)
+          for other_block, position in borrowed_uses:
             consumer = other_block.instrs[position]
+            if id(consumer) in receipted_consumers or sum(
+                int(value.id) in borrowed_ids for value in consumer.args
+            ) != sum(int(value.id) == borrowed_id for value in consumer.args):
+                raise ValueError(
+                    "private owned tensor consumer reads two borrowed views"
+                )
+            receipted_consumers.add(id(consumer))
+            view_output = None
             target = module.functions.get(str(
                 consumer.attributes.get("callee") or ""
             )) if consumer.op == "Call" else None
@@ -2534,7 +2662,7 @@ def publish_computed_region_result_metadata(
             consumed_formals = {
                 formal_id for formal_id, actual in zip(
                     declared_inputs, consumer.args
-                ) if int(actual.id) == tensor_id
+                ) if int(actual.id) == borrowed_id
             }
             if not consumed_formals:
                 raise ValueError(
@@ -2600,17 +2728,17 @@ def publish_computed_region_result_metadata(
                             source.page == SSA_VALUE
                             and source.row == (function_scope_of(caller), value_id)
                             for source in rebinding_causes
-                        ) for value_id in (alias_id, tensor_id))
+                        ) for value_id in (alias_id, borrowed_id))
                         or book.latest_ref(prior_call.page, prior_call.row) != prior_call
                         or book.latest_ref(rebinding.page, rebinding.row) != rebinding
                         or rebinding.row != (function_scope_of(caller), alias_id)
-                        or binding_fact != (tensor_id, target.name, alias_id)
+                        or binding_fact != (borrowed_id, target.name, alias_id)
                         or passthroughs[0][4] != "exact_callee_output_formal"
                         or any(int(value.id) == alias_id
                                for caller_block in caller.blocks.values()
                                for live in caller_block.instrs
                                for value in live.args)
-                        or any(int(value.id) in {tensor_id, alias_id, owner_actual_id}
+                        or any(int(value.id) in {*borrowed_ids, alias_id, owner_actual_id}
                                for value in returns[0][1].args)):
                     raise ValueError(
                         "private owned tensor reborrow escapes its owning caller"
@@ -2644,7 +2772,7 @@ def publish_computed_region_result_metadata(
                 if (len(data_outputs) != 1
                         or data_outputs[0] not in consumed_formals
                         or passthroughs[0][:4] != (
-                            0, alias_id, data_outputs[0], tensor_id,
+                            0, alias_id, data_outputs[0], borrowed_id,
                         )):
                     raise ValueError(
                         "private owned tensor reborrow lacks exact data output"
@@ -2693,9 +2821,14 @@ def publish_computed_region_result_metadata(
                     and int(descriptor.data_value_id) == reborrow[3]
                     and descriptor.alias_of is None
                 ):
-                    raise ValueError(
-                        "private owned tensor consumer may return its storage"
-                    )
+                    # The borrowed formal itself (a metadata-only view such
+                    # as unsqueeze) or a view of it stays borrowed under the
+                    # caller's exact output id; it is followed below.
+                    if consumer.res is None or view_output is not None:
+                        raise ValueError(
+                            "private owned tensor consumer may return its storage"
+                        )
+                    view_output = int(output.id)
                 output_layouts.append((
                     int(output.id), int(descriptor.data_value_id),
                     None if descriptor.alias_of is None
@@ -2722,8 +2855,12 @@ def publish_computed_region_result_metadata(
                 caller, (int(consumer.res.id) if consumer.res is not None
                          else int(reborrow[0].row[1])), book=book,
             )
+            if view_output is not None and len(output_layouts) != 1:
+                raise ValueError(
+                    "private owned tensor view consumer has more than one output"
+                )
             tensor_cell = ssa_value_identity_cell(
-                caller, tensor_id, book=book,
+                caller, borrowed_id, book=book,
             )
             if consumer_cell is None or tensor_cell is None:
                 raise ValueError(
@@ -2740,11 +2877,12 @@ def publish_computed_region_result_metadata(
             )
             book.post(
                 TENSOR_HEAP_CONSUMER_NONESCAPE, nonescape_row,
-                (target.name, tensor_id,
+                (target.name, borrowed_id,
                  tuple(sorted(consumed_formals)), tuple(output_layouts)),
                 stage=TENSOR_SSA_LOWERING,
                 provenance=Derived(tuple(dict.fromkeys((
                     owner_origin,
+                    *((parent_cell,) if parent_cell is not None else ()),
                     consumer_cell, tensor_cell, *output_cells,
                     *metadata_cells,
                     *((reborrow[1], reborrow[2])
@@ -2755,6 +2893,48 @@ def publish_computed_region_result_metadata(
             nonescape_cells.append(book.latest_ref(
                 TENSOR_HEAP_CONSUMER_NONESCAPE, nonescape_row,
             ))
+            if view_output is not None:
+                from .identity_concordance import heap_view_result
+
+                view = heap_view_result(caller, nonescape_row, (
+                    target.name, borrowed_id,
+                    tuple(sorted(consumed_formals)), tuple(output_layouts),
+                ))
+                # A runtime view folded onto this very storage
+                # (``legalize_aggregate_output_views``) left the Call's
+                # outputs; its consumers read the borrowed id itself as the
+                # view and are already among this storage's uses.
+                if view is None and any(
+                    len(binding) == 6 and int(binding[3]) == borrowed_id
+                    and binding[4] == "runtime_view_storage"
+                    for binding in tuple(consumer.attributes.get(
+                        "aggregate_output_passthrough_bindings", (),
+                    ))
+                ):
+                    continue
+                if view is None or view[1] is not consumer:
+                    raise ValueError(
+                        "private owned tensor view lost its caller output"
+                    )
+                view_id = view[0]
+                view_uses = tuple(
+                    (use_block, use_block.instrs.index(instruction))
+                    for use_block in caller.blocks.values()
+                    for instruction in use_block.instrs
+                    if any(int(value.id) == view_id
+                           for value in instruction.args)
+                )
+                if (view_id in borrowed_ids
+                        or any(use_block is not other_block
+                               or use_position <= position
+                               for use_block, use_position in view_uses)
+                        or any(int(value.id) == view_id
+                               for value in returns[0][1].args)):
+                    raise ValueError(
+                        "private owned tensor view has no ordered nonescaping lifetime"
+                    )
+                borrowed_ids.add(view_id)
+                borrowers.append((view_id, view_uses, nonescape_cells[-1]))
         owner_actual = owner_actuals[0]
         block.instrs.insert(return_position, heap_release(owner_actual))
         release_sources = (
@@ -3485,6 +3665,68 @@ def _elementwise_extent_execution(module, function, instruction, fact, *, book):
     return tuple(dict.fromkeys(cells)) if all(cell is not None for cell in cells) else None
 
 
+from .concordance_declarations import (  # noqa: E402
+    AGGREGATE_PASSTHROUGH_REBINDING as _AGGREGATE_PASSTHROUGH_REBINDING_PAGE,
+)
+
+
+def _folded_view_occurrence(value: Any) -> bool:
+    """Whether ``value`` is a runtime view folded onto its storage.
+
+    ``legalize_aggregate_output_views`` folds a region's returned runtime
+    unsqueeze onto the caller's actual: the consumers read the storage's id
+    with the view's own accounting (geometry, rank) and an
+    ``ssa_storage_view`` naming the folded view id, exactly as an in-region
+    runtime view is spelled. That occurrence's geometry is the view's.
+    """
+
+    view = (getattr(value, "accounting", None) or {}).get("ssa_storage_view")
+    return isinstance(view, Mapping) and view.get("folded_view_id") is not None
+
+
+def _shared_select_geometry(module, function, operands, *, pending=()):
+    """The one runtime geometry a ``where`` selects over, or ``None``.
+
+    Program: declared ``Sum(f(k, x), (k, 1, n))`` masks entries past each
+    axis's bound to the reduction's neutral: ``where(mask, term, 0)``. The
+    mask and the term are runtime spans sharing one metadata triple; the
+    neutral is a rank-0 scalar. Every span operand's exact geometry evidence
+    must name the same (shape, rank, count) values; each other operand must be
+    a posted rank-0 scalar. Returns ``(metadata values, evidence cells)``.
+    """
+    from .ssa_record_return_state import posted_ssa_value_fact
+
+    book = identity_book(module)
+    if len(operands) != 3:
+        return None
+    spans, scalars = [], []
+    for operand in operands:
+        fact = posted_ssa_value_fact(function, int(operand.id), book=book)
+        if fact is None:
+            return None
+        if fact.storage == "span" and isinstance(fact.rank, int) and fact.rank > 0:
+            spans.append((operand, fact))
+        elif fact.storage == "scalar" and fact.rank == 0:
+            scalars.append(operand)
+        else:
+            return None
+    if not spans or len({fact.rank for _operand, fact in spans}) != 1:
+        return None
+    evidences = tuple(
+        _dynamic_tensor_geometry_evidence(
+            module, function, int(operand.id), pending=pending,
+        ) for operand, _fact in spans
+    )
+    if any(evidence is None for evidence in evidences):
+        return None
+    triples = {tuple(int(value.id) for value in evidence[0]) for evidence in evidences}
+    if len(triples) != 1:
+        return None
+    return evidences[0][0], tuple(dict.fromkeys(
+        cell for evidence in evidences for cell in evidence[1]
+    ))
+
+
 def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(), _ancestors=()):
     """Read exact local extents or the existing transported metadata binding.
 
@@ -3619,7 +3861,13 @@ def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(),
         return None
     if not all(any(int(formal.id) == identity for formal in function.args) for identity in ids):
         return None
-    if any((value.accounting or {}).get("tensor_extent_for") != value_id
+    # Tensors sharing one geometry share its formals; the first tensor's id is
+    # on them (``_shared_geometry_formal``: region 7's mask 12 and term 21).
+    if any(not _shared_geometry_formal(
+               function, value, int(value_id), ids,
+               ("tensor_shape_value_id", "tensor_rank_value_id",
+                "tensor_element_count_value_id"),
+           )
            or (value.accounting or {}).get("tensor_extent_kind") != kind
            for value, kind in zip(metadata, kinds, strict=True)):
         return None
@@ -4719,7 +4967,8 @@ def _matching_elementwise_metadata_cause(
         "tensor_element_count_value_id",
     ))
     return (
-        cell if isinstance(fact, tuple) and len(fact) in (5, 6)
+        # 5/6: unary/binary; 7: ("where", three operands, shape, rank, count).
+        cell if isinstance(fact, tuple) and len(fact) in (5, 6, 7)
         and all(type(value_id) is int for value_id in metadata)
         and tuple(fact[-3:]) == metadata else None
     )
@@ -5077,8 +5326,16 @@ def propagate_repository_ssa_call_metadata(
                 runtime_view_fact is not None
                 and runtime_view_fact[0] == "unsqueeze"
             )
+            # A folded runtime view (``legalize_aggregate_output_views``)
+            # owns its geometry on the caller's actual; transporting that
+            # storage's own rank/extents onto the callee's view formal, or
+            # onto the declaring occurrence, would erase the view.
+            folded_runtime_view = (
+                _folded_view_occurrence(value) or _folded_view_occurrence(source)
+            )
             retained_view = (
                 retained_runtime_view
+                or folded_runtime_view
                 or (isinstance(declared_view, Mapping)
                     and bool(declared_view_shape)
                     and bool(source_shape)
@@ -5117,7 +5374,10 @@ def propagate_repository_ssa_call_metadata(
                     int(source.id), book=view_book,
                 ) is not None
             )
-            retained_axis_view = retained_runtime_view or static_view_rank_proved
+            retained_axis_view = (
+                retained_runtime_view or static_view_rank_proved
+                or folded_runtime_view
+            )
             local_shape_writer = tuple(
                 (value.accounting or {}).get(
                     "shape_settlement_provenance", ()
@@ -5401,6 +5661,12 @@ def propagate_repository_ssa_call_metadata(
             source_rank = int(live_source_accounting.get(
                 "program_abi_rank", len(live_source_shape),
             ) or len(live_source_shape))
+            if _folded_view_occurrence(source):
+                # The occurrence presents the folded view, whose rank its
+                # declaration states (the storage's physical rank is not it).
+                source_rank = int(
+                    live_source_accounting["ssa_storage_view"]["view_rank"]
+                )
             target_shape = tuple(value.shape or ())
             target_accounting = dict(value.accounting or {})
             target_rank = int(target_accounting.get(
@@ -5524,6 +5790,21 @@ def propagate_repository_ssa_call_metadata(
                         # the override carried: when the transported contract
                         # turns dynamic through it, it is that change's cause.
                         contract_cause,
+                        # A folded runtime view's occurrence reads the
+                        # storage under the view's geometry; its fold
+                        # (``aggregate_passthrough_rebinding`` of the view id)
+                        # is the cause of the source state it now presents.
+                        *((identity_book(module).latest_ref(
+                            _AGGREGATE_PASSTHROUGH_REBINDING_PAGE, (
+                                function_scope_of(
+                                    source_function
+                                    if source_function is not None
+                                    else function
+                                ),
+                                int(((source.accounting or {}).get(
+                                    "ssa_storage_view") or {})["folded_view_id"]),
+                            ),
+                        ),) if _folded_view_occurrence(source) else ()),
                         # The state the source was last resolved to: when
                         # that changed, this edge's revision has its cause.
                         _frame_cite(
@@ -7061,9 +7342,18 @@ def lower_tensor_calls_to_repository_ssa(
             "create_arange_int64": frozenset({3}),
             "cast_double_to_int64_values": frozenset({1}),
         }.get(callee, frozenset())
+        # broadcast_bool is the one kernel whose Boolean buffers are their
+        # own one-byte spans, not the double-backed 0.0/1.0 masks above.
+        bool_buffer_positions = {
+            "broadcast_bool": frozenset({0, 1}),
+        }.get(callee, frozenset())
         for position, value in enumerate((*arguments, result)):
             typed_kernel_physical = (
-                "int64" if position in int64_buffer_positions else None
+                "int64" if position in int64_buffer_positions
+                else "bool" if (
+                    position if position < len(arguments) else output_argument
+                ) in bool_buffer_positions
+                else None
             )
             if (
                 (tuple(value.shape or ()) or (
@@ -7794,6 +8084,37 @@ def lower_tensor_calls_to_repository_ssa(
                             for arm in abi.physical_alternatives
                         ) for abi in declared_abis
                     )
+                    if not full_shape_proved and scalar_slot and not declared_abis:
+                        # Program: tests/test_graph_function_splicing.py
+                        # finite sum.  The declared Sum's count is a region
+                        # formal of a SymPy law: no source annotation, so no
+                        # ``value_type_abi`` row; its ``ssa_value`` row
+                        # derives from the graph's resolved shape state
+                        # (static, rank 0).  Wrong record: registered
+                        # ``unresolved``, its ``to_dtype`` was taken for a
+                        # dynamic span cast and refused.  Rule: that
+                        # concorded shape state is the scalar's proof.
+                        from .identity_concordance import (
+                            SHAPE_STATE_PAGE, shape_transformation_state,
+                        )
+
+                        states = [
+                            shape_book.page(SHAPE_STATE_PAGE).cell(
+                                parent.row, parent.column,
+                            )
+                            for cell in visited
+                            for parent, _stage in shape_book.edges_into(cell)
+                            if parent.page == SHAPE_STATE_PAGE
+                        ]
+                        full_shape_proved = bool(states) and all(
+                            isinstance(state, tuple) and state
+                            and state[0] == "resolved"
+                            and (lambda parts: tuple(parts[0]) == ()
+                                 and int(parts[2]) == 0
+                                 and parts[3] == "static")(
+                                shape_transformation_state(state[1]))
+                            for state in states
+                        )
                 if not full_shape_proved:
                     shape_book = identity_book(module)
                     full_shape_proved = any(
@@ -8451,6 +8772,49 @@ def lower_tensor_calls_to_repository_ssa(
                     and fact.storage == "scalar" and fact.rank == 0
                     for fact in scalar_facts
                 ):
+                    scalar_operation = str(
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.op
+                    )
+                    if (
+                        (scalar_operation in _REDUCTION_CODES
+                         or scalar_operation == "mean")
+                        and len(instruction.args) == 1
+                        and instruction.res is not None
+                        and _attribute(instruction.attributes, "axis", "dim") is None
+                    ):
+                        # Program: declared Sum(f(k, x), (k, 1, n)); the
+                        # Domain's runtime size is max(n - 1) over the bound.
+                        # With a scalar bound that is a one-operand max of a
+                        # rank-0 value. Wrong record: this all-scalar exit
+                        # left it the authored reduction, which no scalar
+                        # template on any lane spells. Rule: an all-axis
+                        # reduction of a rank-0 value is that value -- the
+                        # same identity as the rank-zero reduction below.
+                        # Its decision is the book row that owns this
+                        # revision of the block's geometry (as scalar_cast).
+                        _concord_scalar_kernel_operand(
+                            module, function,
+                            (str(function_name), int(instruction.res.id)),
+                            ("scalar_reduction", scalar_operation),
+                            (instruction.res, instruction.args[0]),
+                        )
+                        emitted_identity = Instr(
+                            (
+                                "clone"
+                                if str(instruction.args[0].dtype)
+                                == str(instruction.res.dtype)
+                                else "Cast"
+                            ),
+                            [instruction.args[0]], instruction.res,
+                            attributes={
+                                "lowered_from": scalar_operation,
+                                "scalar_reduction_identity": True,
+                            },
+                            source_span=instruction.source_span,
+                        )
+                        rewritten.append(emitted_identity)
+                        continue
                     rewritten.append(instruction)
                     continue
                 candidate_only = bool(
@@ -10979,6 +11343,47 @@ def lower_tensor_calls_to_repository_ssa(
                             rewritten.extend((*prefix, *emitted))
                             continue
 
+                # Program: a declared Integral's quadrature rule,
+                # ``get_tensor((n0, ..., n4))`` (owner, 2026-11-25).  Wrong
+                # record: the constructor reached every backend as an
+                # operation none spells ("no repository LLVM emission").
+                # Rule: ``AbstractTensor.get_tensor(data)`` of a static
+                # constant span of the result's own shape and dtype IS that
+                # data -- an identity, lowered as the copy every lane spells;
+                # the decision is its book row.
+                if (
+                    operation == "get_tensor" and len(args) == 1
+                    and result is not None
+                    and tuple(args[0].shape or ())
+                    and tuple(args[0].shape) == tuple(result.shape or ())
+                    and str(args[0].dtype) == str(result.dtype)
+                    # Only an immutable literal: a live tensor's get_tensor
+                    # keeps its storage identity (a copy would sever the
+                    # aliasing a training update relies on).
+                    and any(
+                        candidate.op == "Const" and candidate.res is not None
+                        and int(candidate.res.id) == int(args[0].id)
+                        for candidate_block in function.blocks.values()
+                        for candidate in candidate_block.instrs
+                    )
+                ):
+                    _concord_scalar_kernel_operand(
+                        module, function,
+                        (str(function_name), int(result.id)),
+                        ("tensor_identity", "get_tensor"),
+                        (result, args[0]),
+                    )
+                    # The copy is a static tensor of the literal's own shape;
+                    # its descriptor is what a consuming region's formal is
+                    # proven from (Fortran refused it as unresolved).
+                    register_tensor(result, storage="temporary")
+                    rewritten.append(Instr(
+                        "clone", [args[0]], result,
+                        attributes={"lowered_from": "get_tensor"},
+                        source_span=instruction.source_span,
+                    ))
+                    continue
+
                 # Shape-only operations do not exist at runtime. Preserve the
                 # result's shape/dtype annotation while aliasing its storage.
                 if operation in _VIEW_OPERATIONS and args:
@@ -11057,10 +11462,20 @@ def lower_tensor_calls_to_repository_ssa(
                                     function, int(args[1].id), book=book,
                                 ) if len(args) == 2 else None
                             )
+                            # A SymPy law's axis literal is an
+                            # ``ingestion_value`` identity (no canonical
+                            # relabel); ``literal_from_identity`` reads both.
+                            from .concordance_declarations import (
+                                INGESTION_VALUE as _AXIS_INGESTION_VALUE,
+                            )
+
                             axis_origins = (
                                 tuple(parent for parent, _stage in
                                       book.edges_into(axis_cell)
-                                      if parent.page == CANONICAL_VALUE)
+                                      if parent.page in (
+                                          CANONICAL_VALUE,
+                                          _AXIS_INGESTION_VALUE,
+                                      ))
                                 if axis_cell is not None else ()
                             )
                             axis_literal, literal_cells = (
@@ -11665,7 +12080,24 @@ def lower_tensor_calls_to_repository_ssa(
                         "program_abi_storage"
                     ) == "span"
                 )
-                if operation == "where" and unsettled_span_operands:
+                # A span whose runtime geometry is already booked is not
+                # waiting on call linking even when the arms' geometries
+                # differ: the selection broadcasts them below (region 7 of a
+                # declared Sum over a tensor: mask (count, 1), term
+                # (count, 3)). Only a span with no geometry evidence waits.
+                if (operation == "where" and unsettled_span_operands
+                        and _shared_select_geometry(
+                            module, function, data_args,
+                        ) is None
+                        and any(
+                            _dynamic_tensor_geometry_evidence(
+                                module, function, int(operand.id),
+                            ) is None
+                            for operand in unsettled_span_operands
+                        )):
+                    # (A runtime span whose exact geometry evidence is
+                    # already booked is not waiting on call linking: it
+                    # lowers below over that shared runtime count.)
                     # A linked multi-result call publishes each result's
                     # extents only after whole-program call linking has paired
                     # its output_ids/output_positions with the native result
@@ -12029,9 +12461,66 @@ def lower_tensor_calls_to_repository_ssa(
                                 return False, None
                             return True, value.value
 
-                        has_end, default_end = _arange_default("end")
-                        has_step, default_step = _arange_default("step")
-                        has_dtype, default_dtype = _arange_default("dtype")
+                        # Program: tests/test_graph_function_splicing.py
+                        # finite sum.  A declared Sum's index axis has no
+                        # authored call, so no omitted-argument rows; its
+                        # parameters are its declaration's, read from the
+                        # ``symbolic_transform`` row the Sum lowering posted
+                        # (``REDUCTION_INDEX_AXIS``: end None, step 1, no
+                        # dtype).  An authored call is read as before.
+                        from .concordance_declarations import SYMBOLIC_TRANSFORM
+                        from .symbolic_process_graph import REDUCTION_INDEX_AXIS
+
+                        declared_cell = instruction.attributes.get(
+                            "declared_lowering_cell"
+                        )
+                        declared_fact = (
+                            book.page(SYMBOLIC_TRANSFORM).cell(
+                                declared_cell.row, declared_cell.column,
+                            )
+                            if getattr(declared_cell, "page", None)
+                            == SYMBOLIC_TRANSFORM else None
+                        )
+                        if getattr(declared_fact, "transform", None) == (
+                            REDUCTION_INDEX_AXIS
+                        ):
+                            has_end, default_end = True, None
+                            has_step, default_step = True, 1
+                            has_dtype, default_dtype = True, None
+                            parameter_causes = (declared_cell,)
+                        else:
+                            has_end, default_end = _arange_default("end")
+                            has_step, default_step = _arange_default("step")
+                            has_dtype, default_dtype = _arange_default("dtype")
+                            parameter_causes = tuple(
+                                defaults[name] for name in ("end", "step", "dtype")
+                                if defaults.get(name) is not None
+                            )
+                        if (
+                            has_end and default_end is None
+                            and has_step and default_step == 1
+                            and has_dtype and default_dtype is None
+                        ):
+                            # The parameters this arange runs with, and the
+                            # cells that proved them: one row per result.
+                            from .concordance_declarations import (
+                                RUNTIME_ARANGE_PARAMETERS,
+                                TENSOR_SSA_LOWERING as _ARANGE_STAGE,
+                            )
+                            from .identity_concordance import Derived as _Derived
+                            from .identity_concordance import Mode as _Mode
+                            from .ssa_record_return_state import (
+                                function_scope_of as _arange_scope,
+                            )
+
+                            book.post(
+                                RUNTIME_ARANGE_PARAMETERS,
+                                (_arange_scope(function), function.name,
+                                 int(result.id)),
+                                (None, 1, None), stage=_ARANGE_STAGE,
+                                provenance=_Derived(parameter_causes),
+                                mode=_Mode.CONCORD,
+                            )
                         if (
                             has_end and default_end is None
                             and has_step and default_step == 1
@@ -12122,6 +12611,49 @@ def lower_tensor_calls_to_repository_ssa(
                                 [zero64, one64, count32, carrier],
                                 result, instruction, output_argument=3,
                             ))
+                            # Program: tests/test_graph_function_splicing.py
+                            # finite sum.  Wrong record: the logical arange
+                            # span's ``ssa_value`` row had storage/rank from
+                            # its dynamic shape state but no physical element
+                            # class, so the next region's runtime unsqueeze
+                            # refused its source.  Rule: the lanes are the
+                            # selected kernel's output formal's: DERIVED from
+                            # that formal's cell (as a dynamic cast's are).
+                            from .ssa_record_return_state import (
+                                posted_ssa_value_fact as _arange_formal_fact,
+                                revise_ssa_value as _revise_arange,
+                                ssa_value_identity_cell as _arange_cell,
+                            )
+                            from .concordance_declarations import (
+                                TENSOR_SSA_LOWERING as _ARANGE_LANE_STAGE,
+                            )
+
+                            arange_kernel = reference.module.functions.get(
+                                "create_arange_int64"
+                            )
+                            if arange_kernel is not None and len(arange_kernel.args) > 3:
+                                link_repository_function(
+                                    "create_arange_int64", arange_kernel,
+                                )
+                                lane_formal = arange_kernel.args[3]
+                                lane_cell = _arange_cell(
+                                    arange_kernel, int(lane_formal.id), book=book,
+                                )
+                                lane_fact = _arange_formal_fact(
+                                    arange_kernel, int(lane_formal.id), book=book,
+                                )
+                                if (lane_cell is not None and lane_fact is not None
+                                        and lane_fact.physical_dtype == "int64"):
+                                    _revise_arange(
+                                        function, result.id, dtype="int64",
+                                        shape=tuple(result.shape or ()),
+                                        stage=_ARANGE_LANE_STAGE,
+                                        sources=(lane_cell,), book=book,
+                                        physical={
+                                            "physical_dtype": "int64",
+                                            "storage": "span", "rank": 1,
+                                        },
+                                    )
                 elif operation == "gather" and len(data_args) >= 2:
                     indices = data_args[1]
                     if not tuple(source.shape or ()):
@@ -12909,6 +13441,61 @@ def lower_tensor_calls_to_repository_ssa(
                                         metadata, strict=True,
                                     ))
                     source_descriptor = tensor_table.by_id(int(source.id)) if source is not None else None
+                select_geometry = None
+                if operation == "where" and len(data_args) == 3 and instruction.res is not None:
+                    select_geometry = _shared_select_geometry(
+                        module, function, data_args, pending=prefix,
+                    )
+                    if select_geometry is not None:
+                        # Program: declared Sum; region 7 is
+                        # ``where(mask, term, 0)`` over the runtime span both
+                        # mask and term share. The selection keeps that one
+                        # geometry: the existing elementwise extent receipt,
+                        # spelled for three operands
+                        # ``("where", condition, if_true, if_false, shape,
+                        # rank, count)``, DERIVED from the operands' geometry
+                        # evidence and the SSA cells of every value it names.
+                        from .concordance_declarations import (
+                            TENSOR_ELEMENTWISE_EXTENT_BINDING, TENSOR_SSA_LOWERING,
+                        )
+                        from .identity_concordance import Derived, Mode
+                        from .ssa_record_return_state import (
+                            function_scope_of, ssa_value_identity_cell,
+                        )
+                        select_metadata, select_causes = select_geometry
+                        select_cells = tuple(dict.fromkeys((
+                            *select_causes,
+                            *(ssa_value_identity_cell(
+                                function, int(value.id), book=book,
+                            ) for value in (*data_args, result, *select_metadata)),
+                        )))
+                        if any(cell is None for cell in select_cells):
+                            select_geometry = None
+                        else:
+                            book.post(
+                                TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                (function_scope_of(function), function.name,
+                                 int(result.id)),
+                                ("where", *(int(value.id) for value in data_args),
+                                 *(int(value.id) for value in select_metadata)),
+                                stage=TENSOR_SSA_LOWERING,
+                                provenance=Derived(select_cells),
+                                mode=Mode.CONCORD,
+                            )
+                            result.accounting = {
+                                **dict(result.accounting or {}),
+                                "tensor_metadata_state": "dynamic",
+                                **dict(zip((
+                                    "tensor_shape_value_id",
+                                    "tensor_rank_value_id",
+                                    "tensor_element_count_value_id",
+                                ), (int(value.id) for value in select_metadata),
+                                    strict=True)),
+                            }
+                            dynamic_extents[int(result.id)] = dict(zip(
+                                ("shape", "rank", "element_count"),
+                                select_metadata, strict=True,
+                            ))
                 if (
                     ((opcode_contract is not None
                       and opcode_contract[0] == "binary"
@@ -12935,15 +13522,61 @@ def lower_tensor_calls_to_repository_ssa(
                     rewritten.extend(prefix)
                     rewritten.append(instruction)
                     continue
+                # Program: declared Sum(k*x) over a tensor x; region 7 is
+                # ``where(mask, term, 0)`` with mask (count, 1) and term
+                # (count, 3). A selection broadcasts its operands as an
+                # elementwise binary does: its two spans are the wide/narrow
+                # pair of the runtime broadcast below (the rank-0 arm needs
+                # none), and each span is then conformed to the result's
+                # runtime geometry before the selection runs over it.
+                broadcast_pair = tuple(data_args)
+                if (operation == "where" and len(data_args) == 3
+                        and select_geometry is None
+                        and instruction.res is not None):
+                    from .ssa_record_return_state import (
+                        posted_ssa_value_fact as _select_fact,
+                    )
+                    _select_facts = tuple(
+                        (value, _select_fact(function, int(value.id), book=book))
+                        for value in data_args
+                    )
+                    _select_spans = tuple(
+                        value for value, fact in _select_facts
+                        if fact is not None and fact.storage == "span"
+                        and type(fact.rank) is int and fact.rank > 0
+                    )
+                    _select_scalars = tuple(
+                        value for value, fact in _select_facts
+                        if fact is not None and fact.storage == "scalar"
+                        and fact.rank == 0
+                    )
+                    if len(_select_spans) == 2 and len(_select_scalars) == 1:
+                        broadcast_pair = _select_spans
+                        # The runtime broadcast's result takes the output
+                        # geometry it computes; a display shape that does
+                        # not state its rank (region 7's (3,) for a
+                        # (count, 3) selection) is not its shape. Every
+                        # backend's selection spells a runtime span by its
+                        # empty static shape and declared rank. Cleared
+                        # before any descriptor or row records it.
+                        _select_rank = max(
+                            int(fact.rank) for value, fact in _select_facts
+                            if any(value is span for span in _select_spans)
+                        )
+                        if len(tuple(instruction.res.shape or ())) != _select_rank:
+                            instruction.res.shape = ()
                 if (
-                    opcode_contract is not None
-                    and opcode_contract[0] == "binary"
-                    and len(data_args) == 2
+                    (
+                        (opcode_contract is not None
+                         and opcode_contract[0] == "binary"
+                         and len(data_args) == 2)
+                        or (operation == "where" and len(broadcast_pair) == 2)
+                    )
                     and any(
                         (tensor_table.by_id(int(value.id)) is not None
                          and tensor_table.by_id(int(value.id)).metadata_state
                          == "dynamic")
-                        for value in data_args
+                        for value in broadcast_pair
                     )
                 ):
                     from .ssa_record_return_state import (
@@ -12952,7 +13585,7 @@ def lower_tensor_calls_to_repository_ssa(
 
                     operand_facts = tuple(
                         posted_ssa_value_fact(function, int(value.id), book=book)
-                        for value in data_args
+                        for value in broadcast_pair
                     )
                     mixed_ranks = tuple(
                         int(fact.rank) if fact is not None
@@ -12963,8 +13596,8 @@ def lower_tensor_calls_to_repository_ssa(
                     if all(type(rank) is int and rank > 0 for rank in mixed_ranks):
                         broadcast_rank = max(mixed_ranks)
                         wide_position = mixed_ranks.index(broadcast_rank)
-                        wide = data_args[wide_position]
-                        narrow = data_args[1 - wide_position]
+                        wide = broadcast_pair[wide_position]
+                        narrow = broadcast_pair[1 - wide_position]
                         narrow_rank = mixed_ranks[1 - wide_position]
                         wide_descriptor = tensor_table.by_id(int(wide.id))
                         narrow_descriptor = tensor_table.by_id(int(narrow.id))
@@ -12989,9 +13622,9 @@ def lower_tensor_calls_to_repository_ssa(
                             (value, descriptor, fact)
                             for value, descriptor, fact in (
                                 (wide, wide_descriptor,
-                                 operand_facts[data_args.index(wide)]),
+                                 operand_facts[broadcast_pair.index(wide)]),
                                 (narrow, narrow_descriptor,
-                                 operand_facts[data_args.index(narrow)]),
+                                 operand_facts[broadcast_pair.index(narrow)]),
                             )
                             if descriptor is not None
                             and descriptor.metadata_state == "static"
@@ -13285,6 +13918,127 @@ def lower_tensor_calls_to_repository_ssa(
                             (*axis_indices, *alignment_values,
                              *dimensions, *count_values),
                         ))
+                        if operation == "where" and len(broadcast_pair) == 2:
+                            # Each span arm is conformed to the selection's
+                            # runtime geometry by the typed broadcast kernel
+                            # of its own element (a Boolean mask stays one
+                            # byte per element: broadcast_bool); the rank-0
+                            # arm is read once. The selection then runs over
+                            # one shared geometry, as a declared Sum's
+                            # same-shape selection does.
+                            from .concordance_declarations import (
+                                TENSOR_ELEMENTWISE_EXTENT_BINDING as _CONFORM_EXTENT,
+                                TENSOR_SSA_LOWERING as _CONFORM_STAGE,
+                            )
+                            from .identity_concordance import (
+                                Derived as _ConformDerived, Mode as _ConformMode,
+                            )
+                            from .ssa_record_return_state import (
+                                function_scope_of as _conform_scope,
+                            )
+                            pair_ids = {int(value.id) for value in broadcast_pair}
+                            conformed_select = []
+                            for operand in data_args:
+                                if int(operand.id) not in pair_ids:
+                                    conformed_select.append(operand)
+                                    continue
+                                operand_fact = posted_ssa_value_fact(
+                                    function, int(operand.id), book=book,
+                                )
+                                element = str(
+                                    (operand_fact.physical_dtype
+                                     if operand_fact is not None else None)
+                                    or recorded_dtype(operand, "where operand")
+                                ).casefold()
+                                element = {"i1": "bool", "double": "float64"}.get(
+                                    element, element,
+                                )
+                                kernel_name = {
+                                    "bool": "broadcast_bool",
+                                    "int64": "broadcast_int64",
+                                    "float64": "broadcast_double",
+                                }.get(element)
+                                if kernel_name is None:
+                                    raise ValueError(
+                                        "where operand has no typed broadcast "
+                                        f"kernel for element {element!r}"
+                                    )
+                                operand_extents = dynamic_extents[int(operand.id)]
+                                conformed = fresh(
+                                    shape=tuple(result.shape or ()),
+                                    dtype=str(operand.dtype),
+                                    physical={
+                                        "physical_dtype": element,
+                                        "storage": "span",
+                                        "rank": int(broadcast_rank),
+                                    },
+                                )
+                                # Program: declared Sum over a tensor (LLVM).
+                                # Wrong record: only the Boolean arm passed
+                                # the typed-kernel stamp, so the float64 arm
+                                # kept no span rank in its accounting and the
+                                # selection loop read its element 0 for every
+                                # element (each term k*x read as 1*1; the sum
+                                # was 4, not 10*x).  Rule: each conformed arm's
+                                # accounting is the view of its own posted
+                                # row (span, the selection's rank).
+                                conformed.accounting = _accounting_view(
+                                    function, conformed, module, labels={
+                                        "tensor_metadata_state": "dynamic",
+                                        "tensor_shape_value_id": int(output_shape.id),
+                                        "tensor_rank_value_id": int(rank.id),
+                                        "tensor_element_count_value_id": int(count.id),
+                                    },
+                                )
+                                carrier = own_dynamic_tensor(
+                                    conformed, count, element, prefix,
+                                )
+                                prefix.append(call(
+                                    kernel_name,
+                                    [operand, carrier,
+                                     operand_extents["shape"],
+                                     operand_extents["rank"],
+                                     output_shape, rank],
+                                    conformed, instruction, output_argument=1,
+                                ))
+                                register_tensor(
+                                    conformed, storage="temporary",
+                                    metadata_state="dynamic",
+                                    extent_values=(output_shape, rank, count),
+                                )
+                                dynamic_extents[int(conformed.id)] = {
+                                    "shape": output_shape, "rank": rank,
+                                    "element_count": count,
+                                }
+                                conformed_select.append(conformed)
+                            data_args = conformed_select
+                            instruction.args = list(conformed_select)
+                            select_cells = tuple(dict.fromkeys((
+                                *geometry_cells, *static_cells,
+                                *(ssa_value_identity_cell(
+                                    function, int(value.id), book=book,
+                                ) for value in (
+                                    *conformed_select, result,
+                                    output_shape, rank, count,
+                                )),
+                            )))
+                            if any(cell is None for cell in select_cells):
+                                raise ValueError(
+                                    "broadcast selection lost its exact SSA cells"
+                                )
+                            book.post(
+                                _CONFORM_EXTENT,
+                                (_conform_scope(function), function.name,
+                                 int(result.id)),
+                                ("where", *(int(value.id) for value in conformed_select),
+                                 int(output_shape.id), int(rank.id), int(count.id)),
+                                stage=_CONFORM_STAGE,
+                                provenance=_ConformDerived(select_cells),
+                                mode=_ConformMode.CONCORD,
+                            )
+                            select_geometry = (
+                                (output_shape, rank, count), select_cells,
+                            )
                 from .ssa_record_return_state import posted_ssa_value_fact
                 result_physical = posted_ssa_value_fact(
                     function, int(result.id), book=book,
@@ -13303,14 +14057,23 @@ def lower_tensor_calls_to_repository_ssa(
                     result,
                     storage="temporary",
                     metadata_state=(
-                        "static" if scalar_result else "dynamic" if scalar_geometry is not None
+                        "static" if scalar_result
+                        else "dynamic" if scalar_geometry is not None
+                        or select_geometry is not None
                         else source_descriptor.metadata_state
                         if source_descriptor is not None
                         and not tuple(result.shape)
                         else None
                     ),
-                    extent_ids_from=(None if scalar_result else source_descriptor),
-                    extent_values=(None if scalar_geometry is None else scalar_geometry[2][0]),
+                    extent_ids_from=(
+                        None if scalar_result or select_geometry is not None
+                        else source_descriptor
+                    ),
+                    extent_values=(
+                        tuple(select_geometry[0]) if select_geometry is not None
+                        else None if scalar_geometry is None
+                        else scalar_geometry[2][0]
+                    ),
                 )
                 unary_geometry = (
                     _dynamic_tensor_geometry_evidence(module, function, int(source.id), pending=prefix)
@@ -13349,6 +14112,14 @@ def lower_tensor_calls_to_repository_ssa(
                         mixed_count = mixed_runtime_geometry.get(int(result.id))
                         if mixed_count is not None:
                             return mixed_count
+                        if select_geometry is not None:
+                            from .concordance_declarations import TENSOR_ELEMENTWISE_EXTENT_BINDING
+                            if book.latest_ref(
+                                TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                (function_scope_of(function), function.name,
+                                 int(result.id)),
+                            ) is not None:
+                                return select_geometry[0][2]
                         if scalar_geometry is not None:
                             from .concordance_declarations import TENSOR_ELEMENTWISE_EXTENT_BINDING
                             span, scalar, evidence = scalar_geometry
@@ -13959,6 +14730,39 @@ def lower_tensor_calls_to_repository_ssa(
                     axis_sequence = _as_sequence(axis)
                     if axis_sequence is not None and len(axis_sequence) == 1:
                         axis = axis_sequence[0]
+                    # Program: ``def root(n: float, x: float): return
+                    # fsum(n, x)``, ``fsum = Sum(k*x, (k, 1, n))`` once its
+                    # batch axis folds away (owner, 2026-11-25).  Wrong
+                    # record: ``sum(term, 0)`` over the rank-1 runtime span
+                    # took the axis kernel, whose rank-0 float result has no
+                    # output geometry.  Rule: reducing a rank-1 span over its
+                    # only axis IS the all-axis reduction (an identity), so
+                    # it lowers as that one; the decision is its book row.
+                    if (
+                        isinstance(axis, int) and not isinstance(axis, bool)
+                        and axis in {0, -1}
+                        and not bool(_attribute(
+                            instruction.attributes, "keepdim",
+                        ) or False)
+                    ):
+                        from .ssa_record_return_state import (
+                            posted_ssa_value_fact as _axis_source_fact,
+                        )
+                        sole_axis_source = _axis_source_fact(
+                            function, int(source.id), book=book,
+                        )
+                        if (
+                            sole_axis_source is not None
+                            and sole_axis_source.storage == "span"
+                            and sole_axis_source.rank == 1
+                        ):
+                            _concord_scalar_kernel_operand(
+                                module, function,
+                                (str(function_name), int(result.id)),
+                                ("sole_axis_reduction", str(operation)),
+                                (result, source),
+                            )
+                            axis = None
                     if (
                         axis is None
                         and not shape_unknown(source)
@@ -14427,7 +15231,55 @@ def lower_tensor_calls_to_repository_ssa(
                             )
                             prefix.append(output_count_def)
                             geometry_values.append(output_count)
-                        if output_rank:
+                        # Program: declared Sum(k*x) over x[3]: the (count, 3)
+                        # term summed over its runtime axis is (3,), a shape
+                        # the planner proves (only the reduced axis was
+                        # unknown). Static when static is possible: the
+                        # kernel still reads the source's runtime shape, but
+                        # the result is the static tensor its settled SSA
+                        # fact states, so its consumers (and the root's
+                        # public result) are sized when compiling.
+                        result_fact = posted_ssa_value_fact(
+                            function, int(result.id), book=book,
+                        )
+                        # The authority is the result's posted SSA fact: the
+                        # planner states every extent of a static result (one
+                        # per axis); a runtime result states fewer (its
+                        # leading row form, or none). The provisional
+                        # descriptor the region registered before settling is
+                        # not the authority.
+                        static_result = bool(
+                            output_rank
+                            and result_fact is not None
+                            and result_fact.storage == "span"
+                            and result_fact.rank == output_rank
+                            and len(tuple(result_fact.shape or ())) == output_rank
+                            and all(int(extent) > 0
+                                    for extent in result_fact.shape)
+                            and tuple(result.shape or ()) in {
+                                (), tuple(result_fact.shape),
+                            }
+                        )
+                        if static_result:
+                            # The occurrence is a view of the posted fact.
+                            result.shape = tuple(map(int, result_fact.shape))
+                            incumbent = tensor_table.by_id(int(result.id))
+                            if incumbent is None:
+                                register_tensor(
+                                    result, storage="temporary",
+                                    metadata_state="static",
+                                )
+                            elif incumbent.metadata_state != "static":
+                                tensor_table.tensors[int(result.id)] = (
+                                    dataclasses.replace(
+                                        incumbent, metadata_state="static",
+                                        shape=tuple(map(int, result.shape)),
+                                        shape_value_id=None,
+                                        rank_value_id=None,
+                                        element_count_value_id=None,
+                                    )
+                                )
+                        if output_rank and not static_result:
                             result.accounting = {
                                 **dict(result.accounting or {}),
                                 "tensor_metadata_state": "dynamic",
@@ -15529,10 +16381,165 @@ def lower_tensor_calls_to_repository_ssa(
                             joined = target
                             position += part_extent
 
+                elif (
+                    operation == "where" and len(data_args) == 3
+                    and select_geometry is not None
+                    and not all(
+                        (operand_fact := posted_ssa_value_fact(
+                            function, int(operand.id), book=book,
+                        )) is not None
+                        and str(operand_fact.physical_dtype or "").casefold()
+                        in _FLOAT_KERNEL_DTYPES
+                        for operand in (*data_args, result)
+                    )
+                ):
+                    # The kernel's dtype is part of its identity
+                    # (``_reference_kernel_lacks_dtype``): ``where_double``
+                    # stands for the selection only when its condition, both
+                    # arms and its result are float. Region 7's mask is the
+                    # bool span region 6's ``Le`` wrote; the selection stays
+                    # the instruction, over its booked shared runtime
+                    # geometry, which each backend's span loop spells.
+                    select_physical = posted_ssa_value_fact(
+                        function, int(result.id), book=book,
+                    )
+                    # Its element class is the promotion of the two value
+                    # arms (the selection law), settled on its dtype before
+                    # any physical storage exists; the carrier posts that.
+                    select_dtype = (
+                        str(select_physical.physical_dtype)
+                        if select_physical is not None
+                        and select_physical.physical_dtype
+                        else recorded_dtype(result, "where result")
+                    )
+                    if private_dynamic_result(result):
+                        own_dynamic_tensor(
+                            result, select_geometry[0][2], select_dtype, prefix,
+                        )
+                    # Program: declared Sum; region 8 reduces this selection
+                    # along its runtime axis. Wrong record: a declared tensor
+                    # operation's stamp leaves its element class to its law,
+                    # and nothing posted the selection's physical row, so the
+                    # reduction saw an untyped span. Rule: the selection's
+                    # booked extent row (and its owned carrier, if any) state
+                    # its physical span: its element class over the operands'
+                    # rank.
+                    from .concordance_declarations import (
+                        TENSOR_ELEMENTWISE_EXTENT_BINDING as _SELECT_EXTENT,
+                        TENSOR_OWNED_HEAP_BINDING as _SELECT_HEAP,
+                        TENSOR_SSA_LOWERING as _SELECT_STAGE,
+                    )
+                    from .ssa_record_return_state import (
+                        function_scope_of as _select_scope,
+                        revise_ssa_value as _revise_select,
+                    )
+                    select_row = (
+                        _select_scope(function), function.name, int(result.id),
+                    )
+                    select_sources = tuple(
+                        cell for cell in (
+                            book.latest_ref(_SELECT_EXTENT, select_row),
+                            book.latest_ref(_SELECT_HEAP, select_row),
+                        ) if cell is not None
+                    )
+                    select_rank = next((
+                        fact.rank for operand in data_args
+                        if (fact := posted_ssa_value_fact(
+                            function, int(operand.id), book=book,
+                        )) is not None and fact.storage == "span"
+                    ), None)
+                    if (select_sources and type(select_rank) is int
+                            and (select_physical is None
+                                 or not select_physical.physical_dtype)):
+                        _revise_select(
+                            function, result.id, dtype=select_dtype,
+                            shape=tuple(result.shape or ()),
+                            stage=_SELECT_STAGE, sources=select_sources,
+                            book=book, physical={
+                                "physical_dtype": select_dtype,
+                                "storage": "span", "rank": select_rank,
+                            },
+                        )
+                    # The extent row was posted before the selection's own
+                    # physical revision above; concord that same geometry
+                    # again citing the result's current cell, as the binary
+                    # path re-concords its extent row from the final Call.
+                    from .ssa_record_return_state import (
+                        ssa_value_identity_cell as _select_cell_of,
+                    )
+                    select_extent = book.latest_ref(_SELECT_EXTENT, select_row)
+                    select_cell = _select_cell_of(
+                        function, int(result.id), book=book,
+                    )
+                    if (select_extent is not None and select_cell is not None
+                            and select_cell not in {
+                                cause for cause, _stage
+                                in book.edges_into(select_extent)
+                            }):
+                        from .identity_concordance import (
+                            Derived as _SelectDerived, Mode as _SelectMode,
+                        )
+                        book.post(
+                            _SELECT_EXTENT, select_row,
+                            book.page(_SELECT_EXTENT).cell(
+                                select_extent.row, select_extent.column,
+                            ),
+                            stage=_SELECT_STAGE,
+                            provenance=_SelectDerived(tuple(dict.fromkeys((
+                                select_extent,
+                                *(cause for cause, _stage
+                                  in book.edges_into(select_extent)),
+                                select_cell,
+                            )))),
+                            mode=_SelectMode.CONCORD,
+                        )
+                    rewritten.extend(prefix)
+                    rewritten.append(instruction)
+                    continue
                 elif operation == "where" and len(data_args) == 3:
                     count = need_count(result, result_count)
                     conformed = []
                     for operand in data_args:
+                        if select_geometry is not None:
+                            # The shared runtime geometry: a span operand is
+                            # already that extent; a rank-0 operand is filled
+                            # into a temporary of the same runtime geometry.
+                            operand_fact = posted_ssa_value_fact(
+                                function, int(operand.id), book=book,
+                            )
+                            if count is None or operand_fact is None:
+                                conformed = []
+                                break
+                            if operand_fact.storage == "span":
+                                conformed.append(operand)
+                                continue
+                            scalar = operand
+                            payload = constants.get(int(operand.id))
+                            if (
+                                isinstance(payload, (int, float))
+                                and not isinstance(payload, bool)
+                                and str(operand.dtype or "").casefold()
+                                != "float64"
+                            ):
+                                scalar, scalar_def = constant(
+                                    float(payload), "float64"
+                                )
+                                prefix.append(scalar_def)
+                            temporary = fresh(
+                                dtype=recorded_dtype(result, "where result"),
+                                shape=(),
+                            )
+                            register_tensor(
+                                temporary, storage="temporary",
+                                metadata_state="dynamic",
+                                extent_values=tuple(select_geometry[0]),
+                            )
+                            emitted.append(call(
+                                "fill_double", [temporary, scalar, count],
+                                temporary, instruction, output_argument=0,
+                            ))
+                            conformed.append(temporary)
+                            continue
                         if tuple(operand.shape or ()) == tuple(result.shape or ()):
                             # ``where_double`` reads DOUBLE buffers.  A
                             # shape-matched scalar literal of another dtype
@@ -16000,6 +17007,41 @@ def lower_tensor_calls_to_repository_ssa(
                     # has its dtype (``_reference_kernel_lacks_dtype``).
                     if unary_geometry is not None:
                         post_unary_geometry(operation, source, result, unary_geometry)
+                    # Program: declared Sum; region 6's ``Le(k_axis, n - 1)``
+                    # is a bool span over the index axis's runtime geometry,
+                    # consumed by region 7. Wrong record: the kept
+                    # instruction's result had no storage of its own, so the
+                    # caller sized a frame slot it cannot measure. Rule: as
+                    # for the kept int64 lane above, a private runtime-sized
+                    # result is bound to its caller-owned heap carrier over
+                    # its booked count, in its own physical element class.
+                    from .concordance_declarations import (
+                        TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                    )
+                    from .ssa_record_return_state import (
+                        function_scope_of, posted_ssa_value_fact,
+                    )
+                    kept_count = (
+                        unary_geometry[0][2] if unary_geometry is not None
+                        else scalar_geometry[2][0][2]
+                        if scalar_geometry is not None
+                        and book.latest_ref(
+                            TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                            (function_scope_of(function), function.name,
+                             int(result.id)),
+                        ) is not None
+                        else None
+                    )
+                    kept_physical = posted_ssa_value_fact(
+                        function, int(result.id), book=book,
+                    )
+                    if (kept_count is not None and kept_physical is not None
+                            and kept_physical.physical_dtype
+                            and private_dynamic_result(result)):
+                        own_dynamic_tensor(
+                            result, kept_count, str(kept_physical.physical_dtype),
+                            prefix,
+                        )
                     rewritten.extend(prefix)
                     rewritten.append(instruction)
                     continue

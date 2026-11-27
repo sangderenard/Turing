@@ -29357,7 +29357,8 @@ def _tensor_descriptor_rule(
         provisional_tensor = dict(tensor)
         tensor = {}
     elif (
-        descriptor_operation in _ELEMENTWISE_BINARY_OPERATIONS
+        (descriptor_operation in _ELEMENTWISE_BINARY_OPERATIONS
+         or descriptor_operation == "where")
         and not tuple(tensor.get("shape") or ())
         and any(
             _runtime_sized_descriptor(_tensor_descriptor(graph, operand, seen))
@@ -30622,10 +30623,35 @@ def _tensor_descriptor_rule(
                                 else first + source_rank + 1
                             )
                             if 0 <= position <= source_rank:
+                                # A runtime span whose only unknown extent
+                                # is its leading one (``sequence_row_shape``:
+                                # rank = 1 + len(row)) keeps that form when
+                                # the new unit axis lands after the leading
+                                # axis. Program: a declared Sum's index axis
+                                # ``arange(count).unsqueeze(-1)`` is
+                                # (count, 1), not a rank-2 span of unknown
+                                # extents; its trailing 1 is what lets
+                                # ``(count, 1) * x[3]`` be (count, 3).
+                                base_row = tuple(map(
+                                    int, base.get("sequence_row_shape") or (),
+                                ))
+                                leading_only = (
+                                    str(base.get("metadata_state") or "")
+                                    == "dynamic"
+                                    and source_rank == 1 + len(base_row)
+                                )
                                 return {
                                     "shape": (), "dtype": dtype,
                                     "rank": source_rank + 1,
                                     "metadata_state": "dynamic",
+                                    **(
+                                        {"sequence_row_shape": (
+                                            base_row[:position - 1] + (1,)
+                                            + base_row[position - 1:]
+                                        )}
+                                        if leading_only and position >= 1
+                                        else {}
+                                    ),
                                 }
                         else:
                             position = (
@@ -30687,8 +30713,16 @@ def _tensor_descriptor_rule(
             attributes.get("source_type") == "Call"
             and attributes.get("method_ref") is not None
         )
+        # Program: declared Sum; ``where(mask, term, 0)`` masks entries past
+        # the index bound over the runtime span mask and term share. Wrong
+        # record: ``where`` had only the static-broadcast fold, which drops a
+        # runtime-sized operand, so the selection was stamped rank 0 and its
+        # consumer received a scalar. Rule: a selection is elementwise over
+        # its condition and both arms; its element class is the promotion of
+        # the two value arms (np.where), never of the condition.
+        selection = operation == "where"
         if (
-            operation in _ELEMENTWISE_BINARY_OPERATIONS
+            (operation in _ELEMENTWISE_BINARY_OPERATIONS or selection)
             and not resolved_method_call
         ) or variadic_builtin_selector:
             operands = tuple(
@@ -30895,6 +30929,19 @@ def _tensor_descriptor_rule(
                         # unsettled tensor call, so retain the reduction law's
                         # descriptor when it enters later elementwise work.
                         continue
+                    # Program: tests/test_graph_function_splicing.py finite
+                    # sum.  Wrong record: in ``Le(k_axis, n - 1)`` and
+                    # ``Add(1, k_axis)`` the rank-0 side was taken for an
+                    # ingestion placeholder and dropped, the runtime-span law
+                    # below declined, and the result answered the graph
+                    # domain's scalar default.  Rule: a side whose
+                    # ``law_value_axes`` row says no declared reduction axis
+                    # is among its causes is one settled value of the law.
+                    if int(side.get("rank", 0)) == 0:
+                        from .symbolic_process_graph import law_value_axis_free
+
+                        if law_value_axis_free(graph, int(operand)):
+                            continue
                     if (
                         node.get("tensor")
                         or attributes.get("tensor_candidate")
@@ -30921,9 +30968,10 @@ def _tensor_descriptor_rule(
                     if broadcast is not None:
                         promoting_dtypes = tuple(
                             str(side.get("dtype"))
-                            for side in _promoting_sides(
-                                graph, operands, sides,
-                            )
+                            for side in (_promoting_sides(
+                                graph, operands[1:], sides[1:],
+                            ) if selection and len(sides) == 3
+                                else _promoting_sides(graph, operands, sides))
                             if str(side.get("dtype") or "unknown")
                             != "unknown"
                         )
@@ -30949,6 +30997,105 @@ def _tensor_descriptor_rule(
                             "dtype": dtype,
                             "rank": len(broadcast),
                         }
+                # Program: declared Sum(k*x, (k, 1, n)) over a tensor x[3].
+                # The index axis is (count, 1): a runtime span whose only
+                # unknown extent is its leading one (``sequence_row_shape``).
+                # Wrong record: any runtime side made the whole broadcast an
+                # unsettled span, so (count, 1) * x[3] lost its static 3,
+                # the axis-0 sum lost its static (3,) result, and the root
+                # was asked to return a runtime-sized tensor whose size is
+                # known when compiling. Rule: the broadcast law per axis,
+                # right-aligned. Equal static extents survive, a static 1
+                # yields, a static k != 1 beside the unknown extent is k (the
+                # runtime broadcast guard checks the unknown one), and the
+                # unknown extent survives only where nothing states one. The
+                # result is static when every axis is stated, keeps the
+                # leading-unknown form when only its first axis is unknown,
+                # and otherwise falls through to the runtime-span law below.
+                if all(side is not None for side in sides):
+                    def _stated_extents(side):
+                        if descriptor_states_a_shape(side):
+                            return tuple(map(int, side.get("shape") or ()))
+                        row = side.get("sequence_row_shape")
+                        if (
+                            row is not None
+                            and str(side.get("metadata_state") or "")
+                            == "dynamic"
+                            and int(side.get("rank", 0) or 0)
+                            == 1 + len(tuple(row))
+                        ):
+                            return (None, *map(int, row))
+                        return None
+
+                    stated = [_stated_extents(side) for side in sides]
+                    if (
+                        all(extents is not None for extents in stated)
+                        and any(None in extents for extents in stated)
+                        and any(
+                            extent is not None
+                            for extents in stated for extent in extents
+                        )
+                    ):
+                        width = max(len(extents) for extents in stated)
+                        axes_out: list[int | None] = []
+                        compatible = True
+                        for axis in range(width):
+                            column = [
+                                extents[axis - (width - len(extents))]
+                                for extents in stated
+                                if axis - (width - len(extents)) >= 0
+                            ]
+                            fixed = {
+                                extent for extent in column
+                                if extent is not None and extent != 1
+                            }
+                            if len(fixed) > 1:
+                                compatible = False
+                                break
+                            axes_out.append(
+                                next(iter(fixed)) if fixed
+                                else None if None in column
+                                else 1
+                            )
+                        leading_only = (
+                            compatible and axes_out and axes_out[0] is None
+                            and all(extent is not None
+                                    for extent in axes_out[1:])
+                        )
+                        all_stated = compatible and all(
+                            extent is not None for extent in axes_out
+                        )
+                        if leading_only or all_stated:
+                            stated_dtypes = tuple(
+                                str(side.get("dtype"))
+                                for side in (_promoting_sides(
+                                    graph, operands[1:], sides[1:],
+                                ) if selection and len(sides) == 3
+                                    else _promoting_sides(graph, operands, sides))
+                                if str(side.get("dtype") or "unknown")
+                                != "unknown"
+                            )
+                            stated_dtype = (
+                                "bool"
+                                if operation in _ELEMENTWISE_PREDICATE_OPERATIONS
+                                else _operand_result_dtype(stated_dtypes)
+                                if stated_dtypes else "unknown"
+                            )
+                            if all_stated:
+                                return {
+                                    "shape": tuple(map(int, axes_out)),
+                                    "dtype": stated_dtype,
+                                    "rank": len(axes_out),
+                                }
+                            return {
+                                "shape": (),
+                                "dtype": stated_dtype,
+                                "rank": len(axes_out),
+                                "metadata_state": "dynamic",
+                                "sequence_row_shape": tuple(
+                                    map(int, axes_out[1:])
+                                ),
+                            }
                 # Program: ``def f(x, y): return x * y`` with x and y
                 # declared ``storage: span, rank: 1`` and no ``shape``.
                 # Wrong record: both operands answered a dynamic rank-1
@@ -30982,7 +31129,9 @@ def _tensor_descriptor_rule(
                     known_dtypes = tuple(
                         str(side.get("dtype"))
                         for side in (
-                            _promoting_sides(graph, operands, sides)
+                            (_promoting_sides(graph, operands[1:], sides[1:])
+                             if selection and len(sides) == 3
+                             else _promoting_sides(graph, operands, sides))
                             if scalar_sides else ()
                         )
                         if str(side.get("dtype") or "unknown") != "unknown"
@@ -31320,6 +31469,27 @@ def _tensor_descriptor_rule(
             if source is not None:
                 attributes = data.get("attributes") or {}
                 axis = attributes.get("axis", attributes.get("dim"))
+                if axis is None and static_form:
+                    # Program: declared Sum(f(k, x), (k, 1, n)) reduces its
+                    # masked term with ``AbstractTensor.sum(term, 0)``: the
+                    # tensor is ``arg:0`` and the axis ``arg:1``. Wrong
+                    # record: only the receiver form's positional axis was
+                    # read, so the (n, 1) term's axis-0 sum was typed an
+                    # all-axis scalar. Rule: in the static form the axis is
+                    # the literal ``arg:1`` carries.
+                    positional = [
+                        int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role).casefold() == "arg:1"
+                        and int(parent) in graph.G
+                    ]
+                    if positional:
+                        node = graph.G.nodes[positional[0]]
+                        literal = node.get("constant")
+                        if literal is None:
+                            literal = (node.get("attributes") or {}).get("value")
+                        if isinstance(literal, int) and not isinstance(literal, bool):
+                            axis = int(literal)
                 if axis is None and not static_form:
                     # ``x.sum(0)``: the reduction axis is the first positional
                     # argument (``AbstractTensor.sum(self, dim, keepdim)``),
@@ -31683,6 +31853,20 @@ def _tensor_descriptor_rule(
                     ):
                         result["dtype"] = reference_descriptor["dtype"]
                     return result
+        if operation == "get_tensor":
+            # ``AbstractTensor.get_tensor(data)`` is ``data`` as a tensor:
+            # the quadrature rule's node tuple, stated by its own literal
+            # (``compile_sympy_equations`` stamps no dtype on a declared
+            # tensor operation; its law states it).
+            data_parents = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if _positional_argument_index(str(role)) == 0
+                and int(parent) in graph.G
+            )
+            if len(data_parents) == 1:
+                stated = _tensor_descriptor(graph, data_parents[0], seen)
+                if stated is not None and stated.get("dtype"):
+                    return dict(stated)
         if operation in _DTYPE_CAST_OPERATIONS:
             # ``x.to_dtype("int64")`` preserves the shape exactly and only
             # changes the element type.  Leaving it descriptor-less made
@@ -33617,6 +33801,100 @@ def _fold_callsite_structural_values(
             return None
         return min(widths)
 
+    def batch_axis_alias(
+        node_id: int, data: Mapping[str, Any], batch_cell: Any,
+    ) -> Any:
+        """A declared reduction's batch axis folded to its operand when every
+        input of this copy is a declared scalar, else ``unresolved``."""
+
+        from .concordance_declarations import (
+            PLANNER_STRUCTURAL_FOLD, SYMBOLIC_TRANSFORM, SymbolicTransformFact,
+        )
+        from .identity_concordance import Derived, Mode, current_identity_book
+        from ..common.tensors.topological_reducer import (
+            _posted_node_identity_cell,
+        )
+
+        book = current_identity_book()
+        fact = book.page(SYMBOLIC_TRANSFORM).cell(
+            batch_cell.row, batch_cell.column,
+        )
+        operand = next((
+            int(parent) for parent, role in (data.get("parents") or ())
+            if str(role) == "arg:0" and int(parent) in graph.G
+        ), None)
+        inputs = tuple(
+            int(candidate) for candidate, candidate_data in graph.G.nodes(data=True)
+            if str(candidate_data.get("type") or "").casefold() == "input"
+        )
+        if (
+            operand is None or not inputs
+            or getattr(fact, "transform", None) not in {
+                "reduction_batch_axis", "reduction_batch_axis_elided",
+            }
+        ):
+            return unresolved
+        # The scalars must be STATED by this copy's callsite contract
+        # (``planner_tensor_descriptors``, part of its symbol digest).  A copy
+        # with no contract is the law for every type (``def root(n, x)``):
+        # its batch may be any extent, and it keeps the axis.
+        stated = graph.G.graph.get("planner_tensor_descriptors") or {}
+        if not all(
+            isinstance(stated.get(str((
+                graph.G.nodes[candidate].get("attributes") or {}
+            ).get("binding_name"))), Mapping)
+            and int(stated[str((
+                graph.G.nodes[candidate].get("attributes") or {}
+            ).get("binding_name"))].get("rank", -1)) == 0
+            for candidate in inputs
+        ):
+            return unresolved
+        facts = tuple(known.get(candidate, unresolved) for candidate in inputs)
+        if not all(
+            isinstance(value, _ProgramABIValueFact)
+            and value.storage == "scalar"
+            and value.rank in {None, 0}
+            and not value.optional
+            for value in facts
+        ):
+            return unresolved
+        cells = tuple(dict.fromkeys(cell for cell in (
+            batch_cell,
+            _posted_node_identity_cell(graph, int(node_id)),
+            *(_posted_node_identity_cell(graph, candidate) for candidate in inputs),
+        ) if cell is not None))
+        if len(cells) < 2 + len(inputs):
+            return unresolved
+        row = tuple(batch_cell.row)
+        if getattr(book.page(SYMBOLIC_TRANSFORM).latest(row), "transform", None) != (
+            "reduction_batch_axis_elided"
+        ):
+            round_cells.append(book.post(
+                SYMBOLIC_TRANSFORM, row,
+                SymbolicTransformFact(
+                    "reduction_batch_axis_elided",
+                    "every input of "
+                    f"{graph.G.graph.get('function_name')!s} is a declared "
+                    "scalar: no batch",
+                ),
+                stage=PLANNER_STRUCTURAL_FOLD, provenance=Derived(cells),
+                mode=Mode.REVISE,
+            ))
+        # Every descriptor derived THROUGH the batch axis stated one more
+        # axis than the law now has (``def root(n, x)``: region 5's mask and
+        # term kept rank 2 over the rank-1 index axis, and the rank law never
+        # takes a lower rank as a refinement).  They are re-derived from
+        # their operands in this fixed point; only their element type stays.
+        import networkx as _nx
+
+        for descendant in _nx.descendants(graph.G, int(node_id)):
+            stated = graph.G.nodes[int(descendant)].get("tensor") or {}
+            if "rank" in stated or "shape" in stated:
+                graph.G.nodes[int(descendant)]["tensor"] = {
+                    key: stated[key] for key in ("dtype",) if key in stated
+                }
+        return _StructuralValueAlias(operand)
+
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
         if (data.get("attributes") or {}).get("bound_method_ref") is not None:
             return unresolved
@@ -34200,6 +34478,21 @@ def _fold_callsite_structural_values(
                 for extent in descriptor["shape"]:
                     count *= int(extent)
                 return count
+        batch_axis_cell = (data.get("attributes") or {}).get(
+            "declared_batch_axis_cell"
+        )
+        if operation == "unsqueeze" and batch_axis_cell is not None:
+            # Program: ``def root(n: float, x: float): return fsum(n, x)``
+            # with ``fsum = Sum(k*x, (k, 1, n))`` (owner, 2026-11-25).  Wrong
+            # record: the declared reduction keeps a trailing unit axis for
+            # the batch its law runs over, so a Sum of scalars returned shape
+            # ``(1,)`` whose extent was a runtime value no public input
+            # states, and the root's return was refused.  Rule: the batch is
+            # the broadcast of the law's inputs; when every input of this
+            # copy is a declared scalar there is none, and the batch axis
+            # (``reduction_batch_axis`` row) is its operand.  The fold is a
+            # REVISE of that row, DERIVED from it and every input's cells.
+            return batch_axis_alias(int(node_id), data, batch_axis_cell)
         if node_type == "Phi" or isinstance(expression, ast.IfExp):
             if node_type == "Phi" and failure_exit_guard(
                 (data.get("attributes") or {}).get("source_conditional_id"),

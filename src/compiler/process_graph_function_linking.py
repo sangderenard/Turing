@@ -375,6 +375,11 @@ def splice_process_graph(
         if called else {}
     )
     book = current_identity_book()
+    from .symbolic_process_graph import (
+        law_value_axis_free, post_law_value_axes, resident_identity_nodes,
+    )
+
+    resident = resident_identity_nodes(host)
     inserted: list[int] = []
     for body_id in copied:
         source = body.G.nodes[body_id]
@@ -423,6 +428,43 @@ def splice_process_graph(
         _copy_argument_role_rows(
             body, body_id, host, new_id, GRAPH_FUNCTION_SPLICE_STAGE,
         )
+        # The copy's ``law_value_axes`` row is derived again in the host,
+        # from its host operand rows: ``-s`` in ``k**(-s)`` is axis-free;
+        # ``k*x`` over a Sum's index axis is not (``post_law_value_axes``).
+        resident[node_identity_cell(host, new_id)] = new_id
+        if str(data.get("type") or data.get("op") or "").casefold() in {
+            "const", "constant",
+        }:
+            # A copied literal is the body's literal in the host: its
+            # ``source_literal_value`` row derives from the copy's cell and
+            # the body literal's own cells (a unit seed from ``constants``
+            # is its own literal, caused by the copy and the splice context).
+            from ..common.tensors.topological_reducer import _source_numeric_scope
+            from .concorded_literals import MISSING, literal
+            from .concordance_declarations import SOURCE_LITERAL_VALUE
+            from .identity_concordance import Derived as _LiteralDerived
+
+            if body_id in literal_values:
+                literal_value, literal_cells = literal_values[body_id], context
+            else:
+                literal_value, literal_cells = literal(body, body_id)
+            if literal_value is not MISSING:
+                book.post(
+                    SOURCE_LITERAL_VALUE,
+                    (_source_numeric_scope(host), int(new_id)), literal_value,
+                    stage=GRAPH_FUNCTION_SPLICE_STAGE,
+                    provenance=_LiteralDerived(tuple(dict.fromkeys((
+                        node_identity_cell(host, new_id), *literal_cells,
+                    )))),
+                    mode=Mode.CONCORD,
+                )
+        post_law_value_axes(host, new_id, resident)
+        # The body's scalar stamp is the body's own declaration.  A copy with
+        # a declared reduction axis among its host causes is not one value
+        # of the law (``t*x`` over the Integral's (5, 1) rule axis): its
+        # operator law states its shape, as the envelope stamp rule does.
+        if not law_value_axis_free(host, new_id):
+            host.G.nodes[new_id].get("tensor", {}).pop("shape", None)
         inserted.append(new_id)
     return ProcessGraphSplice(
         body=body,
@@ -1026,6 +1068,7 @@ def link_process_graph_functions(
         table.resolve_graph(reference, callee)
         references[function_name] = int(reference.address)
 
+    bound_callers: list[Any] = []
     for graph in _graphs(root):
         # Source lowering registers linked functions before it ingests the
         # caller.  In that phase the root has no callsites to inspect.  Avoid
@@ -1036,6 +1079,11 @@ def link_process_graph_functions(
         for node_id, data in tuple(graph.G.nodes(data=True)):
             if data.get("op") not in {"Call", "call"}:
                 continue
+            if (data.get("attributes") or {}).get(
+                "callee_resolution"
+            ) == "linked-process-graph":
+                # Bound by an earlier pass of this idempotent link.
+                bound_callers.append(graph)
             parents = tuple(data.get("parents") or ())
             matched = None
             for parent_id, role in parents:
@@ -1083,6 +1131,32 @@ def link_process_graph_functions(
                 record for record in unresolved
                 if str(record.get("name")) != binding_name
             )
+            bound_callers.append(graph)
+    # Program: ``def root(n, x: AbstractTensor): return fsum(n, x)`` over a
+    # declared SymPy Sum whose result is a static (3,) tensor. Wrong record:
+    # this link binds the source call after topology reduction, so the
+    # reducer's pursuit never posted its ``source_function_reachability``
+    # row, and the callsite refused the static return ("no exact source call
+    # reachability authority"). Rule: a call bound here is a call of a table
+    # entry like any other; its caller graph posts the same row the
+    # graph-native admission posts for its own calls (CONCORD with the
+    # reducer's writer when both run).
+    from .concordance_declarations import GRAPH_FUNCTION_SPLICE_STAGE
+
+    # A call may reach a linked graph through this pass or through the
+    # reducer's own name resolution of the registered table entry; either
+    # way its callee_ref names a linked address.
+    linked_addresses = set(references.values())
+    for graph in _graphs(root):
+        if graph is root and not graph.node_map:
+            continue
+        if any(
+            (data.get("attributes") or {}).get("callee_ref") in linked_addresses
+            for _node_id, data in graph.G.nodes(data=True)
+        ):
+            bound_callers.append(graph)
+    for graph in {id(graph): graph for graph in bound_callers}.values():
+        _admit_graph_call_reachability(graph, stage=GRAPH_FUNCTION_SPLICE_STAGE)
     return references
 
 

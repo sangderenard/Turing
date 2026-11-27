@@ -1161,6 +1161,45 @@ _UNSOURCED_KINDS = frozenset({"unsourced-fact", "unsourced-identity",
 _IDENTITY_PAGES = frozenset(("canonical_value", "ingestion_value"))
 
 
+def heap_view_result(function: Any, row: Any, fact: Any) -> Any:
+    """The caller id and Call that keep a receipted consumer's borrowed view.
+
+    ``row``/``fact`` are one ``TENSOR_HEAP_CONSUMER_NONESCAPE`` receipt. The
+    program: declared ``Sum(f(k, x), (k, 1, n))``. Region 5 returns its
+    borrowed arange formal 8 itself with new shape/rank outputs (unsqueeze is
+    metadata-only); the caller's aggregate Call names that output 11 through
+    ``output_ids``. Its single non-metadata output, when it is the borrowed
+    formal or a view of it, is still the caller's storage under this id.
+    Returns ``(view_id, call)`` or ``None`` (no view; a retired reborrow).
+    """
+
+    if not (isinstance(fact, tuple) and len(fact) == 4
+            and isinstance(fact[2], tuple) and isinstance(fact[3], tuple)
+            and len(fact[3]) == 1 and len(fact[3][0]) == 3):
+        return None
+    logical, data, alias = fact[3][0]
+    if data not in fact[2] and alias not in fact[2]:
+        return None
+    calls = tuple(
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call" and instruction.res is not None
+        and int(instruction.res.id) == int(row[2])
+        and instruction.attributes.get("callee") == fact[0]
+    )
+    if len(calls) != 1:
+        return None
+    call = calls[0]
+    outputs = tuple(map(int, call.attributes.get("output_ids", ()) or ()))
+    callee_outputs = tuple(map(int, call.attributes.get(
+        "callee_output_ids", ()) or ()))
+    if not outputs:
+        return int(call.res.id), call
+    if len(outputs) != len(callee_outputs) or callee_outputs.count(logical) != 1:
+        return None
+    return outputs[callee_outputs.index(logical)], call
+
+
 def _canonical_identity_base(book: Any, ref: Any) -> Any:
     """The first copy of an identity cell: a ``canonical_value`` row of a
     read-scope fork derives from the row it copies (``read_scope_fork``),
@@ -1623,6 +1662,7 @@ class CorrelationTable:
         found.extend(self._named_intrinsic_result_projection_findings(module))
         found.extend(self._source_intrinsic_admission_findings(module))
         found.extend(self._source_call_parameter_default_findings(module))
+        found.extend(self._declared_reduction_findings(module))
         found.extend(self._numerical_constructor_default_findings(module))
         found.extend(self._materialized_byte_row_findings(module))
         found.extend(self._specialized_literal_materialized_row_findings(module))
@@ -6511,7 +6551,10 @@ class CorrelationTable:
                         and len(previous_fact) == 2
                         and previous_fact[1] == fact[1]
                         and len(previous_fact[0]) == len(fact[0])
-                        and len(rebindings) == 3
+                        # A partial fold (unsqueeze keeps only its element
+                        # count) rebinds just the ids it replaced; each is
+                        # checked below, every other id must stay unchanged.
+                        and 1 <= len(rebindings) <= len(previous_fact[0])
                         and bool(result_refs)
                     )
                     if valid:
@@ -6624,8 +6667,31 @@ class CorrelationTable:
                         data_projection = metadata_result_caller_value(
                             module, caller, producers[0], predecessor, book=book,
                         )
+
+                        folded_result = any(
+                            len(binding) == 6
+                            and int(binding[1]) == int(result_row[3])
+                            and binding[4] == "runtime_view_storage"
+                            for binding in tuple(producers[0].attributes.get(
+                                "aggregate_output_passthrough_bindings", ()))
+                        )
+
+                        def presents(actual, result_id=int(result_row[3]),
+                                     folded_result=folded_result):
+                            # A runtime view folded onto its storage reads
+                            # the storage's id as that view: such an
+                            # occurrence presents only the view's result row,
+                            # and the view's row only such occurrences.
+                            view = (actual.accounting or {}).get("ssa_storage_view")
+                            folded = (view.get("folded_view_id")
+                                      if isinstance(view, Mapping) else None)
+                            if folded_result:
+                                return folded is not None and int(folded) == result_id
+                            return folded is None
+
                         if (data_projection is None or data_projection[0] not in {
                                 int(actual.id) for actual, _ in source_pairs
+                                if presents(actual)
                         }):
                             continue
                         result_fact = result_page.cell(
@@ -6634,6 +6700,7 @@ class CorrelationTable:
                         data_matches = tuple(
                             formal for actual, formal in source_pairs
                             if int(actual.id) == data_projection[0]
+                            and presents(actual)
                         )
                         projected = (
                             tuple(result_fact[2])
@@ -7313,6 +7380,22 @@ class CorrelationTable:
                         candidate)[3:5] == (int(row[3]), fact[1])
                 ) if len(calls) == 1 else ()
                 owner_bindings = (*owner_bindings, *source_bindings)
+                if not owner_bindings:
+                    # The borrowed tensor is a view an earlier consumer of
+                    # this same owner returned: that consumer's receipt, whose
+                    # exact caller output is this tensor, stands for the owner.
+                    owner_bindings = tuple(
+                        source for source, _stage in book.edges_into(cell)
+                        if source.page == TENSOR_HEAP_CONSUMER_NONESCAPE
+                        and source.row[:2] == row[:2]
+                        and source.row[3] == row[3]
+                        and book.latest_ref(source.page, source.row) == source
+                        and (parent_view := heap_view_result(
+                            caller, source.row,
+                            page.cell(source.row, source.column),
+                        )) is not None
+                        and parent_view[0] == fact[1]
+                    )
                 valid = len(calls) == len(owner_bindings) == 1
             if valid:
                 call = calls[0]
@@ -7389,7 +7472,29 @@ class CorrelationTable:
                                  for logical, data, alias in layouts
                                  if data in formals or alias in formals)
                 valid = valid and tuple(layouts) == fact[3]
-                if valid and borrowed:
+                if valid and borrowed and call.res is not None:
+                    # A returned view: its Call result stays borrowed; the
+                    # release audit follows its own consumers.
+                    valid = (len(borrowed) == len(layouts) == 1
+                             and (heap_view_result(caller, row, fact)
+                                  is not None
+                                  # A runtime view folded onto this borrowed
+                                  # storage: its consumers read the borrowed
+                                  # id itself, already followed by the owner.
+                                  or any(
+                                      len(binding) == 6
+                                      and int(binding[3]) == int(fact[1])
+                                      and binding[4] == "runtime_view_storage"
+                                      and book.latest_ref(
+                                          AGGREGATE_PASSTHROUGH_REBINDING,
+                                          (row[0], int(binding[1])),
+                                      ) is not None
+                                      for binding in tuple(call.attributes.get(
+                                          "aggregate_output_passthrough_bindings",
+                                          (),
+                                      ))
+                                  )))
+                elif valid and borrowed:
                     retirement_causes = {
                         source for source, _stage in book.edges_into(retired)
                     } if isinstance(retired, Ref) else set()
@@ -7540,6 +7645,39 @@ class CorrelationTable:
                 producer_block, producer_index, producer = producers[0]
                 release_index, release = releases[0]
                 return_index, terminal = terminals[0]
+                # The owner's tensor plus every view a receipted consumer
+                # returned of it: the same borrowed storage under each id.
+                nonescape_page = book.page(TENSOR_HEAP_CONSUMER_NONESCAPE)
+                borrowed_ids = {fact[1]}
+                view_definitions = {}
+                views_defined = True
+                frontier = [fact[1]]
+                while frontier:
+                    current = frontier.pop()
+                    for candidate in nonescape_page.rows():
+                        candidate_fact = nonescape_page.latest(candidate)
+                        if (candidate[:2] != row[:2] or candidate[3] != row[2]
+                                or not isinstance(candidate_fact, tuple)
+                                or len(candidate_fact) != 4
+                                or candidate_fact[1] != current):
+                            continue
+                        view = heap_view_result(
+                            function, candidate, candidate_fact,
+                        )
+                        if view is None:
+                            continue
+                        if (view[0] in borrowed_ids
+                                or not any(instruction is view[1]
+                                           for instruction in producer_block.instrs)):
+                            views_defined = False
+                            continue
+                        borrowed_ids.add(view[0])
+                        view_definitions[view[0]] = next(
+                            index for index, instruction
+                            in enumerate(producer_block.instrs)
+                            if instruction is view[1]
+                        )
+                        frontier.append(view[0])
                 if terminal.op != "Ret":
                     valid = producer_block is block
                 control_refs = ()
@@ -7612,16 +7750,19 @@ class CorrelationTable:
                          or book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
                              owner_calls[0].row, owner_calls[0].column,
                          )[1] == int(row[2]))
-                    and valid
+                    and valid and views_defined
                     and (producer_block is not block
                          or producer_index < release_index)
                     and release_index < return_index
-                    and all(int(value.id) not in (fact[1], int(row[2]))
+                    and all(int(value.id) not in {*borrowed_ids, int(row[2])}
                             for value in terminal.args)
                     and all(
                         ((other is producer_block and index > producer_index
-                          and (other is not block or index < release_index))
-                         if any(int(value.id) == fact[1]
+                          and (other is not block or index < release_index)
+                          and all(view_definitions.get(int(value.id), -1) < index
+                                  for value in instruction.args
+                                  if int(value.id) in borrowed_ids))
+                         if any(int(value.id) in borrowed_ids
                                 for value in instruction.args)
                          else (
                              (instruction is producer
@@ -7631,7 +7772,7 @@ class CorrelationTable:
                         for other in function.blocks.values()
                         for index, instruction in enumerate(other.instrs)
                         if instruction is not release
-                        and any(int(value.id) in (fact[1], int(row[2]))
+                        and any(int(value.id) in {*borrowed_ids, int(row[2])}
                                 for value in instruction.args)
                     )
                 )
@@ -7641,7 +7782,7 @@ class CorrelationTable:
                     instruction for other in function.blocks.values()
                     for instruction in other.instrs
                     if instruction is not producer and instruction is not release
-                    and any(int(value.id) == fact[1]
+                    and any(int(value.id) in borrowed_ids
                             for value in instruction.args)
                 )
                 def consumer_result_id(instruction):
@@ -7965,8 +8106,8 @@ class CorrelationTable:
         """An axis-changing view owns an exact transform of its storage."""
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
-            TENSOR_RUNTIME_VIEW_GEOMETRY,
+            CANONICAL_VALUE, SSA_VALUE, TENSOR_METADATA_CALL_BINDING,
+            TENSOR_METADATA_RESULT_BINDING, TENSOR_RUNTIME_VIEW_GEOMETRY,
         )
         from .concorded_literals import literal_from_identity
         from .ssa_record_return_state import (
@@ -8026,9 +8167,14 @@ class CorrelationTable:
                 values = (source_id, row[2], source_shape, source_rank,
                           source_count, result_shape, result_rank)
                 if unsqueeze:
+                    from .concordance_declarations import INGESTION_VALUE
+
+                    # A SymPy law's axis literal is an ``ingestion_value``
+                    # identity (no canonical relabel), exactly as the
+                    # lowering that posted this view reads it.
                     axis_cell = ssa_value_identity_cell(function, axis_id, book=book)
                     canonical_axes = (tuple(cause for cause, _stage in book.edges_into(
-                        axis_cell) if cause.page == CANONICAL_VALUE)
+                        axis_cell) if cause.page in (CANONICAL_VALUE, INGESTION_VALUE))
                         if axis_cell is not None else ())
                     literal, literal_cells = (
                         literal_from_identity(book, canonical_axes[0])
@@ -8067,9 +8213,33 @@ class CorrelationTable:
                     and rank_definition is not None
                     and _constant_payload(rank_definition) == output_rank
                 )
+                # Program: declared Sum; region 5 unsqueezes its input formal
+                # 8 (the caller's arange span). Its geometry is not measured
+                # by local extents: it arrives as the formals 020/021/022
+                # that the caller's exact metadata Call binding pairs with
+                # the producer's projected triple. That booked binding is the
+                # source metadata's identity here.
+                formal_ids = {int(formal.id) for formal in function.args}
+                call_bound = (
+                    source_id in formal_ids
+                    and {source_shape, source_rank, source_count} <= formal_ids
+                    and any(
+                        binding[4] == function.name
+                        and (bound := book.page(
+                            TENSOR_METADATA_CALL_BINDING).latest(binding))
+                        and isinstance(bound, tuple) and len(bound) == 2
+                        and any(tuple(map(int, bound[1][index:index + 3]))
+                                == (source_shape, source_rank, source_count)
+                                for index in range(0, len(bound[1]), 3))
+                        for binding in book.page(
+                            TENSOR_METADATA_CALL_BINDING).rows()
+                    )
+                )
                 for value_id, kind in ((source_shape, "shape"),
                                        (source_rank, "rank"),
                                        (source_count, "element_count")):
+                    if call_bound:
+                        continue
                     extent = definition(value_id, "extent", (source_id,))
                     valid = (valid and extent is not None
                              and extent.attributes.get("extent_kind") == kind)
@@ -8139,13 +8309,38 @@ class CorrelationTable:
                     for block in caller.blocks.values() for call in block.instrs
                     if call.op == "Call" and call.res is not None
                     and call.attributes.get("callee") == function.name
-                    and int(row[2]) in tuple(map(int, call.attributes.get("output_ids", ())))
+                    and (int(row[2]) in tuple(map(int, call.attributes.get("output_ids", ())))
+                         # The view folded onto the caller's storage
+                         # (``legalize_aggregate_output_views``) keeps its
+                         # result binding though it left the Call's outputs.
+                         or any(len(binding) == 6
+                                and int(binding[1]) == int(row[2])
+                                and binding[4] == "runtime_view_storage"
+                                for binding in tuple(call.attributes.get(
+                                    "aggregate_output_passthrough_bindings", ()))))
                 }
+                def revision_causes(binding):
+                    # A passthrough fold revises the result row (its latest
+                    # column cites its prior column and the rebinding); the
+                    # row's own revision chain is one identity.
+                    causes, seen = set(), set()
+                    pending = [book.latest_ref(TENSOR_METADATA_RESULT_BINDING, binding)]
+                    while pending:
+                        revision = pending.pop()
+                        if revision is None or revision in seen:
+                            continue
+                        seen.add(revision)
+                        for cause, _stage in book.edges_into(revision):
+                            causes.add(cause)
+                            if (cause.page == TENSOR_METADATA_RESULT_BINDING
+                                    and cause.row == binding):
+                                pending.append(cause)
+                    return causes
+
                 valid = set(bindings) == expected and all(
                     book.page(TENSOR_METADATA_RESULT_BINDING).latest(binding)[1]
                     == (result_shape, result_rank, source_count)
-                    and ref in {cause for cause, _stage in book.edges_into(
-                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING, binding))}
+                    and ref in revision_causes(binding)
                     for binding in bindings
                 )
             if not valid:
@@ -8422,8 +8617,10 @@ class CorrelationTable:
                 narrow_fact = posted_ssa_value_fact(function, narrow, book=book)
                 result_fact = posted_ssa_value_fact(function, row[2], book=book)
                 valid = (
-                    c_tensor_opcode(operation) is not None
-                    and c_tensor_opcode(operation)[0] == "binary"
+                    (operation == "where" or (
+                        c_tensor_opcode(operation) is not None
+                        and c_tensor_opcode(operation)[0] == "binary"
+                    ))
                     and left != right and {wide, narrow} == {left, right}
                     and all(item is not None for item in (
                         left_desc, right_desc, wide_desc, narrow_desc,
@@ -8753,8 +8950,18 @@ class CorrelationTable:
                     and opcode_def.attributes.get("constant") == signature[1]
                     and result_fact.physical_dtype == "float64"
                 )
+                # A selection broadcasts its two span arms and stays the
+                # instruction (``tensor_ssa_lowering``): each arm is the
+                # typed broadcast of its own element; the third arm is rank 0.
+                selection = (
+                    operation == "where"
+                    and source is not None and source.op != "Call"
+                    and str(source.attributes.get("tensor_operation")
+                            or source.op) == "where"
+                    and len(source.args) == 3
+                )
                 valid = valid and (
-                    (raw_int64 or float_call)
+                    (raw_int64 or float_call or selection)
                     and helper_call is not None
                     and helper_call.attributes.get("callee") == helper_name
                     and len(helper_call.args) == 5
@@ -8851,12 +9058,37 @@ class CorrelationTable:
                     # an unrelated result must not discharge this row.
                     broadcast_calls = tuple(
                         definition(int(value.id), "Call")
-                        for value in source.args[:2]
+                        for value in (
+                            tuple(value for value in source.args
+                                  if definition(int(value.id), "Call")
+                                  is not None)
+                            if selection else source.args[:2]
+                        )
                     )
-                    valid = all(call is not None for call in broadcast_calls)
+                    valid = len(broadcast_calls) == 2 and all(
+                        call is not None for call in broadcast_calls
+                    )
+                    if valid and selection:
+                        # Each arm's kernel is its own element's.
+                        arm_kernels = {
+                            "bool": "broadcast_bool",
+                            "int64": "broadcast_int64",
+                            "float64": "broadcast_double",
+                        }
+                        valid = all(
+                            call.attributes.get("callee") == arm_kernels.get(
+                                str(getattr(posted_ssa_value_fact(
+                                    function, operand_id, book=book,
+                                ), "physical_dtype", None))
+                            )
+                            for call, operand_id in zip(
+                                broadcast_calls, (left, right), strict=True,
+                            )
+                        )
                     if valid:
                         broadcast_callee = (
-                            "broadcast_double" if float_call
+                            None if selection
+                            else "broadcast_double" if float_call
                             else "broadcast_int64"
                         )
                         input_geometry = tuple(
@@ -8866,7 +9098,8 @@ class CorrelationTable:
                             for operand_id in (left, right)
                         )
                         valid = all(
-                            call.attributes.get("callee") == broadcast_callee
+                            (selection
+                             or call.attributes.get("callee") == broadcast_callee)
                             and call.attributes.get("ssa_output_argument") == 1
                             and len(call.args) >= 6
                             and exact_broadcast_input(
@@ -9114,6 +9347,130 @@ class CorrelationTable:
             ref = book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING, row)
             fact = page.cell(ref.row, ref.column)
             function = module.functions.get(str(row[1])) if isinstance(row, tuple) and len(row) == 3 else None
+            if (function is not None and isinstance(fact, tuple)
+                    and len(fact) == 7 and fact[0] == "where"):
+                # The selection over one shared runtime geometry
+                # (``tensor_ssa_lowering._shared_select_geometry``):
+                # ``("where", condition, if_true, if_false, shape, rank,
+                # count)``. The live where_double reads each operand or the
+                # fill_double temporary of its rank-0 value over that count.
+                ids = tuple(fact[4:7])
+                table = module.tensor_tables.get(function.name)
+                producers = [instruction for block in function.blocks.values()
+                             for instruction in block.instrs
+                             if instruction.res is not None
+                             and int(instruction.res.id) == row[2]]
+                call = producers[0] if len(producers) == 1 else None
+                result = None if table is None else table.by_id(row[2])
+                if (call is not None and call.op != "Call"
+                        and str(call.attributes.get("tensor_operation") or call.op) == "where"):
+                    # A non-float selection stays the instruction
+                    # (``_reference_kernel_lacks_dtype``): its operands are
+                    # exactly the booked three, its descriptor the shared one.
+                    valid = (
+                        function_scope_of(function) == row[0]
+                        and all(type(value_id) is int for value_id in fact[1:])
+                        and tuple(int(value.id) for value in call.args) == tuple(fact[1:4])
+                        and result is not None and result.metadata_state == "dynamic"
+                        and tuple(getattr(result, field) for field in (
+                            "shape_value_id", "rank_value_id",
+                            "element_count_value_id")) == ids
+                        and any(
+                            (descriptor := table.by_id(operand_id)) is not None
+                            and descriptor.metadata_state == "dynamic"
+                            and tuple(getattr(descriptor, field) for field in (
+                                "shape_value_id", "rank_value_id",
+                                "element_count_value_id")) == ids
+                            for operand_id in fact[1:4]
+                        )
+                    )
+                    if valid:
+                        causes = {cause for cause, _stage in book.edges_into(ref)}
+                        valid = all(
+                            (cell := ssa_value_identity_cell(
+                                function, value_id, book=book,
+                            )) is not None and cell in causes
+                            for value_id in (*fact[1:4], row[2], *ids)
+                        )
+                    if not valid:
+                        found.append(Finding(
+                            "tensor-elementwise-extent-binding", str(row[1]), row[2],
+                            "selection over runtime span lacks exact operands or "
+                            "shared descriptor",
+                        ))
+                    continue
+                valid = (
+                    function_scope_of(function) == row[0]
+                    and all(type(value_id) is int for value_id in fact[1:])
+                    and call is not None and call.op == "Call"
+                    and call.attributes.get("callee") == "where_double"
+                    and call.attributes.get("ssa_output_argument") == 3
+                    and len(call.args) == 5
+                    and int(call.args[4].id) == ids[2]
+                    and result is not None and result.metadata_state == "dynamic"
+                    and int(call.args[3].id) == result.data_value_id
+                    and tuple(getattr(result, field) for field in (
+                        "shape_value_id", "rank_value_id",
+                        "element_count_value_id")) == ids
+                )
+                fills = {}
+                if valid:
+                    for block in function.blocks.values():
+                        for instruction in block.instrs:
+                            if (instruction.op == "Call"
+                                    and instruction.attributes.get("callee") == "fill_double"
+                                    and len(instruction.args) == 3
+                                    and instruction.res is not None):
+                                fills.setdefault(int(instruction.res.id), []).append(instruction)
+                    spans = 0
+                    for position, operand_id in enumerate(fact[1:4]):
+                        argument = call.args[position]
+                        operand_fact = posted_ssa_value_fact(function, operand_id, book=book)
+                        if operand_fact is None:
+                            valid = False
+                            break
+                        if operand_fact.storage == "span":
+                            descriptor = None if table is None else table.by_id(operand_id)
+                            valid = (
+                                int(argument.id) == operand_id
+                                and descriptor is not None
+                                and descriptor.metadata_state == "dynamic"
+                                and tuple(getattr(descriptor, field) for field in (
+                                    "shape_value_id", "rank_value_id",
+                                    "element_count_value_id")) == ids
+                            )
+                            spans += 1
+                        else:
+                            filled = fills.get(int(argument.id), ())
+                            descriptor = None if table is None else table.by_id(int(argument.id))
+                            valid = (
+                                operand_fact.storage == "scalar" and operand_fact.rank == 0
+                                and len(filled) == 1
+                                and int(filled[0].args[2].id) == ids[2]
+                                and descriptor is not None
+                                and descriptor.metadata_state == "dynamic"
+                                and tuple(getattr(descriptor, field) for field in (
+                                    "shape_value_id", "rank_value_id",
+                                    "element_count_value_id")) == ids
+                            )
+                        if not valid:
+                            break
+                    valid = valid and spans > 0
+                if valid:
+                    causes = {cause for cause, _stage in book.edges_into(ref)}
+                    valid = all(
+                        (cell := ssa_value_identity_cell(
+                            function, value_id, book=book,
+                        )) is not None and cell in causes
+                        for value_id in (*fact[1:4], row[2], *ids)
+                    )
+                if not valid:
+                    found.append(Finding(
+                        "tensor-elementwise-extent-binding", str(row[1]), row[2],
+                        "selection over runtime span lacks exact operands, shared "
+                        "descriptor, fill or where_double execution",
+                    ))
+                continue
             valid = (
                 function is not None and function_scope_of(function) == row[0]
                 and isinstance(fact, tuple) and len(fact) in (5, 6)
@@ -9790,22 +10147,49 @@ class CorrelationTable:
                         ),
                     ) for source in rebinding_cells
                 }
+                # Program: declared Sum; region 5 returns arange.unsqueeze(0).
+                # Only its element count passes through unchanged; its new
+                # shape and rank remain live caller projections. The fold
+                # names exactly the ids it replaced, each with its receipt.
+                # A runtime view folded onto the caller's storage
+                # (``legalize_aggregate_output_views``) is no Call output:
+                # its fold binding and receipt stand for the output, and its
+                # consumers' occurrences (the storage's id declaring this
+                # view) carry the geometry a projection would.
+                folded_view_binding = next((
+                    binding for binding in passthroughs
+                    if len(binding) == 6 and int(binding[1]) == int(row[3])
+                    and binding[4] == "runtime_view_storage"
+                    and book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING,
+                                        (row[0], int(row[3]))) is not None
+                ), None)
+                folded = (
+                    {int(old_id) for old_id, new_id in zip(
+                        previous_fact[2], fact[2], strict=True)
+                     if int(old_id) != int(new_id)}
+                    if isinstance(previous_fact, tuple) and len(previous_fact) == 3
+                    and isinstance(fact, tuple) and len(fact) == 3
+                    and len(previous_fact[2]) == len(fact[2]) else set()
+                )
                 valid = (
-                    previous in causes and len(rebinding_cells) == 3
+                    previous in causes and bool(folded)
+                    and len(rebinding_cells) == len(folded)
                     and isinstance(previous_fact, tuple)
                     and len(previous_fact) == 3
                     and previous_fact[0] == fact[0]
                     and previous_fact[1] == fact[1]
                     and len(returns) == 1
-                    and row[3] in tuple(map(int, call.attributes.get(
-                        "output_ids", ())))
-                    and set(map(int, previous_fact[2])) == set(mapping)
-                    and len(passthroughs) >= 3
+                    and (row[3] in tuple(map(int, call.attributes.get(
+                        "output_ids", ()))) or folded_view_binding)
+                    and folded == set(mapping)
+                    and len(passthroughs) >= len(folded)
                 )
                 if valid:
                     for old_id, new_id, callee_id in zip(
                         previous_fact[2], fact[2], fact[1], strict=True,
                     ):
+                        if int(old_id) not in folded:
+                            continue
                         rebind = mapping.get(int(old_id))
                         matching = tuple(binding for binding in passthroughs
                                          if len(binding) >= 4
@@ -9828,7 +10212,22 @@ class CorrelationTable:
                                        )) != 1):
                             valid = False
                             break
-                if valid:
+                if valid and folded_view_binding is not None:
+                    views = tuple(
+                        argument for block in caller.blocks.values()
+                        for instruction in block.instrs
+                        for argument in instruction.args
+                        if int(argument.id) == int(folded_view_binding[3])
+                        and isinstance(view := (argument.accounting or {}).get(
+                            "ssa_storage_view"), Mapping)
+                        and view.get("folded_view_id") == int(row[3])
+                    )
+                    valid = bool(views) and all(
+                        (view.accounting or {}).get(key) == value_id
+                        for view in views
+                        for key, value_id in zip(keys, fact[2], strict=True)
+                    )
+                elif valid:
                     projections = tuple(instruction for block in caller.blocks.values()
                                         for instruction in block.instrs
                                         if instruction.op == "Load"
@@ -10025,13 +10424,29 @@ class CorrelationTable:
                         and binding[0] == int(carried_id)
                     )
 
+                # The aggregate fold (``legalize_aggregate_output_views``)
+                # removes a passthrough slot from the Call's outputs and keeps
+                # each retained slot's Ret position in ``output_positions``;
+                # the callee Ret keeps every slot. Program: declared Sum over
+                # a tensor; region 6 returns the mask's input geometry
+                # (folded onto the caller's actuals) beside the term's
+                # computed geometry (projected): Ret 8, Call outputs 5.
+                positions = tuple(map(int, call.attributes.get(
+                    "output_positions", range(len(callee_ids)),
+                )))
                 valid = valid and len(returned) == 1 and len(
-                    returned[0].args
-                ) == len(callee_ids) and all(
-                    exact_return_carrier(value, carried_id)
-                    for value, carried_id in zip(
-                        returned[0].args, callee_ids
-                    )
+                    positions
+                ) == len(callee_ids) and len(set(positions)) == len(
+                    positions
+                ) and all(
+                    0 <= position < len(returned[0].args)
+                    for position in positions
+                ) and (
+                    len(returned[0].args) == len(callee_ids)
+                    or call.attributes.get("aggregate_output_passthrough_bindings")
+                ) and all(
+                    exact_return_carrier(returned[0].args[position], carried_id)
+                    for position, carried_id in zip(positions, callee_ids)
                 )
                 projections = [instruction for block in caller.blocks.values()
                                for instruction in block.instrs
@@ -10052,12 +10467,12 @@ class CorrelationTable:
                         if int(projection.res.id) == actual_id
                         and projection.attributes.get("source_output_id") == actual_id
                         and projection.attributes.get("aggregate_index")
-                        == caller_ids.index(actual_id)
+                        == positions[caller_ids.index(actual_id)]
                         and len(projection.args) == 1
                         and int(projection.args[0].id) in addresses
                         and addresses[int(projection.args[0].id)].attributes.get(
                             "aggregate_index"
-                        ) == caller_ids.index(actual_id)
+                        ) == positions[caller_ids.index(actual_id)]
                     ) == 1
                     for actual_id in fact[2]
                 )
@@ -12105,6 +12520,22 @@ class CorrelationTable:
                     expected_rank = (
                         None if rank is None else rank if keepdim else rank - 1
                     )
+                    # A static result (its posted fact states every extent):
+                    # the kernel reads the source's runtime shape, and no
+                    # runtime output geometry is consumed.
+                    static_result_desc = bool(
+                        result_desc is not None and result_fact is not None
+                        and expected_rank is not None and expected_rank > 0
+                        and result_fact.storage == "span"
+                        and len(tuple(result_fact.shape or ())) == expected_rank
+                        and all(int(extent) > 0 for extent in result_fact.shape)
+                        and result_desc.metadata_state == "static"
+                        and tuple(result_desc.shape) == tuple(result_fact.shape)
+                        and (result_desc.shape_value_id,
+                             result_desc.rank_value_id,
+                             result_desc.element_count_value_id)
+                        == (None, None, None)
+                    )
                     valid = (
                         source_desc is not None and result_desc is not None
                         and source_fact is not None and result_fact is not None
@@ -12130,6 +12561,10 @@ class CorrelationTable:
                                    result_desc.rank_value_id,
                                    result_desc.element_count_value_id)
                               == (output_shape, output_rank, output_count))
+                             # A result whose posted fact states every
+                             # extent (the runtime axis was the reduced one)
+                             # is static: its descriptor is that shape.
+                             or static_result_desc
                              or (source_fact.physical_dtype == "int64"
                                  and expected_rank == 0
                                  and result_fact.storage == "scalar"
@@ -12226,7 +12661,7 @@ class CorrelationTable:
                                  rank_value.attributes.get("constant") == 0)
                         )
                     else:
-                        valid = (
+                        valid = static_result_desc or (
                             output_vector is not None
                             and tuple(output_vector.attributes.get("values", ()))
                             == (0,) * expected_rank
@@ -12234,7 +12669,7 @@ class CorrelationTable:
                             and rank_value.attributes.get("constant")
                             == expected_rank
                         )
-                if valid:
+                if valid and not static_result_desc:
                     dimension_ids = []
                     for source_axis in range(rank):
                         if source_axis == axis and not keepdim:
@@ -13544,6 +13979,102 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _declared_reduction_findings(module: Any) -> list[Finding]:
+        """Re-derive each declared-reduction row from its own cause cells.
+
+        ``declared_tensor_operation``: the operator named is the op of the
+        value's ``ingestion_value`` row it derives from.
+        ``law_value_axes``: False exactly when a ``reduction_index_axis``
+        transform, a False operand row or a non-scalar literal is among its
+        causes; one operand row per edge of its ``process_graph_operands``
+        cause.  ``runtime_arange_parameters``: ``(None, 1, None)``, proved
+        by a ``reduction_index_axis`` transform or by source default cells.
+        """
+
+        from .concordance_declarations import (
+            DECLARED_TENSOR_OPERATION, INGESTION_VALUE, LAW_VALUE_AXES,
+            PROCESS_GRAPH_OPERANDS, RUNTIME_ARANGE_PARAMETERS,
+            SOURCE_CALL_PARAMETER_DEFAULT, SYMBOLIC_TRANSFORM,
+        )
+        from .symbolic_process_graph import REDUCTION_INDEX_AXIS
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+
+        def causes(page, row):
+            receipt = book.latest_ref(page, row)
+            return receipt, tuple(
+                source for source, _stage in book.edges_into(receipt)
+            )
+
+        def is_axis(cell) -> bool:
+            return (cell.page == SYMBOLIC_TRANSFORM and getattr(
+                book.page(SYMBOLIC_TRANSFORM).cell(cell.row, cell.column),
+                "transform", None,
+            ) == REDUCTION_INDEX_AXIS)
+
+        page = book.page(DECLARED_TENSOR_OPERATION)
+        for row in page.rows():
+            _receipt, sources = causes(DECLARED_TENSOR_OPERATION, row)
+            values = [cell for cell in sources if cell.page == INGESTION_VALUE]
+            if not (len(values) == 1 and getattr(book.page(INGESTION_VALUE).cell(
+                    values[0].row, values[0].column), "op", None)
+                    == page.latest(row)):
+                found.append(Finding(
+                    "declared-tensor-operation", str(row), None,
+                    "declared operator is not its value's ingested operation",
+                ))
+
+        page = book.page(LAW_VALUE_AXES)
+        for row in page.rows():
+            _receipt, sources = causes(LAW_VALUE_AXES, row)
+            fact = page.latest(row)
+            operand_rows = [cell for cell in sources if cell.page == LAW_VALUE_AXES]
+            edge_rows = [cell for cell in sources if cell.page == PROCESS_GRAPH_OPERANDS]
+            edges = (book.page(PROCESS_GRAPH_OPERANDS).cell(
+                edge_rows[0].row, edge_rows[0].column) if edge_rows else ())
+            axis = any(is_axis(cell) for cell in sources)
+            operand_false = any(
+                not book.page(LAW_VALUE_AXES).cell(cell.row, cell.column).axis_free
+                for cell in operand_rows
+            )
+            literal = any(
+                cell.page not in {LAW_VALUE_AXES, PROCESS_GRAPH_OPERANDS,
+                                  SYMBOLIC_TRANSFORM, INGESTION_VALUE}
+                for cell in sources
+            )
+            valid = (
+                len(edge_rows) <= 1
+                and len(operand_rows) == len(tuple(edges or ()))
+                and (not fact.axis_free or not (axis or operand_false))
+                and (fact.axis_free or axis or operand_false or literal)
+            )
+            if not valid:
+                found.append(Finding(
+                    "law-value-axes", str(row), None,
+                    "law_value_axes row does not follow from its axis, operand "
+                    "and literal causes",
+                ))
+
+        page = book.page(RUNTIME_ARANGE_PARAMETERS)
+        for row in page.rows():
+            _receipt, sources = causes(RUNTIME_ARANGE_PARAMETERS, row)
+            declared = [cell for cell in sources if is_axis(cell)]
+            defaults = [cell for cell in sources
+                        if cell.page == SOURCE_CALL_PARAMETER_DEFAULT]
+            if not (page.latest(row) == (None, 1, None) and (
+                    (len(declared) == 1 and len(sources) == 1)
+                    or (len(defaults) == 3 and len(sources) == 3))):
+                found.append(Finding(
+                    "runtime-arange-parameters", str(row), None,
+                    "runtime arange parameters lack a declared index axis or "
+                    "their three source default cells",
+                ))
+        return found
+
+    @staticmethod
     def _source_call_parameter_default_findings(module: Any) -> list[Finding]:
         """Check an intrinsic omitted argument against its source call."""
 
@@ -14761,8 +15292,15 @@ class CorrelationTable:
                     and (parent, role) in book.page(PROCESS_GRAPH_OPERANDS).cell(
                         operands[0].row, operands[0].column,
                     )
-                    and consumer in {
-                        source for source, _stage in book.edges_into(operands[0])
+                    # A read-scope fork's operand row is a copy of the
+                    # authored operand row (its ``_canonical_identity_base``);
+                    # that row derives from the consumer.
+                    and _canonical_identity_base(book, consumer) in {
+                        _canonical_identity_base(book, source)
+                        for source, _stage in book.edges_into(
+                            _canonical_identity_base(book, operands[0]),
+                        )
+                        if source.page == consumer.page
                     }
                 )
             if valid:
@@ -14770,7 +15308,7 @@ class CorrelationTable:
                     dtype_cells[0].row, dtype_cells[0].column,
                 )
                 valid = (
-                    dtype_cells[0].row == consumer.row
+                    dtype_cells[0].row[1] == consumer.row[1]
                     and settled_dtype == dtype
                     and consumer in {
                         source for source, _stage in book.edges_into(dtype_cells[0])

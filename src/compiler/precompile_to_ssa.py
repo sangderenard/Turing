@@ -1870,11 +1870,18 @@ def _runtime_rank_physical(
 
         shape, dtype, rank, _metadata, _row_shape = state
         layout = resolve(dtype)
+        # Python's ``int``/``float`` spell a value whose width scalar
+        # settlement decides (an inferred integer widens to int64), not a
+        # physical layout. Program: the authored broadcast kernel's
+        # ``compatible = rank - rank`` in its break arm was minted physical
+        # ``int`` (int32) while the same expression's loop seed, minted with
+        # no physical dtype, settled int64; the exit Phi then merged i64 and
+        # i32 and LLVM refused it.
         if (
             layout is not None
             and layout.kind in {"bool", "int", "uint", "float"}
             and str(dtype) == str(value.dtype)
-            and str(dtype) != "opaque_ref"
+            and str(dtype) not in {"opaque_ref", "int", "float"}
             and rank == len(shape)
             and tuple(shape) == tuple(value.shape or ())
         ):
@@ -11272,6 +11279,15 @@ class _ControlSSABuilder(TiledObject):
         ``integer_narrowing`` (``trap`` reports ``INT_OVERFLOW`` for a value
         the header's width does not hold).  Same width, a non-integer or a
         shaped value is returned as is.
+
+        The conversion's target is the header's width, not a width of its
+        own: ``carried_header_id`` declares that the Cast follows its header,
+        so scalar settlement moves both together.  Program: the authored
+        broadcast kernel's ``axis = rank - rank`` header was minted int32
+        from its seed's planning row; settlement widened the inferred seed
+        to int64 but left this Cast at int32, so the header received int64
+        and int32 and its one carried identity fed int64 and int32 into the
+        same region formal.
         """
 
         if header is None:
@@ -11294,6 +11310,7 @@ class _ControlSSABuilder(TiledObject):
             Handler.Cast, [update], narrowed,
             attributes={
                 "target_dtype": target,
+                "carried_header_id": int(header.id),
                 **_numeric_conversion_attributes(source, target),
             },
         )
@@ -26064,6 +26081,7 @@ def _post_ssa_block_geometry(book, scope, function):
     from .concordance_declarations import (
         CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING,
         PASSTHROUGH_OUTPUT_RETIREMENT, PURE_CALL_RETIREMENT,
+        SCALAR_KERNEL_OPERAND,
         SSA_BLOCK_GEOMETRY, SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
         TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_CALL_BINDING,
         TENSOR_METADATA_RESULT_BINDING,
@@ -26244,6 +26262,16 @@ def _post_ssa_block_geometry(book, scope, function):
                      for value in instruction.args)),
             *release_cells,
             *block_call_bindings,
+            # Program: tests/test_graph_function_splicing.py finite sum.  A
+            # scalar ``to_dtype`` lowered to its scalar ``Cast`` keeps its
+            # value IDs and facts; the decision that changed the opcode is
+            # its ``scalar_kernel_operand_concordance`` row, which owns that
+            # revision of the block's geometry.
+            *(book.latest_ref(SCALAR_KERNEL_OPERAND, (
+                str(function.name), int(instruction.res.id),
+            ))
+              for instruction in block.instrs
+              if instruction.res is not None),
             *(function_outputs if any(
                 instruction.op in {"Ret", "ret", "Return", "return"}
                 for instruction in block.instrs

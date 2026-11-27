@@ -229,6 +229,9 @@ _C_MATH_INTRINSICS = {
     "asin": "asin", "acos": "acos", "atan": "atan",
     "sinh": "sinh", "cosh": "cosh",
     "asinh": "asinh", "acosh": "acosh", "atanh": "atanh",
+    # ``binary_value``'s atan2 arm (repository kernel, the LLVM lane's
+    # ``@atan2``): C spells the same libm call.
+    "atan2": "atan2",
 }
 
 #: Python's ``%`` and ``//`` are FLOORED -- the remainder carries the
@@ -1022,8 +1025,11 @@ def _scalar_c_type(dtype) -> str:
     layout = dtype_layout(name)
     # A float32 scalar's register is the work contract's
     # ``float32_scalar_register``: ``float32`` (the default) computes it as
-    # float; ``float64`` keeps the earlier double register.  Span storage is
-    # float under both.
+    # float; ``float64`` keeps the earlier double register.  A float16
+    # scalar uses the lane's double register (as the LLVM lane does).  Span
+    # storage stays float / _Float16 under both.
+    if layout.name == "float16":
+        return "double"
     if layout.name == "float32":
         from .work_contract import active_contract
 
@@ -1415,6 +1421,10 @@ class CModuleArtifact:
     linked_libraries: tuple[tuple[str, str], ...] = ()
     linked_objects: tuple[tuple[str, str], ...] = ()
     needs_validation_runtime: bool = False
+    #: Root formals this artifact allocates as its own frame storage (zeroed
+    #: or relocated, never a public buffer).  A caller value fed for one of
+    #: them would be silently discarded, so ``prepare_execution`` refuses it.
+    private_root_formals: tuple[int, ...] = ()
     #: Declared externals this module calls through its exported slot table
     #: (``external_functions.external_slot_rows``); the host fills them at
     #: load with ``external_functions.bind_external_slots``.
@@ -1722,6 +1732,21 @@ class CModuleArtifact:
         import numpy as np
 
         feed_values = {int(key): value for key, value in dict(feeds or {}).items()}
+        # Program: ``def root(a: int64)`` while ``a`` was misjoined to a
+        # record view.  Wrong record: ``a`` became zero-filled private frame
+        # storage, the fed 5 was dropped without a word, and root returned
+        # 1.  Rule: zero-filling a formal nobody passes is the frame's own
+        # business; a value the caller hands is never discarded for it.
+        discarded = sorted(
+            value_id for value_id in feed_values
+            if value_id in set(self.private_root_formals)
+        )
+        if discarded:
+            raise ValueError(
+                f"root formal(s) {discarded} of {self.name} are private frame "
+                "storage of this artifact, not public buffers; the fed "
+                "value(s) would be discarded and the frame zero-filled"
+            )
         shape_overrides = {
             int(key): tuple(map(int, value))
             for key, value in dict(shapes or {}).items()
@@ -3148,6 +3173,12 @@ def emit_ssa_module_to_c(
 
     precision_present = False
     prototypes: list[str] = []
+    # A fault exit leaves the whole SSA call chain (ssa_fault_exits).
+    from .ssa_fault_exits import (
+        fault_exit_functions as _fault_exit_functions,
+        propagates_fault_after_call as _propagates_fault_after_call,
+    )
+    fault_exits = _fault_exit_functions(module)
     definitions: list[str] = []
     # Outlined deployment lanes (deployment_outlining.py) become native span
     # deploys on the persistent turing_pool. Support text is collected here:
@@ -4370,7 +4401,7 @@ def emit_ssa_module_to_c(
                                 ).cell(geometry_cell.row, geometry_cell.column)
                                 geometry_ids = (
                                     tuple(map(int, geometry_fact[-3:]))
-                                    if isinstance(geometry_fact, tuple) and len(geometry_fact) in (5, 6)
+                                    if isinstance(geometry_fact, tuple) and len(geometry_fact) in (5, 6, 7)
                                     else ()
                                 )
                                 descriptor_ids = (
@@ -4644,6 +4675,14 @@ def emit_ssa_module_to_c(
                 )
             elif op == "Pow" and len(elements) == 2 and not integral:
                 expression = f"pow({elements[0]}, {elements[1]})"
+            elif op in {"where", "Select"} and len(elements) == 3:
+                # A kept selection (its Boolean mask is not a double
+                # kernel's operand, rule of 2026-11-18) is one select per
+                # element, as the LLVM lane's span loop spells it.
+                expression = (
+                    f"(({elements[0]}) ? ({result_type})({elements[1]}) "
+                    f": ({result_type})({elements[2]}))"
+                )
             elif op == "Neg" and len(elements) == 1 and integral:
                 # Negation through the unsigned type, as Add/Sub/Mul above:
                 # INT64_MIN wraps to itself instead of being undefined.
@@ -7610,6 +7649,17 @@ def emit_ssa_module_to_c(
                             f"call to {callee!r} has an unbound native formal",
                         ))
                         continue
+                    from .ssa_call_operand_extents import (
+                        undersized_call_message, undersized_call_operands,
+                    )
+                    undersized = undersized_call_operands(
+                        module, fn, callee, instruction.args,
+                    )
+                    if undersized:
+                        shortfalls.append(CEmissionShortfall(
+                            "Call", undersized_call_message(callee, undersized),
+                        ))
+                        continue
                     if callee in extent_users:
                         rendered_args.append("extents")
                     invocation = (
@@ -7617,17 +7667,34 @@ def emit_ssa_module_to_c(
                         + ", ".join(rendered_args) + ")"
                     )
                     callee_return_type = function_return_types[callee]
+                    # A fault exit leaves the whole SSA call chain
+                    # (ssa_fault_exits): the callee may have left without
+                    # writing its outputs.
+                    fault_check = ()
+                    if _propagates_fault_after_call(
+                        module, fn, callee, fault_exits,
+                    ):
+                        prototype = "uint32_t turing_validation_error_pending(void);"
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        fault_check = (
+                            "        if (turing_validation_error_pending()) "
+                            f"goto cleanup_{_c_symbol(fn)};",
+                        )
                     if callee_return_type != "void" and instruction.res is not None:
                         result_id = int(instruction.res.id)
                         body.append(
                             f"        const {callee_return_type} t{result_id} = "
                             f"{invocation};"
                         )
+                        body.extend(fault_check)
                         expressions[result_id] = f"t{result_id}"
                         if _is_integer_dtype(instruction.res.dtype):
                             integer_ids.add(result_id)
                     else:
                         body.append(f"        {invocation};")
+                        body.extend(fault_check)
                         if instruction.res is not None:
                             output_position = instruction.attributes.get(
                                 "ssa_output_argument"
@@ -7962,7 +8029,9 @@ def emit_ssa_module_to_c(
                     op.casefold(), op,
                 )
                 if (
-                    scalar_likeness(span_op) is not None
+                    (scalar_likeness(span_op) is not None
+                     or (op in {"where", "Select"}
+                         and len(instruction.args) == 3))
                     and (
                         _declared_span_rank(instruction.res) > 0
                         or tuple(instruction.res.shape or ())
@@ -9714,6 +9783,11 @@ def emit_ssa_module_to_c(
             )), stage=EMISSION_C,
         )
     return CModuleArtifact(
+        private_root_formals=tuple(
+            int(formal.id) for formal in root.args
+            if int(formal.id) in owned_storage_names
+            and int(formal.id) not in buffer_order
+        ),
         external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
         linked_libraries=tuple(linked_libraries),

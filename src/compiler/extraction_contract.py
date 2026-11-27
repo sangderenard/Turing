@@ -916,12 +916,31 @@ def record_row_columns(
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramABIKernelLibrary:
+    """Informed consent to compile an entry's whole type matrix.
+
+    Owner's rule (2026-11-26): a vague entry type is never silently
+    compiled as every type.  An author who does want the kernel library
+    states it here, with the exact number of versions per lane the matrix
+    requires (``versions: {llvm: 12, c: 11, fortran: 7}`` for one untyped
+    parameter); a count that disagrees with the matrix is refused.
+    """
+
+    function: str
+    versions: Mapping[str, int]
+
+    def receipt(self) -> dict[str, Any]:
+        return {"function": self.function, "versions": dict(self.versions)}
+
+
+@dataclass(frozen=True, slots=True)
 class ProgramABIContract:
     """Typed host/native boundary independent of Python object identity."""
 
     records: Mapping[str, ProgramABIRecord] = field(default_factory=dict)
     bindings: tuple[ProgramABIBinding, ...] = ()
     values: tuple[ProgramABIValueBinding, ...] = ()
+    kernel_libraries: tuple[ProgramABIKernelLibrary, ...] = ()
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "ProgramABIContract":
@@ -929,7 +948,7 @@ class ProgramABIContract:
             return cls()
         if not isinstance(raw, Mapping):
             raise ExtractionContractError("program_abi must be a mapping")
-        extra = sorted(set(raw) - {"records", "bindings", "values"})
+        extra = sorted(set(raw) - {"records", "bindings", "values", "kernel_libraries"})
         if extra:
             raise ExtractionContractError(
                 f"program_abi has unknown fields {extra}"
@@ -1093,7 +1112,47 @@ class ProgramABIContract:
                 expectations[0],
                 expectations,
             ))
-        return cls(records, tuple(bindings), tuple(values))
+        raw_libraries = raw.get("kernel_libraries", [])
+        if not isinstance(raw_libraries, list):
+            raise ExtractionContractError("program_abi.kernel_libraries must be a list")
+        libraries = []
+        for index, library_raw in enumerate(raw_libraries):
+            location = f"program_abi.kernel_libraries[{index}]"
+            if not isinstance(library_raw, Mapping) or set(library_raw) != {
+                "function", "versions",
+            }:
+                raise ExtractionContractError(
+                    f"{location} must define exactly function and versions"
+                )
+            versions_raw = library_raw["versions"]
+            if not isinstance(versions_raw, Mapping) or not versions_raw or any(
+                not isinstance(count, int) or isinstance(count, bool) or count <= 0
+                for count in versions_raw.values()
+            ):
+                raise ExtractionContractError(
+                    f"{location}.versions must map each lane to its positive "
+                    "number of versions"
+                )
+            libraries.append(ProgramABIKernelLibrary(
+                str(library_raw["function"]),
+                {str(lane): int(count) for lane, count in versions_raw.items()},
+            ))
+        return cls(records, tuple(bindings), tuple(values), tuple(libraries))
+
+    def kernel_library_for(
+        self, function_name: str, *, method_owner: str | None = None,
+    ) -> ProgramABIKernelLibrary | None:
+        """The entry's kernel-library consent, if the contract states one."""
+
+        found = tuple(
+            library for library in self.kernel_libraries
+            if binding_names_function(library.function, function_name, method_owner)
+        )
+        if len(found) > 1:
+            raise ExtractionContractError(
+                f"program_abi.kernel_libraries names {function_name!r} more than once"
+            )
+        return found[0] if found else None
 
     def records_for_function(
         self,
@@ -1151,6 +1210,9 @@ class ProgramABIContract:
             },
             "bindings": [binding.receipt() for binding in self.bindings],
             "values": [binding.receipt() for binding in self.values],
+            **({"kernel_libraries": [
+                library.receipt() for library in self.kernel_libraries
+            ]} if self.kernel_libraries else {}),
         }
 
 
