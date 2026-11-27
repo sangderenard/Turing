@@ -53,6 +53,11 @@ def _returns(module, export):
 
 
 def _run(tmp_path, lane, source, n):
+    # One directory per build: a test that builds twice keeps the first
+    # library loaded, and Windows refuses to overwrite a loaded DLL (lld:
+    # "failed to write output ... Permission denied").
+    tmp_path = Path(tmp_path) / f"{lane}_{n}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
     module, export = _lowered(source)
     (ret,) = _returns(module, export)
     (output,) = (int(value.id) for value in ret.args)

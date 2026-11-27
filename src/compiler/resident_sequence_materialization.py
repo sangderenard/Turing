@@ -3875,6 +3875,19 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         and int(data.get("value_id", node_id)) not in mutated_ids
         and int(data.get("value_id", node_id)) not in output_ids
     }
+    # Program: ``g = [[1, 2, 3], [4, 5, 6]]; return g[n % 3][n % 4]``
+    # (tests/test_native_list_index_error.py, NESTED).  Wrong record: the
+    # rows had no graph successor -- the outer literal names them in its
+    # ``aggregate_leaf_value_ids``, not by an edge -- so both rows counted as
+    # unread, were never born, and every ``g[i][j]`` raised IndexError on an
+    # empty row.  Rule: an aggregate that names a collection as its member
+    # reads it; the member is unread only when that aggregate is unread.
+    member_holders: dict[int, set[int]] = {}
+    for holder_id, holder_data in graph_obj.nodes(data=True):
+        for leaf_id in (holder_data.get("attributes") or {}).get(
+            "aggregate_leaf_value_ids"
+        ) or ():
+            member_holders.setdefault(int(leaf_id), set()).add(int(holder_id))
     unread_collections: set[int] = set()
     grew = True
     while grew:
@@ -3884,6 +3897,12 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             readers.update(
                 int(child) for child, _role in
                 graph_obj.nodes[candidate].get("children") or ()
+            )
+            readers.update(
+                holder for holder in member_holders.get(int(
+                    graph_obj.nodes[candidate].get("value_id", candidate)
+                ), ())
+                if holder != int(candidate)
             )
             # Program: ``AbstractTensor.cat([a, b], dim=1)``.  Wrong record:
             # the list literal was born as resident sequence storage (a

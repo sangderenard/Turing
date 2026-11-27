@@ -25810,6 +25810,18 @@ def _class_surface_ssa_program(
                         _declared_field_types = (
                             str(_declared_field_layout["python_type"]),
                         )
+                    if (not _declared_field_types and _declared_field_cell is not None
+                            and str(field.get("aggregate_kind") or "") == "array"):
+                        # Program: ``self.values = array("Q")`` then
+                        # ``self.values[i]`` in another method
+                        # (tests/test_carried_integer_width_narrowing.py).
+                        # Wrong record: the field has no annotation, so its
+                        # read had no class, no VALUE_TYPE_ABI and the record
+                        # field input was refused.  Rule: the initializer's
+                        # ``array(typecode)`` allocation states the class --
+                        # an ``array.array`` instance -- as its typecode
+                        # states the row dtype.
+                        _declared_field_types = ("array.array",)
                     if _declared_field_types:
                         contract[
                             "program_abi_field_declaration_cell"
