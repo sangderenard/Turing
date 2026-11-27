@@ -155,6 +155,39 @@ def test_a_failure_after_writing_removes_what_this_open_made(world, monkeypatch)
     assert open_(world, contract())["identity"] == "ann/garden", "and the same open then succeeds"
 
 
+def test_a_refused_open_removes_only_its_own_row_not_another_open_in_flight(world):
+    """[WHOLE] two opens on one branch at once: the refused one must not delete the other's head-NULL row."""
+    call = lambda op, **b: central_checkout.run(world["db"], world["policy"], world["root"], user_id=ANN,  # noqa: E731
+                                                username="ann", operation=op,
+                                                body={"repository": "work", "branch": "ann/garden", **b})
+    project_open.ensure(world["db"])
+    world["db"].execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?,?,?)",           # the other open, mid-flight
+                        ("ann/other", ANN, "ann", "branch", "work", "ann/garden", "projects/ann/other/project.yaml",
+                         None, 1.0))
+    call("open")
+    call("write", path="projects/ann/other/project.yaml", text="in flight\n")      # its file, not yet committed
+    with pytest.raises(project_open.ProjectError, match="uncommitted changes"):
+        open_(world, contract())
+    rows = [r[0] for r in world["db"].execute("SELECT identity FROM projects")]
+    assert rows == ["ann/other"], "the other open's in-flight row survives this open's undo"
+
+
+def test_an_open_whose_row_is_lost_before_recording_its_head_is_not_reported_as_open(world, monkeypatch):
+    real = central_checkout.commit
+
+    def commit_then_lose_row(db, row, *, user_id, message):
+        done = real(db, row, user_id=user_id, message=message)
+        db.execute("DELETE FROM projects WHERE identity = ?", ("ann/garden",))
+        return done
+
+    monkeypatch.setattr(central_checkout, "commit", commit_then_lose_row)
+    with pytest.raises(project_open.ProjectError, match="catalog row was removed meanwhile") as refused:
+        open_(world, contract())
+    assert refused.value.status == 409 and project_open.projects_of(world["db"], ANN) == []
+    head = run(world["work"], "rev-parse", "refs/heads/ann/garden")
+    assert head in refused.value.message, "the commit that stands is named"
+
+
 def test_rest_needs_dev_ui_and_takes_the_account_from_the_session(world):
     class Handler:
         def __init__(self, path, body, user, username, caps=("dev_ui",)):
