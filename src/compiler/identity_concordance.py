@@ -20375,6 +20375,7 @@ class IdentityBook:
         state = dict(self.__dict__)
         state["_spill"] = None
         state.pop("_tile_store", None)  # the serialized copy owns no tile file
+        state.pop("_row_readers", None)  # live callbacks, not facts (await_row)
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -20775,9 +20776,12 @@ class IdentityBook:
         cells the claim stood on (``FailureClaim``).  The neighborhood is not
         walked here -- a refusal is also control flow for some callers -- but
         by ``annotate_failure_with_neighborhood`` where the failure reports.
+
+        A successful post re-runs the readers waiting on its row
+        (``await_row``), whichever writer made it.
         """
         try:
-            return self._post(
+            target = self._post(
                 page, row, fact, stage=stage, provenance=provenance,
                 mode=mode,
             )
@@ -20786,6 +20790,28 @@ class IdentityBook:
                 self, error, page, row, fact, stage, provenance, mode,
             )
             raise
+        readers = self.__dict__.get("_row_readers")
+        if readers:
+            # Popped before any reader runs: a reader that posts this row
+            # again, or waits on it again, does not see itself here.
+            for reader in readers.pop((page.name, target.row), ()):
+                reader()
+        return target
+
+    def await_row(self, page: Page, row: tuple, reader: Any) -> None:
+        """Run ``reader()`` once, after the next post of ``row`` on ``page``.
+
+        For a reader that found the row absent and must ask again when it is
+        written.  The writer owns the transition: ``post`` is the one
+        sanctioned writer, so every writer of the row wakes its readers, not
+        only the one the reader expected.  The readers are held by this book
+        and end with it: a later book that reuses its address never sees
+        them, and a copy or pickle of the book carries none (they hold live
+        graphs, not facts).
+        """
+        self.__dict__.setdefault("_row_readers", {}).setdefault(
+            (page.name, tuple(row)), [],
+        ).append(reader)
 
     def _post(
         self,
