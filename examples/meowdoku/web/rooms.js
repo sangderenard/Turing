@@ -91,6 +91,10 @@ async function open(name, { quiet = false } = {}) {
     }
     if (!messages.length) list.append(el("li", "No message yet.", "muted"));
     const compose = el("div", null, "compose"), text = document.createElement("textarea"), send = el("button", "Send");
+    const account = el("p", `Room opened as ${who.username}`, "muted");
+    account.id = "compose-account";
+    text.setAttribute("aria-describedby", account.id);
+    send.setAttribute("aria-describedby", account.id);
     text.rows = 2; text.maxLength = 4000; text.setAttribute("aria-label", `Message to ${settings.title} (Enter sends, Shift+Enter starts a new line)`);
     send.type = "button";
     // One post per press: while a post is in flight the composer is busy (Send disabled, text read-only), so a slow or
@@ -115,7 +119,7 @@ async function open(name, { quiet = false } = {}) {
     sticker.type = "button"; sticker.setAttribute("aria-expanded", "false");
     sticker.onclick = () => { picker.hidden = !picker.hidden; sticker.setAttribute("aria-expanded", String(!picker.hidden)); if (!picker.hidden) picker.load(); };
     compose.append(text, send, sticker);
-    panel.append(list, compose, picker);
+    panel.append(list, account, compose, picker);
     if (!settings.system) panel.append(roomSet(name, set), ...(isOwner(settings) ? [ownerSettings(name, settings)] : []), forwarding(name, set));
   } catch (error) { panel.replaceChildren(el("p", `The room could not be read: ${error.message}`, "muted")); }
 }
