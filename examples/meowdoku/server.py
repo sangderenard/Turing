@@ -2642,6 +2642,18 @@ def make_handler(sessions: Sessions):
             return central_checkout.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
                                                root=sessions.state.content_dir / "checkouts")
 
+        def _projects_route(self, path: str, method: str) -> None:
+            """[PROJECTS] a dev page's project opened in its placement (project_open.py, research case d442be8d); the
+            branch placement works through the central checkout."""
+            from meowdoku import branch_gate, project_open
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return project_open.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db,
+                                           root=sessions.state.content_dir / "checkouts")
+
         def _link_ticket_route(self, path: str) -> None:
             """[LINK] POST /api/link/ticket/<prefix> {grant_id, secret, direction} -> the two tickets of one new Nodus link.
 
@@ -3829,6 +3841,8 @@ def make_handler(sessions: Sessions):
                 return self._git_route(path, "GET")
             if path == "/api/checkouts" or path.startswith("/api/checkouts/"):   # [CHECKOUT]
                 return self._checkout_route(path, "GET")
+            if path == "/api/projects" or path.startswith("/api/projects/"):   # [PROJECTS]
+                return self._projects_route(path, "GET")
             if path == "/api/operator-control":
                 from meowdoku import admin_script_control
                 return admin_script_control.route(self, sessions, "GET")
@@ -4454,6 +4468,8 @@ def make_handler(sessions: Sessions):
                 return self._git_route(path0, "POST")
             if path0 == "/api/checkouts" or path0.startswith("/api/checkouts/"):   # [CHECKOUT]
                 return self._checkout_route(path0, "POST")
+            if path0 == "/api/projects" or path0.startswith("/api/projects/"):   # [PROJECTS]
+                return self._projects_route(path0, "POST")
             if path0 == "/api/operator-control":
                 from meowdoku import admin_script_control
                 return admin_script_control.route(self, sessions, "POST")
