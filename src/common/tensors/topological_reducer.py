@@ -3699,9 +3699,11 @@ def _set_operands(
     (declared by step 5; the Append post landed with step 9, plan 100 1.2):
     a new position with no move source and no fork is
     ``OperandAppend(cause, operand)`` DERIVED(operand node cell, consumer
-    node cell); a graph with no operand-position scope posts one
-    ``Unsourced(NO_OPERAND_POSITION_SCOPE)`` row per rewrite under
-    ``_UNSCOPED_OPERANDS``, which the audit lists.
+    node cell).  A graph with no operand-position scope (neither built by
+    ``build_from_ast`` nor entered normalization, e.g. a bare
+    ``build_graph``) has no cell to derive from: a rewrite that moves or
+    adds a position raises ``ValueError``, and an identity rewrite returns
+    without posting.
 
     Step 9 also makes this the writer of the other two copies of every
     operand edge: ``children`` on the parents and the networkx edge

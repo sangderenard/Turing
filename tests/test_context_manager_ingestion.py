@@ -167,8 +167,12 @@ def save(path, payload):
         "turing.shell.files.close",
     )
 
+    # build_from_ast is the ingestion entry: it mints the build's
+    # ingestion_value_scope, which every authored operand edge is posted
+    # under.  A bare build_graph has no scope and _set_operands refuses its
+    # edges (8af44b07: a post derives from its cells or is refused).
     graph = ProcessGraph(materialize_memory=False)
-    graph.build_graph(tree)
+    graph.build_from_ast(tree)
     shell_nodes = [
         (node_id, data)
         for node_id, data in graph.G.nodes(data=True)
