@@ -389,6 +389,43 @@ def test_worker_has_loop_inside_try(tmp_path):
     run_source(tmp_path, source, 2)
 
 
+@pytest.mark.parametrize('n', [0, 3])
+def test_failure_skips_later_statements_of_the_try_body(tmp_path, n):
+    # The failing division's statement is a failure site: the work after it
+    # in the same protected body is a separate region the exit test skips.
+    source = '''def root(n: int) -> int:
+    total = 1
+    try:
+        total = total + 12 // n
+        total = total * 10
+    except ZeroDivisionError:
+        total = total + 50
+    return total
+'''
+    run_source(tmp_path, source, n)
+
+
+def test_failure_site_records_its_guard_operator_and_bindings():
+    from src.compiler.concordance_declarations import (
+        SOURCE_EXCEPTION_GUARD, SOURCE_FAILURE_SITE, SOURCE_OPERATOR_KIND,
+    )
+    from src.compiler.concorded_literals import origin_cell
+    module = compile_source(PROTECTED_LOOP)
+    book = module.metadata['identity_book']
+    rows = tuple(book.page(SOURCE_FAILURE_SITE).rows())
+    assert len(rows) == 1
+    operators, named, loops, guard = book.page(SOURCE_FAILURE_SITE).latest(rows[0])
+    assert book.page(SOURCE_EXCEPTION_GUARD).latest((guard,))[1] is True
+    assert len(loops) == 1
+    assert [str(book.page(SOURCE_OPERATOR_KIND).latest((origin_cell(book, cell),)))
+            for cell in operators] == ['FloorDiv']
+    assert {'total', 'i', 'n'} <= {name for name, _cell in named}
+    assert any(instruction.op == 'ExceptionPending'
+               for function in module.functions.values()
+               for block in function.blocks.values() for instruction in block.instrs)
+    assert '0 finding(s)' in concordance_report(module)
+
+
 @pytest.mark.parametrize('n', [-2, 0])
 def test_zero_iteration_loop_inside_try_runs_else_and_finally(tmp_path, n):
     run_source(tmp_path, PROTECTED_LOOP.replace('range(4)', 'range(n)'), n)
