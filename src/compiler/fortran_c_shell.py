@@ -26406,7 +26406,19 @@ def _class_surface_ssa_program(
             value_id = int(data.get("value_id", node_id))
             contract = linked_value_abi_by_graph.setdefault(id(planned_graph), {}).setdefault(value_id, {})
             if contract.get("dtype") not in (None, "", dtype):
-                raise ValueError("authored local scalar conflicts with an existing physical ABI")
+                # Name the value, its function and both carriers: the
+                # refusal alone did not say which declaration disagreed.
+                raise ValueError(
+                    "authored local scalar conflicts with an existing physical ABI: "
+                    f"function={planned_graph.graph.get('function_name')!r} "
+                    f"value={value_id} node={node_id} "
+                    f"binding={(data.get('attributes') or {}).get('binding_name')!r} "
+                    f"op={data.get('op') or data.get('type')!r} "
+                    f"annotation={declared_fact.annotation!r} declared={dtype!r} "
+                    f"existing={contract.get('dtype')!r} contract={contract!r} "
+                    "existing_sources="
+                    f"{linked_value_type_source_cells_by_graph.get(id(planned_graph), {}).get(value_id)!r}"
+                )
             contract.update(storage="scalar", dtype=dtype, rank=0, shape=())
             linked_value_type_source_cells_by_graph.setdefault(id(planned_graph), {})[value_id] = tuple(dict.fromkeys((
                 *linked_value_type_source_cells_by_graph.get(id(planned_graph), {}).get(value_id, ()),
