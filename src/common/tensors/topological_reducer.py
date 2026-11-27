@@ -8834,6 +8834,23 @@ def _normalize_lexical_values(
         "str": "builtins.str",
         "builtins.str": "builtins.str",
     }
+    # Program: the entry type matrix (``def root(a)`` compiled with ``a:
+    # int8``, ``a: float64``...).  Wrong record: a fixed-width scalar
+    # annotation named no class here, so the formal had no
+    # SOURCE_VALUE_CLASS, no VALUE_TYPE_ABI row and no posted physical
+    # dtype, and the C lane refused it (scalar-physical-layout-unproven)
+    # while ``a: int`` compiled.  Rule: a declared fixed-width scalar layout
+    # name is the Python class of its kind; its width stays in the scalar
+    # receipt (``_authored_annotation_field_receipt``).
+    from ...transmogrifier.dtype_layout import DTYPES as _SCALAR_LAYOUTS
+
+    for _layout_name, _layout in _SCALAR_LAYOUTS.items():
+        _kind_class = {
+            "int": "builtins.int", "uint": "builtins.int",
+            "float": "builtins.float", "bool": "builtins.bool",
+        }.get(_layout.kind)
+        if _kind_class is not None:
+            primitive_class_identities.setdefault(str(_layout_name), _kind_class)
 
     local_class_declarations: dict[str, tuple[str, Any]] = {}
     local_scalar_declarations: dict[str, tuple[str, Any]] = {}

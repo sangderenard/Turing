@@ -5382,6 +5382,15 @@ def _typed_parameter_record_receipts(
             # limb COUNT as y and the computed limbs never reached the
             # output (C wrote 3 into y[0]; LLVM left y zero).
             continue
+        if str(identity) in {"builtins.int", "builtins.float", "builtins.bool"}:
+            # Program: the entry type matrix (``a: int64``).  Wrong record:
+            # a fixed-width scalar annotation's class is ``builtins.int``,
+            # and the contract's table row record ``CompilerSSAExtent``
+            # (identity ``builtins.int``) was joined to the parameter, so
+            # the C lane kept the scalar as private record storage and read
+            # 0.  Rule: a primitive scalar class is a scalar parameter,
+            # never a record view.
+            continue
         matches = tuple(
             record
             for name, record in records.items()
@@ -64817,9 +64826,63 @@ def _linked_piece_interface_module(piece):
 class UntypedEntryParameterWarning(UserWarning):
     """An entry parameter with no annotation and no contract binding.
 
-    A vague type means every type: the compiler compiles the type matrix.
-    An author who did not mean that states the type in the code or contract.
+    A vague type means every type: ``lower_ast_source_type_matrix`` compiles
+    one copy per member of the type matrix.  An author who did not mean that
+    states the type in the code or contract.
     """
+
+
+def untyped_entry_parameters(
+    source: str, entrypoint: str, extraction_policy: Any = None, *, book: Any = None,
+) -> tuple[str, ...]:
+    """The entry's formals that nothing types, in declaration order.
+
+    A formal is typed by its annotation, by an extraction-contract binding of
+    the entry, or by the called inventory's selected class (root-call
+    records on ``book``).  Anything else is a vague type.
+    """
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+    definitions = tuple(
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == str(entrypoint)
+    )
+    if len(definitions) != 1:
+        return ()
+    arguments = definitions[0].args
+    named = tuple(argument.arg for argument in (
+        *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+    ))
+    contracted: set[str] = set()
+    if extraction_policy is not None:
+        contracted |= set(map(str, extraction_policy.program_abi.values_for_function(
+            str(entrypoint), method_owner=None,
+        )))
+        contracted |= set(map(str, extraction_policy.program_abi.records_for_function(
+            str(entrypoint), method_owner=None, parameters=named,
+        )))
+    inventoried: set[str] = set()
+    if book is not None:
+        from .called_inventory import called_class
+        inventoried = {
+            name for name in named
+            if called_class(book, str(entrypoint), name) is not None
+        }
+    return tuple(
+        argument.arg for argument in (
+            *arguments.posonlyargs, *arguments.args,
+            *((arguments.vararg,) if arguments.vararg else ()),
+            *arguments.kwonlyargs,
+            *((arguments.kwarg,) if arguments.kwarg else ()),
+        )
+        if argument.annotation is None
+        and argument.arg not in contracted
+        and argument.arg not in inventoried
+    )
 
 
 def _lower_ast_source_to_ssa_impl(
@@ -67293,53 +67356,28 @@ def _lower_ast_source_to_ssa_impl(
     # to lower. Owner's rule (2026-11-25): a vague type means every type --
     # the compiler compiles the type matrix. If that is not what the author
     # meant, the author must state the type, in the code or in the contract.
-    # Say so loudly, at the entry, by name. The entry's own definition and the
-    # contract's bindings for it are the two places a type can be stated.
+    # Say so loudly, at the entry, by name. The entry's own definition, the
+    # contract's bindings and the called inventory (root-call records) are
+    # the places a type can be stated.
     if entrypoint is not None and source_language == "python":
-        try:
-            _entry_tree = ast.parse(source)
-        except SyntaxError:
-            _entry_tree = None
-        _entry_defs = tuple(
-            node for node in (_entry_tree.body if _entry_tree is not None else ())
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == str(entrypoint)
+        from .identity_concordance import current_identity_book
+        _entry_untyped = untyped_entry_parameters(
+            source, str(entrypoint), extraction_policy,
+            book=current_identity_book(),
         )
-        if len(_entry_defs) == 1:
-            _entry_arguments = _entry_defs[0].args
-            _entry_contracted = set()
-            if extraction_policy is not None:
-                _entry_contracted |= set(map(str, extraction_policy.program_abi.values_for_function(
-                    str(entrypoint), method_owner=None,
-                )))
-                _entry_contracted |= set(map(str, extraction_policy.program_abi.records_for_function(
-                    str(entrypoint), method_owner=None,
-                    parameters=tuple(argument.arg for argument in (
-                        *_entry_arguments.posonlyargs, *_entry_arguments.args,
-                        *_entry_arguments.kwonlyargs,
-                    )),
-                )))
-            _entry_untyped = tuple(
-                argument.arg for argument in (
-                    *_entry_arguments.posonlyargs, *_entry_arguments.args,
-                    *((_entry_arguments.vararg,) if _entry_arguments.vararg else ()),
-                    *_entry_arguments.kwonlyargs,
-                    *((_entry_arguments.kwarg,) if _entry_arguments.kwarg else ()),
-                )
-                if argument.annotation is None
-                and argument.arg not in _entry_contracted
+        if _entry_untyped:
+            _entry_message = (
+                f"entry {str(entrypoint)!r} parameter(s) "
+                f"{', '.join(map(repr, _entry_untyped))} have NO declared type "
+                "(no annotation, no extraction-contract binding, no root-call "
+                "record). A vague type means EVERY type: "
+                "lower_ast_source_type_matrix compiles one copy per member of "
+                "the type matrix. This lowering compiles one copy and has no "
+                "type for them. If one type is what you meant, state it in "
+                "the code (an annotation) or in the contract."
             )
-            if _entry_untyped:
-                _entry_message = (
-                    f"entry {str(entrypoint)!r} parameter(s) "
-                    f"{', '.join(map(repr, _entry_untyped))} have NO declared type "
-                    "(no annotation, no extraction-contract binding). A vague "
-                    "type means EVERY type: the compiler compiles the type "
-                    "matrix for them. If that is not what you meant, state the "
-                    "type in the code (an annotation) or in the contract."
-                )
-                report(f"WARNING: {_entry_message}")
-                warnings.warn(UntypedEntryParameterWarning(_entry_message), stacklevel=2)
+            report(f"WARNING: {_entry_message}")
+            warnings.warn(UntypedEntryParameterWarning(_entry_message), stacklevel=2)
     graph.G.graph["compile_targets"] = tuple(dict.fromkeys(compile_targets))
     for intrinsic_graph in (
         graph,
@@ -68619,6 +68657,105 @@ def lower_ast_source_by_signature(source: str, entrypoint: str, root_calls, **kw
             root_signature=signature, **opts,
         ))
     return result
+
+
+#: The owner's type matrix (2026-11-26): what a vague entry type means.
+TYPE_MATRIX: tuple[str, ...] = (
+    "bool", "int8", "float16", "int16", "float32", "int32", "float64", "int64",
+)
+
+#: Which dtype-layout field spells a dtype in each native lane.
+_LANE_SPELLING_FIELD = {
+    "llvm": "llvm_type", "c": "c_storage_type", "fortran": "fortran_kind",
+}
+
+
+def type_matrix_members(lane: str, members: Sequence[str] = TYPE_MATRIX) -> dict[str, str]:
+    """Each matrix member and the dtype its copy is compiled at on ``lane``.
+
+    Owner's rule (2026-11-26): bool is its own member only where the
+    backend has a true bool.  A lane whose bool storage is spelled as one of
+    its integer storages (the C module lane stores bool as ``uint8_t``) has
+    no true bool: there the bool member is the 8-bit member, ``int8``.  A
+    member with no declared dtype layout is a named refusal, never skipped.
+    """
+
+    from ..transmogrifier.dtype_layout import DTYPES, resolve
+
+    field = _LANE_SPELLING_FIELD.get(str(lane))
+    if field is None:
+        raise ValueError(
+            f"type matrix lane {lane!r} is not one of {sorted(_LANE_SPELLING_FIELD)}"
+        )
+    undeclared = [member for member in members if resolve(str(member)) is None]
+    if undeclared:
+        raise ValueError(
+            f"type matrix member(s) {undeclared!r} have no declared dtype "
+            "layout (transmogrifier/dtype_layout.py): no lane spelling, no "
+            "storage size. Declare the layout before compiling the matrix."
+        )
+    integer_spellings = {
+        getattr(layout, field) for layout in DTYPES.values()
+        if layout.kind in {"int", "uint"} and getattr(layout, field)
+    }
+    result: dict[str, str] = {}
+    for member in members:
+        layout = resolve(str(member))
+        compiled = layout.name
+        if layout.kind == "bool" and (
+            not getattr(layout, field)
+            or getattr(layout, field) in integer_spellings
+        ):
+            compiled = "int8"
+        result[layout.name] = compiled
+    return result
+
+
+def lower_ast_source_type_matrix(
+    source: str, entrypoint: str, *, lane: str,
+    members: Sequence[str] = TYPE_MATRIX, **kwargs,
+):
+    """Compile one copy of the entry per type-matrix signature on ``lane``.
+
+    Owner's rule (2026-11-25): a vague type means every type.  The entry's
+    untyped formals (``untyped_entry_parameters``) each range over the
+    lane's matrix members (``type_matrix_members``); every combination is
+    one root-call record, and ``lower_ast_source_by_signature`` lowers one
+    exact-typed copy per distinct signature.  Returns ``{"lane", "members",
+    "formals", "copies"}``: ``members`` maps each member to the dtype its
+    copy is compiled at (bool -> int8 where the lane has no true bool), and
+    ``copies`` is ``lower_ast_source_by_signature``'s result.
+    """
+
+    import itertools
+
+    from .called_inventory import ScalarClass
+    from .extraction_contract import ExtractionContract
+
+    if "root_calls" in kwargs or "root_signature" in kwargs:
+        raise ValueError(
+            "lower_ast_source_type_matrix states the root calls itself; "
+            "pass typed formals as annotations or contract bindings"
+        )
+    policy = kwargs.get("extraction_contract")
+    if isinstance(policy, (str, os.PathLike)):
+        policy = ExtractionContract(policy)
+    formals = untyped_entry_parameters(source, str(entrypoint), policy)
+    compiled = type_matrix_members(lane, members)
+    dtypes = tuple(dict.fromkeys(compiled.values()))
+    rows = [
+        {formal: ScalarClass(dtype) for formal, dtype in zip(formals, combination)}
+        for combination in itertools.product(dtypes, repeat=len(formals))
+    ] if formals else []
+    # Every formal typed: the matrix is the one stated signature.
+    copies = (
+        lower_ast_source_by_signature(source, entrypoint, rows, **kwargs)
+        if rows else {(): ({}, lower_ast_source_to_ssa(source, entrypoint, **kwargs))}
+    )
+    return {
+        "lane": str(lane), "members": compiled, "formals": formals,
+        "copies": copies,
+    }
 
 
 def _run_source_lowering(lowering, *args: Any, **kwargs: Any):

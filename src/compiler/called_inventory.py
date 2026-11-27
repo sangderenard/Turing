@@ -41,6 +41,23 @@ class TensorClass:
         return f"AbstractTensor[{self.dtype}]"
 
 
+class ScalarClass:
+    """The class of a fixed-width scalar argument, by its dtype-layout name
+    (``int8``, ``float32``, ``bool``...).  Its spelling is the annotation
+    ``source_annotation_dtype`` reads, so the formal is typed exactly."""
+
+    def __init__(self, dtype: str) -> None:
+        from ..transmogrifier.dtype_layout import resolve
+
+        layout = resolve(str(dtype))
+        if layout is None or layout.kind not in {"bool", "int", "uint", "float"}:
+            raise ValueError(f"no scalar dtype layout declared for {dtype!r}")
+        self.dtype = layout.name
+
+    def __str__(self) -> str:
+        return self.dtype
+
+
 class MappingClass:
     """``Mapping[key, value]`` where the value class is a class record."""
 
@@ -66,7 +83,7 @@ class RecordClass:
 def class_spelling(value: Any) -> str:
     """The exact Python class of a call argument (a value or a class)."""
 
-    if isinstance(value, (TensorClass, MappingClass, RecordClass)):
+    if isinstance(value, (TensorClass, ScalarClass, MappingClass, RecordClass)):
         return str(value)
     cls = value if isinstance(value, type) else type(value)
     # A list call record names its element class: ``list[int]`` types the
