@@ -28032,6 +28032,43 @@ def _source_primitive_scalar_descriptor(graph: Any, node_id: int):
     ))
     if receipt is None or receipt["storage"] != "scalar" or receipt["rank"] != 0:
         return None, ()
+    # Program: GLSL ``float rand01(inout uint s)`` read as ``held:
+    # 'float32' = float(s & mask)``.  Wrong record: the class (builtins.float)
+    # alone was read, so the declared float32 value was described float64,
+    # its caller's actual was float64, and the callee formal it fed
+    # (``u: 'float32'``) and every expression over it followed ("conditional
+    # union arm changes its physical ABI" in the Studio shader's
+    # cosine_dir).  Rule: the class names the kind; a value bound to an
+    # annotated fixed-width local of that kind has the declared width (the
+    # declaration proved by its ANNOTATION_DECLARATION cell, which is cited).
+    local_declaration = (
+        graph.G.nodes[int(node_id)].get("attributes") or {}
+    ).get("local_scalar_annotation")
+    if local_declaration is not None:
+        from .concordance_declarations import ANNOTATION_DECLARATION
+        from ..transmogrifier.dtype_layout import (
+            resolve as _declared_layout,
+            source_annotation_dtype as _declared_dtype,
+        )
+
+        width, annotation_cell = local_declaration
+        fact = book.page(ANNOTATION_DECLARATION).cell(
+            annotation_cell.row, annotation_cell.column,
+        )
+        declared_layout = _declared_layout(str(width))
+        class_layout = _declared_layout(receipt["dtype"])
+        if (
+            _declared_dtype(fact.annotation) == width
+            and declared_layout is not None and class_layout is not None
+            and (declared_layout.kind == class_layout.kind
+                 or {declared_layout.kind, class_layout.kind} <= {"int", "uint"})
+        ):
+            return {"shape": (), "dtype": str(width), "rank": 0}, tuple(
+                dict.fromkeys((
+                    evidence.class_cell, identity, annotation_cell,
+                    *evidence.proof_cells,
+                ))
+            )
     # _ascending_order's weights.shape[0] already had builtins.int while
     # descriptor planning read it as tensor indexing. Only Inputs consulted
     # that class; waiting for the later VALUE_TYPE_ABI publication was too
@@ -29597,6 +29634,56 @@ def _tensor_descriptor_rule(
                 tensor["metadata_state"] = str(boundary["metadata_state"])
     if "shape" not in tensor:
         scalar_descriptor, _scalar_cells = _source_primitive_scalar_descriptor(graph, int(node_id))
+        if (
+            scalar_descriptor is not None
+            and descriptor_operation in _ELEMENTWISE_BINARY_OPERATIONS
+            and descriptor_operation not in _ELEMENTWISE_PREDICATE_OPERATIONS
+        ):
+            # Program: GLSL ``max(0.0, 1.0 - u)`` with ``u: 'float32'`` and
+            # ``1.0`` a declared float32 literal (the Studio shader's
+            # cosine_dir).  Wrong record: the class (builtins.float) answered
+            # first, with its class default float64, before the elementwise
+            # law below read the float32 operands, so the conditional's arms
+            # disagreed (float32 against float64).  Rule: the class proves the
+            # KIND; when every operand is a rank-0 scalar of that kind, the
+            # width is the elementwise join of the operand widths
+            # (``_operand_result_dtype``), the same law the elementwise rule
+            # applies.  Otherwise the class receipt stands.
+            from ..transmogrifier.dtype_layout import resolve as _kind_layout
+
+            class_layout = _kind_layout(scalar_descriptor.get("dtype"))
+            operand_ids = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role).casefold() in {
+                    "lhs", "rhs", "left", "right", "operand", "value", "other",
+                } and int(parent) in graph.G
+            )
+            sides = [
+                _tensor_descriptor(graph, operand, seen)
+                for operand in operand_ids
+            ]
+            side_layouts = [
+                None if not isinstance(side, Mapping)
+                or tuple(side.get("shape") or ()) != ()
+                else _kind_layout(side.get("dtype"))
+                for side in sides
+            ]
+            if (
+                class_layout is not None
+                and len(operand_ids) >= 2
+                and None not in side_layouts
+                and all(
+                    layout.kind == class_layout.kind
+                    or {layout.kind, class_layout.kind} <= {"int", "uint"}
+                    for layout in side_layouts
+                )
+            ):
+                return {
+                    **scalar_descriptor,
+                    "dtype": _operand_result_dtype(
+                        tuple(str(side["dtype"]) for side in sides)
+                    ),
+                }
         if scalar_descriptor is not None:
             return scalar_descriptor
     if "shape" not in tensor:

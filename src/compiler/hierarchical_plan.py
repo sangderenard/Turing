@@ -547,6 +547,49 @@ def plan_region_to_ssa_instrs(
                         return str(width)
         return python_int_literal_dtype(literal)
 
+    def scalar_cast_result_dtype(opcode: str, value_id: int | None) -> str:
+        """The width of a scalar cast's result: its declaration, else the class.
+
+        Program: GLSL ``float rand01(inout uint s)`` read as ``held:
+        'float32' = float(s & mask)``.  Wrong record: the cast took the
+        class's table width (``float`` -> float64), so the division over it
+        ran in float64 and only the boundary rounded to float32, one ulp off
+        the shader.  Rule: a cast whose result is the value of an annotated
+        fixed-width local of the cast's kind -- its one VALUE_TYPE_ABI arm
+        citing that ANNOTATION_DECLARATION -- converts to the declared
+        width; the table width is the default only without one.
+        """
+
+        default = scalar_cast_dtypes[opcode]
+        if value_id is None or lexical_read_scope is None:
+            return default
+        from .concordance_declarations import ANNOTATION_DECLARATION, VALUE_TYPE_ABI
+        from ..transmogrifier.dtype_layout import resolve, source_annotation_dtype
+
+        default_layout = resolve(default)
+        book = current_identity_book()
+        abi = book.page(VALUE_TYPE_ABI).latest(
+            (tuple(lexical_read_scope), int(value_id)),
+        )
+        arms = tuple(getattr(abi, "physical_alternatives", ()))
+        if default_layout is None or len(arms) != 1:
+            return default
+        arm = arms[0]
+        if arm.storage != "scalar" or arm.rank != 0 or arm.shape:
+            return default
+        for cell in arm.source_cells:
+            if cell.page != ANNOTATION_DECLARATION:
+                continue
+            declaration = book.page(ANNOTATION_DECLARATION).cell(cell.row, cell.column)
+            width = source_annotation_dtype(declaration.annotation)
+            layout = resolve(width) if width is not None else None
+            if width == arm.dtype and layout is not None and (
+                layout.kind == default_layout.kind
+                or {layout.kind, default_layout.kind} <= {"int", "uint"}
+            ):
+                return str(width)
+        return default
+
     # An authored Python scalar literal is a weak operand: it names a value,
     # not an element width, so beside a typed float operand it does not widen
     # the result (``float32 * 2.0`` is float32, as in the eager lane).
@@ -708,7 +751,7 @@ def plan_region_to_ssa_instrs(
             elif opcode in integer_result_ops:
                 inferred = "int64"
             elif opcode in scalar_cast_dtypes:
-                inferred = scalar_cast_dtypes[opcode]
+                inferred = scalar_cast_result_dtype(opcode, output_id)
             elif opcode == "bitcast":
                 # A bit reinterpretation's result is its declared type.
                 inferred = str(dict(item.attributes)["target_dtype"])
@@ -764,7 +807,9 @@ def plan_region_to_ssa_instrs(
         elif item.outputs and opcode in integer_result_ops:
             dtype_of[int(item.outputs[0])] = "int64"
         elif item.outputs and opcode in scalar_cast_dtypes:
-            dtype_of[int(item.outputs[0])] = scalar_cast_dtypes[opcode]
+            dtype_of[int(item.outputs[0])] = scalar_cast_result_dtype(
+                opcode, int(item.outputs[0]),
+            )
         elif item.outputs and opcode == "bitcast":
             dtype_of[int(item.outputs[0])] = str(
                 dict(item.attributes)["target_dtype"]
@@ -1079,7 +1124,10 @@ def plan_region_to_ssa_instrs(
         if opcode.casefold() in scalar_cast_dtypes:
             attributes.setdefault("source_operator", opcode)
             attributes.setdefault(
-                "target_dtype", scalar_cast_dtypes[opcode.casefold()]
+                "target_dtype", scalar_cast_result_dtype(
+                    opcode.casefold(),
+                    int(item.outputs[0]) if item.outputs else None,
+                )
             )
             opcode = "Cast"
         elif opcode.casefold() == "bitcast":
