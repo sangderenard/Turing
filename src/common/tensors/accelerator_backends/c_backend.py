@@ -31,6 +31,7 @@ import os
 import ctypes
 import ctypes.util
 import json
+import re
 from typing import Any, Tuple, Optional, List
 from cffi import FFI
 
@@ -48,34 +49,35 @@ from ..abstraction_methods.indexing import (
 )
 
 
+from pathlib import Path
+
+C_BACKEND_DIRECTORY = Path(__file__).with_name("c_backend")
+HEADER_PATH = C_BACKEND_DIRECTORY / "ctensor_ops.h"
+HEADER_TYPES = ("CTensorOp", "CTensorOperandKind", "CTensorPrimitiveInstruction")
+
+
+def header_type_declarations(text: str) -> str:
+    """The ``typedef`` enums and structs of ``ctensor_ops.h``, exactly as written there.
+
+    cffi numbers an enum as C does (the explicit first value, then one more per name), so these declarations give
+    a plain library loaded with ``ffi.dlopen`` the header's own opcodes. Python keeps no second opcode table.
+    """
+
+    blocks = {
+        match.group(1): match.group(0)
+        for match in re.finditer(
+            r"(?ms)^typedef[ \t]+(?:enum|struct)[ \t]+(\w+)[ \t]*\{.*?\}[ \t]*\1[ \t]*;", text
+        )
+    }
+    missing = [name for name in HEADER_TYPES if name not in blocks]
+    if missing:
+        raise ValueError(f"ctensor_ops.h does not declare {', '.join(missing)}")
+    return "\n".join(blocks[name] for name in HEADER_TYPES)
+
+
 ffi = FFI()
+ffi.cdef(header_type_declarations(HEADER_PATH.read_text(encoding="utf-8")))
 ffi.cdef("""
-    typedef enum CTensorOp {
-        CT_OP_ADD, CT_OP_SUB, CT_OP_MUL, CT_OP_DIV, CT_OP_POW,
-        CT_OP_MOD, CT_OP_FLOORDIV, CT_OP_SQRT, CT_OP_EXP, CT_OP_LOG,
-        CT_OP_NEG, CT_OP_ABS, CT_OP_ROUND, CT_OP_TRUNC, CT_OP_FLOOR,
-        CT_OP_CEIL, CT_OP_ISFINITE, CT_OP_ISNAN, CT_OP_ISINF,
-        CT_OP_LOGICAL_NOT, CT_OP_LT, CT_OP_LE, CT_OP_GT, CT_OP_GE,
-        CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, CT_OP_TANH,
-        CT_OP_SIN, CT_OP_COS, CT_OP_TAN, CT_OP_ASIN, CT_OP_ACOS,
-        CT_OP_ATAN, CT_OP_SINH, CT_OP_COSH, CT_OP_ASINH, CT_OP_ACOSH,
-        CT_OP_ATANH, CT_OP_SIGN, CT_OP_INVERT, CT_OP_SIGMOID,
-        CT_OP_BITAND, CT_OP_BITOR,
-        CT_OP_BITXOR, CT_OP_SHL, CT_OP_SHR, CT_OP_LOGICAL_AND,
-        CT_OP_LOGICAL_OR, CT_OP_ATAN2, ...
-    } CTensorOp;
-    typedef enum CTensorOperandKind {
-        CT_OPERAND_NONE, CT_OPERAND_SLOT, CT_OPERAND_SCALAR
-    } CTensorOperandKind;
-    typedef struct CTensorPrimitiveInstruction {
-        CTensorOp op;
-        int out_slot;
-        int left_slot;
-        CTensorOperandKind right_kind;
-        int right_slot;
-        double right_scalar;
-        int reverse;
-    } CTensorPrimitiveInstruction;
     void fill_double(double* out, double value, int n);
     void binary_double(
         const double* a, const double* b, double* out, int n, int op);
@@ -226,25 +228,79 @@ ffi.cdef("""
     void cat_double(const double** tensors, const int* dim_sizes, int num_tensors, const int* shape, int ndim, int dim, double* out);
 """)
 
-from pathlib import Path
-
 # Attempt to load the C implementation from a standalone source file. The
 # repository previously embedded a full copy of the C source as a fallback, but
 # this redundancy made maintenance difficult. The file must now exist or the
 # backend will raise an error. This approach encourages explicit dependency
 # management and avoids silent mismatches between versions.
-SOURCE_PATH = Path(__file__).with_name("c_backend") / "ctensor_ops.c"
+SOURCE_PATH = C_BACKEND_DIRECTORY / "ctensor_ops.c"
 VALIDATION_SOURCE_PATH = SOURCE_PATH.with_name("turing_validation_runtime.c")
 if not SOURCE_PATH.exists():
     raise FileNotFoundError(f"Missing C source: {SOURCE_PATH}")
 C_SOURCE = SOURCE_PATH.read_text() + '\n' + VALIDATION_SOURCE_PATH.read_text()
 
+
+def native_library_path() -> Path | None:
+    """Build the ops as a plain shared library in the accelerator cache, or ``None`` without a GNU toolchain.
+
+    ``native_library`` compiles with a real compiler into a short temporary folder, so the build does not depend on
+    how deep the checkout is; the library is then moved into one cache folder per source and toolchain identity.
+    No Python headers, no extension module. On Windows the validation runtime's ``dllexport`` marks would make
+    the linker export only those functions, so every symbol is exported explicitly.
+
+    The toolchain's libm computes the transcendentals, as the numeric contract's ``compute`` mode names
+    (``transcendentals: backend_intrinsic``); a host-independent, correctly rounded result is the
+    ``scientific``/``stochastic`` modes' ``signal_cores`` route (``ssa_call_input_adapters``), not a choice of compiler.
+    """
+
+    import sys
+    import tempfile
+
+    from .artifact_cache import artifact_identity, implementation_digest, repository_cache_root
+    from .native_library import compile_shared_library, preferred_toolchain
+
+    toolchain = preferred_toolchain()
+    if toolchain is None or toolchain.kind != "gnu":
+        return None
+    flags = ["-I", str(C_BACKEND_DIRECTORY)]
+    # Windows: export every symbol (see above), and link the compiler's runtimes (libgcc, winpthread for
+    # _Thread_local) in statically, so the library loads with only the system C runtime.
+    flags += ["-Wl,--export-all-symbols", "-static"] if sys.platform == "win32" else ["-lm"]
+    sources = tuple(sorted((*C_BACKEND_DIRECTORY.glob("*.c"), *C_BACKEND_DIRECTORY.glob("*.h"))))
+    identity = artifact_identity({
+        "artifact": "ctensor_ops", "sources": implementation_digest(sources),
+        "toolchain": toolchain.executable, "flags": flags,
+    })
+    suffix = ".dll" if sys.platform == "win32" else (".dylib" if sys.platform == "darwin" else ".so")
+    library = repository_cache_root() / "c" / "ctensor" / identity[:16] / f"ctensor_ops{suffix}"
+    if library.exists():
+        return library
+    with tempfile.TemporaryDirectory(prefix="ctensor_") as build:
+        built, _toolchain = compile_shared_library(
+            C_SOURCE, name="ctensor_ops", directory=build, extra_flags=flags, toolchain=toolchain,
+        )
+        library.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(built, library)
+        except OSError:
+            if not library.exists():           # another process placed the same library first
+                raise
+    return library
+
+
+# How ``C`` was loaded: "prebuilt" (TENSOR_CTENSOR_LIB), "native" (a plain shared library), or "cffi" (an
+# extension module, only when no GNU toolchain exists).
 _prebuilt = os.environ.get("TENSOR_CTENSOR_LIB")
 if _prebuilt and os.path.exists(_prebuilt):
-    C = ffi.dlopen(_prebuilt)
+    C_LIBRARY, C_LOADING = Path(_prebuilt), "prebuilt"
+else:
+    C_LIBRARY = native_library_path()
+    C_LOADING = "cffi" if C_LIBRARY is None else "native"
+if C_LIBRARY is not None:
+    C = ffi.dlopen(str(C_LIBRARY))
 else:
     C = ffi.verify(
-        C_SOURCE, include_dirs=[str(SOURCE_PATH.parent)],
+        C_SOURCE, include_dirs=[str(C_BACKEND_DIRECTORY)],
     )
 
 # ########## STUB: build_ctensor_with_zig ##########
