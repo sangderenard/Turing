@@ -11,7 +11,9 @@ library_manage, see DEFAULT_POLICY); so is ``intern`` (a guest agent's kiosk acc
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
-photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit, compile_unstable, message.  ``capabilities(principal, policy)`` is the one place they are computed:
+photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit, compile_unstable, message,
+mail_send (sending mail, mail.py: admin by default; another role gets it when an admin adds it to that role's list
+in the policy file, which REPLACES the default list, so write the role's whole list plus mail_send).  ``capabilities(principal, policy)`` is the one place they are computed:
 
     effective = tier_caps[tier] | role_caps[role]
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
@@ -123,7 +125,7 @@ except ImportError:
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
         "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git", "paper_train", "nodus_edit",
-        "operator_workspace", "agent_scratch", "private_read", "agent_execute")
+        "operator_workspace", "agent_scratch", "private_read", "agent_execute", "mail_send")
 ROLES = ("admin", "member", "dev", "service", "operator", "intern", "guest")
 KIOSK_ROLES = ("intern",)      # answered only on catalog endpoints declared kiosk (see KIOSK above)
 ORIGINS = ("lan", "ip", "dns")
@@ -136,7 +138,7 @@ DEFAULT_POLICY = {
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
         "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message",
-                                              "core_git", "paper_train", "private_read")],
+                                              "core_git", "paper_train", "private_read", "mail_send")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],

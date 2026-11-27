@@ -63,7 +63,7 @@ def test_admin_lan_everything():
 def test_member_lan_edit_has_no_admin_caps():
     caps = authz.capabilities(P("member", "lan", "edit"), authz.DEFAULT_POLICY)
     assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts", "federate", "core_git", "paper_train", "operator_workspace",
-                    "private_read"}
+                    "private_read", "mail_send"}
 
 
 def test_higher_permission_group_inherits_lower_capabilities():

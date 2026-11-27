@@ -42,13 +42,16 @@
         "--nodus-ui",
         "nodus-messenger:47614",
         "--nodus-ui",
-        "nodus-training:47620"
+        "nodus-training:47620",
+        "--mail-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/mail"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
       "studio_prefix": "studio.product",
       "system_events": true,
+      "mail_prefix": "mail",
       "firewall": [
         {"protocol": "TCP", "port": 8766, "program": "C:/dev/Powershell/srv/python/python.exe"}
       ],
@@ -137,7 +140,9 @@
         "--cron",
         "cron:7201:C:/dev/Powershell/srv/state/jobs/cron",
         "--nodus-root",
-        "C:/dev/Powershell/nodus"
+        "C:/dev/Powershell/nodus",
+        "--cron",
+        "mail:7204:C:/dev/Powershell/srv/state/jobs/mail"
       ],
       "leases": [],
       "nodus": {
@@ -148,7 +153,8 @@
           "gui.proof:4:54000",
           "studio.product:4:7200",
           "cron:4:36000",
-          "userlist:4:3600"
+          "userlist:4:3600",
+          "mail:4:36000"
         ],
         "rate": 60,
         "console_port": 47612,
@@ -345,6 +351,30 @@
         "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
         "127.0.0.1",
         "47698"
+      ]
+    },
+    {
+      "name": "mail",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "0.0.0.0",
+      "account": "svc-mail",
+      "federation_from": "nodus-messenger",
+      "mail_prefix": "mail",
+      "firewall": [
+        {"protocol": "TCP", "port": 47625, "program": "C:/dev/Powershell/srv/python/python.exe"}
+      ],
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/deploy/mail_service.py",
+        "--config",
+        "C:/dev/Powershell/turing/examples/meowdoku/deploy/mail.json",
+        "--accounts-db",
+        "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--mail-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/mail"
       ]
     },
     {
