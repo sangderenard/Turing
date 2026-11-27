@@ -1020,9 +1020,16 @@ def _scalar_c_type(dtype) -> str:
         # Conceptual None's existing inert scalar carrier; not a numeric dtype.
         return "double"
     layout = dtype_layout(name)
-    # Scalar float32 arithmetic deliberately uses the native lane's double
-    # register contract. Its span storage remains float below.
-    return "double" if layout.name == "float32" else layout.c_storage_type
+    # A float32 scalar's register is the work contract's
+    # ``float32_scalar_register``: ``float32`` (the default) computes it as
+    # float; ``float64`` keeps the earlier double register.  Span storage is
+    # float under both.
+    if layout.name == "float32":
+        from .work_contract import active_contract
+
+        if active_contract().float32_scalar_register == "float64":
+            return "double"
+    return layout.c_storage_type
 
 
 def _unsigned_c_type(dtype) -> str:

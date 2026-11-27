@@ -163,7 +163,12 @@ def test_pointer_call_abi_does_not_erase_integer_signedness():
     assert any("call integer storage requires explicit conversion" in item.reason for item in artifact.shortfalls)
 
 
-def test_float32_row_load_widens_after_reading_four_bytes(tmp_path):
+@pytest.mark.parametrize("register", ["float32", "float64"])
+def test_float32_row_load_widens_after_reading_four_bytes(tmp_path, monkeypatch, register):
+    # The work contract's ``float32_scalar_register``: under ``float32`` (the
+    # default) a float32 scalar result is a float32 value; under ``float64``
+    # it is held in the lane's double register, widened after the 4-byte read.
+    monkeypatch.setenv("TURING_FLOAT32_SCALAR_REGISTER", register)
     data = SSAValue(0, "float32", (3,))
     index, address, loaded = SSAValue(1, "int64"), SSAValue(2, "ptr"), SSAValue(3, "float32")
     module = IRModule({"root": Function("root", [data], {"entry": BasicBlock("entry", [
@@ -173,9 +178,13 @@ def test_float32_row_load_widens_after_reading_four_bytes(tmp_path):
     ])})})
     artifact, buffers = run(module, {0: np.array([3, 1.5, 9], dtype="float32")}, tmp_path)
     assert buffers[3].item() == 1.5
-    assert buffers[3].dtype == np.dtype("float64")
     assert "load float" in artifact.llvm_ir
-    assert "fpext float" in artifact.llvm_ir
+    if register == "float64":
+        assert buffers[3].dtype == np.dtype("float64")
+        assert "fpext float" in artifact.llvm_ir
+    else:
+        assert buffers[3].dtype == np.dtype("float32")
+        assert "fpext float" not in artifact.llvm_ir
 
 
 def test_elementwise_integer_sweep_keeps_common_dtype_refusal():

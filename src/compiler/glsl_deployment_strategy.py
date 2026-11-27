@@ -1096,6 +1096,64 @@ def _callsite_argument_descriptor(
     return _planned_scalar_actual_descriptor(caller, int(argument_id))
 
 
+def _declared_formal_descriptors(
+    callee: Any, descriptors: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Formal descriptors with each declared fixed scalar width applied.
+
+    Program: the Studio response shader's ``vec3 cosine_dir(float u, float
+    v, vec3 normal)``, read as ``u: 'float32'``, called from 13 sites.
+    Wrong record: a formal's descriptor was its actual's, and one actual was
+    described float64, so ``u``, ``v`` and everything computed from them
+    (``sqrt``, ``cos``, ``1.0 - u``) were float64 beside the float32
+    literals; the conditional ``max(0.0, 1.0 - u)`` refused ("conditional
+    union arm changes its physical ABI").  Rule (owner, 2026-11-26: "whatever
+    the output says it should be is what it needs to be cast as"): a rank-0
+    scalar formal whose authored annotation declares a fixed width
+    (``PARAMETER_ANNOTATION``; ``source_annotation_states_width``) of the
+    actual's kind has the declared width; the actual converts at the call.
+    A class annotation (``x: float``) or none keeps the actual's width.
+    """
+
+    from .concordance_declarations import PARAMETER_ANNOTATION
+    from .identity_concordance import current_identity_book
+    from ..transmogrifier.dtype_layout import (
+        resolve, source_annotation_dtype, source_annotation_states_width,
+    )
+
+    owner = getattr(callee, "G", callee).graph.get("authored_function_identity")
+    result = dict(descriptors)
+    if not isinstance(owner, (tuple, list)) or len(owner) != 2:
+        return result
+    book = current_identity_book()
+    page = book.pages.get(PARAMETER_ANNOTATION.name)
+    if page is None:
+        return result
+    for name, descriptor in descriptors.items():
+        if not isinstance(descriptor, Mapping) or tuple(
+            descriptor.get("shape") or ()
+        ) != () or int(descriptor.get("rank", 0) or 0) != 0:
+            continue
+        cell = book.latest_ref(PARAMETER_ANNOTATION, (*owner, str(name)))
+        if cell is None:
+            continue
+        annotation = page.cell(cell.row, cell.column)
+        if not source_annotation_states_width(annotation):
+            continue
+        width = source_annotation_dtype(annotation)
+        declared = resolve(width)
+        actual = resolve(descriptor.get("dtype"))
+        if declared is None or actual is None or str(width) == str(
+            descriptor.get("dtype")
+        ):
+            continue
+        if declared.kind == actual.kind or {declared.kind, actual.kind} <= {
+            "int", "uint",
+        }:
+            result[name] = {**dict(descriptor), "dtype": str(width)}
+    return result
+
+
 def _concorded_tensor_result_class(
     graph: Any, value_id: int,
 ) -> tuple[bool, Any]:
@@ -25278,7 +25336,9 @@ def _propagate_callsite_tensor_specializations(
                 caller, int(node_id), int(parent),
             )
             if descriptor is not None:
-                descriptors[parameter] = descriptor
+                descriptors[parameter] = _declared_formal_descriptors(
+                    callee, {parameter: descriptor},
+                )[parameter]
             actual_record, actual_record_cell = (
                 _source_value_record_view_with_cell(caller, int(parent))
             )
@@ -25557,7 +25617,7 @@ def _propagate_callsite_tensor_specializations(
             specialization_dtypes,
         )
         specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
-            descriptors
+            _declared_formal_descriptors(specialized, descriptors)
         )
         specialized.G.graph["planner_aggregate_descriptors"] = copy.deepcopy(
             aggregate_descriptors
@@ -26840,6 +26900,10 @@ def _propagate_callsite_tensor_specializations(
             callee = function_table.entry(reference).graph
             if callee is None:
                 continue
+            # Compared and stored at the formal's declared width: comparing
+            # the actual's width with the stored declared width read as a
+            # change every round ("repeated a completed state").
+            descriptors = _declared_formal_descriptors(callee, descriptors)
             existing = callee.G.graph.setdefault(
                 "planner_tensor_descriptors", {}
             )
@@ -28041,9 +28105,34 @@ def _source_primitive_scalar_descriptor(graph: Any, node_id: int):
     # cosine_dir).  Rule: the class names the kind; a value bound to an
     # annotated fixed-width local of that kind has the declared width (the
     # declaration proved by its ANNOTATION_DECLARATION cell, which is cited).
-    local_declaration = (
-        graph.G.nodes[int(node_id)].get("attributes") or {}
-    ).get("local_scalar_annotation")
+    node_attributes = graph.G.nodes[int(node_id)].get("attributes") or {}
+    if (
+        graph.G.nodes[int(node_id)].get("type") == "Input"
+        and node_attributes.get("binding_kind") == "parameter"
+    ):
+        # The same rule for a formal: its declared fixed width
+        # (``_declared_formal_descriptors``), the annotation cell cited.
+        from .concordance_declarations import PARAMETER_ANNOTATION
+
+        owner = graph.G.graph.get("authored_function_identity")
+        parameter_cell = (
+            book.latest_ref(PARAMETER_ANNOTATION, (
+                *owner, str(node_attributes.get("binding_name")),
+            ))
+            if isinstance(owner, (tuple, list)) and len(owner) == 2
+            else None
+        )
+        declared = _declared_formal_descriptors(graph, {
+            str(node_attributes.get("binding_name")): {
+                "shape": (), "dtype": receipt["dtype"], "rank": 0,
+            },
+        })[str(node_attributes.get("binding_name"))]
+        if parameter_cell is not None and declared["dtype"] != receipt["dtype"]:
+            return dict(declared), tuple(dict.fromkeys((
+                evidence.class_cell, identity, parameter_cell,
+                *evidence.proof_cells,
+            )))
+    local_declaration = node_attributes.get("local_scalar_annotation")
     if local_declaration is not None:
         from .concordance_declarations import ANNOTATION_DECLARATION
         from ..transmogrifier.dtype_layout import (
@@ -37039,6 +37128,7 @@ def _apply_callsite_tensor_descriptors(
     graph: Any,
     descriptors: Mapping[str, Mapping[str, Any]],
 ) -> None:
+    descriptors = _declared_formal_descriptors(graph, descriptors)
     graph.G.graph["callsite_tensor_descriptor_names"] = tuple(sorted({
         *map(
             str,
@@ -39384,7 +39474,11 @@ def _callsite_literal_shell_type(
                 file=sys.stderr, flush=True,
             )
         if descriptor is not None:
-            tensor_descriptors[parameter] = descriptor
+            # The formal's declared fixed width, before it enters the
+            # specialization signature (``_declared_formal_descriptors``).
+            tensor_descriptors[parameter] = _declared_formal_descriptors(
+                original, {parameter: descriptor},
+            )[parameter]
         static_argument = _source_static_value(
             caller, int(parent),
         ) and _callsite_argument_is_initializer(
@@ -39816,7 +39910,7 @@ def _callsite_literal_shell_type(
         sorted(parameter_int_ranges.items())
     )
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
-        tensor_descriptors
+        _declared_formal_descriptors(specialized, tensor_descriptors)
     )
     # A member-bound aggregate formal is a different frame from the same
     # formal bound whole as storage; the symbol digest reads this record.

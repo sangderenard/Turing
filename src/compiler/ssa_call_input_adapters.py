@@ -1779,10 +1779,47 @@ def _adapt_physical_call_inputs_round(
                                 source_dtype, formal.dtype,
                             )
                         )
+                        # Program: the Studio response shader's ``cosine_dir(
+                        # float u, ...)`` (``u: 'float32'``) reached by a
+                        # float64 actual; the test ``main(x: float) ->
+                        # f(x)`` with ``f(u: 'float32')``.  Wrong record: an
+                        # actual with a physical (contract) dtype passed BY
+                        # VALUE to a narrower declared scalar formal met no
+                        # rule -- the physical rule excludes by-value formals
+                        # of another dtype, the logical rule excludes
+                        # physical actuals -- and was refused ("incompatible
+                        # physical call inputs").  Rule: the actual's storage
+                        # stays immutable; the formal receives a converted
+                        # VALUE, as the numeric contract's
+                        # ``implicit_conversion`` allows, rounded by its
+                        # ``float_precision_rounding`` (and integer
+                        # narrowing by ``integer_narrowing``).
+                        declared_scalar_value_conversion = bool(
+                            not actual.shape
+                            and not formal.shape
+                            and formal.dtype != 'ptr'
+                            # A formal with a physical contract of its own
+                            # (an authored callee's ``physical_dtype``) is
+                            # judged by the physical rule above; this rule
+                            # is for a formal whose width is its declaration.
+                            and not (formal.accounting or {}).get('physical_dtype')
+                            and (accounting.get('program_abi_storage') == 'scalar'
+                                 or accounting.get('physical_dtype'))
+                            and int(accounting.get('program_abi_rank') or 0) == 0
+                            and not sequence_arena_by_reference
+                            and source_numeric_dtype is not None
+                            and _numeric_physical_name(formal.dtype) is not None
+                            and source_numeric_dtype != _numeric_physical_name(formal.dtype)
+                            and not _call_writes_argument(instruction, index)
+                            and read_only(callee, formal.id)
+                        )
                         if proven_integer_edge:
                             target_dtype = formal.dtype
-                        elif not (logical_scalar_conversion or logical_pointer_scalar_conversion or physical_conversion):
+                        elif not (logical_scalar_conversion or logical_pointer_scalar_conversion
+                                  or physical_conversion or declared_scalar_value_conversion):
                             continue
+                        if declared_scalar_value_conversion and not physical_conversion:
+                            target_dtype = formal.dtype
                         # Only numerical scalar representation changes belong
                         # here. Records, references and string tokens are not
                         # interchangeable numerical values.
