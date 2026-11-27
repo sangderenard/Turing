@@ -449,6 +449,67 @@ def test_declared_int_return_and_folded_constants_keep_glsl_widths_on_llvm():
         assert int(outs[0]) == expected
 
 
+def test_uint_conditional_compared_to_uint_literal_stays_uint32_on_llvm():
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    # The Studio response shader's studio_response_copy termination code:
+    # ``(... ? 2u : ...) == 0u ? 8u : ...``.  Before: the conditional's
+    # contract named only its class (builtins.int), whose int64 default
+    # was seeded over its uint32 arms, so the comparison's region was fed
+    # int64 from the uint32 Phi ("incompatible final physical call
+    # inputs"; in the whole shader "native union alternative has
+    # conflicting physical ProgramABI" uint32 != int64).
+    source = '''#version 430
+    layout(local_size_x = 1) in;
+    layout(std430, binding = 0) buffer Vals { float vals[]; };
+    layout(std430, binding = 1) buffer Outs { uint outs[]; };
+    void main() {
+        float z = vals[0];
+        outs[0] = (z < 0.0 ? 2u : 3u) == 2u ? 8u : 1u;
+    }'''
+    result = lower_glsl_source_to_ast(source)
+    assert result.complete, result.shortfall_report()
+    root = Path(__file__).resolve().parents[1]
+    span = {'function': '*', 'storage': 'span', 'rank': 1,
+            'python_type': 'src.common.tensors.abstraction.AbstractTensor'}
+    contract = ExtractionContract(
+        root / 'extraction_contracts/program_extraction.yaml'
+    ).with_program_abi({'records': {}, 'bindings': [], 'values': [
+        {**span, 'parameter': 'vals', 'dtype': 'float32'},
+        {**span, 'parameter': 'outs', 'dtype': 'uint32'},
+    ]}).with_execution_file(
+        root / 'extraction_contracts/vehicle_full_native_execution.yaml')
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        ast.unparse(result.module), 'main', extraction_contract=contract,
+        python_bindings={'AbstractTensor': AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        runtime_closure_only=True, progress_bars=False)
+    phis = [ins for fn in module.functions.values() for block in fn.blocks.values()
+            for ins in block.instrs if ins.op == 'Phi']
+    assert phis and all(arg.dtype == 'uint32' for ins in phis for arg in ins.args)
+    entry = exports[0]
+    names = dict(module.functions[entry].metadata['parameter_names'])
+    emitted = emit_ssa_function_to_llvm(module, entry)
+    assert not emitted.shortfalls
+    artifact = compile_artifact(emitted, directory=tempfile.mkdtemp())
+    for z, expected in ((-1.0, 8), (0.5, 1), (float('nan'), 1)):
+        vals = np.array([z], dtype=np.float32)
+        outs = np.zeros(1, dtype=np.uint32)
+        prepare_artifact_execution(
+            artifact, {names['vals']: vals, names['outs']: outs}).run()
+        assert int(outs[0]) == expected
+
+
 def test_float_returned_through_inout_tuple_stays_float32_on_llvm():
     import tempfile
     from pathlib import Path
