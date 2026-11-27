@@ -1642,6 +1642,10 @@ exit:
     "turing_validation_error_take_active": (
         "declare i32 @turing_validation_error_take_active(ptr)"
     ),
+    # ssa_fault_exits: a caller reads whether its callee left by a fault.
+    "turing_validation_error_pending": (
+        "declare i32 @turing_validation_error_pending()"
+    ),
     "turing_validation_error_raise_packet": (
         "declare void @turing_validation_error_raise_packet(ptr)"
     ),
@@ -2678,6 +2682,12 @@ def _emit_repository_call_module(
         name: "__ssa_" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", name)
         for name in reachable
     }
+    # A fault exit leaves the whole SSA call chain (ssa_fault_exits).
+    from .ssa_fault_exits import (
+        fault_exit_functions as _fault_exit_functions,
+        propagates_fault_after_call as _propagates_fault_after_call,
+    )
+    fault_exits = _fault_exit_functions(module)
 
     def literal(payload: _Any, llvm_type: str) -> str:
         if llvm_type == "double":
@@ -4953,6 +4963,27 @@ def _emit_repository_call_module(
                     selected = aggregate_positions.get(
                         (name, result_id), tuple(range(len(callee_outputs)))
                     )
+                    # Program: declared Sum over a tensor; region 5 returns
+                    # (view storage, shape, rank) and the folded view leaves
+                    # the call selecting Ret slots (1, 2).  Wrong record: the
+                    # callee's outputs are those selected Ret positions
+                    # renumbered 0..k-1 (function_output_ret_positions), but
+                    # the call read result_ptrs[slot] by the raw Ret slot, so
+                    # the shape (slot 1) took the rank cell and both region 6
+                    # operands were the rank: the runtime broadcast guard
+                    # failed (code 100).  Rule: a slot names a Ret position;
+                    # its out parameter is that position's index among the
+                    # callee's published outputs.
+                    callee_ret_positions = function_output_ret_positions.get(
+                        symbol
+                    )
+
+                    def callee_output_index(slot: int) -> int:
+                        if callee_ret_positions is None:
+                            return int(slot)
+                        if int(slot) in callee_ret_positions:
+                            return callee_ret_positions.index(int(slot))
+                        return -1
                     projections = projection_values.get(result_id, {})
                     forwarded = forwarded_aggregate_calls.get(name)
                     if (
@@ -4987,12 +5018,13 @@ def _emit_repository_call_module(
                         and len(declared_ids) == len(declared_positions)
                         == len(declared_slots)
                         and all(
-                            0 <= slot < len(callee_outputs)
+                            0 <= callee_output_index(slot) < len(callee_outputs)
                             for slot in declared_slots
                         )
                     ):
                         selected_position_by_slot = dict(zip(
-                            declared_slots, declared_positions
+                            map(callee_output_index, declared_slots),
+                            declared_positions,
                         ))
                         result_ptrs = []
                         for output_index, value in enumerate(callee_outputs):
@@ -5313,6 +5345,25 @@ def _emit_repository_call_module(
                             ))
                             + ")"
                         )
+                        if _propagates_fault_after_call(
+                            module, name, symbol, fault_exits,
+                        ):
+                            # The callee may have left through its fault
+                            # exit without writing its outputs: leave as
+                            # this function's own fault exit does.
+                            prefix = f"fault.propagate.{tag}"
+                            body.extend((
+                                f"  %{prefix}.code = call i32 "
+                                "@turing_validation_error_pending()",
+                                f"  %{prefix}.set = icmp ne i32 %{prefix}.code, 0",
+                                f"  br i1 %{prefix}.set, label %{prefix}.exit, "
+                                f"label %{prefix}.continue",
+                                f"{prefix}.exit:",
+                                "  ret void",
+                                f"{prefix}.continue:",
+                            ))
+                            block_exit_label[active_block] = f"{prefix}.continue"
+                            register_cache.clear()
                     if result is not None:
                         if forwarded is not None and int(forwarded[0]) == result_id:
                             # The call already wrote the wrapper's public
@@ -5325,11 +5376,11 @@ def _emit_repository_call_module(
                         else:
                             if "output_slots" in instruction.attributes:
                                 aggregate_members[result_id] = {
-                                    position: result_ptrs[slot]
+                                    position: result_ptrs[callee_output_index(slot)]
                                     for position, slot in zip(
                                         declared_positions, declared_slots
                                     )
-                                    if 0 <= slot < len(result_ptrs)
+                                    if 0 <= callee_output_index(slot) < len(result_ptrs)
                                 }
                             else:
                                 aggregate_members[result_id] = {

@@ -986,6 +986,7 @@ class _FunctionEmitter:
         value_dtypes: Mapping[int, str] | None = None,
         value_shapes: Mapping[int, Sequence[int]] | None = None,
         tensor_table: SSATensorTable | None = None,
+        runtime_shape_vectors: Mapping[int, int] | None = None,
         sequence_table: SSASequenceTable | None = None,
         native_symbol: str | None = None,
         callee_native_symbols: Mapping[str, str] | None = None,
@@ -1016,6 +1017,12 @@ class _FunctionEmitter:
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.tensor_table = tensor_table or SSATensorTable()
+        # Runtime tensor id -> the shape vector its producing call publishes
+        # (TENSOR_METADATA_RESULT_BINDING), for operands with no descriptor.
+        self.runtime_shape_vectors = {
+            int(key): int(value)
+            for key, value in dict(runtime_shape_vectors or {}).items()
+        }
         self.sequence_table = sequence_table
         # Value ids used as an address base anywhere in the module (dynamic
         # arrays), and those a store mutates -- shared across a method's
@@ -1087,6 +1094,23 @@ class _FunctionEmitter:
             int(value.id)
             for value in self.function.args
             if str(value.dtype or "").casefold() in {"ptr", "pointer"}
+        )
+        # Program: declared Sum over a tensor (broadcast_bool's mask
+        # buffers).  Wrong record: a typed kernel buffer (the int64 and bool
+        # registries of c_backend_llvm_ssa retype its ``ptr``) lost the
+        # pointer mark, so callers' runtime ranks unified into it and its
+        # dynamic extents climbed to the root as public parameters.  Rule:
+        # an imported kernel's pointer argument, as its LLVM origin declares
+        # it, is a raw flat buffer whatever element type it was given.
+        kernel_origins = (
+            self.function.metadata.get("llvm_repository_kernel") or (None, {})
+        )[1] or {}
+        self._pointer_value_ids.update(
+            int(value.id)
+            for value in self.function.args
+            if (origin := kernel_origins.get(int(value.id))) is not None
+            and origin[1] == "argument"
+            and str(origin[2]).startswith("ptr ")
         )
         sequence_columns = set() if sequence_table is None else {
             int(column)
@@ -2801,6 +2825,25 @@ class _FunctionEmitter:
                 subscripts = ", ".join("1" for _ in range(source_rank))
                 conformed.append(f"{expression}({subscripts})")
                 continue
+            owned_count = (
+                self._owned_counts.get(int(instr.res.id))
+                if int(instr.res.id) in self._owned_views else None
+            )
+            if (not shape and source_rank > 1 and owned_count is not None
+                    and not result_shape):
+                # Program: declared Sum over a tensor; the folded view
+                # ``arange(count).unsqueeze(-1)`` reaches region 6 as a
+                # rank-2 runtime dummy.  Wrong record: its elementwise
+                # results are owned arenas, flat over their count, and the
+                # whole-array assignment mixed ranks 1 and 2 (gfortran
+                # refused).  Rule: an owned result is its arena over its
+                # count, so a runtime span operand is read in its storage
+                # order over the same count, the flat walk LLVM and C take.
+                count = self._operand(SSAValue(owned_count, "int32", ()))
+                conformed.append(
+                    f"reshape({expression}, [int({count}, c_int)])"
+                )
+                continue
             if shape == result_shape or not shape:
                 conformed.append(expression)
                 continue
@@ -2904,6 +2947,37 @@ class _FunctionEmitter:
                 if axis == 1 and dynamic_extent is not None:
                     replacement = str(dynamic_extent)
                     break
+                # Program: declared Sum over a tensor.  Wrong record: every
+                # runtime-shaped region operand (the folded arange view, the
+                # mask and term arenas) had no static shape and no dummy
+                # extent here, so its extents climbed to the root as public
+                # parameters the host cannot know.  Rule: a runtime tensor's
+                # extents are its runtime shape vector, a value this caller
+                # already computes.
+                shape_vector_id = (actual.accounting or {}).get(
+                    "tensor_shape_value_id"
+                )
+                if shape_vector_id is None:
+                    shape_vector_id = self.runtime_shape_vectors.get(
+                        int(actual.id)
+                    )
+                if shape_vector_id is None:
+                    descriptor = self.tensor_table.by_id(int(actual.id))
+                    if (descriptor is not None
+                            and descriptor.metadata_state == "dynamic"):
+                        shape_vector_id = descriptor.shape_value_id
+                if shape_vector_id is not None:
+                    shape_vector = self._value_types.get(int(shape_vector_id))
+                    vector_shape = tuple(
+                        getattr(shape_vector, "shape", None) or ()
+                    )
+                    if (len(vector_shape) == 1
+                            and axis <= int(vector_shape[0])):
+                        replacement = (
+                            f"int({_name(SSAValue(int(shape_vector_id), 'int32', ()))}"
+                            f"({axis}), c_int)"
+                        )
+                        break
             resolved.append(replacement or extent)
         return tuple(resolved)
 
@@ -3006,7 +3080,11 @@ class _FunctionEmitter:
             for position, record_value in enumerate(raw_record):
                 slot = slot_index_by_id.get(int(record_value.id))
                 if slot is None:
-                    return None
+                    if position in outputs:
+                        return None
+                    # An unread record position with no native slot (a
+                    # returned view of the callee's own formal storage).
+                    continue
                 position_to_slot[position] = slot
             if any(position not in position_to_slot for position in outputs):
                 return None
@@ -6267,6 +6345,7 @@ def emit_function(
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, Sequence[int]] | None = None,
     tensor_table: SSATensorTable | None = None,
+    runtime_shape_vectors: Mapping[int, int] | None = None,
     sequence_table: SSASequenceTable | None = None,
     native_symbol: str | None = None,
     callee_native_symbols: Mapping[str, str] | None = None,
@@ -6324,6 +6403,7 @@ def emit_function(
         value_dtypes=value_dtypes,
         value_shapes=value_shapes,
         tensor_table=tensor_table,
+        runtime_shape_vectors=runtime_shape_vectors,
         sequence_table=sequence_table,
         native_symbol=native_symbol,
         callee_native_symbols=callee_native_symbols,
@@ -6596,6 +6676,29 @@ def emit_module(
         if isinstance(module, IRModule)
         else {}
     )
+    # A region's computed tensor result publishes its runtime geometry as
+    # outputs of the same call; the exact binding names the caller's shape
+    # vector for that result (TENSOR_METADATA_RESULT_BINDING).
+    module_runtime_shape_vectors: dict[str, dict[int, int]] = {}
+    if isinstance(module, IRModule):
+        from .concordance_declarations import TENSOR_METADATA_RESULT_BINDING
+        from .identity_concordance import identity_book
+        from .ssa_record_return_state import function_scope_of
+
+        result_page = identity_book(module).page(TENSOR_METADATA_RESULT_BINDING)
+        scope_names = {
+            function_scope_of(function): str(name)
+            for name, function in module.functions.items()
+        }
+        for row in result_page.rows():
+            owner = scope_names.get(row[0])
+            fact = result_page.latest(row)
+            if (owner is None or not isinstance(fact, tuple) or len(fact) != 3
+                    or len(tuple(fact[2])) != 3):
+                continue
+            module_runtime_shape_vectors.setdefault(owner, {})[
+                int(row[3])
+            ] = int(tuple(fact[2])[0])
 
     def _published_tensor_layout(
         function_name: str, value_id: int, seen: set[tuple[str, int]] | None = None,
@@ -6944,9 +7047,40 @@ def emit_module(
         function_name: tuple(values)
         for function_name, values in named_outputs.items()
     }
+    def _unread_storage_view(function_name: str, value: SSAValue) -> bool:
+        """A returned formal of the function itself, read by no caller.
+
+        Program: declared Sum over a tensor; planned region 5 returns
+        ``arange(count).unsqueeze(-1)``: its own formal arange storage (and
+        count) beside the view's shape and rank, and the aggregate fold
+        rebinds every caller to that storage.  Wrong record: the returned
+        formal still named an in/out slot, so the storage formal was
+        declared at the view's rank 2 and the caller passed it the arena's
+        ``c_ptr`` (type mismatch).  Rule: a formal returned unchanged is the
+        caller's own value; when no caller projects it, it is not a native
+        output.
+        """
+
+        function = functions.get(function_name)
+        if function is None:
+            return False
+        if int(value.id) not in {int(formal.id) for formal in function.args}:
+            return False
+        if str(function_name) not in aggregate_outputs:
+            # Only aggregate call sites say which positions they read; a
+            # root or single-result callee publishes every return.
+            return False
+        record = named_output_records.get(function_name, ())
+        projected = aggregate_outputs.get(str(function_name), {})
+        return not any(
+            position < len(record) and int(record[position].id) == int(value.id)
+            for position in projected
+        )
+
     named_outputs = {
         function_name: tuple({
             int(value.id): value for value in values
+            if not _unread_storage_view(function_name, value)
         }.values())
         for function_name, values in named_outputs.items()
     }
@@ -7313,6 +7447,23 @@ def emit_module(
                         continue
                     callee_ranks = function_value_ranks[callee_name]
                     for actual, formal in zip(instruction.args, callee.args):
+                        folded_view = (actual.accounting or {}).get(
+                            "ssa_storage_view"
+                        )
+                        if (isinstance(folded_view, Mapping)
+                                and folded_view.get("folded_view_id") is not None):
+                            # Program: declared Sum over a tensor.  Wrong
+                            # record: a folded view occurrence carries its
+                            # storage's id, so unifying it with the view
+                            # formal (rank 2) raised the storage (rank 1)
+                            # and, through it, region 5's storage formal.
+                            # Rule: the formal takes the view's rank; the
+                            # storage keeps its own.
+                            view_rank = int(folded_view.get("view_rank") or 0)
+                            if callee_ranks.get(int(formal.id), 0) < view_rank:
+                                callee_ranks[int(formal.id)] = view_rank
+                                changed_ranks = True
+                            continue
                         if unify_rank(
                             caller_ranks, actual, callee_ranks, formal
                         ):
@@ -7985,6 +8136,9 @@ def emit_module(
                 value_dtypes=function_value_dtypes.get(function_name, {}),
                 value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
+                runtime_shape_vectors=module_runtime_shape_vectors.get(
+                    function_name, {}
+                ),
                 sequence_table=module_sequence_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
@@ -8057,6 +8211,9 @@ def emit_module(
                 value_dtypes=function_value_dtypes.get(function_name, {}),
                 value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
+                runtime_shape_vectors=module_runtime_shape_vectors.get(
+                    function_name, {}
+                ),
                 sequence_table=module_sequence_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,

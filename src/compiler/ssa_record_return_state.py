@@ -203,6 +203,31 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
                         matches = (int(caller_outputs[position]),)
                         carrier_proofs = (view_ref,)
     if not matches:
+        # Program: declared Sum over a tensor; region 5's runtime unsqueeze
+        # view 11 was folded onto the caller's arange storage 8
+        # (``legalize_aggregate_output_views``): the semantic output left the
+        # Call's outputs and its consumers read the caller's actual as that
+        # declared view. The fold's passthrough binding and its rebinding
+        # receipt name the caller value that now carries the view.
+        from .concordance_declarations import AGGREGATE_PASSTHROUGH_REBINDING
+
+        for binding in tuple(call.attributes.get(
+            "aggregate_output_passthrough_bindings", (),
+        )):
+            if (len(binding) == 6 and int(binding[1]) == callee_id
+                    and binding[4] == "runtime_view_storage"):
+                rebinding = book.latest_ref(
+                    AGGREGATE_PASSTHROUGH_REBINDING,
+                    (function_scope_of(caller), int(binding[1])),
+                )
+                if rebinding is not None and not call.attributes.get("source_linked"):
+                    # Consumers read the caller's actual as the view (the
+                    # in-region view spelling); it is a different id from
+                    # the callee's semantic output by construction, and the
+                    # rebinding receipt is the identity proof.
+                    return int(binding[3]), (rebinding,)
+                break
+    if not matches:
         # A source function can return a region-allocated tensor. Its outer
         # Call publishes the source's loaded pointer carrier, while the
         # semantic RESULT_BINDING still names the source tensor. The exact

@@ -3144,6 +3144,12 @@ def emit_ssa_module_to_c(
 
     precision_present = False
     prototypes: list[str] = []
+    # A fault exit leaves the whole SSA call chain (ssa_fault_exits).
+    from .ssa_fault_exits import (
+        fault_exit_functions as _fault_exit_functions,
+        propagates_fault_after_call as _propagates_fault_after_call,
+    )
+    fault_exits = _fault_exit_functions(module)
     definitions: list[str] = []
     # Outlined deployment lanes (deployment_outlining.py) become native span
     # deploys on the persistent turing_pool. Support text is collected here:
@@ -7601,17 +7607,34 @@ def emit_ssa_module_to_c(
                         + ", ".join(rendered_args) + ")"
                     )
                     callee_return_type = function_return_types[callee]
+                    # A fault exit leaves the whole SSA call chain
+                    # (ssa_fault_exits): the callee may have left without
+                    # writing its outputs.
+                    fault_check = ()
+                    if _propagates_fault_after_call(
+                        module, fn, callee, fault_exits,
+                    ):
+                        prototype = "uint32_t turing_validation_error_pending(void);"
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        fault_check = (
+                            "        if (turing_validation_error_pending()) "
+                            f"goto cleanup_{_c_symbol(fn)};",
+                        )
                     if callee_return_type != "void" and instruction.res is not None:
                         result_id = int(instruction.res.id)
                         body.append(
                             f"        const {callee_return_type} t{result_id} = "
                             f"{invocation};"
                         )
+                        body.extend(fault_check)
                         expressions[result_id] = f"t{result_id}"
                         if _is_integer_dtype(instruction.res.dtype):
                             integer_ids.add(result_id)
                     else:
                         body.append(f"        {invocation};")
+                        body.extend(fault_check)
                         if instruction.res is not None:
                             output_position = instruction.attributes.get(
                                 "ssa_output_argument"

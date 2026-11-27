@@ -1869,8 +1869,11 @@ def publish_computed_region_result_metadata(
                         if target is None or "__planned_region_" not in downstream_name:
                             continue
                         feeds = tuple(map(int, downstream.attributes.get("feed_ids", ())))
+                        # A folded runtime view of this storage shares its id
+                        # but not its geometry; its own binding forwards that.
                         positions = tuple(index for index, actual in enumerate(downstream.args)
-                                          if int(actual.id) == caller_data_id)
+                                          if int(actual.id) == caller_data_id
+                                          and not _folded_view_occurrence(actual))
                         if len(positions) != 1:
                             continue
                         position = positions[0]
@@ -2897,6 +2900,18 @@ def publish_computed_region_result_metadata(
                     target.name, borrowed_id,
                     tuple(sorted(consumed_formals)), tuple(output_layouts),
                 ))
+                # A runtime view folded onto this very storage
+                # (``legalize_aggregate_output_views``) left the Call's
+                # outputs; its consumers read the borrowed id itself as the
+                # view and are already among this storage's uses.
+                if view is None and any(
+                    len(binding) == 6 and int(binding[3]) == borrowed_id
+                    and binding[4] == "runtime_view_storage"
+                    for binding in tuple(consumer.attributes.get(
+                        "aggregate_output_passthrough_bindings", (),
+                    ))
+                ):
+                    continue
                 if view is None or view[1] is not consumer:
                     raise ValueError(
                         "private owned tensor view lost its caller output"
@@ -3648,6 +3663,25 @@ def _elementwise_extent_execution(module, function, instruction, fact, *, book):
                                         (selected, tuple(selected.args)))
                   for value in values)
     return tuple(dict.fromkeys(cells)) if all(cell is not None for cell in cells) else None
+
+
+from .concordance_declarations import (  # noqa: E402
+    AGGREGATE_PASSTHROUGH_REBINDING as _AGGREGATE_PASSTHROUGH_REBINDING_PAGE,
+)
+
+
+def _folded_view_occurrence(value: Any) -> bool:
+    """Whether ``value`` is a runtime view folded onto its storage.
+
+    ``legalize_aggregate_output_views`` folds a region's returned runtime
+    unsqueeze onto the caller's actual: the consumers read the storage's id
+    with the view's own accounting (geometry, rank) and an
+    ``ssa_storage_view`` naming the folded view id, exactly as an in-region
+    runtime view is spelled. That occurrence's geometry is the view's.
+    """
+
+    view = (getattr(value, "accounting", None) or {}).get("ssa_storage_view")
+    return isinstance(view, Mapping) and view.get("folded_view_id") is not None
 
 
 def _shared_select_geometry(module, function, operands, *, pending=()):
@@ -5292,8 +5326,16 @@ def propagate_repository_ssa_call_metadata(
                 runtime_view_fact is not None
                 and runtime_view_fact[0] == "unsqueeze"
             )
+            # A folded runtime view (``legalize_aggregate_output_views``)
+            # owns its geometry on the caller's actual; transporting that
+            # storage's own rank/extents onto the callee's view formal, or
+            # onto the declaring occurrence, would erase the view.
+            folded_runtime_view = (
+                _folded_view_occurrence(value) or _folded_view_occurrence(source)
+            )
             retained_view = (
                 retained_runtime_view
+                or folded_runtime_view
                 or (isinstance(declared_view, Mapping)
                     and bool(declared_view_shape)
                     and bool(source_shape)
@@ -5332,7 +5374,10 @@ def propagate_repository_ssa_call_metadata(
                     int(source.id), book=view_book,
                 ) is not None
             )
-            retained_axis_view = retained_runtime_view or static_view_rank_proved
+            retained_axis_view = (
+                retained_runtime_view or static_view_rank_proved
+                or folded_runtime_view
+            )
             local_shape_writer = tuple(
                 (value.accounting or {}).get(
                     "shape_settlement_provenance", ()
@@ -5616,6 +5661,12 @@ def propagate_repository_ssa_call_metadata(
             source_rank = int(live_source_accounting.get(
                 "program_abi_rank", len(live_source_shape),
             ) or len(live_source_shape))
+            if _folded_view_occurrence(source):
+                # The occurrence presents the folded view, whose rank its
+                # declaration states (the storage's physical rank is not it).
+                source_rank = int(
+                    live_source_accounting["ssa_storage_view"]["view_rank"]
+                )
             target_shape = tuple(value.shape or ())
             target_accounting = dict(value.accounting or {})
             target_rank = int(target_accounting.get(
@@ -5739,6 +5790,21 @@ def propagate_repository_ssa_call_metadata(
                         # the override carried: when the transported contract
                         # turns dynamic through it, it is that change's cause.
                         contract_cause,
+                        # A folded runtime view's occurrence reads the
+                        # storage under the view's geometry; its fold
+                        # (``aggregate_passthrough_rebinding`` of the view id)
+                        # is the cause of the source state it now presents.
+                        *((identity_book(module).latest_ref(
+                            _AGGREGATE_PASSTHROUGH_REBINDING_PAGE, (
+                                function_scope_of(
+                                    source_function
+                                    if source_function is not None
+                                    else function
+                                ),
+                                int(((source.accounting or {}).get(
+                                    "ssa_storage_view") or {})["folded_view_id"]),
+                            ),
+                        ),) if _folded_view_occurrence(source) else ()),
                         # The state the source was last resolved to: when
                         # that changed, this edge's revision has its cause.
                         _frame_cite(
@@ -13889,13 +13955,23 @@ def lower_tensor_calls_to_repository_ssa(
                                         "rank": int(broadcast_rank),
                                     },
                                 )
-                                conformed.accounting = {
-                                    **dict(conformed.accounting or {}),
-                                    "tensor_metadata_state": "dynamic",
-                                    "tensor_shape_value_id": int(output_shape.id),
-                                    "tensor_rank_value_id": int(rank.id),
-                                    "tensor_element_count_value_id": int(count.id),
-                                }
+                                # Program: declared Sum over a tensor (LLVM).
+                                # Wrong record: only the Boolean arm passed
+                                # the typed-kernel stamp, so the float64 arm
+                                # kept no span rank in its accounting and the
+                                # selection loop read its element 0 for every
+                                # element (each term k*x read as 1*1; the sum
+                                # was 4, not 10*x).  Rule: each conformed arm's
+                                # accounting is the view of its own posted
+                                # row (span, the selection's rank).
+                                conformed.accounting = _accounting_view(
+                                    function, conformed, module, labels={
+                                        "tensor_metadata_state": "dynamic",
+                                        "tensor_shape_value_id": int(output_shape.id),
+                                        "tensor_rank_value_id": int(rank.id),
+                                        "tensor_element_count_value_id": int(count.id),
+                                    },
+                                )
                                 carrier = own_dynamic_tensor(
                                     conformed, count, element, prefix,
                                 )

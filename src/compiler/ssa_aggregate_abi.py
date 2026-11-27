@@ -1082,7 +1082,13 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     if instruction.res is not None:
                         occurrences.append(instruction.res)
             for value in occurrences:
-                if int(value.id) != int(output_id):
+                # A runtime view folded onto its storage carries the view's
+                # geometry under the storage's id (``folded_view_id``).
+                folded_view = (value.accounting or {}).get("ssa_storage_view")
+                if int(value.id) != int(output_id) and not (
+                    isinstance(folded_view, Mapping)
+                    and folded_view.get("folded_view_id") == int(output_id)
+                ):
                     continue
                 accounting = dict(value.accounting or {})
                 for key, old_id, new_id in zip(
@@ -1460,7 +1466,48 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                                 == callee_id)
                         )
                     )
-                    if runtime_view:
+                    # Program: declared Sum(k*x) over a tensor x; region 5
+                    # returns ``arange(count).unsqueeze(-1)``, a runtime view
+                    # of the arange storage its caller owns and passes in.
+                    # Wrong record: the view stayed a region output, and no
+                    # native lane can return a view of its input's storage
+                    # (LLVM copied one element, C found no count origin,
+                    # Fortran mismatched ranks). Rule: an unsqueeze view's
+                    # data IS the caller's actual; its runtime geometry is
+                    # the Call's own metadata outputs, which stay projected.
+                    # The consumer reads the caller's storage as that view
+                    # (``ssa_storage_view`` with the runtime geometry ids).
+                    # Reshape and prefix-slice views keep their refusal.
+                    runtime_unsqueeze_geometry = None
+                    if (runtime_view and unsqueeze_proof is not None
+                            and reshape_proof is None and prefix_proof is None
+                            and call.res is not None):
+                        geometry_fact = book.page(
+                            TENSOR_METADATA_RESULT_BINDING,
+                        ).latest((
+                            function_scope_of(function), int(call.res.id),
+                            str(callee_name), int(caller_id),
+                        ))
+                        live_caller_ids = {
+                            int(value.id)
+                            for value in (
+                                *function.args,
+                                *(instruction.res
+                                  for live_block in function.blocks.values()
+                                  for instruction in live_block.instrs
+                                  if instruction.res is not None),
+                            )
+                        }
+                        if (isinstance(geometry_fact, tuple)
+                                and len(geometry_fact) == 3
+                                and int(geometry_fact[0]) == int(caller_id)
+                                and len(tuple(geometry_fact[2])) == 3
+                                and all(int(value_id) in live_caller_ids
+                                        for value_id in geometry_fact[2])):
+                            runtime_unsqueeze_geometry = tuple(
+                                map(int, geometry_fact[2]),
+                            )
+                    if runtime_view and runtime_unsqueeze_geometry is None:
                         # The exact reshape validity receipt gives this view
                         # runtime geometry distinct from its input storage.
                         # Folding its aggregate slot to that storage would
@@ -1489,6 +1536,102 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     binding_cells = returned_formal_cells(
                         function, call, callee_id, caller_id, actual,
                     )
+                    if runtime_unsqueeze_geometry is not None:
+                        # The view keeps its own caller identity and uses;
+                        # only its data projection goes. The caller's tensor
+                        # table states that its data is the actual (as the
+                        # callee's table states it of the formal), with the
+                        # runtime geometry the Call still projects.
+                        from ..transmogrifier.ssa import (
+                            SSATensorDescriptor, SSATensorTable,
+                        )
+
+                        caller_table = module.tensor_tables.setdefault(
+                            function.name, SSATensorTable(),
+                        )
+                        caller_table.tensors.pop(int(caller_id), None)
+                        caller_table.register(SSATensorDescriptor(
+                            tensor_id=int(caller_id),
+                            data_value_id=int(actual.id),
+                            dtype=str(output_descriptor.dtype),
+                            shape=(),
+                            shape_value_id=runtime_unsqueeze_geometry[0],
+                            rank_value_id=runtime_unsqueeze_geometry[1],
+                            element_count_value_id=runtime_unsqueeze_geometry[2],
+                            storage="view", metadata_state="dynamic",
+                            arena_id=int(actual.id),
+                            allocation_owner=int(actual.id),
+                            owns_allocation=False,
+                            alias_of=int(actual.id), writable=False,
+                        ))
+                        # As an in-region runtime view is spelled (the
+                        # unsqueeze lowering's alias): every consumer reads
+                        # the storage's id with the view's accounting --
+                        # its runtime geometry, rank and ``ssa_storage_view``
+                        # -- and the table names the view id an alias of it.
+                        replacement = SSAValue(
+                            int(actual.id),
+                            dtype=projection.value.dtype or actual.dtype,
+                            shape=(),
+                            device=projection.value.device or actual.device,
+                            accounting={
+                                # The physical fields under this id are the
+                                # storage's posted fact (rank 1 here); the
+                                # view's rank is its runtime geometry below.
+                                **{
+                                    key: value
+                                    for key, value in dict(
+                                        projection.value.accounting or {},
+                                    ).items()
+                                    if key not in {
+                                        "physical_dtype", "program_abi_storage",
+                                        "program_abi_rank", "sequence_arena",
+                                        "device",
+                                    }
+                                },
+                                "tensor_metadata_state": "dynamic",
+                                "tensor_shape_value_id": runtime_unsqueeze_geometry[0],
+                                "tensor_rank_value_id": runtime_unsqueeze_geometry[1],
+                                "tensor_element_count_value_id": runtime_unsqueeze_geometry[2],
+                                "ssa_storage_alias": int(actual.id),
+                                "ssa_aggregate_passthrough": (
+                                    callee_name, int(caller_id),
+                                ),
+                                "ssa_storage_view": {
+                                    "storage_value_id": int(actual.id),
+                                    "view_shape": (),
+                                    "operation": "unsqueeze",
+                                    "folded_view_id": int(caller_id),
+                                    "view_rank": int(
+                                        (projection.value.accounting or {}).get(
+                                            "program_abi_rank",
+                                        ) or posted_ssa_value_fact(
+                                            target, int(callee_id), book=book,
+                                        ).rank + 1
+                                    ),
+                                },
+                            },
+                        )
+                        _replace_exact_uses(
+                            function, projection.value, replacement,
+                            via=(callee_name, int(caller_id)),
+                            sources=binding_cells,
+                        )
+                        passthrough_bindings.append((
+                            int(output_position), int(caller_id),
+                            int(callee_id), int(actual.id),
+                            "runtime_view_storage",
+                            "incumbent_on_equal_priority",
+                        ))
+                        removed.update((
+                            id(projection.address), id(projection.load),
+                        ))
+                        if len(projection.address.args) > 1:
+                            constant_candidates.append(
+                                projection.address.args[1]
+                            )
+                        changed = True
+                        continue
                     # Posted occurrences can share the projection's identity
                     # only across this exact recorded caller/callee binding.
                     # Raw standalone SSA retains the incumbent object path.
@@ -1615,6 +1758,17 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         if len(values) == len(caller_ids):
                             call.attributes[key] = tuple(
                                 values[index] for index in retained
+                            )
+                        elif not values:
+                            # Program: declared Sum over a tensor; region 5's
+                            # view slot 0 and region 6's mask geometry slots
+                            # were folded out of the middle of the Ret. With
+                            # no recorded slots, a lane reading slots took
+                            # the default 0..n-1 and published the folded
+                            # slots into the retained outputs. The retained
+                            # Ret positions ARE the slots.
+                            call.attributes[key] = tuple(
+                                output_positions[index] for index in retained
                             )
                     if not retained and not any(
                         argument is call.res

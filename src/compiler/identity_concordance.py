@@ -6627,8 +6627,31 @@ class CorrelationTable:
                         data_projection = metadata_result_caller_value(
                             module, caller, producers[0], predecessor, book=book,
                         )
+
+                        folded_result = any(
+                            len(binding) == 6
+                            and int(binding[1]) == int(result_row[3])
+                            and binding[4] == "runtime_view_storage"
+                            for binding in tuple(producers[0].attributes.get(
+                                "aggregate_output_passthrough_bindings", ()))
+                        )
+
+                        def presents(actual, result_id=int(result_row[3]),
+                                     folded_result=folded_result):
+                            # A runtime view folded onto its storage reads
+                            # the storage's id as that view: such an
+                            # occurrence presents only the view's result row,
+                            # and the view's row only such occurrences.
+                            view = (actual.accounting or {}).get("ssa_storage_view")
+                            folded = (view.get("folded_view_id")
+                                      if isinstance(view, Mapping) else None)
+                            if folded_result:
+                                return folded is not None and int(folded) == result_id
+                            return folded is None
+
                         if (data_projection is None or data_projection[0] not in {
                                 int(actual.id) for actual, _ in source_pairs
+                                if presents(actual)
                         }):
                             continue
                         result_fact = result_page.cell(
@@ -6637,6 +6660,7 @@ class CorrelationTable:
                         data_matches = tuple(
                             formal for actual, formal in source_pairs
                             if int(actual.id) == data_projection[0]
+                            and presents(actual)
                         )
                         projected = (
                             tuple(result_fact[2])
@@ -7412,8 +7436,24 @@ class CorrelationTable:
                     # A returned view: its Call result stays borrowed; the
                     # release audit follows its own consumers.
                     valid = (len(borrowed) == len(layouts) == 1
-                             and heap_view_result(caller, row, fact)
-                             is not None)
+                             and (heap_view_result(caller, row, fact)
+                                  is not None
+                                  # A runtime view folded onto this borrowed
+                                  # storage: its consumers read the borrowed
+                                  # id itself, already followed by the owner.
+                                  or any(
+                                      len(binding) == 6
+                                      and int(binding[3]) == int(fact[1])
+                                      and binding[4] == "runtime_view_storage"
+                                      and book.latest_ref(
+                                          AGGREGATE_PASSTHROUGH_REBINDING,
+                                          (row[0], int(binding[1])),
+                                      ) is not None
+                                      for binding in tuple(call.attributes.get(
+                                          "aggregate_output_passthrough_bindings",
+                                          (),
+                                      ))
+                                  )))
                 elif valid and borrowed:
                     retirement_causes = {
                         source for source, _stage in book.edges_into(retired)
@@ -8229,7 +8269,15 @@ class CorrelationTable:
                     for block in caller.blocks.values() for call in block.instrs
                     if call.op == "Call" and call.res is not None
                     and call.attributes.get("callee") == function.name
-                    and int(row[2]) in tuple(map(int, call.attributes.get("output_ids", ())))
+                    and (int(row[2]) in tuple(map(int, call.attributes.get("output_ids", ())))
+                         # The view folded onto the caller's storage
+                         # (``legalize_aggregate_output_views``) keeps its
+                         # result binding though it left the Call's outputs.
+                         or any(len(binding) == 6
+                                and int(binding[1]) == int(row[2])
+                                and binding[4] == "runtime_view_storage"
+                                for binding in tuple(call.attributes.get(
+                                    "aggregate_output_passthrough_bindings", ()))))
                 }
                 def revision_causes(binding):
                     # A passthrough fold revises the result row (its latest
@@ -10063,6 +10111,18 @@ class CorrelationTable:
                 # Only its element count passes through unchanged; its new
                 # shape and rank remain live caller projections. The fold
                 # names exactly the ids it replaced, each with its receipt.
+                # A runtime view folded onto the caller's storage
+                # (``legalize_aggregate_output_views``) is no Call output:
+                # its fold binding and receipt stand for the output, and its
+                # consumers' occurrences (the storage's id declaring this
+                # view) carry the geometry a projection would.
+                folded_view_binding = next((
+                    binding for binding in passthroughs
+                    if len(binding) == 6 and int(binding[1]) == int(row[3])
+                    and binding[4] == "runtime_view_storage"
+                    and book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING,
+                                        (row[0], int(row[3]))) is not None
+                ), None)
                 folded = (
                     {int(old_id) for old_id, new_id in zip(
                         previous_fact[2], fact[2], strict=True)
@@ -10079,8 +10139,8 @@ class CorrelationTable:
                     and previous_fact[0] == fact[0]
                     and previous_fact[1] == fact[1]
                     and len(returns) == 1
-                    and row[3] in tuple(map(int, call.attributes.get(
-                        "output_ids", ())))
+                    and (row[3] in tuple(map(int, call.attributes.get(
+                        "output_ids", ()))) or folded_view_binding)
                     and folded == set(mapping)
                     and len(passthroughs) >= len(folded)
                 )
@@ -10112,7 +10172,22 @@ class CorrelationTable:
                                        )) != 1):
                             valid = False
                             break
-                if valid:
+                if valid and folded_view_binding is not None:
+                    views = tuple(
+                        argument for block in caller.blocks.values()
+                        for instruction in block.instrs
+                        for argument in instruction.args
+                        if int(argument.id) == int(folded_view_binding[3])
+                        and isinstance(view := (argument.accounting or {}).get(
+                            "ssa_storage_view"), Mapping)
+                        and view.get("folded_view_id") == int(row[3])
+                    )
+                    valid = bool(views) and all(
+                        (view.accounting or {}).get(key) == value_id
+                        for view in views
+                        for key, value_id in zip(keys, fact[2], strict=True)
+                    )
+                elif valid:
                     projections = tuple(instruction for block in caller.blocks.values()
                                         for instruction in block.instrs
                                         if instruction.op == "Load"
