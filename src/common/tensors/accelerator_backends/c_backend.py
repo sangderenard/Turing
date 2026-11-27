@@ -209,6 +209,9 @@ ffi.cdef("""
         int k,
         double* indices,
         double* out);
+    void topk_int64_dim(
+        const long long* input, const int* shape, int ndim, int dim, int k,
+        long long* indices, long long* values);
     void for_each_cell_along_dim(
         const double* data,
         const int* shape,
