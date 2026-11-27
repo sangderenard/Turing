@@ -24,11 +24,14 @@ export function applyPalette(candidate) {
   // Derived shades the shared stylesheet (pages.css) reads: a dark tint for backgrounds, a mid edge for borders.
   root.style.setProperty("--palette-tint", `color-mix(in srgb, ${color} 35%, #101722)`);
   root.style.setProperty("--palette-edge", `color-mix(in srgb, ${color} 55%, #384d67)`);
-  if (typeof candidate.secondary === "string" && HEX.test(candidate.secondary))
-    root.style.setProperty("--palette-secondary", candidate.secondary);
-  // The design's own bevel and shadow, worn by the site's buttons and cards.
-  for (const [name, value] of [["--palette-bevel", candidate.bevel], ["--palette-shadow", candidate.shadow]]) {
-    if (typeof value === "string" && SHADOW.test(value)) root.style.setProperty(name, value);
+  // The secondary color and the design's own bevel and shadow (worn by the site's buttons and cards). A value that is
+  // omitted or fails its pattern is removed, so the page falls back to the stylesheet defaults instead of still wearing
+  // the previous design's value.
+  for (const [name, value, pattern] of [["--palette-secondary", candidate.secondary, HEX],
+                                        ["--palette-bevel", candidate.bevel, SHADOW],
+                                        ["--palette-shadow", candidate.shadow, SHADOW]]) {
+    if (typeof value === "string" && pattern.test(value)) root.style.setProperty(name, value);
+    else root.style.removeProperty(name);
   }
   if (!document.getElementById("palette-theme")) {
     const style = document.createElement("style");
