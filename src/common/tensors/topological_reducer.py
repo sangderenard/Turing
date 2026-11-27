@@ -19494,7 +19494,41 @@ def _normalize_lexical_values(
             # value ... Add has no settled dtype", also before 2716cd06).  Rule:
             # the arm a literal-constant test never takes does not reach the
             # statement after the If -- it is terminal, as a raising arm is.
-            if isinstance(body_statement.test, ast.Constant):
+            #
+            # Program: ``total = 1; try: total = total + 12 // n; total =
+            # total * 10; except ZeroDivisionError: total = total + 50``.
+            # Wrong record: the protected body's guard is ``if True:``, so
+            # its else was terminal and ``total`` after the guard was the
+            # body's ``total * 10`` alone; the failure exit reached the
+            # guard's end with ``total`` at 1, and the handler read a value
+            # defined only on the path that did not fail (final concordance:
+            # "reads a value defined at failure_continue").  Rule: a guard a
+            # failure site exits to (``source_failure_site``, recorded as
+            # its body statements were reduced) is reached at its end from
+            # the site as well; it keeps its merge, whose true arm is the
+            # failure join of the control builder.  A name the body binds
+            # first has no version on the exit (Python leaves it unbound),
+            # so the body's binding stands for it, as for the terminal arm.
+            failure_exit_guard = False
+            if (
+                isinstance(body_statement.test, ast.Constant)
+                and bool(body_statement.test.value)
+            ):
+                from ...compiler.concordance_declarations import (
+                    SOURCE_FAILURE_SITE as _FAILURE_SITE,
+                )
+                failure_page = current_identity_book().pages.get(
+                    _FAILURE_SITE.name,
+                )
+                guard_occurrence = (
+                    None if failure_page is None
+                    else _post_source_span(body_statement)
+                )
+                failure_exit_guard = guard_occurrence is not None and any(
+                    failure_page.latest(row)[3].row == guard_occurrence.row
+                    for row in failure_page.rows()
+                )
+            if isinstance(body_statement.test, ast.Constant) and not failure_exit_guard:
                 if bool(body_statement.test.value):
                     else_terminal = True
                 else:
@@ -19568,6 +19602,12 @@ def _normalize_lexical_values(
                     body_value = body_environment.get(name, before.get(name))
                     else_value = else_environment.get(name, before.get(name))
                     if body_value == else_value:
+                        if body_value is not None:
+                            environment[name] = body_value
+                        continue
+                    if failure_exit_guard and else_value is None:
+                        # Bound first in the protected body: no exit carries
+                        # a version of it (see ``failure_exit_guard``).
                         if body_value is not None:
                             environment[name] = body_value
                         continue
