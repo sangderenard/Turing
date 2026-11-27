@@ -1215,7 +1215,7 @@ def test_the_out_reasons_cover_n_out():
     counts only outside ids, and every outside id has at least one reason (an id may have two)."""
     n = 5
     cols = F.initial_columns(n, mix=0.0)
-    half, dh = float(cols["half"][0]), float(cols["dh"][0])
+    half, dh = float(cols["half"]), float(cols["dh"])                       # uniforms: one value, not a column
     cols["age"][:] = 1.0e3
     cols["x"][:] = [3.0 * half, 0.0, 0.0, 3.0 * half, 0.0]                   # past a side wall, under the floor,
     cols["y"][:] = [0.05, -3.0, 0.05, -3.0, 0.05]                            # past the plexiglass, two at once, inside
