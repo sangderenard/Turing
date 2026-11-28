@@ -53,11 +53,12 @@ Pages by ``cold_after`` (this table is generated from ``PAGE_LIFECYCLE``; the
 counts are pages, not cells):
 
 * never spilled (10)
-* source-closure (5)
-* ssa-lowering:functions (28)
-* ssa-lowering (133)
-* pre-native-repairs (37)
-* emission (11)
+* source-closure (8)
+* graph-planning (1)
+* ssa-lowering:functions (30)
+* ssa-lowering (181)
+* pre-native-repairs (193)
+* emission (52)
 """
 from __future__ import annotations
 
@@ -108,9 +109,12 @@ EMISSION = "emission"
 PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     # Live structural recipes are consulted through finalization and by
     # accepted-component readers. Their proof imports retain their owner;
-    # they are book edges, not scratch lowering pages.
-    "concordance_imported_cell": PageLifecycle(EMISSION, EMISSION, None),
-    "live_derivation": PageLifecycle(EMISSION, EMISSION, None),
+    # they are book edges, not scratch lowering pages: cold only once
+    # emission is done (a later touch reloads them).  They are not in
+    # ``identity_spill.NEVER_SPILLED``, so ``None`` here was not "never
+    # spilled" -- a budget spill could already take them.
+    "concordance_imported_cell": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "live_derivation": PageLifecycle(EMISSION, EMISSION, EMISSION),
     "structural_value": PageLifecycle(EMISSION, EMISSION, EMISSION),
     "boundary_transport": PageLifecycle("compiler-finalization", EMISSION, EMISSION),
     "optional_value_structure": PageLifecycle(REPAIRS, EMISSION, EMISSION),
@@ -499,6 +503,122 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "value_type_abi": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "value_type_tag": PageLifecycle(FUNCTIONS, LOWERING, LOWERING),
     "while_carried_test": PageLifecycle(FUNCTIONS, None, FUNCTIONS),
+    # Pages declared after this table was last read (issue 1a6f0c9e).  Each
+    # is classified CONSERVATIVELY by static reference: the module of every
+    # reference was found, and the page is assigned the latest stage any of
+    # them may run in -- emission when an emission or backend module
+    # (ssa_c_backend, c_shell_sections, deployment_outlining, the storage
+    # requirements, the aggregate / record-return ABI, the native tensor
+    # family, the scalar batch, the compilation product) touches it, and
+    # pre-native-repairs otherwise (most are read by the compile-tail
+    # detector in identity_concordance).  written_in / read_in are that same
+    # upper bound, not a per-reference split.  Too late only keeps a page
+    # resident longer; refine a page to an earlier stage when its references
+    # are traced.
+    "assignment_projection_identity_concordance": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "borrowed_record_span_role": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "builtin_iterable_element": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "c_deployment_policy": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "c_shell_section": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "c_shell_section_build": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "c_shell_section_demand": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "call_edge_int_range": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "callsite_projection_identity_concordance": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "declared_tensor_operation": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "function_return_annotation": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "glsl_pure_function_source": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "graph_tensor_descriptor": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "guarded_call_actual_range": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "item_operand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "law_value_axes": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "loop_native_scalar_union_gap": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "loop_storage_version": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "loop_update_minimum_trips": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "method_return_annotation": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "native_tensor_family_source": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "native_tensor_result_family": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "native_tensor_wrap": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "numerical_constructor_code_reference": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "numerical_constructor_default": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "numerical_constructor_dimension": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "numerical_dtype_operand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "numerical_schema_operand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "process_escape_classification": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "public_owned_sequence_return": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "public_source_entry": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "record_owned_return_projection": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "return_output_arms": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "runtime_arange_parameters": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "scalar_batch_contract": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "semantic_output": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "sequence_column_type_abi": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "sequence_helper_heap_operation": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "sequence_storage_lifetime": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "shape.ssa": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_activity_corridor": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_actual_formal": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_closed_class_alternatives": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_closed_tuple_lengths": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_field_effect_completion": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_field_state_transfer": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_object_alias": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_parameter_default": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_call_tuple_member_projection_demand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_callable_signature": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_class_union_native_gap": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_closed_aggregate_lengths": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_closed_class_alternatives": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_closure_free_names": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_comprehension_capacity_bound": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "source_constructor_field_effect_demand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_dispatch_target": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_evidence_flush_round": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_exception_normal_binding": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_extraction_identity": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_field_sequence_element": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_formal_closed_class_alternatives": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_formal_closed_tuple_lengths": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_function_exit_field_state": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_guarded_mapping_payload": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_int_range_concordance": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_intrinsic_admission": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_lambda_normalization": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_mapping_get_copy_state_demand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_mapping_get_key_version_demand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_mapping_get_read": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_method_receiver_class_demand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_named_tuple_layout": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_owned_sequence_return": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "source_parameter_default": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_parameter_memory_contract": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_private_dynamic_sequence": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_resource_admission_demand": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_sequence_capacity_bound": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "source_sequence_constructor_snapshot": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_tensor_prefix_slice": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_tensor_shape_dimension": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_terminal_return": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_thread_barrier_policy": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_thread_region_control": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_tuple_key_native_gap": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "source_value_record_view": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "ssa_deployment_discovery": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "ssa_deployment_outline": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "static_shape_parameter": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "tensor_elementwise_extent_binding": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_heap_consumer_nonescape": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "tensor_heap_owner_call_binding": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "tensor_heap_release_binding": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "tensor_metadata_result_binding": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_output_capacity_bound": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_owned_heap_binding": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_runtime_broadcast_validity": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_runtime_prefix_slice_geometry": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_runtime_reshape_validity": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_runtime_scan_geometry": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "tensor_runtime_topk_selection": PageLifecycle(REPAIRS, REPAIRS, REPAIRS),
+    "tensor_runtime_view_geometry": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "tensor_source_owned_return": PageLifecycle(EMISSION, EMISSION, EMISSION),
 }
 
 
