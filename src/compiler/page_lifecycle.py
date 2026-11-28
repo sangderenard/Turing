@@ -318,6 +318,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "root_call_record": PageLifecycle(CLOSURE, LOWERING, LOWERING),
     "called_inventory": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "call_edge_actual": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "called_generic_claim": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "parameter_annotation": PageLifecycle(CLOSURE, LOWERING, LOWERING),
     "parameter_record_class": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "host_callback_admission": PageLifecycle(CLOSURE, FUNCTIONS, FUNCTIONS),

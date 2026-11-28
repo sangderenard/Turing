@@ -887,6 +887,14 @@ CALL_EDGE_INT_RANGE = declare_page("call_edge_int_range", (
 CALLED_INVENTORY = declare_page("called_inventory", (
     RowField("function_identity", K.NAME), RowField("formal", K.NAME),
 ), CalledInventoryFact)
+#: Past the custom-version limit: the class of the first call edge that
+#: reached the formal, for which the callee's one generic body is built
+#: (``called_inventory.post_call_edge_actual(claim_generic=True)``).  DERIVED
+#: from that edge's ``call_edge_actual`` cell; posted once (CONCORD).  An
+#: edge of another class gets a fanned copy.
+CALLED_GENERIC_CLAIM = declare_page("called_generic_claim", (
+    RowField("function_identity", K.NAME), RowField("formal", K.NAME),
+), str)
 SCALAR_PARAMETER = declare_page("scalar_parameter", (
     RowField("scope", K.SCOPE), RowField("input_id", K.VALUE_ID),
 ), ValueKind)
