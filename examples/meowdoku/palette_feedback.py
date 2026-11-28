@@ -1,8 +1,8 @@
 """The color game: random designs, ranked and scored, teaching a native network.
 
 A round is ``ROUND`` designs drawn at random (``palette_designs.random_design``:
-one of the 148 named CSS colors with a random bevel and shadow), fresh for every
-round and every participant.  Ranking a round stores every ordered pair (the
+a palette of 1 to 6 named CSS colors and a token for every element of a page),
+fresh for every round and every participant.  Ranking a round stores every ordered pair (the
 preferred design first).  The site then wears a proposed design -- the best
 of a random pool as the network scores it for this participant -- and the
 participant scores it on a continuous slider from 0 to 1.  Rankings and
@@ -84,14 +84,15 @@ def _learner(accounts_db):
                 return [(designs.features(json.loads(p)), designs.features(json.loads(o))) for p, o in rows]
 
             def ratings(rows):
-                return [(designs.features(json.loads(d)), float(s)) for d, s in rows]
+                # A design scored before palettes was worn with a second design as its secondary color.
+                return [(designs.features(json.loads(d), json.loads(sec)), float(s)) for d, sec, s in rows]
 
             own_pairs = pairs(db.execute("SELECT preferred,other FROM palette_pair WHERE owner=? ORDER BY id DESC LIMIT 64",
                                          (owner,)).fetchall()[::-1])
-            own_ratings = ratings(db.execute("SELECT design,score FROM palette_rating WHERE owner=? ORDER BY id DESC LIMIT 16",
+            own_ratings = ratings(db.execute("SELECT design,secondary,score FROM palette_rating WHERE owner=? ORDER BY id DESC LIMIT 16",
                                              (owner,)).fetchall()[::-1])
             all_pairs = pairs(db.execute("SELECT preferred,other FROM palette_pair ORDER BY id DESC LIMIT 64").fetchall()[::-1])
-            all_ratings = ratings(db.execute("SELECT design,score FROM palette_rating ORDER BY id DESC LIMIT 16").fetchall()[::-1])
+            all_ratings = ratings(db.execute("SELECT design,secondary,score FROM palette_rating ORDER BY id DESC LIMIT 16").fetchall()[::-1])
             return own_pairs, own_ratings, all_pairs, all_ratings, _personal(db, owner)
         finally:
             db.close()
@@ -129,17 +130,9 @@ def _round(db, owner):
     return (row[0], json.loads(row[1])) if row else _new_round(db, owner)
 
 
-def _distinct(one, two):
-    """Two designs a site can wear together: different colors, apart in OKLab."""
-    a, b = designs.oklab(one["color"]), designs.oklab(two["color"])
-    return one["color"] != two["color"] and sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 > 0.1
-
-
 def _choose(pool, scores, rng):
     order = sorted(range(len(pool)), key=lambda i: scores[i], reverse=True)
-    first = order[0] if rng.random() >= EXPLORE else rng.choice(order[:8])
-    second = next(i for i in order if i != first and _distinct(pool[first], pool[i]))
-    return first, second
+    return order[0] if rng.random() >= EXPLORE else rng.choice(order[:8])
 
 
 def _draft(model, personal):
@@ -161,21 +154,19 @@ def _propose(db, owner, draft):
         # The network has not compiled yet: a random design, said plainly in ``model``.
         yours = everyone = [0.0] * len(pool)
         first = 0
-        second = next(i for i in range(1, len(pool)) if _distinct(pool[0], pool[i]))
     else:
-        first, second = _choose(pool, yours, _RNG)
+        first = _choose(pool, yours, _RNG)
     shared_best = max(range(len(pool)), key=lambda i: everyone[i])
-    shared_second = next(i for i in sorted(range(len(pool)), key=lambda i: everyone[i], reverse=True)
-                         if i != shared_best and _distinct(pool[shared_best], pool[i]))
+    # A design carries its own palette; the ``secondary`` columns (a second design, before palettes) hold null.
     scores = {"yours": yours[first], "everyone": everyone[first],
-              "everyone_best": {"design": pool[shared_best], "secondary": pool[shared_second],
+              "everyone_best": {"design": pool[shared_best], "secondary": None,
                                 "everyone": everyone[shared_best], "yours": yours[shared_best]}}
     nonce = secrets.token_urlsafe(18)
     db.execute("INSERT INTO palette_offer(owner,nonce,design,secondary,scores,updated) VALUES (?,?,?,?,?,?) "
                "ON CONFLICT(owner) DO UPDATE SET nonce=excluded.nonce,design=excluded.design,"
                "secondary=excluded.secondary,scores=excluded.scores,updated=excluded.updated",
-               (owner, nonce, json.dumps(pool[first]), json.dumps(pool[second]), json.dumps(scores), time.time()))
-    _save(db, owner, pool[first], pool[second])
+               (owner, nonce, json.dumps(pool[first]), "null", json.dumps(scores), time.time()))
+    _save(db, owner, pool[first], None)
 
 
 def _key(design, secondary):
@@ -193,12 +184,15 @@ def _save(db, owner, design, secondary):
     return saved
 
 
-def _view(design):
-    return {"name": design["name"], "color": design["color"], "square": designs.square_css(design)}
+def _view(design, secondary=None):
+    """A design as the color game draws it: its palette, style and the dark colors and geometry of its mockup."""
+    palette = designs.upgrade(design, secondary)
+    return {"names": designs.names(palette), "colors": [c["color"] for c in palette["colors"]],
+            "style": palette["style"], "scheme": palette["scheme"], "preview": designs.preview(palette)}
 
 
-def _wear(design, secondary):
-    return {**designs.site_css(design, secondary), "design": _view(design), "secondary_design": _view(secondary)}
+def _wear(design, secondary=None):
+    return {**designs.wear(design, secondary), "design": _view(design, secondary)}
 
 
 def _state(db, owner, model):
@@ -208,10 +202,9 @@ def _state(db, owner, model):
     saved = []
     for saved_id, design, secondary, created in db.execute(
             "SELECT id,design,secondary,created FROM palette_design_saved WHERE owner=? ORDER BY id", (owner,)):
-        design, secondary = json.loads(design), json.loads(secondary)
-        css = designs.site_css(design, secondary)
-        saved.append({"id": saved_id, "color": css["color"], "secondary": css["secondary"],
-                      "names": [design["name"], secondary["name"]], "created": created})
+        palette = designs.upgrade(json.loads(design), json.loads(secondary))
+        saved.append({"id": saved_id, "colors": [c["color"] for c in palette["colors"]],
+                      "names": designs.names(palette), "style": palette["style"], "created": created})
     candidate = comparison = None
     if offer:
         design, secondary, scores = json.loads(offer[1]), json.loads(offer[2]), json.loads(offer[3])
@@ -225,7 +218,8 @@ def _state(db, owner, model):
     ratings, mean = db.execute("SELECT COUNT(*), AVG(score) FROM palette_rating WHERE owner=?", (owner,)).fetchone()
     steps = db.execute("SELECT steps FROM palette_personal WHERE owner=?", (owner,)).fetchone()
     return {"round": {"nonce": nonce, "designs": [{"id": i, **_view(d)} for i, d in enumerate(round_designs)]},
-            "swatches": [{"id": i, "color": d["color"]} for i, d in enumerate(round_designs)],
+            "swatches": [{"id": i, "colors": [c["color"] for c in designs.upgrade(d)["colors"]]}
+                         for i, d in enumerate(round_designs)],
             "candidate": candidate, "comparison": comparison, "saved": saved,
             "active": active[0] if active else None,
             "history": {"rounds": rounds, "pairs": pairs, "ratings": ratings,
@@ -289,10 +283,10 @@ def route(handler, path, method, *, accounts_db):
         elif path == "/api/palette/clear":
             draft = _draft(model, None)
         elif path == "/api/palette/select" and type(body.get("id")) is int:
-            chosen_row = db.execute("SELECT design FROM palette_design_saved WHERE id=? AND owner=?",
+            chosen_row = db.execute("SELECT design,secondary FROM palette_design_saved WHERE id=? AND owner=?",
                                     (body["id"], owner)).fetchone()
             if chosen_row is not None:
-                selected = _selected_scores(model, db, owner, json.loads(chosen_row[0]))
+                selected = _selected_scores(model, db, owner, json.loads(chosen_row[0]), json.loads(chosen_row[1]))
         db.execute("BEGIN IMMEDIATE")
         try:
             if path == "/api/palette/rank":
@@ -360,13 +354,13 @@ def route(handler, path, method, *, accounts_db):
         db.close()
 
 
-def _selected_scores(model, db, owner, design):
+def _selected_scores(model, db, owner, design, secondary=None):
     """The scores of a design worn again, with the comparison it was offered beside."""
-    row = designs.features(design)
+    row = designs.features(design, secondary)
     personal = _personal(db, owner)
     yours = model.score([row], personal) if model.ready else None
     everyone = model.score([row], None) if model.ready else None
     previous = db.execute("SELECT scores FROM palette_offer WHERE owner=?", (owner,)).fetchone()
     best = json.loads(previous[0])["everyone_best"] if previous else {
-        "design": design, "secondary": design, "everyone": 0.0, "yours": 0.0}
+        "design": design, "secondary": secondary, "everyone": 0.0, "yours": 0.0}
     return {"yours": yours[0] if yours else 0.0, "everyone": everyone[0] if everyone else 0.0, "everyone_best": best}

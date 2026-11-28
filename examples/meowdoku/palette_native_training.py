@@ -38,7 +38,7 @@ def run_parameter_group(schedule, group_name, buffers, *, steps=1, learning_rate
     from src.compiler.llvm_training_runtime import run_parameter_group as run
     return run(schedule, group_name, buffers, steps=steps, learning_rate=learning_rate)
 
-HIDDEN = 16
+HIDDEN = 64         # the design is a palette and a token per page element (palette_designs.FEATURES)
 PAIRS = 64          # ranked-pair slots per step
 RATINGS = 16        # slider-rating slots per step
 ALPHA = 0.25        # weight of the personal layer in a score
@@ -137,8 +137,10 @@ def initial_parameters(ids: dict[str, int], seed: int = 0) -> dict[int, np.ndarr
     rng = np.random.default_rng(seed)
     shapes = dict(BINDINGS)
     buffers = {ids[name]: np.zeros(shapes[name]) for name, _shape in BINDINGS}
-    buffers[ids["shared.w1"]] = rng.normal(0.0, 0.3, shapes["shared.w1"])
-    buffers[ids["shared.w2"]] = rng.normal(0.0, 0.3, shapes["shared.w2"])
+    # Scaled by each layer's fan-in, so a wide design (FEATURES inputs) does not saturate the tanh layer at the start:
+    # with 11 inputs and 16 hidden units these are the 0.3 the network began with before palettes.
+    buffers[ids["shared.w1"]] = rng.normal(0.0, 1.0 / np.sqrt(FEATURES), shapes["shared.w1"])
+    buffers[ids["shared.w2"]] = rng.normal(0.0, 1.2 / np.sqrt(HIDDEN), shapes["shared.w2"])
     return buffers
 
 

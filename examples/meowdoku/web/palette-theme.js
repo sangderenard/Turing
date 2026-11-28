@@ -1,6 +1,7 @@
-// Apply only this participant's server-selected color. Every page that loads site-nav.js (with the home feed and the color
-// game) wears it: the two accent variables, and the color game's accent rules for links, buttons, focus, selection, form
-// controls and a stripe along the top of the page. A page's own class rules still win over these element rules.
+// Apply only this participant's server-selected design. Every page that loads site-nav.js (with the home feed and the
+// color game) wears it: the --palette-* colors of every page element, the radius, border and shadow of every box, and
+// the color game's accent rules for links, buttons, focus, selection, form controls and a stripe along the top of the
+// page. A page's own class rules still win over these element rules.
 // A palette chosen or rated on the color game reaches every open page of the site at once (BroadcastChannel).
 const HEX = /^#[0-9a-f]{6}$/i;
 // A design's bevel and shadow are box-shadow lists the server builds from numbers and rgba(); nothing else is worn.
@@ -30,12 +31,30 @@ function onAccent(color) {
 }
 const RULES = `
 :root { accent-color: var(--palette-accent); }
-body { box-shadow: inset 0 4px 0 var(--palette-accent), inset 0 6px 0 var(--palette-secondary, var(--palette-accent)); }
+body { box-shadow: inset 0 4px 0 var(--palette-stripe, var(--palette-accent)),
+                  inset 0 6px 0 var(--palette-secondary, var(--palette-accent)); }
+:focus-visible { outline-color: var(--palette-focus, var(--palette-accent)); }
 a { color: var(--palette-ink, var(--palette-accent)); }
 a:hover { color: var(--palette-secondary, var(--palette-ink, var(--palette-accent))); }
 button { box-shadow: var(--palette-bevel, 0 0 0 transparent), var(--palette-shadow, 0 0 0 transparent); }
 button:hover, button:focus-visible { border-color: var(--palette-accent); outline-color: var(--palette-accent); }
 ::selection { background: color-mix(in srgb, var(--palette-accent) 45%, transparent); }
+`;
+// The worn design's element variables (palette_designs.wear): names, and the three kinds of value they may hold.
+const VARIABLE = /^--palette-[a-z0-9]+(-[a-z0-9]+){0,3}$/;
+const COLOR = /^(#[0-9a-f]{6}|light-dark\(#[0-9a-f]{6}, #[0-9a-f]{6}\))$/i;
+const LENGTH = /^\d{1,3}(\.\d{1,2})?px$/;
+const SET_HERE = new Set(["--palette-accent", "--palette-on-accent", "--palette-secondary", "--palette-bevel",
+                          "--palette-shadow", ...SHADES.map(([name]) => name)]);
+let wornVariables = new Set();
+// Present only while a design with element geometry is worn (a rule with an unset variable would reset the property):
+// the site's controls take the design's control (button2) and input geometry. A page's own class rules still win.
+const GEOMETRY_RULES = `
+button { border-radius: var(--palette-button2-radius); border-width: var(--palette-button2-border);
+         box-shadow: var(--palette-button2-shadow); }
+input:not([type=range]):not([type=checkbox]):not([type=radio]):not([type=color]), select, textarea {
+  border-radius: var(--palette-input-radius); border-width: var(--palette-input-border);
+  box-shadow: var(--palette-input-shadow); }
 `;
 
 export function applyPalette(candidate) {
@@ -59,11 +78,29 @@ export function applyPalette(candidate) {
     if (typeof value === "string" && pattern.test(value)) root.style.setProperty(name, value);
     else root.style.removeProperty(name);
   }
-  if (!document.getElementById("palette-theme")) {
-    const style = document.createElement("style");
-    style.id = "palette-theme";
-    style.textContent = RULES;
-    document.head.append(style);
+  // A palette design (palette_designs.wear) carries every element's own color and every box's radius, border width and
+  // box-shadow; each replaces the derived shade of the same name. A variable the previous design set and this one does
+  // not, or one whose value fails its pattern, is removed.
+  const variables = candidate.variables && typeof candidate.variables === "object" ? candidate.variables : {};
+  const worn = new Set();
+  for (const [name, value] of Object.entries(variables)) {
+    if (typeof value !== "string" || !VARIABLE.test(name)) continue;
+    const pattern = name.endsWith("-radius") || name.endsWith("-border") ? LENGTH
+                  : name.endsWith("-shadow") ? SHADOW : COLOR;
+    if (!pattern.test(value)) continue;
+    root.style.setProperty(name, value);
+    worn.add(name);
+  }
+  for (const name of wornVariables) if (!worn.has(name) && !SET_HERE.has(name)) root.style.removeProperty(name);
+  wornVariables = worn;
+  for (const [id, text, wanted] of [["palette-theme", RULES, true], ["palette-geometry", GEOMETRY_RULES, worn.size > 0]]) {
+    const existing = document.getElementById(id);
+    if (wanted && !existing) {
+      const style = document.createElement("style");
+      style.id = id;
+      style.textContent = text;
+      document.head.append(style);
+    } else if (!wanted && existing) existing.remove();
   }
 }
 
@@ -72,7 +109,7 @@ export function sharePalette(candidate) {
   if (typeof BroadcastChannel !== "function" || !candidate) return;
   const channel = new BroadcastChannel(CHANNEL);
   channel.postMessage({color: candidate.color, secondary: candidate.secondary,
-                       bevel: candidate.bevel, shadow: candidate.shadow});
+                       bevel: candidate.bevel, shadow: candidate.shadow, variables: candidate.variables});
   channel.close();
 }
 

@@ -67,12 +67,19 @@ class PaletteModel:
             self.directory.mkdir(parents=True, exist_ok=True)
             schedule_path = self.directory / "schedule.json"
             ids_path = self.directory / "ids.json"
-            if schedule_path.is_file() and ids_path.is_file():
+            # The schedule is compiled for one layout of the network (the bindings' names and shapes); a schedule
+            # compiled for another layout (an earlier design's features) is compiled again.
+            layout_path = self.directory / "layout.json"
+            layout = [[name, list(shape)] for name, shape in trainer.BINDINGS]
+            same_layout = (layout_path.is_file()
+                           and json.loads(layout_path.read_text(encoding="utf-8")) == layout)
+            if same_layout and schedule_path.is_file() and ids_path.is_file():
                 schedule = trainer.load_training_schedule(schedule_path)
                 ids = json.loads(ids_path.read_text(encoding="utf-8"))
             else:
                 schedule, ids = trainer.compile_palette_trainer(self.directory)
                 ids_path.write_text(json.dumps(ids), encoding="utf-8")
+                layout_path.write_text(json.dumps(layout), encoding="utf-8")
             shared = self._load_shared(ids)
             with self.lock:
                 self.schedule, self.ids, self.shared = schedule, ids, shared
@@ -86,11 +93,12 @@ class PaletteModel:
         buffers = trainer.initial_parameters(ids)
         if path.is_file():
             with np.load(path) as stored:
-                for name in trainer.SHARED:
-                    value = np.asarray(stored[name], dtype=np.float64)
-                    if value.shape == buffers[ids[name]].shape:
-                        buffers[ids[name]] = value
-                self.shared_steps = int(stored["steps"]) if "steps" in stored else 0
+                values = {name: np.asarray(stored[name], dtype=np.float64) for name in trainer.SHARED if name in stored}
+                # Parameters of another layout are not this network's: it starts from its initial parameters.
+                if all(name in values and values[name].shape == buffers[ids[name]].shape for name in trainer.SHARED):
+                    for name in trainer.SHARED:
+                        buffers[ids[name]] = values[name]
+                    self.shared_steps = int(stored["steps"]) if "steps" in stored else 0
         return {name: buffers[ids[name]] for name in trainer.SHARED}
 
     def _save_shared(self) -> None:
@@ -114,9 +122,11 @@ class PaletteModel:
         buffers = trainer.initial_parameters(ids)
         for name, value in self.shared.items():
             buffers[ids[name]] = value.copy()
+        # A personal layer of another layout (an earlier design's features) starts again from zero.
         buffers[ids["personal.u"]] = (
-            np.zeros((designs.FEATURES, 1)) if personal is None
-            else np.asarray(personal, dtype=np.float64).reshape(designs.FEATURES, 1)
+            np.asarray(personal, dtype=np.float64).reshape(designs.FEATURES, 1)
+            if personal is not None and len(personal) == designs.FEATURES
+            else np.zeros((designs.FEATURES, 1))
         )
         trainer.feedback_batch(buffers, ids)
         return buffers

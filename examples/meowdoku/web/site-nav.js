@@ -45,11 +45,11 @@ async function postJson(path, body) {
 
 const CSS = `
 :host { all: initial; }
-.wrap { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right)); z-index: 2147483000; font: 13px/1.3 system-ui, sans-serif; color: var(--palette-fg, #e8e8ee); display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; max-width: calc(100vw - 32px); padding: 6px; border: 1px solid var(--palette-line, #454556); border-radius: 10px; background: color-mix(in srgb, var(--palette-surface, #14141e) 93%, transparent); }
+.wrap { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right)); z-index: 2147483000; font: 13px/1.3 system-ui, sans-serif; color: var(--palette-fg, #e8e8ee); display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; max-width: calc(100vw - 32px); padding: 6px; border: var(--palette-nav-border, 1px) solid var(--palette-line, #454556); border-radius: var(--palette-nav-radius, 10px); background: color-mix(in srgb, var(--palette-nav-bg, var(--palette-surface, #14141e)) 93%, transparent); box-shadow: var(--palette-nav-shadow, none); }
 .actions { display: contents; }
 .chip.toggle { min-height: 32px; box-sizing: border-box; }
 .label { font-size: 11px; color: var(--palette-muted, #b6b6ca); margin: 0 4px; }
-.chip { all: unset; cursor: pointer; padding: 5px 10px; border-radius: 14px; background: color-mix(in srgb, var(--palette-raised, #1c1c24) 82%, transparent); border: 1px solid color-mix(in srgb, var(--palette-line, #ffffff) 18%, transparent);
+.chip { all: unset; cursor: pointer; padding: 5px 10px; border-radius: var(--palette-button2-radius, 14px); background: color-mix(in srgb, var(--palette-button2-bg, var(--palette-raised, #1c1c24)) 82%, transparent); border: 1px solid color-mix(in srgb, var(--palette-line, #ffffff) 18%, transparent);
         color: var(--palette-fg, #e8e8ee); font: inherit; text-decoration: none; display: inline-block; }
 .chip:hover, .chip:focus-visible { background: color-mix(in srgb, var(--palette-raised, #30303e) 95%, transparent); outline: 2px solid var(--palette-accent, #7aa2ff); outline-offset: 1px; }
 .chip.quiet { opacity: .55; } .chip.quiet:hover, .chip.quiet:focus-visible { opacity: 1; }

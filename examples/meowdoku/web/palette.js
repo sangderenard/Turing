@@ -12,12 +12,32 @@ async function request(path, body) {
   return data;
 }
 
-function square(view, className = "square") {
+// A design drawn as a small page (palette_designs.preview): nav bar, header, a card with text, muted text, a link, an
+// input, a primary and a secondary button and a badge, a stripe, and the palette's colors along the bottom. Each part
+// wears its element's color and, for boxes, its radius, border width and box-shadow.
+const PREVIEW_KEY = /^[a-z0-9_]{1,24}$/;
+function mockup(view, className = "mock") {
   const node = document.createElement("span");
   node.className = className;
-  node.style.background = view.square.background;
-  node.style.boxShadow = view.square.boxShadow;
-  node.title = view.name;
+  for (const [key, value] of Object.entries(view.preview || {})) {
+    if (!PREVIEW_KEY.test(key)) continue;
+    node.style.setProperty(`--m-${key.replaceAll("_", "-")}`, typeof value === "number" ? `${value}px` : String(value));
+  }
+  const part = (name, ...children) => {
+    const element = document.createElement("span");
+    element.className = `m-${name}`;
+    element.append(...children);
+    return element;
+  };
+  const strip = part("palette", ...(view.colors || []).map((color) => {
+    const swatch = document.createElement("span");
+    swatch.style.background = color;
+    return swatch;
+  }));
+  node.append(part("stripe"), part("nav", part("dot"), part("dot"), part("dot")), part("header", part("title")),
+    part("card", part("text"), part("muted"), part("link"), part("input"),
+         part("row", part("button"), part("button2"), part("badge"))), strip);
+  node.title = `${(view.names || []).join(" · ")} (${view.style}, ${view.scheme})`;
   return node;
 }
 
@@ -27,7 +47,7 @@ function scatterChips(designs) {
   const field = $("field");
   field.replaceChildren();
   const rect = field.getBoundingClientRect();
-  const chip = 96; // one inch at the CSS reference pixel density
+  const chip = 160; // a small page: 156 by 116 CSS pixels
   const marginX = Math.max(24, rect.width * 0.07);
   const marginY = Math.max(24, rect.height * 0.12);
   const availW = Math.max(chip, rect.width - 2 * marginX);
@@ -57,9 +77,8 @@ function scatterChips(designs) {
     node.className = "chip";
     node.style.left = `${marginX + cell.rowOffset + cell.col * cellW + cellW / 2 + (Math.random() - 0.5) * looseX}px`;
     node.style.top = `${marginY + cell.row * cellH + cellH / 2 + (Math.random() - 0.5) * looseY}px`;
-    node.style.background = design.square.background;
-    node.style.boxShadow = design.square.boxShadow;
-    node.setAttribute("aria-label", `Choose ${design.name}`);
+    node.append(mockup(design));
+    node.setAttribute("aria-label", `Choose the design of ${design.names.join(", ")}`);
     node.addEventListener("click", () => choose(design.id, node));
     field.append(node);
   });
@@ -110,10 +129,12 @@ function renderDesign(target, wear) {
     return;
   }
   const text = document.createElement("div");
-  text.innerHTML = "";
-  text.append(Object.assign(document.createElement("strong"), {textContent: wear.design.name}),
-    document.createTextNode(` with ${wear.secondary_design.name}`));
-  target.append(square(wear.design), square(wear.secondary_design, "square small"), text);
+  text.append(Object.assign(document.createElement("strong"), {textContent: wear.design.names.join(" · ")}),
+    document.createElement("br"),
+    Object.assign(document.createElement("span"), {className: "muted",
+      textContent: `${wear.design.colors.length} color${wear.design.colors.length === 1 ? "" : "s"}, ` +
+                   `${wear.design.scheme}, ${wear.design.style}`}));
+  target.append(mockup(wear.design), text);
 }
 
 function card(title, wear) {
@@ -160,9 +181,9 @@ function renderSaved() {
     const button = document.createElement("button");
     button.type = "button";
     button.setAttribute("aria-pressed", String(palette.id === state.active));
-    button.setAttribute("aria-label", `Palette ${index + 1}: ${palette.names.join(" and ")}`);
-    button.title = palette.names.join(" · ");
-    for (const color of [palette.color, palette.secondary]) {
+    button.setAttribute("aria-label", `Palette ${index + 1}: ${palette.names.join(", ")}`);
+    button.title = `${palette.names.join(" · ")} (${palette.style})`;
+    for (const color of palette.colors) {
       const swatch = document.createElement("span");
       swatch.style.background = color;
       button.append(swatch);

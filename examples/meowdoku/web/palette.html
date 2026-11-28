@@ -18,8 +18,36 @@
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
   #notice { min-height: 1.5rem; }
   .design { display: flex; gap: .9rem; align-items: center; }
-  .square { width: 3.2rem; height: 3.2rem; flex: none; }
-  .square.small { width: 1.8rem; height: 1.8rem; }
+  /* A design drawn as a small page (palette.js mockup): every part wears its element's --m-* color and geometry. */
+  .mock { position: relative; display: flex; flex-direction: column; gap: 5px; width: 156px; height: 116px; flex: none;
+          box-sizing: border-box; padding: 5px 6px 14px; overflow: hidden; text-align: left; background: var(--m-page);
+          border-radius: 6px; }
+  .mock span { display: block; box-sizing: border-box; }
+  .mock .m-stripe { position: absolute; inset: 0 0 auto; height: 3px; background: var(--m-stripe); }
+  .mock .m-nav { display: flex; gap: 3px; align-items: center; height: 11px; padding: 0 4px; background: var(--m-nav);
+                 border: var(--m-nav-border) solid var(--m-line); border-radius: var(--m-nav-radius); box-shadow: var(--m-nav-shadow); }
+  .mock .m-dot { width: 9px; height: 3px; border-radius: 2px; background: var(--m-muted); }
+  .mock .m-header { height: 13px; padding: 3px 4px; background: var(--m-header); border-radius: var(--m-header-radius);
+                    border: var(--m-header-border) solid var(--m-line); box-shadow: var(--m-header-shadow); }
+  .mock .m-title { width: 55%; height: 5px; border-radius: 2px; background: var(--m-text); }
+  .mock .m-card { flex: 1; display: flex; flex-direction: column; gap: 3px; padding: 5px; background: var(--m-surface);
+                  border: var(--m-surface-border) solid var(--m-line); border-radius: var(--m-surface-radius);
+                  box-shadow: var(--m-surface-shadow); }
+  .mock .m-text { width: 80%; height: 3px; background: var(--m-text); }
+  .mock .m-muted { width: 62%; height: 3px; background: var(--m-muted); }
+  .mock .m-link { width: 34%; height: 3px; background: var(--m-link); }
+  .mock .m-input { width: 70%; height: 8px; background: var(--m-input); border: var(--m-input-border) solid var(--m-line);
+                   border-radius: var(--m-input-radius); box-shadow: var(--m-input-shadow); }
+  .mock .m-row { display: flex; gap: 4px; align-items: center; }
+  .mock .m-button { width: 30px; height: 10px; background: var(--m-button); border-radius: var(--m-button-radius);
+                    border: var(--m-button-border) solid color-mix(in srgb, var(--m-button) 60%, var(--m-on-button));
+                    box-shadow: var(--m-button-shadow); }
+  .mock .m-button2 { width: 26px; height: 10px; background: var(--m-button2); border-radius: var(--m-button2-radius);
+                     border: var(--m-button2-border) solid var(--m-line); box-shadow: var(--m-button2-shadow); }
+  .mock .m-badge { width: 16px; height: 7px; background: var(--m-badge); border-radius: var(--m-badge-radius);
+                   border: var(--m-badge-border) solid var(--m-secondary); box-shadow: var(--m-badge-shadow); }
+  .mock .m-palette { position: absolute; inset: auto 0 0; display: flex; height: 8px; }
+  .mock .m-palette span { flex: 1; }
   .score label { display: block; margin: .8rem 0 .3rem; }
   .score input[type=range] { width: min(28rem, 100%); accent-color: var(--palette-accent); }
   .compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; }
@@ -36,8 +64,8 @@
   #overlay { position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.55); }
   #overlay[hidden] { display: none; }
   #field { position: relative; width: 100%; height: 100%; }
-  .chip { position: absolute; width: 1in; height: 1in; border: none; border-radius: 0; padding: 0;
-          cursor: pointer; transform: translate(-50%, -50%); }
+  .chip { position: absolute; width: 156px; height: 116px; border: none; border-radius: 6px; padding: 0;
+          background: none; box-shadow: none; cursor: pointer; transform: translate(-50%, -50%); }
   .chip:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
   .hint { position: absolute; top: 1rem; left: 0; right: 0; text-align: center; color: #e6e6e6;
           font: .95rem/1.4 system-ui, sans-serif; pointer-events: none; }
@@ -51,7 +79,9 @@
 <main id="page">
   <p><a href="/">← Site home</a></p>
   <h1>Play the color preference game</h1>
-  <p>Each round shows designs drawn at random: a named color with its own bevel and shadow. Choose them favorite first.
+  <p>Each round shows designs drawn at random, each a small page: a palette of one to six named colors, and how every
+     part of the page wears them (nav bar, header, cards, text, links, inputs, buttons, badges), with its own corners,
+     borders, bevels and shadows. Choose them favorite first.
      A learning network, compiled to native code, proposes a design for your view of the site; score it with the slider.
      Everyone's answers teach the shared network, which is the site's default. Your own answers also teach a small personal
      layer that nudges that default for you alone.</p>

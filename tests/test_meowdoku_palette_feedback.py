@@ -68,13 +68,16 @@ def test_rounds_are_random_rankings_and_scores_are_recorded(tiered, compiled_mod
     state = _ready(call, a)
     round_one = state["round"]
     assert len(round_one["designs"]) == 8
-    assert len({d["color"] for d in round_one["designs"]}) == 8, "no two squares of a round share a color"
-    assert all(d["name"] in designs.NAMED and d["color"] == designs.NAMED[d["name"]] for d in round_one["designs"])
-    assert all("inset" in d["square"]["boxShadow"] and "rgba(0,0,0," in d["square"]["boxShadow"] for d in round_one["designs"])
+    assert len({d["colors"][0] for d in round_one["designs"]}) == 8, "no two designs of a round start with one color"
+    for d in round_one["designs"]:
+        assert 1 <= len(d["colors"]) <= 6 and len(set(d["colors"])) == len(d["colors"])
+        assert all(designs.NAMED[n] == c for n, c in zip(d["names"], d["colors"]))
+        assert d["style"] in designs.STYLES and d["scheme"] in designs.SCHEMES
+        assert set(designs.ELEMENTS) <= set(d["preview"]) and isinstance(d["preview"]["surface_shadow"], str)
     # Try again draws a new random round and records nothing.
     status, again, _ = call("POST", "/api/palette/round", {}, a)
     assert status == 200 and again["round"]["nonce"] != round_one["nonce"]
-    assert [d["name"] for d in again["round"]["designs"]] != [d["name"] for d in round_one["designs"]]
+    assert [d["names"] for d in again["round"]["designs"]] != [d["names"] for d in round_one["designs"]]
     assert again["history"]["pairs"] == 0
     # A stale round is refused; the current one ranks into every ordered pair.
     order = [d["id"] for d in again["round"]["designs"]][::-1]
@@ -84,9 +87,12 @@ def test_rounds_are_random_rankings_and_scores_are_recorded(tiered, compiled_mod
     assert status == 200 and ranked["history"]["pairs"] == 28 and ranked["history"]["rounds"] == 1
     assert ranked["round"]["nonce"] != again["round"]["nonce"]
     candidate = ranked["candidate"]
-    assert candidate and candidate["design"]["name"] in designs.NAMED and candidate["color"].startswith("#")
-    assert candidate["design"]["color"] != candidate["secondary_design"]["color"]
-    assert designs.contrast(candidate["color"], designs.BACKGROUND) >= designs.ACCENT_CONTRAST
+    assert candidate and all(n in designs.NAMED for n in candidate["design"]["names"])
+    assert candidate["color"].startswith("#") and candidate["variables"]["--palette-fg"].startswith("light-dark(#")
+    assert candidate["variables"]["--palette-surface-radius"].endswith("px")
+    preview = candidate["design"]["preview"]        # readability is enforced, not learned
+    assert designs.contrast(preview["text"], preview["surface"]) >= 4.5
+    assert designs.contrast(preview["link"], preview["surface"]) >= 4.5
     assert set(ranked["comparison"]) == {"yours", "everyone"}
     # The slider score: a number from 0 to 1 for the current design.
     nonce = candidate["nonce"]
@@ -101,12 +107,13 @@ def test_rounds_are_random_rankings_and_scores_are_recorded(tiered, compiled_mod
     # Another browser has its own rounds and history.
     status, other, b = call("GET", "/api/palette")
     assert status == 200 and b != a and other["history"]["pairs"] == 0
-    assert [d["name"] for d in other["round"]["designs"]] != [d["name"] for d in scored["round"]["designs"]]
+    assert [d["names"] for d in other["round"]["designs"]] != [d["names"] for d in scored["round"]["designs"]]
     # Saved designs are kept and can be worn again.
     saved = scored["saved"]
     assert len(saved) >= 3 and scored["active"] == saved[-1]["id"]
     status, worn, _ = call("POST", "/api/palette/select", {"id": saved[0]["id"]}, a)
-    assert status == 200 and worn["active"] == saved[0]["id"] and worn["candidate"]["color"] == saved[0]["color"]
+    assert status == 200 and worn["active"] == saved[0]["id"]
+    assert worn["candidate"]["design"]["colors"] == saved[0]["colors"]
     assert call("POST", "/api/palette/select", {"id": saved[0]["id"]}, b)[0] == 404
     # Clear forgets this participant only.
     _model(compiled_model).drain()
@@ -123,13 +130,19 @@ def test_the_network_learns_a_preference_continuously(tiered, compiled_model):
     state = _ready(call, a)
     model = _model(compiled_model)
     shared_before = model.status()["shared_steps"]
-    # A participant who always prefers lighter colors (OKLab lightness, the first feature).
+    # A participant who always prefers lighter cards (the OKLab lightness of the surface, one of the features).
+    # The slider spans the surface's dark lightness band (0 at its darkest, 1 at its lightest), as a person would.
+    low, high = designs.ELEMENTS["surface"][2]
+
+    def surface_lightness(view):
+        return min(1.0, max(0.0, (designs.oklab(view["preview"]["surface"])[0] - low) / (high - low)))
+
     for _round in range(6):
-        ranked = sorted(state["round"]["designs"], key=lambda d: designs.oklab(d["color"])[0], reverse=True)
+        ranked = sorted(state["round"]["designs"], key=surface_lightness, reverse=True)
         status, state, _ = call("POST", "/api/palette/rank",
                                 {"nonce": state["round"]["nonce"], "ranking": [d["id"] for d in ranked]}, a)
         assert status == 200
-        lightness = designs.oklab(state["candidate"]["design"]["color"])[0]
+        lightness = surface_lightness(state["candidate"]["design"])
         status, state, _ = call("POST", "/api/palette/feedback",
                                 {"nonce": state["candidate"]["nonce"], "rating": round(lightness, 3)}, a)
         assert status == 200
@@ -147,7 +160,7 @@ def test_the_network_learns_a_preference_continuously(tiered, compiled_model):
     weights = json.loads(sqlite3.connect(str(tiered[2].accounts_db)).execute(
         "SELECT weights FROM palette_personal").fetchone()[0])
     scores = model.score(rows, weights)
-    light = [designs.oklab(d["color"])[0] for d in held_out]
+    light = [designs.oklab(designs.preview(d)["surface"])[0] for d in held_out]
     agree = np.mean([(scores[i] > scores[j]) == (light[i] > light[j])
                      for i in range(64) for j in range(i + 1, 64) if light[i] != light[j]])
     assert agree > 0.75, agree
