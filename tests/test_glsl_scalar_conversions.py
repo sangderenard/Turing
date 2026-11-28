@@ -99,3 +99,23 @@ def test_uint_conversion_of_int_keeps_the_bit_pattern_on_native(depth_zero):
     iwords = np.array([-1, 41, -2], dtype=np.int32)
     _run_native(_UINT_CONVERSION, uwords, iwords, depth_zero=depth_zero)
     assert uwords.tolist() == [4294967295, 42, 4294967295]
+
+
+_DOUBLE_CONVERSION = '''#version 430
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer UWords { uint uwords[]; };
+layout(std430, binding = 1) buffer IWords { int iwords[]; };
+void main() {
+    uwords[0] = uint(double(iwords[0]) + 1.0);
+}'''
+
+
+@pytest.mark.parametrize('depth_zero', [True, False], ids=['depth0', 'default'])
+def test_double_conversion_is_float64_on_native(depth_zero):
+    # 16777216 + 1 is exact in float64 and rounds back to 16777216 in
+    # float32: the result shows the width the planner chose for double().
+    import numpy as np
+    uwords = np.array([7], dtype=np.uint32)
+    iwords = np.array([16777216], dtype=np.int32)
+    _run_native(_DOUBLE_CONVERSION, uwords, iwords, depth_zero=depth_zero)
+    assert uwords.tolist() == [16777217]
