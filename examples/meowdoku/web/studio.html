@@ -4,18 +4,18 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Meowdoku loading studio</title>
 <style>
-  :root { --bg:#14151a; --panel:#1d1f27; --line:#2f3240; --fg:#e8e8ea; --dim:#9a9caa; --accent:#6aa9ff; --warn:#ffb14a; --bad:#ff6a6a; --ok:#6fe39a; }
+  :root { color-scheme:dark; --bg:var(--palette-bg,#14151a); --panel:var(--palette-surface,#1d1f27); --line:var(--palette-line,#2f3240); --fg:var(--palette-fg,#e8e8ea); --dim:var(--palette-muted,#9a9caa); --accent:var(--palette-accent,#6aa9ff); --warn:#ffb14a; --bad:#ff6a6a; --ok:#6fe39a; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
   header { display:flex; flex-wrap:wrap; gap:12px 20px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
   header h1 { font-size:16px; margin:0; font-weight:700; }
-  header a { color:var(--accent); text-decoration:none; }
+  header a { color:var(--palette-ink,var(--accent)); text-decoration:none; }
   main { max-width:1280px; margin:0 auto; padding:16px; display:grid; gap:18px; }
   section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
   section > h2 { margin:0 0 10px; font-size:15px; }
-  button, select, input { font:inherit; color:var(--fg); background:#262935; border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
+  button, select, input { font:inherit; color:var(--fg); background:var(--palette-raised,#262935); border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
   button { cursor:pointer; } button:hover:not(:disabled) { border-color:var(--accent); } button:disabled { opacity:.45; cursor:default; }
-  button.on { background:var(--accent); color:#06101e; border-color:var(--accent); font-weight:600; }
+  button.on { background:var(--accent); color:var(--palette-on-accent,#06101e); border-color:var(--accent); font-weight:600; }
   button.danger:hover:not(:disabled) { border-color:var(--bad); color:var(--bad); }
   label { display:grid; gap:3px; font-size:12px; color:var(--dim); } label > span { display:flex; justify-content:space-between; }
   label b { color:var(--fg); font-weight:600; }
@@ -33,7 +33,7 @@
   .stats { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; } .stats dt { color:var(--dim); } .stats dd { margin:0; font-variant-numeric:tabular-nums; }
   .msg { min-height:1.4em; font-size:13px; } .msg.err { color:var(--bad); } .msg.ok { color:var(--ok); }
   .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:12px; }
-  .card { border:1px solid var(--line); border-radius:8px; padding:8px; background:#191b22; display:grid; gap:6px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:8px; background:var(--palette-raised,#191b22); display:grid; gap:6px; }
   .card.active { border-color:var(--ok); } .card.sel { outline:2px solid var(--accent); }
   .card canvas { width:100%; aspect-ratio:4/3; background:#101116; border-radius:6px; display:block; }
   .card .meta { font-size:12px; color:var(--dim); } .card .meta b { color:var(--fg); font-weight:600; }

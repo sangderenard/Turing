@@ -5,16 +5,16 @@
 <title>Connected services</title>
 <style>
 :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
-body { margin: 0; background: #111823; color: #eef2fa; }
+body { margin: 0; background: var(--palette-bg, #111823); color: var(--palette-fg, #eef2fa); }
 main { max-width: 52rem; margin: auto; padding: 1.5rem 1rem 5rem; }
-a { color: #a9ceff; } .muted { color: #bac7d8; }
-.card { background: #1c2939; border: 1px solid #44536a; border-radius: 12px; padding: 1.25rem; margin: 1rem 0 2rem; }
+a { color: var(--palette-ink, #a9ceff); } .muted { color: var(--palette-muted, #bac7d8); }
+.card { background: var(--palette-surface, #1c2939); border: 1px solid var(--palette-line, #44536a); border-radius: 12px; padding: 1.25rem; margin: 1rem 0 2rem; }
 h1 { margin-bottom: .4rem; } h3 { margin-top: 0; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
-button { font: inherit; padding: .5rem .9rem; color: inherit; background: #162234; border: 1px solid #647792; border-radius: 6px; cursor: pointer; }
+button { font: inherit; padding: .5rem .9rem; color: inherit; background: var(--palette-raised, #162234); border: 1px solid var(--palette-line, #647792); border-radius: 6px; cursor: pointer; }
 button:disabled { opacity: .6; cursor: not-allowed; }
 dt { font-weight: 600; margin-top: .8rem; } dd { margin-left: 0; }
-select, textarea { display:block; width:100%; box-sizing:border-box; color:inherit; background:#111823; font:inherit; margin:.6rem 0; }
+select, textarea { display:block; width:100%; box-sizing:border-box; color:inherit; background:var(--palette-raised, #111823); font:inherit; margin:.6rem 0; }
 pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:28rem; overflow:auto; }
 code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
 </style>

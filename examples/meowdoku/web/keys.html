@@ -5,13 +5,13 @@
 <title>Keys and credentials · Meowdoku</title>
 <style>
   :root { color-scheme: dark; font: 15px/1.45 system-ui, sans-serif; }
-  body { margin: 0; color: #eef2fa; background: #111823; }
+  body { margin: 0; color: var(--palette-fg, #eef2fa); background: var(--palette-bg, #111823); }
   main { max-width: 50rem; margin: auto; padding: 1rem 1rem 5rem; }
-  a { color: #a9ceff; } .card { background: #1c2939; border: 1px solid #44536a; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
-  input, select, textarea, button { box-sizing: border-box; font: inherit; color: inherit; background: #111c2b; border: 1px solid #647792; border-radius: 5px; padding: .45rem; }
+  a { color: var(--palette-ink, #a9ceff); } .card { background: var(--palette-surface, #1c2939); border: 1px solid var(--palette-line, #44536a); border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  input, select, textarea, button { box-sizing: border-box; font: inherit; color: inherit; background: var(--palette-raised, #111c2b); border: 1px solid var(--palette-line, #647792); border-radius: 5px; padding: .45rem; }
   input, textarea { width: 100%; } textarea { min-height: 7rem; } button { cursor: pointer; } button:disabled { opacity: .5; }
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; } .row > * { flex: 1 1 12rem; }
-  .muted { color: #bac7d8; } code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
+  .muted { color: var(--palette-muted, #bac7d8); } code { overflow-wrap: anywhere; } [hidden] { display: none !important; }
 </style>
 </head>
 <body><main>

@@ -6,26 +6,26 @@
 <title>Pages · Meowdoku</title>
 <style>
   :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
-  body { margin: 0; background: radial-gradient(circle at 90% 0%, color-mix(in srgb, var(--palette-accent, #4b6888) 28%, #121822), #121822 32rem); color: #edf2fb; }
+  body { margin: 0; background: radial-gradient(circle at 90% 0%, color-mix(in srgb, var(--palette-accent, #4b6888) 28%, var(--palette-bg, #121822)), var(--palette-bg, #121822) 32rem); color: var(--palette-fg, #edf2fb); }
   main { max-width: 56rem; margin: auto; padding: 2rem 1rem 5rem; }
-  a { color: var(--palette-accent, #a9cfff); }
+  a { color: var(--palette-ink, #a9cfff); }
   .row { display: flex; gap: .7rem; align-items: center; flex-wrap: wrap; }
-  .card { border: 1px solid color-mix(in srgb, var(--palette-accent, #34455c) 40%, #34455c); border-radius: 12px; padding: 1rem; margin: 1rem 0; background: #1a2534; }
+  .card { border: 1px solid color-mix(in srgb, var(--palette-accent, #34455c) 40%, var(--palette-line, #34455c)); border-radius: 12px; padding: 1rem; margin: 1rem 0; background: var(--palette-surface, #1a2534); }
   .card h2 { margin: .1rem 0 .4rem; }
-  .muted { color: #becbe0; }
-  button, input, select, textarea { font: inherit; color: inherit; background: #101a29; border: 1px solid #506582; border-radius: 6px; padding: .45rem; }
+  .muted { color: var(--palette-muted, #becbe0); }
+  button, input, select, textarea { font: inherit; color: inherit; background: var(--palette-raised, #101a29); border: 1px solid var(--palette-line, #506582); border-radius: 6px; padding: .45rem; }
   button { cursor: pointer; }
   input[type=text], textarea { box-sizing: border-box; width: 100%; }
   textarea { min-height: 5rem; }
   form { display: grid; gap: .8rem; }
   .views { display: inline-flex; gap: .3rem; }
-  .views button[aria-pressed="true"] { outline: 2px solid #a7c7ff; }
+  .views button[aria-pressed="true"] { outline: 2px solid var(--palette-accent, #a7c7ff); }
   .grid.thread { display: block; max-width: 760px; }
   .grid.thread .card { margin-bottom: 1.2rem; }
-  .card-thread { border-top: 1px solid #39465c; margin-top: .6rem; padding-top: .6rem; }
+  .card-thread { border-top: 1px solid var(--palette-line, #39465c); margin-top: .6rem; padding-top: .6rem; }
   .card-thread ul { list-style: none; padding: 0; margin: .4rem 0; }
-  .card-thread li { padding: .3rem 0; border-bottom: 1px solid #253045; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .card-thread .who { color: #acc7ff; font-weight: 600; margin-right: .5rem; }
+  .card-thread li { padding: .3rem 0; border-bottom: 1px solid var(--palette-line, #253045); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .card-thread .who { color: var(--palette-ink, #acc7ff); font-weight: 600; margin-right: .5rem; }
   .card-thread form { display: flex; gap: .5rem; align-items: flex-end; }
   .card-thread textarea { flex: 1; }
   [hidden] { display: none !important; }

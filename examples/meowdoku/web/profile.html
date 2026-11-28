@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Profile</title>
 <style>
-  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --acc:#1a5fb4; --card:#fff; --sel:#e8f0fb; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --acc:#7db0ff; --card:#202024; --sel:#26324a; } }
+  :root { color-scheme: light dark; --bg:var(--palette-bg,#fbfaf7); --fg:var(--palette-fg,#1d1d1f); --mut:var(--palette-muted,#6b6b70); --line:var(--palette-line,#d9d6cf); --acc:var(--palette-ink,#1a5fb4); --card:var(--palette-surface,#fff); --sel:var(--palette-raised,#e8f0fb); }
+  @media (prefers-color-scheme: dark) { :root { --bg:var(--palette-bg,#17171a); --fg:var(--palette-fg,#ececee); --mut:var(--palette-muted,#9a9aa1); --line:var(--palette-line,#37373d); --acc:var(--palette-ink,#7db0ff); --card:var(--palette-surface,#202024); --sel:var(--palette-raised,#26324a); } }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
   main { max-width:78rem; margin:0 auto; padding:1rem 16px 4rem; }
   a { color:var(--acc); }

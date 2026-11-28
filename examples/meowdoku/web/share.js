@@ -352,7 +352,7 @@ async function loadIncoming() {
 
 // ---------------------------------------------------------------- the UI and the host (app.js) hooks
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
-const STYLE = "position:fixed;z-index:60;right:8px;bottom:8px;max-width:min(28rem,94vw);background:var(--ctl,#223);color:var(--fg,#eee);border:1px solid var(--line,#556);border-radius:8px;padding:8px 10px;font:13px/1.35 system-ui,sans-serif;display:grid;gap:6px";
+const STYLE = "position:fixed;z-index:60;right:8px;bottom:8px;max-width:min(28rem,94vw);background:var(--ctl,var(--palette-raised,#223));color:var(--fg,var(--palette-fg,#eee));border:1px solid var(--line,var(--palette-line,#556));border-radius:8px;padding:8px 10px;font:13px/1.35 system-ui,sans-serif;display:grid;gap:6px";
 
 function panel() {
   let p = document.getElementById("share-panel");
@@ -492,7 +492,7 @@ function addButtons() {
 function banner(text, ...buttons) {
   document.getElementById("share-banner")?.remove();
   const n = el("div", { id: "share-banner" }, el("span", { textContent: text + " " }), ...buttons);
-  n.style.cssText = "position:fixed;z-index:60;left:8px;bottom:8px;background:var(--ctl,#223);color:var(--fg,#eee);border:1px solid var(--line,#556);border-radius:8px;padding:6px 10px;font:13px system-ui,sans-serif;max-width:min(30rem,94vw)";
+  n.style.cssText = "position:fixed;z-index:60;left:8px;bottom:8px;background:var(--ctl,var(--palette-raised,#223));color:var(--fg,var(--palette-fg,#eee));border:1px solid var(--line,var(--palette-line,#556));border-radius:8px;padding:6px 10px;font:13px system-ui,sans-serif;max-width:min(30rem,94vw)";
   document.body.append(n);
   return n;
 }

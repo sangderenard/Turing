@@ -154,8 +154,8 @@ export function initTipJar(hooks) {
   #tipjar .legend div { display: flex; gap: 6px; align-items: center; margin: 2px 0; font-size: 12px; }
   #tipjar .sw { width: 12px; height: 12px; border-radius: 50%; flex: none; }
   #tipjar .ramp { width: 70px; height: 10px; border-radius: 5px; flex: none; }
-  #tipjar-tip { position: fixed; z-index: 4; pointer-events: none; display: none; padding: 6px 9px; border-radius: 8px; background: rgba(12,12,16,.92); color: #f4f4f6;
-                border: 1px solid #55555e; font: 12px/1.35 system-ui, sans-serif; max-width: 260px; }
+  #tipjar-tip { position: fixed; z-index: 4; pointer-events: none; display: none; padding: 6px 9px; border-radius: 8px; background: color-mix(in srgb, var(--palette-surface, #0c0c10) 92%, transparent); color: var(--palette-fg, #f4f4f6);
+                border: 1px solid var(--palette-line, #55555e); font: 12px/1.35 system-ui, sans-serif; max-width: 260px; }
   @media (max-width: 700px) { #tipjar { left: 10px; right: 10px; width: auto; bottom: 36px; max-height: 38%; } }`;
   document.head.appendChild(css);
   const panel = document.createElement("div"); panel.id = "tipjar";
@@ -244,7 +244,7 @@ export function initTipJar(hooks) {
     if (!g) { tip.style.display = "none"; return; }
     const d = describeGrain(g, current.kinds);
     tip.replaceChildren(el("div", null, d.amount), el("div", null, d.date + " · " + d.status), el("div", null, "from " + d.from));
-    if (g.txid) { const a = el("a", null, "txid " + g.txid.slice(0, 12) + "…"); a.href = "https://mempool.space/tx/" + g.txid; a.target = "_blank"; a.rel = "noopener"; a.style.pointerEvents = "auto"; a.style.color = "#9bd"; tip.append(a); }
+    if (g.txid) { const a = el("a", null, "txid " + g.txid.slice(0, 12) + "…"); a.href = "https://mempool.space/tx/" + g.txid; a.target = "_blank"; a.rel = "noopener"; a.style.pointerEvents = "auto"; a.style.color = "var(--palette-ink, #9bd)"; tip.append(a); }
     tip.style.display = "block";
     tip.style.left = Math.min(innerWidth - 270, x + 14) + "px"; tip.style.top = Math.max(8, y - 10) + "px";
   }
