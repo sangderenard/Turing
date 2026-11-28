@@ -68,6 +68,57 @@ param(
     [string]$GeminiModel = 'gemini-3.5-flash-lite'
 )
 $ErrorActionPreference = 'Stop'
+# One tick per agent alive at a time (owner, 2026-11-28). While an older tick for this agent still runs, a new tick does
+# nothing and exits at once, before any other work. 2026-11-28: the external-agent registry read below hung, and every
+# minute's five ticks stacked behind it: 431 ticks and 133 Python reads, 13 GB of memory and 1.4 GB left on C:. The
+# mutex belongs to the process: the OS releases it when the tick exits or is killed, so a dead tick never blocks.
+if ($Tick -and $Agent) {
+    $TickMutex = [Threading.Mutex]::new($false, "Local\SpeakToMe-agent-tick-$Agent")
+    try { $TickHeld = $TickMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $TickHeld = $true }
+    if (-not $TickHeld) { exit 0 }
+    # No orphans (owner, 2026-11-28). The tick and every process it starts (the Python calls, a work run) go into one
+    # job object whose only handle lives in the tick's parent, the headless conhost Task Scheduler started. When that
+    # parent ends for any reason (the task stopped, conhost killed), the kernel closes the handle and kills the tick
+    # with its whole tree at once: Task Scheduler stopping conhost used to leave the pwsh and its Python behind.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SpeakToMeTickJob {
+    [StructLayout(LayoutKind.Sequential)] struct Basic {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Io { public ulong R, W, O, RB, WB, OB; }
+    [StructLayout(LayoutKind.Sequential)] struct Extended {
+        public Basic BasicLimitInformation; public Io IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref Extended info, int length);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess, out IntPtr target, int access, bool inherit, int options);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static void BindToParent(int parentPid) {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        Extended info = new Extended();
+        info.BasicLimitInformation.LimitFlags = 0x2000;                    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if (!SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(typeof(Extended)))) throw new System.ComponentModel.Win32Exception();
+        if (!AssignProcessToJobObject(job, GetCurrentProcess())) throw new System.ComponentModel.Win32Exception();
+        IntPtr parent = OpenProcess(0x0040, false, parentPid);             // PROCESS_DUP_HANDLE
+        if (parent == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        IntPtr moved;                                                       // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS
+        bool ok = DuplicateHandle(GetCurrentProcess(), job, parent, out moved, 0, false, 3);
+        CloseHandle(parent);
+        if (!ok) throw new System.ComponentModel.Win32Exception();
+    }
+}
+'@
+    [SpeakToMeTickJob]::BindToParent((Get-Process -Id $PID).Parent.Id)
+}
 Import-Module (Join-Path $PSScriptRoot 'AgentAccounts.psm1') -Force
 $Workspace = 'C:\dev\Powershell'
 $Base = 'https://stichka.duckdns.org:8766'
@@ -99,6 +150,35 @@ $Agents = [ordered]@{
 while (`$prompt -match '^(room|tail):\s*(\S+)\s*\r?\n') { `$extra += "--`$(`$Matches[1])", `$Matches[2]; `$prompt = `$prompt.Substring(`$Matches[0].Length) }
 `$null | & '$Python' '$Workspace\turing\examples\meowdoku\deploy\gemini_agent.py' --model '$GeminiModel' --tools '$GeminiTools' --prompt `$prompt @extra 2>&1
 "@ }
+}
+
+# One Python call that cannot outlive -Seconds: on timeout its whole process tree is killed and the call reports exit
+# -1. A tick's own time limit does not reach it: Task Scheduler stops the headless conhost the task started, not the
+# pwsh under it, so a call hung on a locked or slow disk kept its tick alive (2026-11-20: ~190 ticks piled up behind
+# the execution-queue claim while icacls rewrote the tree's permissions).
+function Invoke-BoundedPython([string[]]$Arguments, [int]$Seconds = 60, [string]$InputText = $null) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Python)
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.RedirectStandardInput = $null -ne $InputText
+    $utf8 = [Text.UTF8Encoding]::new($false)                  # Python here speaks UTF-8 (PYTHONIOENCODING above)
+    $info.StandardOutputEncoding = $utf8
+    $info.StandardErrorEncoding = $utf8
+    if ($null -ne $InputText) { $info.StandardInputEncoding = $utf8 }
+    $process = [Diagnostics.Process]::Start($info)
+    $out = $process.StandardOutput.ReadToEndAsync()
+    $err = $process.StandardError.ReadToEndAsync()
+    if ($null -ne $InputText) { $process.StandardInput.Write($InputText); $process.StandardInput.Close() }
+    if (-not $process.WaitForExit($Seconds * 1000)) {
+        try { $process.Kill($true) } catch { }
+        $process.WaitForExit()
+        return [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true }
+    }
+    $process.WaitForExit()
+    [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $out.Result; TimedOut = $false; Error = $err.Result }
 }
 
 # External API agents (case 989e507e): each one an admin declared on /operator-control.html and the owner installed with
@@ -221,15 +301,17 @@ function Get-DefaultMemoryId([string]$name, [bool]$bellRun) {
 # -Session) holds the session's output and writes each line, then its exit, with Log.  The record names the relay, which
 # lives exactly as long as the session does.
 function Start-AgentSession([string]$name, [string]$why) {
-    $info = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
-    foreach ($a in @('-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-Session', '-Agent', $name, '-Why', $why,
-                     '-AgentDays', $AgentDays, '-AccountsDb', $AccountsDb, '-BellTimeoutMinutes', "$BellTimeoutMinutes")) {
-        $info.ArgumentList.Add($a)
-    }
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $relay = [Diagnostics.Process]::Start($info)
-    Add-AgentRecord $AgentDays 'session' $Agents[$name].account $relay.Id @{ agent = $name; reason = 'bell' } | Out-Null
+    # Started by WMI, not as the tick's child: the tick's job kills everything in it when the tick's parent ends, and
+    # the relay is meant to outlive the tick. A WMI-created process is in no job of the tick's.
+    $quote = { param($s) '"' + ($s -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }
+    $line = (@((Join-Path $PSHOME 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-Session',
+               '-Agent', $name, '-Why', $why, '-AgentDays', $AgentDays, '-AccountsDb', $AccountsDb,
+               '-BellTimeoutMinutes', "$BellTimeoutMinutes") | ForEach-Object { & $quote $_ }) -join ' '
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = $line; CurrentDirectory = $PSScriptRoot; ProcessStartupInformation = $startup }
+    if ($created.ReturnValue -ne 0) { throw "relay not started: Win32_Process.Create returned $($created.ReturnValue)" }
+    Add-AgentRecord $AgentDays 'session' $Agents[$name].account ([int]$created.ProcessId) @{ agent = $name; reason = 'bell' } | Out-Null
 }
 
 # The relay's body: the session as the agent's account, its output into tick.log line by line, then its exit.
@@ -337,35 +419,6 @@ function Invoke-AgentRun([string]$name, [string]$reason, [string]$why) {
         ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $AgentDays 'runs.jsonl') -Encoding utf8
 }
 
-# One Python call that cannot outlive -Seconds: on timeout its whole process tree is killed and the call reports exit
-# -1. A tick's own time limit does not reach it: Task Scheduler stops the headless conhost the task started, not the
-# pwsh under it, so a call hung on a locked or slow disk kept its tick alive (2026-11-20: ~190 ticks piled up behind
-# the execution-queue claim while icacls rewrote the tree's permissions).
-function Invoke-BoundedPython([string[]]$Arguments, [int]$Seconds = 60, [string]$InputText = $null) {
-    $info = [Diagnostics.ProcessStartInfo]::new($Python)
-    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $info.RedirectStandardInput = $null -ne $InputText
-    $utf8 = [Text.UTF8Encoding]::new($false)                  # Python here speaks UTF-8 (PYTHONIOENCODING above)
-    $info.StandardOutputEncoding = $utf8
-    $info.StandardErrorEncoding = $utf8
-    if ($null -ne $InputText) { $info.StandardInputEncoding = $utf8 }
-    $process = [Diagnostics.Process]::Start($info)
-    $out = $process.StandardOutput.ReadToEndAsync()
-    $err = $process.StandardError.ReadToEndAsync()
-    if ($null -ne $InputText) { $process.StandardInput.Write($InputText); $process.StandardInput.Close() }
-    if (-not $process.WaitForExit($Seconds * 1000)) {
-        try { $process.Kill($true) } catch { }
-        $process.WaitForExit()
-        return [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true }
-    }
-    $process.WaitForExit()
-    [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $out.Result; TimedOut = $false; Error = $err.Result }
-}
-
 function Invoke-AgentExecution([string]$name, $declared) {
     # HTTP queued this agent's own command. The existing owner task, which already
     # holds the saved account credential, starts it through Invoke-AsAgent.
@@ -435,9 +488,9 @@ if ($Register -or $Unregister) {
         # -MaxRunning runs before any had written its record (2026-11-14 23:50: three ran at once under a limit of two).
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds((15 * $order++) % 60) -RepetitionInterval (New-TimeSpan -Minutes 1)
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-        # Parallel: a tick that is waiting for its work run must not stop the next minute's bell. The agent's lock in
-        # -Tick keeps two ticks from deciding at once.
-        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances Parallel `
+        # IgnoreNew (owner, 2026-11-28; was Parallel): while a tick still runs, the next minute's start does nothing.
+        # Parallel let hung ticks stack without limit (431 on 2026-11-28). The tick's own mutex enforces the same rule.
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
             -ExecutionTimeLimit (New-TimeSpan -Minutes ($TimeoutMinutes + 10))
         Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
         Write-Host "registered '$task': every minute, hourly work at :$('{0:00}' -f $Agents[$name].offset), only while $env:USERNAME is signed in"
