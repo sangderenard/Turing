@@ -28,6 +28,8 @@ BIT_REINTERPRETATIONS = {
     "float_bits_to_int": ("float32", "int32"),
     "uint_bits_to_float": ("uint32", "float32"),
     "int_bits_to_float": ("int32", "float32"),
+    "int_bits_to_uint": ("int32", "uint32"),
+    "uint_bits_to_int": ("uint32", "int32"),
 }
 
 #: Each reinterpretation's exact inverse.
@@ -36,6 +38,8 @@ BIT_REINTERPRETATION_INVERSES = {
     "uint_bits_to_float": "float_bits_to_uint",
     "float_bits_to_int": "int_bits_to_float",
     "int_bits_to_float": "float_bits_to_int",
+    "int_bits_to_uint": "uint_bits_to_int",
+    "uint_bits_to_int": "int_bits_to_uint",
 }
 
 
@@ -69,8 +73,21 @@ def int_bits_to_float(value):
     return _reinterpret(value, "int32", "float32")
 
 
+def int_bits_to_uint(value):
+    """The int32 ``value``'s bits as a uint32 (GLSL ``uint(int)``)."""
+
+    return _reinterpret(value, "int32", "uint32")
+
+
+def uint_bits_to_int(value):
+    """The uint32 ``value``'s bits as an int32 (GLSL ``int(uint)``)."""
+
+    return _reinterpret(value, "uint32", "int32")
+
+
 __all__ = [
     "BIT_REINTERPRETATIONS", "BIT_REINTERPRETATION_INVERSES",
     "float_bits_to_int", "float_bits_to_uint",
-    "int_bits_to_float", "uint_bits_to_float",
+    "int_bits_to_float", "int_bits_to_uint",
+    "uint_bits_to_float", "uint_bits_to_int",
 ]

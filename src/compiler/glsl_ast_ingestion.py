@@ -1147,19 +1147,19 @@ class _ASTExpressionParser:
             # annotated temporary below declares its GLSL width; the planner
             # takes a cast's width from that annotation (int and uint are
             # one kind there, ``hierarchical_plan.scalar_cast_result_dtype``).
+            if (self.context is not None and name == "uint"
+                    and _type_of(args[0]) == "int"):
+                # GLSL ``uint(int)`` keeps the bit pattern (``uint(-1)`` is
+                # 4294967295): the same-width ``BitCast``
+                # ``int_bits_to_uint``, whose result is a uint32 value.
+                # Program: ``uwords[0] = uint(iwords[0]) + 1u`` with -1.
+                # Wrong record: written as ``int(int(x) & 0xFFFFFFFF)``, the
+                # result's source class was Python's ``int``, so the add
+                # ran in int64 and the uint32 store faulted 86 on 2**32
+                # instead of wrapping to 0 (issue cb85552d).
+                self.context.imports.add("int_bits_to_uint")
+                return _typed(_call("int_bits_to_uint", list(args)), name)
             converted = _typed(_call(_PYTHON_CAST_SPELLING.get(name, name), args), name)
-            if name == "uint" and _type_of(args[0]) == "int":
-                # GLSL ``uint(int)`` keeps the bit pattern: the value modulo
-                # 2**32 (``uint(-1)`` is 4294967295).  The builtin ``int``
-                # is a value-preserving conversion, so the wrap is written
-                # out instead of left to the narrowing: ``int(x)`` widens to
-                # int64, the int64 mask takes the low 32 bits, and the outer
-                # ``int`` is the cast the annotation below narrows to uint32.
-                mask = ast.Constant(value=0xFFFFFFFF)
-                mask._glsl_scalar_dtype = "int64"
-                wrapped = ast.BinOp(left=_call("int", args), op=ast.BitAnd(),
-                                    right=mask)
-                converted = _typed(_call("int", [wrapped]), name)
             if self.context is None:
                 return converted
             # GLSL ``int(x)`` converts to int32 and ``float(x)`` to

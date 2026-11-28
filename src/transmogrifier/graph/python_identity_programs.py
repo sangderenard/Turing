@@ -191,6 +191,8 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
             ("float_bits_to_int", ("float32", "int32")),
             ("uint_bits_to_float", ("uint32", "float32")),
             ("int_bits_to_float", ("int32", "float32")),
+            ("int_bits_to_uint", ("int32", "uint32")),
+            ("uint_bits_to_int", ("uint32", "int32")),
         )
     ),
     _operator("builtins.float", operator="float", description="scalar extraction/cast"),

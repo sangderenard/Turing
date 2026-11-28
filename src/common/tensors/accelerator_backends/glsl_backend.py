@@ -256,6 +256,9 @@ _GLSL_BIT_REINTERPRETATIONS = {
     ("float", "int"): "floatBitsToInt",
     ("uint", "float"): "uintBitsToFloat",
     ("int", "float"): "intBitsToFloat",
+    # int32 <-> uint32 keeps the bits: GLSL's own constructor conversion.
+    ("int", "uint"): "uint",
+    ("uint", "int"): "int",
 }
 _UNARY_OPS: frozenset[str] = frozenset(_UNARY) | {"bitcast"}
 

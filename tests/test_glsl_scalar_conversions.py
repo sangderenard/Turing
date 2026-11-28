@@ -4,7 +4,9 @@ Before: both lowered to bare Python calls ``uint(v)``/``double(v)``, names
 nothing binds; the planner made the unknown Call a third formal of ``main``
 ("unaccounted_formals") on the full-native path at every expansion depth.
 Now: each is the builtin conversion of its kind under the annotated GLSL
-width, and ``uint(int)`` wraps modulo 2**32 as GLSL defines it.
+width, and ``uint(int)`` is the same-width bitcast ``int_bits_to_uint``, so
+it keeps the bit pattern and later uint arithmetic wraps modulo 2**32 as GLSL
+defines it (issue cb85552d).
 """
 import ast
 
@@ -22,6 +24,9 @@ void main() {
     uwords[1] = uint(iwords[1]) + 1u;
     uint t = uint(iwords[2]);
     uwords[2] = t + 1u;
+    uwords[3] = uint(iwords[3]) + 1u;
+    uint w = uint(iwords[4]);
+    uwords[4] = w + 2u;
 }'''
 
 
@@ -85,20 +90,22 @@ def test_uint_and_double_constructors_lower_to_bound_conversions():
     result = lower_glsl_source_to_ast(source)
     assert result.complete, result.shortfall_report()
     text = ast.unparse(result.module)
-    assert 'uint(' not in text and 'double(' not in text, text
+    assert ' uint(' not in text and 'double(' not in text, text
     assert "'float64' = float(" in text, text
-    # The int operand is wrapped to its low 32 bits before the u32 cast.
-    assert "'u32' = int(int(iwords[" in text, text
-    assert "'int64' = 4294967295" in text, text
+    # The int operand's bits are reinterpreted as uint32 (a BitCast).
+    assert "int_bits_to_uint(iwords[" in text, text
+    assert '4294967295' not in text, text
 
 
 @pytest.mark.parametrize('depth_zero', [True, False], ids=['depth0', 'default'])
 def test_uint_conversion_of_int_keeps_the_bit_pattern_on_native(depth_zero):
     import numpy as np
-    uwords = np.array([7, 7, 7], dtype=np.uint32)
-    iwords = np.array([-1, 41, -2], dtype=np.int32)
+    # uwords[3] and uwords[4]: a uint add past 2**32 after the conversion
+    # wraps (issue cb85552d); it used to fault 86 at the uint32 store.
+    uwords = np.array([7, 7, 7, 7, 7], dtype=np.uint32)
+    iwords = np.array([-1, 41, -2, -1, -1], dtype=np.int32)
     _run_native(_UINT_CONVERSION, uwords, iwords, depth_zero=depth_zero)
-    assert uwords.tolist() == [4294967295, 42, 4294967295]
+    assert uwords.tolist() == [4294967295, 42, 4294967295, 0, 1]
 
 
 _DOUBLE_CONVERSION = '''#version 430
