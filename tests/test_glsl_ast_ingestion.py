@@ -449,6 +449,77 @@ def test_declared_int_return_and_folded_constants_keep_glsl_widths_on_llvm():
         assert int(outs[0]) == expected
 
 
+def test_mixed_width_atomics_fan_one_body_per_element_type_at_depth_zero():
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm, prepare_artifact_execution,
+    )
+    from src.compiler.work_contract import (
+        active_contract, scoped_work_contract, with_expansion_policy,
+    )
+    # The Studio response shader at expansion depth 0: ``atomicAdd`` on a
+    # ``uint`` buffer and on an ``int`` buffer are both
+    # ``AbstractTensor.atomic_add``.  Before: the one generic body received a
+    # uint32 and an int32 span for ``self`` ("native union alternative has
+    # conflicting physical ProgramABI"), and even a single call lost its
+    # declared literal widths (the shell's dict folded ``index``/``value``
+    # with no ``planner_specialization`` row: "exact integer domain").
+    # Now: one body per element type (the fanned copy), widths kept.
+    source = '''#version 430
+    layout(local_size_x = 1) in;
+    layout(std430, binding = 0) buffer UWords { uint uwords[]; };
+    layout(std430, binding = 1) buffer IWords { int iwords[]; };
+    void main() {
+        uint a = atomicAdd(uwords[0], 1u);
+        int b = atomicAdd(iwords[0], 2);
+        uwords[1] = a;
+        iwords[1] = b;
+    }'''
+    result = lower_glsl_source_to_ast(source)
+    assert result.complete, result.shortfall_report()
+    root = Path(__file__).resolve().parents[1]
+    span = {'function': '*', 'storage': 'span', 'rank': 1,
+            'python_type': 'src.common.tensors.abstraction.AbstractTensor'}
+    contract = ExtractionContract(
+        root / 'extraction_contracts/program_extraction.yaml'
+    ).with_program_abi({'records': {}, 'bindings': [], 'values': [
+        {**span, 'parameter': 'uwords', 'dtype': 'uint32'},
+        {**span, 'parameter': 'iwords', 'dtype': 'int32'},
+    ]}).with_execution_file(
+        root / 'extraction_contracts/vehicle_full_native_execution.yaml')
+    depth_zero = with_expansion_policy(active_contract(), {
+        'inline_depth': 0, 'custom_version_depth': 0, 'unroll_depth': 0,
+    })
+    with scoped_work_contract(depth_zero):
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            ast.unparse(result.module), 'main', extraction_contract=contract,
+            python_bindings={'AbstractTensor': AbstractTensor},
+            tensor_ssa_reference=c_backend_repository_ssa_reference(),
+            runtime_closure_only=True, progress_bars=False)
+    bodies = [name for name in module.functions
+              if 'atomic_add' in name and '__planned_region' not in name]
+    assert len(bodies) == 2, bodies
+    entry = exports[0]
+    names = dict(module.functions[entry].metadata['parameter_names'])
+    emitted = emit_ssa_function_to_llvm(module, entry)
+    assert not emitted.shortfalls
+    artifact = compile_artifact(emitted, directory=tempfile.mkdtemp())
+    uwords = np.array([0xFFFFFFFF, 0], dtype=np.uint32)
+    iwords = np.array([5, 0], dtype=np.int32)
+    prepare_artifact_execution(
+        artifact, {names['uwords']: uwords, names['iwords']: iwords}).run()
+    assert uwords.tolist() == [0, 0xFFFFFFFF]
+    assert iwords.tolist() == [7, 5]
+
+
 def test_uint_conditional_compared_to_uint_literal_stays_uint32_on_llvm():
     import tempfile
     from pathlib import Path

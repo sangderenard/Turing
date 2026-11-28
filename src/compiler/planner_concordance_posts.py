@@ -1179,6 +1179,46 @@ def _materialize_planner_specializations(graph: Any) -> None:
     graph.G.graph["planner_specializations"] = view
 
 
+def carry_function_shell_specializations(source: Any, shell: Any) -> None:
+    """A function's own shell restates its function-table graph's
+    ``planner_specialization`` facts as rows of its own scope.
+
+    Program: GLSL ``atomicAdd(uwords[0], 1u)`` at expansion depth 0.  Main
+    passes ``__glsl_literal_0: 'int32' = 0`` and ``__glsl_literal_1:
+    'uint32' = 1``; ``_propagate_callsite_planner_specializations`` posted
+    ``index = 0 (int32)`` and ``value = 1 (uint32)`` under the table graph's
+    scope.  ``extract_clean_process_subgraph`` cut the function shell with a
+    fresh read-scope fork and a copy of the graph's
+    ``planner_specializations`` dict, but this page does not read through a
+    fork (``READ_THROUGH_EXCLUDED_PAGES``: a copy states its own).  Wrong
+    record: the shell's dict folded both formals while its page held no row,
+    so the declared widths were lost and the literals materialized int64
+    ("exact integer domain='uint32'").  Rule: the shell IS that function's
+    body, not a callsite variant, so each latest fact of the source scope is
+    posted under the shell's scope, DERIVED from the source cell, and the
+    dict is rebuilt as the page's view.
+    """
+
+    from .concordance_declarations import PLANNER_SPECIALIZATION_PAGE
+    from .identity_concordance import current_identity_book
+
+    origin = source.G.graph.get("lexical_read_scope")
+    scope = shell.G.graph.get("lexical_read_scope")
+    if origin is None or scope is None or tuple(origin) == tuple(scope):
+        return
+    book = current_identity_book()
+    page = book.pages.get(PLANNER_SPECIALIZATION_PAGE.name)
+    if page is None:
+        return
+    for row in page.scope_rows(tuple(origin)):
+        fact = page.latest(row)
+        cell = book.latest_ref(PLANNER_SPECIALIZATION_PAGE, row)
+        if fact is None or cell is None:
+            continue
+        _post_planner_specialization(shell, str(row[1]), fact, (cell,))
+    _materialize_planner_specializations(shell)
+
+
 def planner_specialization_dtypes(metadata: Mapping[str, Any]) -> dict[str, str]:
     """The declared dtype of each formal of this copy that a DECLARED
     literal argument specialized (``SpecializationFact.dtype``), read from

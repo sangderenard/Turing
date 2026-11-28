@@ -235,15 +235,52 @@ def annotate_from_inventory(tree: Any, function_identity: str, book: Any) -> Non
                     ast.parse(got[0], mode="eval").body, arg)
 
 
+def tensor_actual_class_spelling(class_identity: str, descriptor: Any) -> str:
+    """The class one call edge's actual is spelled with in the inventory.
+
+    A tensor actual is its class with its element dtype, as
+    :class:`TensorClass` spells a root-call tensor (``AbstractTensor[uint32]``
+    against ``AbstractTensor[int32]``): the element dtype is part of the
+    physical signature a body is built for.  The dtype is the actual's own
+    descriptor's; a rank-0 actual (a scalar) is its class alone.
+    """
+
+    cls = str(class_identity)
+    if cls.startswith("builtins."):
+        cls = cls[len("builtins."):]
+    if not isinstance(descriptor, Mapping):
+        return cls
+    dtype = str(descriptor.get("dtype") or "")
+    rank = int(descriptor.get("rank", len(tuple(descriptor.get("shape") or ()))) or 0)
+    if rank < 1 or not dtype:
+        return cls
+    return f"{cls}[{dtype}]"
+
+
+def claimed_generic_class(book: Any, callee_identity: str, formal: str):
+    """The class the callee's one generic body was claimed for, or ``None``."""
+
+    from .concordance_declarations import CALLED_INVENTORY
+
+    fact = book.page(CALLED_INVENTORY).latest((str(callee_identity), str(formal)))
+    return None if fact is None or fact.root else fact.selected
+
+
 def post_call_edge_actual(
     book: Any, callee_identity: str, formal: str, caller_scope: Any,
     call_id: int, class_spelling_: str, class_cell: Any,
+    *, claim_generic: bool = False,
 ) -> None:
     """Record one internal call edge's actual and fold it into the callee
     formal's inventory.  The edge cell is Derived from the caller's
     SOURCE_VALUE_CLASS cell; the inventory cell is Derived from every edge
     cell (and root-call record) that reaches the formal, so its provenance
-    cites each call edge.  The set grows to exactly the classes found."""
+    cites each call edge.  The set grows to exactly the classes found.
+
+    ``claim_generic`` (a call planned past the expansion limit): when no
+    class holds the formal's generic body yet, this edge's class does
+    (``selected``).  A later edge with another class is fanned to its own
+    copy (``glsl_deployment_strategy._callsite_literal_shell_type``)."""
 
     from .concordance_declarations import (
         CALL_EDGE_ACTUAL, CALLED_INVENTORY, CalledInventoryFact,
@@ -274,17 +311,19 @@ def post_call_edge_actual(
     cell = book.latest_ref(CALLED_INVENTORY, row) if incumbent is not None else None
     cited = [ref for ref, _stage in book.edges_into(cell)] if cell is not None else []
     classes = set(incumbent.classes) if incumbent is not None else set()
-    if incumbent is not None and cls in classes and edge in cited:
+    selected = None if incumbent is None else incumbent.selected
+    root = False if incumbent is None else incumbent.root
+    claim = claim_generic and selected is None and not root
+    if incumbent is not None and cls in classes and edge in cited and not claim:
         return
+    if claim:
+        selected = cls
     classes.add(cls)
-    cited.append(edge)
+    if edge not in cited:
+        cited.append(edge)
     book.post(
         CALLED_INVENTORY, row,
-        CalledInventoryFact(
-            tuple(sorted(classes)),
-            None if incumbent is None else incumbent.selected,
-            False if incumbent is None else incumbent.root,
-        ),
+        CalledInventoryFact(tuple(sorted(classes)), selected, root),
         stage=PLANNER_TENSOR_SPECIALIZATION,
         provenance=Derived(tuple(dict.fromkeys(cited))), mode=Mode.REVISE,
     )
