@@ -10,17 +10,17 @@
      time (the same colour the WebGL clear and the shaders' empty colour use); html[data-night="1"] is its
      night mode.  The dark palette below is tinted by it; the fallbacks are the old fixed colours. */
   :root { color-scheme: dark; --scene-bg: #16161a;
-          --panel: color-mix(in srgb, var(--scene-bg) 14%, #14141a); --ctl: #26262c; --ctl-hover: #30303a;
-          --line: #3a3a42; --fg: #e8e8ea; --fg-strong: #f0f0f3; }
-  :root[data-night="1"] { --panel: color-mix(in srgb, var(--scene-bg) 55%, #04060c); --ctl: #151b2e; --ctl-hover: #212b48;
-          --line: #55648c; --fg: #f4f6ff; --fg-strong: #ffffff; }
+          --panel: var(--palette-surface, color-mix(in srgb, var(--scene-bg) 14%, #14141a)); --ctl: var(--palette-raised, #26262c); --ctl-hover: var(--palette-raised, #30303a);
+          --line: var(--palette-line, #3a3a42); --fg: var(--palette-fg, #e8e8ea); --fg-strong: var(--palette-fg, #f0f0f3); }
+  :root[data-night="1"] { --panel: var(--palette-surface, color-mix(in srgb, var(--scene-bg) 55%, #04060c)); --ctl: var(--palette-raised, #151b2e); --ctl-hover: var(--palette-raised, #212b48);
+          --line: var(--palette-line, #55648c); --fg: var(--palette-fg, #f4f6ff); --fg-strong: var(--palette-fg, #ffffff); }
   /* MOBILE: the page never zooms (the scene owns pinch and pan): no double-tap zoom anywhere, no gestures leaving the canvas, and no
      iOS focus-zoom on text fields (it zooms any field under 16px) */
   html, body { touch-action: manipulation; overscroll-behavior: none; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   @media (pointer: coarse) { input, select, textarea { font-size: 16px; } }
   #unzoom { position: fixed; z-index: 99; left: 50%; top: 10px; transform: translateX(-50%); display: none; padding: 8px 14px;
             border-radius: 18px; border: 1px solid var(--line); background: var(--ctl); color: var(--fg-strong); font: 600 15px system-ui; }
-  html, body { margin: 0; height: 100%; background: var(--scene-bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  html, body { margin: 0; height: 100%; background: var(--palette-bg, var(--scene-bg)); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
   #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
          background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
          /* a wrapping bar must not eat the viewport: past a third of the screen it scrolls, so the
@@ -30,7 +30,7 @@
   #bar button:hover { background: var(--ctl-hover); }
   #bar label { display: inline-flex; gap: 6px; align-items: center; }
   #bar input[type=range] { width: 90px; }
-  #bar .tool.active { background: #3b5a8a; border-color: #6a9be0; }
+  #bar .tool.active { background: var(--palette-accent, #3b5a8a); border-color: var(--palette-ink, #6a9be0); }
   #bar .tool, #hint { align-items: center; }
   /* The status / instruction line never takes layout space (a long one used to wrap the bar and shift the canvas): it
      floats over the bottom of the scene, see-through and click-through.  (On the fountain the page also draws it into
@@ -47,7 +47,7 @@
   #gamectl .gctl-body label { display: grid; grid-template-columns: 9rem 1fr 3rem; align-items: center; gap: 6px; }
   #gamectl .gctl-body select { grid-column: 2 / 4; }
   #gamectl .gctl-val { font-variant-numeric: tabular-nums; opacity: .7; }
-  #gamectl .saved-particle-note:not(:empty) { color: #ffbd80; font-size: 12px; max-width: 18rem; }
+  #gamectl .saved-particle-note:not(:empty) { color: var(--palette-ink, #ffbd80); font-size: 12px; max-width: 18rem; }
   #gamectl button.on { outline: 2px solid currentColor; }
   #scene-settings { position: relative; }
   #scene-settings > summary { cursor: pointer; background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; }
@@ -69,19 +69,19 @@
   canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw);
            height: calc(var(--vh100, 100vh) - var(--bar-h, 0px)); touch-action: none; }
   #marble-pad { box-sizing: border-box; max-width: min(96vw, 320px); max-height: calc(var(--vh100, 100vh) - var(--bar-h, 0px) - 20px);
-                overflow: auto; flex-wrap: wrap; justify-content: center; border: 2px solid #f3cc7b;
-                background: rgba(12, 19, 31, .96) !important; box-shadow: 0 6px 28px #000b; }
-  #marble-pad input[type=range] { accent-color: #f3cc7b; height: 24px; }
+                overflow: auto; flex-wrap: wrap; justify-content: center; border: 2px solid var(--palette-accent, #f3cc7b);
+                background: color-mix(in srgb, var(--palette-surface, #0c131f) 96%, transparent) !important; box-shadow: 0 6px 28px #000b; }
+  #marble-pad input[type=range] { accent-color: var(--palette-accent, #f3cc7b); height: 24px; }
   #marble-pad label { white-space: nowrap; }
   #marble-sticks { display:flex; gap:12px; justify-content:center; width:100%; }
   .marble-stick-wrap { display:grid; justify-items:center; gap:4px; font-size:12px; }
-  .marble-stick { position:relative; width:104px; height:104px; border-radius:50%; border:2px solid #9eb8d1; background:#19283b; touch-action:none; cursor:grab; }
-  .marble-stick:focus-visible { outline:3px solid #f3cc7b; outline-offset:3px; }
-  .marble-stick::before, .marble-stick::after { content:""; position:absolute; background:#6885a3; pointer-events:none; }
+  .marble-stick { position:relative; width:104px; height:104px; border-radius:50%; border:2px solid var(--palette-line, #9eb8d1); background:var(--palette-raised, #19283b); touch-action:none; cursor:grab; }
+  .marble-stick:focus-visible { outline:3px solid var(--palette-accent, #f3cc7b); outline-offset:3px; }
+  .marble-stick::before, .marble-stick::after { content:""; position:absolute; background:var(--palette-muted, #6885a3); pointer-events:none; }
   .marble-stick::before { width:1px; height:80%; left:50%; top:10%; }
   .marble-stick::after { height:1px; width:80%; top:50%; left:10%; }
-  .marble-stick .nub { position:absolute; left:50%; top:50%; width:30px; height:30px; margin:-15px; border-radius:50%; background:#f3cc7b; box-shadow:0 2px 8px #0008; pointer-events:none; }
-  .marble-stick-wrap output { max-width:120px; min-height:2.4em; text-align:center; color:#c5d7e9; }
+  .marble-stick .nub { position:absolute; left:50%; top:50%; width:30px; height:30px; margin:-15px; border-radius:50%; background:var(--palette-accent, #f3cc7b); box-shadow:0 2px 8px #0008; pointer-events:none; }
+  .marble-stick-wrap output { max-width:120px; min-height:2.4em; text-align:center; color:var(--palette-muted, #c5d7e9); }
   /* Wordle's entry is drawn in the scene (the entry bar); this input is only its keyboard: visually hidden, off-screen, still focusable
      (16px font so a phone does not zoom on focus) */
   #word { position: fixed; left: 0; top: 0; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; display: none; }
@@ -93,21 +93,21 @@
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
   /* A light, readable frame around the lit Meowdoku board. Other games keep
      their own dark controls and atmosphere. */
-  body[data-game="meowdoku"] { color-scheme: light; background: #e3f0ef; color: #183047; }
-  body[data-game="meowdoku"] #bar { background: rgba(247,251,248,.96); border-bottom: 2px solid #9bcac7;
+  body[data-game="meowdoku"] { color-scheme: light; background: var(--palette-bg, #e3f0ef); color: var(--palette-fg, #183047); }
+  body[data-game="meowdoku"] #bar { background: color-mix(in srgb, var(--palette-surface, #f7fbf8) 96%, transparent); border-bottom: 2px solid var(--palette-line, #9bcac7);
                                     box-shadow: 0 3px 14px rgba(25,67,73,.12); }
   body[data-game="meowdoku"] #bar select, body[data-game="meowdoku"] #bar button,
   body[data-game="meowdoku"] #bar input[type=text], body[data-game="meowdoku"] #gamectl .gctl-file {
-    background: #fff; color: #183047; border: 1px solid #668e97; font-weight: 600; }
-  body[data-game="meowdoku"] #bar button:hover { background: #e5f5ef; }
-  body[data-game="meowdoku"] #bar .tool.active { background: #186d73; color: #fff; border-color: #104e56; }
-  body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #b14a78; outline-offset: 2px; }
+    background: var(--palette-raised, #fff); color: var(--palette-fg, #183047); border: 1px solid var(--palette-line, #668e97); font-weight: 600; }
+  body[data-game="meowdoku"] #bar button:hover { background: var(--palette-raised, #e5f5ef); }
+  body[data-game="meowdoku"] #bar .tool.active { background: var(--palette-accent, #186d73); color: var(--palette-on-accent, #fff); border-color: var(--palette-accent, #104e56); }
+  body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid var(--palette-secondary, #b14a78); outline-offset: 2px; }
   body[data-game="meowdoku"] #status { opacity: 1; font-weight: 650; }
-  body[data-game="meowdoku"] #splash { color: #183047; background: rgba(255,255,255,.95); border-color: #668e97; }
+  body[data-game="meowdoku"] #splash { color: var(--palette-fg, #183047); background: color-mix(in srgb, var(--palette-surface, #ffffff) 95%, transparent); border-color: var(--palette-line, #668e97); }
   body[data-game="meowdoku"] #splash.win #splash-title { color: #11635b; }
   body[data-game="meowdoku"] #splash.loss #splash-title { color: #a33f57; }
-  body[data-game="meowdoku"].immersive #hud { opacity: 1; color: #183047; text-shadow: 0 1px 2px #fff; }
-  body[data-game="meowdoku"].immersive #fs-exit { background: rgba(255,255,255,.92); color: #183047; border-color: #668e97; }
+  body[data-game="meowdoku"].immersive #hud { opacity: 1; color: var(--palette-fg, #183047); text-shadow: 0 1px 2px #fff; }
+  body[data-game="meowdoku"].immersive #fs-exit { background: color-mix(in srgb, var(--palette-surface, #ffffff) 92%, transparent); color: var(--palette-fg, #183047); border-color: var(--palette-line, #668e97); }
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   .arena-only, #bar .arena-only { display: none; }
   .pilot-only, #bar .pilot-only { display: none; }
@@ -154,7 +154,7 @@
   body.immersive canvas { top: 0; height: var(--vh100, 100vh); }
   body.immersive #hud { display: block; left: 10px; top: 8px; right: 64px; font-size: 13px; opacity: 0.8; pointer-events: none;
                         text-shadow: 0 1px 2px #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  body.immersive #fs-exit { display: block; right: 10px; top: 6px; background: color-mix(in srgb, var(--ctl) 75%, transparent); color: #e8e8ea;
+  body.immersive #fs-exit { display: block; right: 10px; top: 6px; background: color-mix(in srgb, var(--ctl) 75%, transparent); color: var(--palette-fg, #e8e8ea);
                             border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; }
   #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(var(--vw100, 100vw) - 20px));
             max-height: calc(var(--vh100, 100vh) * 0.7); overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
@@ -169,18 +169,18 @@
   #scores h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
   #scores table { width: 100%; border-collapse: collapse; font-size: 13px; }
   #scores td { padding: 2px 4px; } #scores td.n { text-align: right; font-variant-numeric: tabular-nums; }
-  #scores tr.me { color: #ffd76a; }
+  #scores tr.me { color: var(--palette-ink, #ffd76a); }
   #scores .muted { opacity: 0.6; font-size: 12px; }
   /* NIGHT MODE for the light Meowdoku frame: the same rules as its day look, on the dark palette. */
-  :root[data-night="1"] body[data-game="meowdoku"] { color-scheme: dark; background: var(--scene-bg); color: var(--fg); }
+  :root[data-night="1"] body[data-game="meowdoku"] { color-scheme: dark; background: var(--palette-bg, var(--scene-bg)); color: var(--fg); }
   :root[data-night="1"] body[data-game="meowdoku"] #bar { background: color-mix(in srgb, var(--panel) 94%, transparent);
                                     border-bottom: 2px solid var(--line); box-shadow: 0 3px 14px rgba(0,0,0,.4); }
   :root[data-night="1"] body[data-game="meowdoku"] #bar select, :root[data-night="1"] body[data-game="meowdoku"] #bar button,
   :root[data-night="1"] body[data-game="meowdoku"] #bar input[type=text], :root[data-night="1"] body[data-game="meowdoku"] #gamectl .gctl-file {
     background: var(--ctl); color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
   :root[data-night="1"] body[data-game="meowdoku"] #bar button:hover { background: var(--ctl-hover); }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar .tool.active { background: #2f7f86; color: #fff; border-color: #7fd0d6; }
-  :root[data-night="1"] body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #ffd76a; outline-offset: 2px; }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar .tool.active { background: var(--palette-accent, #2f7f86); color: var(--palette-on-accent, #fff); border-color: var(--palette-accent, #7fd0d6); }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid var(--palette-secondary, #ffd76a); outline-offset: 2px; }
   :root[data-night="1"] body[data-game="meowdoku"] #splash { color: var(--fg); background: color-mix(in srgb, var(--panel) 92%, transparent); border-color: var(--line); }
   :root[data-night="1"] body[data-game="meowdoku"] #splash.win #splash-title { color: #ffd76a; }
   :root[data-night="1"] body[data-game="meowdoku"] #splash.loss #splash-title { color: #ff8a7a; }
@@ -250,7 +250,7 @@
   <button id="scores-toggle">Scores</button>
   <button id="shop-toggle" title="Points you have earned, and what they buy">Shop</button>
   <details id="marble-designer" style="position:relative"><summary>Marble designer</summary>
-    <div style="position:absolute;z-index:30;right:0;top:100%;min-width:220px;padding:10px;background:#202632;color:#fff;border:1px solid #768397;border-radius:8px;box-shadow:0 8px 22px #0008">
+    <div style="position:absolute;z-index:30;right:0;top:100%;min-width:220px;padding:10px;background:var(--palette-surface,#202632);color:var(--palette-fg,#fff);border:1px solid var(--palette-line,#768397);border-radius:8px;box-shadow:0 8px 22px #0008">
       <label><input id="marble-preview" type="checkbox"> Show lit preview</label><br>
       <label>Dyed eye <select id="marble-eye"><option value="blue">Blue</option><option value="green">Green</option><option value="amber">Amber</option></select></label><br>
       <label>Width <input id="marble-width" type="range" min="8" max="42" value="28"></label><br>
@@ -284,7 +284,7 @@
 <div id="splash"><div id="splash-title"></div><div id="splash-detail"></div></div>
 <button id="fs-exit" title="Leave fullscreen (F or Esc)">✕</button>
 <canvas id="gl"></canvas>
-<div id="marble-pad" style="display:none;position:fixed;right:14px;bottom:18px;z-index:25;gap:10px;align-items:center;background:#111a;padding:8px;border-radius:12px;color:white;touch-action:none">
+<div id="marble-pad" style="display:none;position:fixed;right:14px;bottom:18px;z-index:25;gap:10px;align-items:center;background:color-mix(in srgb, var(--palette-surface,#111111) 67%, transparent);padding:8px;border-radius:12px;color:var(--palette-fg,white);touch-action:none">
   <label><input id="marble-phone-tilt" type="checkbox"> Phone tilt</label>
   <label title="Allow touch camera gestures to pitch the view; marble gravity is controlled separately"><input id="marble-camera-tilt" type="checkbox" checked> Camera tilt</label>
   <label title="Keep the camera close to the simulated marble"><input id="marble-follow" type="checkbox" checked> Follow marble</label>
@@ -343,9 +343,9 @@
     check();
   })();
 </script>
-<dialog id="ticket-dialog" style="background:#141923;color:#e4eaf4;border:1px solid #56647a;border-radius:10px;max-width:min(90vw,520px);box-shadow:0 15px 60px #0009">
+<dialog id="ticket-dialog" style="background:var(--palette-surface,#141923);color:var(--palette-fg,#e4eaf4);border:1px solid var(--palette-line,#56647a);border-radius:10px;max-width:min(90vw,520px);box-shadow:0 15px 60px #0009">
   <form id="ticket-form"><h2>Report issue</h2><p>The current game state, particle sample, and recent browser log will be attached to your account’s issue ticket, visible to you and site administrators. Sign in before submitting.</p>
-    <textarea id="ticket-note" rows="4" maxlength="3000" placeholder="What happened?" aria-label="What happened?" style="box-sizing:border-box;width:100%;background:#0c0e13;color:inherit;border:1px solid #56647a;border-radius:6px;padding:8px;font:inherit"></textarea>
+    <textarea id="ticket-note" rows="4" maxlength="3000" placeholder="What happened?" aria-label="What happened?" style="box-sizing:border-box;width:100%;background:var(--palette-raised,#0c0e13);color:inherit;border:1px solid var(--palette-line,#56647a);border-radius:6px;padding:8px;font:inherit"></textarea>
     <p id="ticket-result" role="status"></p><button id="ticket-send" type="submit">Send ticket</button> <button id="ticket-cancel" type="button">Close</button></form>
 </dialog>
 <script type="module" src="loading_panel.js"></script>   <!-- [LOADING] first: its fetch wrapper counts the page's downloads -->

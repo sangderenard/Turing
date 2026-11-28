@@ -45,36 +45,36 @@ async function postJson(path, body) {
 
 const CSS = `
 :host { all: initial; }
-.wrap { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right)); z-index: 2147483000; font: 13px/1.3 system-ui, sans-serif; color: #e8e8ee; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; max-width: calc(100vw - 32px); padding: 6px; border: 1px solid #454556; border-radius: 10px; background: #14141eee; }
+.wrap { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right)); z-index: 2147483000; font: 13px/1.3 system-ui, sans-serif; color: var(--palette-fg, #e8e8ee); display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; max-width: calc(100vw - 32px); padding: 6px; border: 1px solid var(--palette-line, #454556); border-radius: 10px; background: color-mix(in srgb, var(--palette-surface, #14141e) 93%, transparent); }
 .actions { display: contents; }
 .chip.toggle { min-height: 32px; box-sizing: border-box; }
-.label { font-size: 11px; color: #b6b6ca; margin: 0 4px; }
-.chip { all: unset; cursor: pointer; padding: 5px 10px; border-radius: 14px; background: rgba(28,28,36,.82); border: 1px solid rgba(255,255,255,.18);
-        color: #e8e8ee; font: inherit; text-decoration: none; display: inline-block; }
-.chip:hover, .chip:focus-visible { background: rgba(48,48,62,.95); outline: 2px solid #7aa2ff; outline-offset: 1px; }
+.label { font-size: 11px; color: var(--palette-muted, #b6b6ca); margin: 0 4px; }
+.chip { all: unset; cursor: pointer; padding: 5px 10px; border-radius: 14px; background: color-mix(in srgb, var(--palette-raised, #1c1c24) 82%, transparent); border: 1px solid color-mix(in srgb, var(--palette-line, #ffffff) 18%, transparent);
+        color: var(--palette-fg, #e8e8ee); font: inherit; text-decoration: none; display: inline-block; }
+.chip:hover, .chip:focus-visible { background: color-mix(in srgb, var(--palette-raised, #30303e) 95%, transparent); outline: 2px solid var(--palette-accent, #7aa2ff); outline-offset: 1px; }
 .chip.quiet { opacity: .55; } .chip.quiet:hover, .chip.quiet:focus-visible { opacity: 1; }
 .chip:disabled, .chip.quiet:disabled { opacity: .35; cursor: default; }
-.menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 210px; max-width: calc(100vw - 48px); max-height: 65vh; overflow: auto; background: #1c1c24; border: 1px solid rgba(255,255,255,.18);
+.menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 210px; max-width: calc(100vw - 48px); max-height: 65vh; overflow: auto; background: var(--palette-surface, #1c1c24); border: 1px solid color-mix(in srgb, var(--palette-line, #ffffff) 18%, transparent);
         border-radius: 8px; padding: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
 .menu a, .menu button { all: unset; display: block; box-sizing: border-box; width: 100%; padding: 6px 10px; border-radius: 5px; cursor: pointer;
-        color: #e8e8ee; font: inherit; }
-.menu a:hover, .menu button:hover, .menu a:focus-visible, .menu button:focus-visible { background: #2c2c3a; }
-.menu a[aria-current="page"] { color: #9fb8ff; }
-.menu button[aria-pressed="true"] { color: #9fb8ff; font-weight: 600; }
+        color: var(--palette-fg, #e8e8ee); font: inherit; }
+.menu a:hover, .menu button:hover, .menu a:focus-visible, .menu button:focus-visible { background: var(--palette-raised, #2c2c3a); }
+.menu a[aria-current="page"] { color: var(--palette-ink, #9fb8ff); }
+.menu button[aria-pressed="true"] { color: var(--palette-ink, #9fb8ff); font-weight: 600; }
 .menu button:disabled { opacity: .45; cursor: default; }
-.head { padding: 4px 10px 6px; color: #a8a8b8; font-size: 12px; }
-.sep { height: 1px; margin: 5px 4px; background: rgba(255,255,255,.12); }
-.suite { position: absolute; right: 0; top: calc(100% + 6px); box-sizing: border-box; width: min(420px, calc(100vw - 32px)); max-height: min(70vh, 560px); overflow: auto; padding: 12px; border: 1px solid #454556; border-radius: 10px; background: #14141e; }
-.binding { display: grid; gap: 3px; padding: 7px; margin: 4px 0; border: 1px solid #454556; border-radius: 4px; overflow-wrap: anywhere; }
-.binding span { font-size: 11px; color: #b6b6ca; }
+.head { padding: 4px 10px 6px; color: var(--palette-muted, #a8a8b8); font-size: 12px; }
+.sep { height: 1px; margin: 5px 4px; background: color-mix(in srgb, var(--palette-line, #ffffff) 12%, transparent); }
+.suite { position: absolute; right: 0; top: calc(100% + 6px); box-sizing: border-box; width: min(420px, calc(100vw - 32px)); max-height: min(70vh, 560px); overflow: auto; padding: 12px; border: 1px solid var(--palette-line, #454556); border-radius: 10px; background: var(--palette-surface, #14141e); }
+.binding { display: grid; gap: 3px; padding: 7px; margin: 4px 0; border: 1px solid var(--palette-line, #454556); border-radius: 4px; overflow-wrap: anywhere; }
+.binding span { font-size: 11px; color: var(--palette-muted, #b6b6ca); }
 .binding.active { border-color: #ffd166; background: #80551e; }
 .radio-bands { display: flex; gap: 4px; align-items: center; min-height: 30px; }
 .radio-bands meter { flex: 1; min-width: 0; width: 40px; height: 24px; }
 .radio-audio { width: 100%; margin: 8px 0; }
-.suite[aria-label="Nodus Radio"] { border-radius: 2px; background: #171b20; border-color: #5f747d; font: 12px/1.35 ui-monospace, Consolas, monospace; }
-.suite[aria-label="Nodus Radio"] .radio-bands { padding: 4px; border: 1px solid #435960; background: #071317; }
+.suite[aria-label="Nodus Radio"] { border-radius: 2px; background: var(--palette-surface, #171b20); border-color: var(--palette-line, #5f747d); font: 12px/1.35 ui-monospace, Consolas, monospace; }
+.suite[aria-label="Nodus Radio"] .radio-bands { padding: 4px; border: 1px solid var(--palette-line, #435960); background: var(--palette-bg, #071317); }
 .suite[aria-label="Nodus Radio"] .chip { border-radius: 2px; }
-.suite[aria-label="Nodus Radio"] input[type="search"], .suite[aria-label="Nodus Radio"] select { box-sizing: border-box; width: 100%; margin: 4px 0; padding: 5px; color: #e8f7f4; background: #101a1e; border: 1px solid #5f747d; font: inherit; }
+.suite[aria-label="Nodus Radio"] input[type="search"], .suite[aria-label="Nodus Radio"] select { box-sizing: border-box; width: 100%; margin: 4px 0; padding: 5px; color: var(--palette-fg, #e8f7f4); background: var(--palette-raised, #101a1e); border: 1px solid var(--palette-line, #5f747d); font: inherit; }
 [hidden] { display: none !important; }
 .note { padding: 4px 10px; color: #ffb3a8; font-size: 12px; }
 `;
@@ -646,11 +646,11 @@ function mountRadio(wrap, host, canControl = false) {
 // for the whole page the site header and its menu are never blocked. Text only: nothing in a notice is read as HTML.
 const NOTICE_CSS = `
 :host { all: initial; }
-.notice { box-sizing: border-box; font: 15px/1.45 system-ui, sans-serif; color: #f3f6f8; background: #13202a;
+.notice { box-sizing: border-box; font: 15px/1.45 system-ui, sans-serif; color: var(--palette-fg, #f3f6f8); background: var(--palette-surface, #13202a);
   border-bottom: 3px solid #e0a526; padding: 14px 18px; max-height: 100%; overflow: auto; }
 .notice.overlay { box-shadow: 0 8px 28px rgba(0,0,0,.45); }
 .notice.block { height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;
-  background: rgba(10, 16, 22, .94); border-bottom: none; }
+  background: color-mix(in srgb, var(--palette-bg, #0a1016) 94%, transparent); border-bottom: none; }
 .notice.block > * { max-width: 72ch; }
 h2 { margin: 0 0 6px; font-size: 18px; color: #ffd26a; }
 p { margin: 6px 0; white-space: pre-wrap; }
@@ -658,7 +658,7 @@ p { margin: 6px 0; white-space: pre-wrap; }
 .countdown { font: 700 22px/1.3 ui-monospace, monospace; color: #ffd26a; margin: 8px 0; }
 .countdown small { display: block; font: 600 12px/1.3 system-ui, sans-serif; opacity: .8; }
 .posted { font-size: 12px; opacity: .7; }
-button { font: inherit; margin-top: 8px; padding: 5px 12px; border-radius: 6px; border: 1px solid #5f747d; background: #1d2c35;
+button { font: inherit; margin-top: 8px; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--palette-line, #5f747d); background: var(--palette-raised, #1d2c35);
   color: inherit; cursor: pointer; }
 `;
 

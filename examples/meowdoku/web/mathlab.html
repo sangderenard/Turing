@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Math lab</title>
 <style>
-  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --ok:#17743a; --bad:#b3261e; --card:#fff; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --ok:#5fcf86; --bad:#ff8a80; --card:#202024; } }
+  :root { color-scheme: light dark; --bg:var(--palette-bg,#fbfaf7); --fg:var(--palette-fg,#1d1d1f); --mut:var(--palette-muted,#6b6b70); --line:var(--palette-line,#d9d6cf); --ok:#17743a; --bad:#b3261e; --card:var(--palette-surface,#fff); }
+  @media (prefers-color-scheme: dark) { :root { --bg:var(--palette-bg,#17171a); --fg:var(--palette-fg,#ececee); --mut:var(--palette-muted,#9a9aa1); --line:var(--palette-line,#37373d); --ok:#5fcf86; --bad:#ff8a80; --card:var(--palette-surface,#202024); } }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
   main { max-width:60rem; margin:0 auto; padding:1.2rem 16px 4rem; }
   h1 { font-size:1.3rem; margin:0 0 .2rem; } h2 { font-size:1.05rem; margin:1.6rem 0 .4rem; }

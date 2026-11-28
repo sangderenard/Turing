@@ -5,17 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My files · Meowdoku</title>
 <style>
-  :root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
-  body { margin: 0; background: #171b24; color: #f0f3fa; }
+  :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; }
+  body { margin: 0; background: var(--palette-bg, #171b24); color: var(--palette-fg, #f0f3fa); }
   main { max-width: 48rem; margin: auto; padding: 2rem 1rem 5rem; }
-  a { color: #9fc7ff; }
-  .card { background: #242b38; border: 1px solid #435066; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
-  button, select, input { font: inherit; color: inherit; background: #1b2230; border: 1px solid #62718b; border-radius: 6px; padding: .4rem; }
+  a { color: var(--palette-ink, #9fc7ff); }
+  .card { background: var(--palette-surface, #242b38); border: 1px solid var(--palette-line, #435066); border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  button, select, input { font: inherit; color: inherit; background: var(--palette-raised, #1b2230); border: 1px solid var(--palette-line, #62718b); border-radius: 6px; padding: .4rem; }
   button { cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
   li { margin: .8rem 0; }
-  small { color: #bec8db; }
+  small { color: var(--palette-muted, #bec8db); }
   [hidden] { display: none !important; }
 </style>
 </head>

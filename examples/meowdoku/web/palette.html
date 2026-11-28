@@ -6,15 +6,15 @@
 <title>Color preference game · SpeakToMe</title>
 <style>
   :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; --palette-accent: #9fc8ff; --palette-secondary: #d0a8ef; }
-  body { margin: 0; color: #edf2fb; background: radial-gradient(circle at 90% 5%, color-mix(in srgb, var(--palette-accent) 28%, #101722), #101722 32rem); }
+  body { margin: 0; color: var(--palette-fg, #edf2fb); background: radial-gradient(circle at 90% 5%, color-mix(in srgb, var(--palette-accent) 28%, var(--palette-bg, #101722)), var(--palette-bg, #101722) 32rem); }
   main { max-width: 52rem; margin: auto; padding: 2rem 1rem 5rem; }
-  a, .accent { color: var(--palette-accent); }
+  a, .accent { color: var(--palette-ink, var(--palette-accent)); }
   h1 { line-height: 1.12; }
-  .panel { border: 1px solid color-mix(in srgb, var(--palette-accent) 45%, #384d67); border-radius: 1rem; padding: 1.2rem; margin: 1.4rem 0; background: #1b2839; }
-  button { font: inherit; border-radius: .5rem; border: 1px solid #6984a5; padding: .42rem .7rem; color: #edf2fb; background: #263953; cursor: pointer; }
+  .panel { border: 1px solid color-mix(in srgb, var(--palette-accent) 45%, var(--palette-line, #384d67)); border-radius: 1rem; padding: 1.2rem; margin: 1.4rem 0; background: var(--palette-surface, #1b2839); }
+  button { font: inherit; border-radius: .5rem; border: 1px solid var(--palette-line, #6984a5); padding: .42rem .7rem; color: var(--palette-fg, #edf2fb); background: var(--palette-raised, #263953); cursor: pointer; }
   button:hover, button:focus-visible { border-color: var(--palette-accent); outline-color: var(--palette-accent); }
   button:disabled { opacity: .45; cursor: default; }
-  .muted { color: #c2cddd; }
+  .muted { color: var(--palette-muted, #c2cddd); }
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
   #notice { min-height: 1.5rem; }
   .design { display: flex; gap: .9rem; align-items: center; }
