@@ -92,7 +92,7 @@ def test_read_only_preview_can_be_kept_with_a_unique_chosen_password(server):
     me = _call(server.port, "/api/account/me", headers=authorized)[3]
     assert me["role"] == "trial" and me["account"]["temporary"] is True
     who = _call(server.port, "/api/whoami", headers=authorized)[3]
-    assert who["role"] == "trial" and set(who["capabilities"]) == {"view_site", "photo_read"}
+    assert who["role"] == "trial" and set(who["capabilities"]) == {"view_site", "photo_read", "agent_scratch"}  # scratch: c6fcdb4b
     assert _call(server.port, "/api/reports", "POST", authorized, {"title": "blocked"})[0] == 403
     assert _call(server.port, "/api/account/keep", "POST", {**authorized, "X-Meowdoku-Preview": "1"},
                  {"username": "keeper", "password": PASSWORD, **terms, "agree_research": False})[0] == 400
@@ -158,6 +158,7 @@ def test_login_page_and_consented_alpha_signup_are_public(server):
 
 
 def test_wrong_password_six_times_locks_with_retry_after(server, monkeypatch):
+    monkeypatch.setenv("MEOWDOKU_RATE_LIMITS", "1")                              # the guard is off unless switched on (rate_limits.py)
     monkeypatch.setattr(srv.time, "sleep", lambda s: None)
     _account(server, "cat_one", "member")
     for _ in range(5):
@@ -208,7 +209,8 @@ def test_form_content_type_is_refused(server):
     assert status == 415 and not any(c.startswith(srv.ACCOUNT_COOKIE + "=") and not c.startswith(srv.ACCOUNT_COOKIE + "=;") for c in cookies)
 
 
-def test_guard_limits_and_pruning(tmp_path):
+def test_guard_limits_and_pruning(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEOWDOKU_RATE_LIMITS", "1")                              # the guard is off unless switched on (rate_limits.py)
     db = login_guard.connect(tmp_path / "accounts.db")
     now = 1_000_000.0
     assert login_guard.check(db, "1.1.1.1", "a", now) == 0
