@@ -143,6 +143,10 @@ _BUFFER_BLOCK = re.compile(
     r"\bbuffer\s+(?P<block>[A-Za-z_]\w*)\s*\{(?P<body>[^{}]*)\}"
     r"\s*(?P<instance>[A-Za-z_]\w*)?\s*;"
 )
+# GLSL scalar constructors whose spelling is not a Python builtin -> the
+# builtin conversion of the same kind; the declared width is the annotation
+# of the temporary that holds the result.
+_PYTHON_CAST_SPELLING = {"uint": "int", "double": "float"}
 # GLSL scalar element type -> the canonical dtype a span declares.
 _BUFFER_ELEMENT_DTYPES = {"float": "float32", "int": "int32", "uint": "uint32"}
 
@@ -1138,7 +1142,24 @@ class _ASTExpressionParser:
                 return self._vector_call(token, args, vector)
         if name in GLSL_CASTS:
             self._arity(token, args, 1)
-            converted = _typed(_call(name, args), name)
+            # ``uint`` and ``double`` are not Python names: the conversion
+            # is the builtin of the same kind (``int``/``float``), and the
+            # annotated temporary below declares its GLSL width; the planner
+            # takes a cast's width from that annotation (int and uint are
+            # one kind there, ``hierarchical_plan.scalar_cast_result_dtype``).
+            converted = _typed(_call(_PYTHON_CAST_SPELLING.get(name, name), args), name)
+            if name == "uint" and _type_of(args[0]) == "int":
+                # GLSL ``uint(int)`` keeps the bit pattern: the value modulo
+                # 2**32 (``uint(-1)`` is 4294967295).  The builtin ``int``
+                # is a value-preserving conversion, so the wrap is written
+                # out instead of left to the narrowing: ``int(x)`` widens to
+                # int64, the int64 mask takes the low 32 bits, and the outer
+                # ``int`` is the cast the annotation below narrows to uint32.
+                mask = ast.Constant(value=0xFFFFFFFF)
+                mask._glsl_scalar_dtype = "int64"
+                wrapped = ast.BinOp(left=_call("int", args), op=ast.BitAnd(),
+                                    right=mask)
+                converted = _typed(_call("int", [wrapped]), name)
             if self.context is None:
                 return converted
             # GLSL ``int(x)`` converts to int32 and ``float(x)`` to
