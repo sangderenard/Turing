@@ -1095,10 +1095,11 @@ def _read_imported(read, row):
 
 def test_the_live_recipes_survive_the_emission_boundary_cold():
     """Review 7429db70 (issue 1a6f0c9e) gave concordance_imported_cell and
-    live_derivation cold_after=emission.  Force both cold through the stage
-    policy at completed_through=emission, then read the accepted component's
-    view: the recipe snapshot and the imported owner must come back as they
-    were."""
+    live_derivation cold_after=emission.  At completed_through=emission the
+    stage policy selects both pages as candidates; it spills live_derivation
+    and keeps the private import receipt (and its owner book) resident.  Then
+    read the accepted component's view: the recipe snapshot and the imported
+    owner must come back as they were."""
     from src.compiler.concordance_declarations import INGESTION, INGEST_SOURCE
     from src.compiler.identity_concordance import IMPORTED_CELL, LIVE_DERIVATION
 
