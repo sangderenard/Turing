@@ -1063,3 +1063,79 @@ def test_the_unsourced_detector_scans_a_spilled_book_without_reading_it_back():
         fact = receipts.latest(row)
         assert fact.action == "reload" and PAGE not in fact.parts, fact
         assert set(fact.parts) <= set(PARTITIONED)
+
+
+# ---------------------------------- the live recipes cool after emission
+def _registry_with_test_pages():
+    """A registry holding every declared page plus two test pages, so the
+    test pages never enter the global REGISTRY (which the classification
+    test above requires to be fully classified)."""
+    import src.compiler.concordance_declarations  # noqa: F401  (declares)
+    from src.compiler.identity_concordance import REGISTRY
+
+    registry = Registry()
+    registry.pages.update(REGISTRY.pages)
+    registry.stages.update(REGISTRY.stages)
+    registry.transforms.update(REGISTRY.transforms)
+    registry.reasons.update(REGISTRY.reasons)
+    registry.private_pages.update(REGISTRY.private_pages)
+    owned = registry.declare_page(
+        "spill_test_owned", (RowField("name", RowFieldKind.NAME),), str)
+    view = registry.declare_page(
+        "spill_test_imported_view", (RowField("name", RowFieldKind.NAME),), tuple)
+    return registry, owned, view
+
+
+def _read_imported(read, row):
+    """An import-owned live recipe reading one verified import receipt."""
+    from src.compiler.identity_concordance import IMPORTED_CELL
+
+    return ("seen", read(IMPORTED_CELL, row).fact)
+
+
+def test_the_live_recipes_survive_the_emission_boundary_cold():
+    """Review 7429db70 (issue 1a6f0c9e) gave concordance_imported_cell and
+    live_derivation cold_after=emission.  Force both cold through the stage
+    policy at completed_through=emission, then read the accepted component's
+    view: the recipe snapshot and the imported owner must come back as they
+    were."""
+    from src.compiler.concordance_declarations import INGESTION, INGEST_SOURCE
+    from src.compiler.identity_concordance import IMPORTED_CELL, LIVE_DERIVATION
+
+    registry, owned, view_page = _registry_with_test_pages()
+    owner = IdentityBook(registry=registry)            # the accepted leaf's book
+    source = owner.post(owned, ("leaf",), "leaf-fact", stage=INGESTION,
+                        provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
+    book = IdentityBook(registry=registry)             # the caller's emission book
+    imported = book.import_cell(owner, source, "a" * 64)
+    view = book.derive_current(view_page, ("view",), _read_imported,
+                               (imported.row,), stage=INGESTION)
+    snapshot0 = book.page(LIVE_DERIVATION).latest(("spill_test_imported_view", ("view",)))
+    receipt0 = book.page(IMPORTED_CELL).cell(imported.row, imported.column)
+    assert receipt0.owner is owner
+
+    for name in (IMPORTED_CELL.name, LIVE_DERIVATION.name):
+        assert page_lifecycle.PAGE_LIFECYCLE[name].cold_after == page_lifecycle.EMISSION
+    assert set(page_lifecycle.cold_pages(
+        (IMPORTED_CELL.name, LIVE_DERIVATION.name), page_lifecycle.EMISSION,
+    )) == {IMPORTED_CELL.name, LIVE_DERIVATION.name}
+    result = page_lifecycle.spill_cold_pages(book, page_lifecycle.EMISSION, trigger="policy")
+
+    # live_derivation leaves RAM; concordance_imported_cell is a private page,
+    # so never_spilled keeps it (and the owner book it holds) resident.
+    assert LIVE_DERIVATION.name in result.spilled
+    assert IMPORTED_CELL.name not in result.spilled
+    assert IMPORTED_CELL.name not in result.refused
+    assert never_spilled(book, IMPORTED_CELL.name)
+    assert dict.get(book.pages, LIVE_DERIVATION.name).spilled
+
+    # The accepted-component read after the boundary.
+    assert book.current_ref(view_page, ("view",)) == view
+    assert book.page(view_page).latest(("view",)) == ("seen", "leaf-fact")
+    assert not book.stale_derivations()
+    snapshot1 = book.page(LIVE_DERIVATION).latest(("spill_test_imported_view", ("view",)))
+    assert snapshot1 == snapshot0 and snapshot1.recipe is _read_imported
+    receipt1 = book.page(IMPORTED_CELL).cell(imported.row, imported.column)
+    assert receipt1 == receipt0 and receipt1.owner is owner
+    assert book._source_stamp(imported) == book.page(IMPORTED_CELL).stamp_at(
+        imported.row, imported.column)
