@@ -277,10 +277,11 @@ def tensor_actual_class_spelling(class_identity: str, descriptor: Any) -> str:
 def claimed_generic_class(book: Any, callee_identity: str, formal: str):
     """The class the callee's one generic body was claimed for, or ``None``."""
 
-    from .concordance_declarations import CALLED_INVENTORY
+    from .concordance_declarations import CALLED_GENERIC_CLAIM
 
-    fact = book.page(CALLED_INVENTORY).latest((str(callee_identity), str(formal)))
-    return None if fact is None or fact.root else fact.selected
+    return book.page(CALLED_GENERIC_CLAIM).latest(
+        (str(callee_identity), str(formal))
+    )
 
 
 def post_call_edge_actual(
@@ -296,12 +297,12 @@ def post_call_edge_actual(
 
     ``claim_generic`` (a call planned past the expansion limit): when no
     class holds the formal's generic body yet, this edge's class does
-    (``selected``).  A later edge with another class is fanned to its own
-    copy (``glsl_deployment_strategy._callsite_literal_shell_type``)."""
+    (``CALLED_GENERIC_CLAIM``).  A later edge with another class is fanned
+    to its own copy (``glsl_deployment_strategy._callsite_literal_shell_type``)."""
 
     from .concordance_declarations import (
-        CALL_EDGE_ACTUAL, CALLED_INVENTORY, CalledInventoryFact,
-        PLANNER_TENSOR_SPECIALIZATION,
+        CALL_EDGE_ACTUAL, CALLED_GENERIC_CLAIM, CALLED_INVENTORY,
+        CalledInventoryFact, PLANNER_TENSOR_SPECIALIZATION,
     )
     from .identity_concordance import Derived, Mode
 
@@ -328,22 +329,28 @@ def post_call_edge_actual(
     cell = book.latest_ref(CALLED_INVENTORY, row) if incumbent is not None else None
     cited = [ref for ref, _stage in book.edges_into(cell)] if cell is not None else []
     classes = set(incumbent.classes) if incumbent is not None else set()
-    selected = None if incumbent is None else incumbent.selected
-    root = False if incumbent is None else incumbent.root
-    claim = claim_generic and selected is None and not root
-    if incumbent is not None and cls in classes and edge in cited and not claim:
-        return
-    if claim:
-        selected = cls
-    classes.add(cls)
-    if edge not in cited:
+    if not (incumbent is not None and cls in classes and edge in cited):
+        classes.add(cls)
         cited.append(edge)
-    book.post(
-        CALLED_INVENTORY, row,
-        CalledInventoryFact(tuple(sorted(classes)), selected, root),
-        stage=PLANNER_TENSOR_SPECIALIZATION,
-        provenance=Derived(tuple(dict.fromkeys(cited))), mode=Mode.REVISE,
-    )
+        book.post(
+            CALLED_INVENTORY, row,
+            CalledInventoryFact(
+                tuple(sorted(classes)),
+                None if incumbent is None else incumbent.selected,
+                False if incumbent is None else incumbent.root,
+            ),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived(tuple(dict.fromkeys(cited))), mode=Mode.REVISE,
+        )
+    if claim_generic and book.page(CALLED_GENERIC_CLAIM).latest(row) is None:
+        # The claim is its own fact, DERIVED from the claiming edge's cell:
+        # posted once, never revised (a later edge of another class is
+        # fanned, not re-claimed).
+        book.post(
+            CALLED_GENERIC_CLAIM, row, cls,
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived((edge,)), mode=Mode.CONCORD,
+        )
 
 
 def post_call_edge_range(
