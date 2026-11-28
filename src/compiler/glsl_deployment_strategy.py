@@ -237,6 +237,7 @@ from .planner_concordance_posts import (
     _post_identity_table_mutation as _post_identity_table_mutation,
     _post_copy_planner_specializations as _post_copy_planner_specializations,
     _materialize_planner_specializations as _materialize_planner_specializations,
+    carry_function_shell_specializations as carry_function_shell_specializations,
     _callsite_descriptor_receipt as _callsite_descriptor_receipt,
     _post_callsite_return_member as _post_callsite_return_member,
 )
@@ -39884,6 +39885,62 @@ def _callsite_actual_may_be_none(caller: Any, value_id: int) -> bool:
     return False
 
 
+def _fanned_callsite_disagrees(
+    caller: Any, node_id: int, original: Any,
+    receiver: Any, positional: Any,
+) -> bool:
+    """Past the expansion limit: does this call need its own fanned copy?
+
+    Each argument's actual is posted to the callee formal's called
+    inventory (its class; a tensor's with its element dtype).  The first
+    edge to reach a formal claims the generic body for its class; this call
+    disagrees when any of its actuals is another class than the claimed
+    one.  Nothing else is posted: the literal, interval and record
+    publications belong to the copy, when one is minted.
+    """
+
+    from . import source_evidence_resolver
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .called_inventory import (
+        claimed_generic_class, post_call_edge_actual,
+        tensor_actual_class_spelling,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    caller_scope = _source_numeric_scope(caller.G)
+    callee_identity = str(original.G.graph.get("function_name") or "")
+    disagrees = False
+    for parent, role_value in _expanded_callsite_argument_edges(
+        caller, int(node_id),
+    ):
+        parameter = _callsite_parameter_name(
+            str(role_value), receiver, positional,
+        )
+        if parameter is None:
+            continue
+        answer = source_evidence_resolver.require_class(
+            caller_scope, int(parent), book=book,
+        )
+        if not isinstance(answer, source_evidence_resolver.ClassEvidence):
+            continue
+        class_cell = answer.class_cell or answer.subject_cell
+        if class_cell is None:
+            continue
+        actual_class = tensor_actual_class_spelling(
+            str(answer.class_identity), _tensor_descriptor(caller, int(parent)),
+        )
+        post_call_edge_actual(
+            book, callee_identity, str(parameter), caller_scope,
+            int(node_id), actual_class, class_cell, claim_generic=True,
+        )
+        claimed = claimed_generic_class(book, callee_identity, str(parameter))
+        disagrees = disagrees or (
+            claimed is not None and claimed != actual_class
+        )
+    return disagrees
+
+
 def _callsite_specialized_shell_type(
     owner: Any,
     node_id: int,
@@ -39926,10 +39983,20 @@ def _callsite_literal_shell_type(
     limit = policy["custom_version_depth"]
     caller = owner.process_graph
     generation = int(caller.G.graph.get("custom_version_generation", 0))
-    if limit is not None and generation >= limit:
-        # Keep the already planned generic shell. Descriptor/ABI propagation
-        # is independent and remains enabled; this veto only avoids body copies.
-        return fallback
+    # Past the expansion limit the optional copies stop: no literal, shape,
+    # interval or receiver-field specialization.  The FANNED copy does not
+    # stop (DTYPE_AND_SPECTRAL_DOMAIN_MANIFESTO.md 5.2: a finite set of
+    # encodings is one branch-free body per member).  Program: the Studio
+    # response shader at depth 0, ``atomicAdd`` on a ``uint`` buffer and on
+    # an ``int`` buffer, both ``AbstractTensor.atomic_add(self, ...)``.
+    # Wrong record: one generic body received a uint32 span and an int32
+    # span for ``self`` and the native union refused ("conflicting physical
+    # ProgramABI").  Rule: each edge's actual (class, and element dtype for
+    # a tensor) is posted to the called inventory; the first fanned edge
+    # claims the generic body as that inventory's ``selected`` class, and
+    # an edge whose actual differs gets a copy keyed by its physical
+    # signature alone.  Callers that agree keep the one generic body.
+    fan_only = limit is not None and generation >= limit
     if int(node_id) not in caller.G:
         return fallback
     function_table = getattr(caller, "function_table", None)
@@ -39942,6 +40009,10 @@ def _callsite_literal_shell_type(
     if original is None:
         return fallback
     receiver, positional, _all = _method_parameter_layout(original.G)
+    if fan_only and not _fanned_callsite_disagrees(
+        caller, int(node_id), original, receiver, positional,
+    ):
+        return fallback
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
     aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
@@ -40072,13 +40143,21 @@ def _callsite_literal_shell_type(
                 # The called inventory (called_inventory.py): this call edge's
                 # actual is one record the callee formal's class set is
                 # gathered from.
-                from .called_inventory import post_call_edge_actual
+                from .called_inventory import (
+                    post_call_edge_actual, tensor_actual_class_spelling,
+                )
 
+                callee_identity = str(
+                    original.G.graph.get("function_name") or ""
+                )
+                actual_class = tensor_actual_class_spelling(
+                    str(class_fact[0]),
+                    _tensor_descriptor(caller, int(parent)),
+                )
                 post_call_edge_actual(
-                    current_identity_book(),
-                    str(original.G.graph.get("function_name") or ""),
+                    current_identity_book(), callee_identity,
                     parameter, caller_scope, int(node_id),
-                    str(class_fact[0]), class_cell,
+                    actual_class, class_cell,
                 )
         declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
@@ -40166,7 +40245,10 @@ def _callsite_literal_shell_type(
             tensor_descriptors[parameter] = _declared_formal_descriptors(
                 original, {parameter: descriptor},
             )[parameter]
-        static_argument = _source_static_value(
+        # A fanned copy (past the expansion limit) specializes no literal:
+        # the argument is the formal's dynamic actual, as for the generic
+        # body, and publishes no formal literal the copy would fold.
+        static_argument = (not fan_only) and _source_static_value(
             caller, int(parent),
         ) and _callsite_argument_is_initializer(
             caller, int(node_id), int(parent),
@@ -40358,6 +40440,26 @@ def _callsite_literal_shell_type(
             )
         ):
             specializations[parameter] = copy.deepcopy(default)
+    if fan_only:
+        # The fanned copy is keyed by the physical signature alone: the
+        # actuals' classes, element classes, tensor and record descriptors
+        # and presence.  Literals, defaults, intervals and receiver fields
+        # are the optional specializations the limit stops.  A literal's
+        # DECLARED width (``__glsl_literal_N: 'int32' = 2``) is physical:
+        # it stays as the formal's rank-0 descriptor, the literal does not.
+        for parameter, declared_dtype in specialization_dtypes.items():
+            tensor_descriptors[parameter] = {
+                "shape": (), "dtype": str(declared_dtype), "rank": 0,
+            }
+        specializations.clear()
+        specialization_cells.clear()
+        specialization_dtypes.clear()
+        aggregate_descriptors.clear()
+        aggregate_member_classes.clear()
+        parameter_int_ranges.clear()
+        parameter_int_range_cells.clear()
+        receiver_field_specializations.clear()
+        receiver_field_cells.clear()
     if not (
         specializations or tensor_descriptors
         or aggregate_descriptors or record_descriptors
@@ -41099,6 +41201,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                             and entry.metadata.get("host_ssa_module") is None
                             and entry.metadata.get("implementation_kind") != "authored-source-fallback"):
                         function_graph = extract_clean_process_subgraph(entry.graph, entry.graph.G)
+                        carry_function_shell_specializations(entry.graph, function_graph)
                         function_graph.G.graph["custom_version_generation"] = max(
                             int(function_graph.G.graph.get("custom_version_generation", 0)),
                             int(owner.process_graph.G.graph.get("custom_version_generation", 0)))
@@ -45401,6 +45504,7 @@ def strategize_shell_deployment(
                     entry.graph.G,
                 ),
             )
+            carry_function_shell_specializations(entry.graph, function_graph)
             # A function's graph is built independently, not carved out of
             # the caller's, so it does not inherit the compilation's loop
             # settings the way an extracted subgraph does. Seeding them here
